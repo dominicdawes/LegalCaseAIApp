@@ -50,11 +50,12 @@ def insert_mp3_supabase_record(
     except Exception as e:
         raise Exception(f"Failed to insert into Supabase: {e}")
 
-def insert_document_supabase_record(client, table_name, cdn_url, content_tags, uploaded_by):
+def insert_document_supabase_record(client, table_name, cdn_url, project_id, content_tags, uploaded_by):
     """Inserts a record into the Supabase Library table."""
     try:
         data = {
             "cdn_url": cdn_url,
+            "project_id": project_id,
             "content_tags": content_tags,
             "uploaded_by":uploaded_by,
         }
@@ -65,7 +66,7 @@ def insert_document_supabase_record(client, table_name, cdn_url, content_tags, u
         if response.data:
             # Successful insertion
             print("Successful Supabase row insert")
-            return response.data[0]["id"]  # Return document ID... prior version is just response.data
+            return response.data[0]["id"]  # Return document_sources.id
         else:
             # If there's no data, check for errors
             raise Exception(f"Supabase error: {response.error}")

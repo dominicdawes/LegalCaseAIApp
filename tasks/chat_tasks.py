@@ -47,7 +47,7 @@ class BaseTaskWithRetry(Task):
     retry_jitter = True
 
 @celery_app.task(bind=True, autoretry_for=(Exception,), retry_backoff=True, max_retries=5)
-def rag_chat_task(self, user_id, conversation_id, query, document_ids, media_id):
+def rag_chat_task(self, user_id, conversation_id, query, document_ids, project_id, model_type):
     """
     MAIN Celery task for handling RAG (Retrieval-Augmented Generation) chatbot logic.
 
@@ -57,6 +57,8 @@ def rag_chat_task(self, user_id, conversation_id, query, document_ids, media_id)
         "conversation_id": "conv456",      // Or leave empty for a new conversation
         "query": "What were the results of the researchers' conclusion?",
         "document_ids": ["fjs78dkbf9fksfnuhis-89s", "789s-khw9hdfjksdjhk9sdh"]
+        "project_id": "vjkbnoasdf7y892wb", 
+        "model_type": "deepseek-v3"
     }
     """
     try:

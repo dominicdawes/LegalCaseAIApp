@@ -9,7 +9,8 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # CloudFront domain name (replace with actual CloudFront domain or use an environment variable)
-cloudfront_domain = os.getenv('AWS_CLOUDFRONT_DOMAIN')
+# cloudfront_domain = os.getenv('AWS_CLOUDFRONT_DOMAIN_TEST')
+cloudfront_domain = os.getenv('AWS_CLOUDFRONT_DOMAIN_PROD')
 
 def get_cloudfront_url(object_key, domain=cloudfront_domain):
     """

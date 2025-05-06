@@ -3,6 +3,7 @@ import uuid
 import boto3
 from botocore.exceptions import ClientError
 from botocore.client import Config
+from boto3.s3.transfer import TransferConfig
 from dotenv import load_dotenv
 from datetime import datetime, timedelta, timezone
 
@@ -32,6 +33,7 @@ def upload_to_s3(client, file_path, s3_object_key, bucket_name=s3_bucket_name):
         # set pdf content type
         content_type = "application/pdf" if file_path.endswith(".pdf") else "binary/octet-stream"
 
+        # Multipart uploads for large PDFs
         client.upload_file(
             file_path, 
             bucket_name, 
@@ -41,7 +43,8 @@ def upload_to_s3(client, file_path, s3_object_key, bucket_name=s3_bucket_name):
                 "ContentDisposition": "inline",                 # inline display for preview
                 "CacheControl": "public, max-age=31536000",     # Cache for 1 year
                 "Expires": expires_date
-            }
+            },
+            cfg = TransferConfig(multipart_chunksize=8*1024*1024)   
         )
         return f"https://{bucket_name}.s3.amazonaws.com/{s3_object_key}"
     except Exception as e:

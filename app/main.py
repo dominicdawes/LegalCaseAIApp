@@ -5,8 +5,9 @@ from datetime import datetime, timezone
 from typing import List, Dict, Any
 import uuid
 from utils.pdf_utils import extract_text_from_pdf
-from tasks.generate_tasks import validate_and_generate_audio_task, generate_dialogue_only_task, process_pdf_task, insert_sources_media_association_task
-from tasks.generate_tasks import addition_task
+from tasks.podcast_generate_tasks import validate_and_generate_audio_task, generate_dialogue_only_task
+from tasks.upload_tasks import process_pdf_task, insert_sources_media_association_task, insert_project_documents_task
+from tasks.test_tasks import addition_task
 from tasks.chat_tasks import rag_chat_task
 from celery import chain, chord, group
 from celery.result import AsyncResult
@@ -65,6 +66,16 @@ class PDFRequest(BaseModel):
     files: List[str]  # List of URLs or file paths of the PDFs
     metadata: Dict[str, Any]  # A dictionary for any metadata information
 
+# New RAG pipeline request model
+class NewRagRequest(BaseModel):
+    ''' WeWeb specific pydantic struct '''
+    files: List[str]  # List of URLs or file paths of the PDFs
+    metadata: Dict[str, Any]  # A dictionary for any metadata information
+
+# New RAG pipeline response model
+class NewRagResponse(BaseModel):
+    embedding_task_id: str      # from vector embedding task
+
 # Pydantic model for the response
 class PDFResponse(BaseModel):
     audio_task_id: str
@@ -76,14 +87,17 @@ class RAGRequest(BaseModel):
     conversation_id: str
     query: str
     document_ids: List[str]
-    media_id: str
+    project_id: str
+    model_type: str
 
-# ======== TEST ENDPOINTS ======== #
+# ================================================ #
+#               TEST ENDPOINTS
+# ================================================ #
 
 # Root endpoint
 @app.get("/")
 async def root():
-    return {"success": "Hello Server LawStudentPath FastAPI App"}
+    return {"success": "Hello Server LegalNoteAI FastAPI App"}
 
 # Endpoint for sanity check 
 @app.post("/sum_two_num/")
@@ -128,8 +142,6 @@ async def pdf_extract_batch(files: List[str]):
     
     return {"results": results}
 
-# ======= PDF2PODCAST CELERY TASKS ========= #
-
 # POST endpoint for addition using Celery
 @app.post("/celery_test_addition/")
 async def celery_test_addition(request: AdditionRequest):
@@ -143,10 +155,186 @@ async def celery_test_addition(request: AdditionRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# Endpoint to process PDF and generate audio
+
+# ================================================ #
+#               RAG API ENDPOINTS
+# ================================================ #
+@app.post("/new-rag-project/", response_model=NewRagResponse)
+async def creat_new_rag_project(request: NewRagRequest, background_tasks: BackgroundTasks):
+    '''
+    Endpoint to create both a RAG pipeline for AI notes in one call:
+        - process_pdf_task:
+            input: request.files, request.metadata
+            returns: source_ids
+        
+    Request contains:
+        request.files (List): list of pdf file links
+        request.metadata (json): {
+            project_id:
+        }
+    '''
+    try:
+        job = process_pdf_task.apply_async(
+            args=[request.files, request.metadata]
+        )
+        return {"task_id": job.id}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    
+@app.post("/new-rag-project/", response_model=NewRagResponse)
+async def create_new_rag_project_DEPR(request: NewRagRequest, background_tasks: BackgroundTasks):
+    '''
+    @INVESTIGATE: Should i use this to kill 2 birds with one stone? Using chords
+    Endpoint to create both a RAG pipeline for AI notes in one call:
+        - process_pdf_task:
+            input: request.files, request.metadata
+            returns: source_ids
+        - process_pdf_task:
+            input: source_ids
+            returns: None
+        
+    Request contains
+    project_id
+        request.files (List): list of pdf file links
+        request.metadata (json): {
+            project_id:
+        }
+    '''
+    try:
+        # Create signatures for the tasks
+        process_pdf_task_signature = process_pdf_task.s(request.files, request.metadata)        # Upload PDFs to AWS S3, and Supabase
+        # validate_and_generate_audio_task_signature = validate_and_generate_audio_task.s(request.files, request.metadata)
+
+        # Create the group
+        task_group = group(
+            process_pdf_task_signature,
+            # validate_and_generate_audio_task_signature
+        )
+
+        # Create the chord with the group and callback
+        task_chord = chord(task_group)(insert_project_documents_task.s())
+
+        # The result of the chord is the AsyncResult of the callback task
+        chord_result = task_chord
+
+        # Get task IDs
+        process_pdf_task_id = chord_result.parent.results[0].id
+        # validate_and_generate_audio_task_id = chord_result.parent.results[1].id
+        insert_task_id = chord_result.id
+
+        # Return the task IDs to the client
+        return {
+            # "audio_task_id": validate_and_generate_audio_task_id,
+            "embedding_task_id": process_pdf_task_id,
+            "insert_task_id": insert_task_id,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.post("/add-to-rag-project/", response_model=NewRagResponse)
+async def append_sources_to_project(request: NewRagRequest, background_tasks: BackgroundTasks):
+    '''
+    @TODO HAVE NOT STARTED !!!
+    Endpoint to add new sources to an existing RAG pipeline for AI notes in one call:
+        - process_pdf_task:
+            input: request.files, request.metadata
+            returns: source_ids
+        
+    Request contains
+    project_id
+        request.files (List): list of pdf file links
+        request.metadata (json): {
+            project_id:
+        }
+    '''
+    try:
+        # Create signatures for the tasks
+        process_pdf_task_signature = process_pdf_task.s(request.files, request.metadata)        # Upload PDFs to AWS S3, and Supabase
+        # validate_and_generate_audio_task_signature = validate_and_generate_audio_task.s(request.files, request.metadata)
+
+        # Create the group
+        task_group = group(
+            process_pdf_task_signature,
+            # validate_and_generate_audio_task_signature
+        )
+
+        # Create the chord with the group and callback
+        task_chord = chord(task_group)(insert_project_documents_task.s())
+
+        # The result of the chord is the AsyncResult of the callback task
+        chord_result = task_chord
+
+        # Get task IDs
+        process_pdf_task_id = chord_result.parent.results[0].id
+        # validate_and_generate_audio_task_id = chord_result.parent.results[1].id
+        insert_task_id = chord_result.id
+
+        # Return the task IDs to the client
+        return {
+            # "audio_task_id": validate_and_generate_audio_task_id,
+            "embedding_task_id": process_pdf_task_id,
+            "insert_task_id": insert_task_id,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.post("/generate-rag-note/")
+async def rag_chat(request: RAGRequest):
+    try:
+        # Trigger the RAG task asynchronously and add it to the queue
+        task = rag_chat_task.apply_async(args=[
+            request.user_id,
+            request.conversation_id,
+            request.query,
+            request.document_ids,
+            request.project_id,
+            request.model_type
+        ])
+        
+        # Return the task ID to the client
+        return {"task_id": task.id}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.post("/rag-chat/")
+async def rag_chat(request: RAGRequest):
+    try:
+        # Trigger the RAG task asynchronously and add it to the queue
+        task = rag_chat_task.apply_async(args=[
+            request.user_id,
+            request.conversation_id,
+            request.query,
+            request.document_ids,
+            request.project_id
+        ])
+        
+        # Return the task ID to the client
+        return {"task_id": task.id}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.get("/rag-chat-status/{task_id}")
+async def get_rag_chat_status(task_id: str):
+    """Endpoint to check the status and result of the RAG chat task."""
+    result = AsyncResult(task_id)
+    if result.state == "SUCCESS":
+        return {"status": result.state, "result": result.result}
+    elif result.state == "FAILURE":
+        return {"status": result.state, "error": str(result.result)}
+    else:
+        return {"status": result.state}
+
+# ================================================ #
+#              PODCAST API ENDPOINTS
+# ================================================ #
 
 @app.post("/pdf-to-dialogue/", response_model=PDFResponse)
 async def pdf_to_dialogue(request: PDFRequest, background_tasks: BackgroundTasks):
+    '''
+    Endpoint to create both a pdf/RAG pipeline and create an AI podcast in one call:
+        - process_pdf_task 
+        - validate_and_generate_audio_task
+    '''
     try:
         # Create signatures for the tasks
         process_pdf_task_signature = process_pdf_task.s(request.files, request.metadata)
@@ -177,7 +365,7 @@ async def pdf_to_dialogue(request: PDFRequest, background_tasks: BackgroundTasks
         }
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
-
+    
 # Endpoint to process PDFs and generate dialogue transcript
 @app.post("/pdf-to-dialogue-transcript/", response_model=PDFResponse)
 async def pdf_to_dialogue_transcript(request: PDFRequest, background_tasks: BackgroundTasks):
@@ -241,33 +429,3 @@ async def get_task_status(task_id: str):
     except Exception as e:
         # Handle any unexpected exceptions
         raise HTTPException(status_code=500, detail=f"Error retrieving task status: {str(e)}")
-
-# ======= RAG CELERY TASKS ========= #
-
-@app.post("/rag-chat/")
-async def rag_chat(request: RAGRequest):
-    try:
-        # Trigger the RAG task asynchronously and add it to the queue
-        task = rag_chat_task.apply_async(args=[
-            request.user_id,
-            request.conversation_id,
-            request.query,
-            request.document_ids,
-            request.media_id
-        ])
-        
-        # Return the task ID to the client
-        return {"task_id": task.id}
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-@app.get("/rag-chat-status/{task_id}")
-async def get_rag_chat_status(task_id: str):
-    """Endpoint to check the status and result of the RAG chat task."""
-    result = AsyncResult(task_id)
-    if result.state == "SUCCESS":
-        return {"status": result.state, "result": result.result}
-    elif result.state == "FAILURE":
-        return {"status": result.state, "error": str(result.result)}
-    else:
-        return {"status": result.state}
