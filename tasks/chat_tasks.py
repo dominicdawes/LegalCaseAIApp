@@ -1,4 +1,4 @@
-'''
+"""
 This file runs Celery tasks for handling RAG chat tasks (non-streaming LLM responses)
 Handles RAG chat tasks without token streaming. Returns full answer in one go.
 
@@ -6,15 +6,22 @@ Models
 o4-mini
 gpt-4.1-nano
 
-'''
+"""
 
 from celery import Task
-from tasks.celery_app import celery_app  # Import the Celery app instance (see celery_app.py for LocalHost config)
+from tasks.celery_app import (
+    celery_app,
+)  # Import the Celery app instance (see celery_app.py for LocalHost config)
 import logging
 import os
 import gc
 import redis
-from utils.supabase_utils import supabase_client, insert_chat_message_supabase_record, create_new_chat_session
+from utils.supabase_utils import (
+    supabase_client,
+    insert_chat_message_supabase_record,
+    create_new_chat_session,
+    log_llm_error,
+)
 from datetime import datetime, timezone
 import tempfile
 import uuid
@@ -33,8 +40,8 @@ OPENAI_API_KEY = os.environ.get("OPENAI_API_PROD_KEY")  # ← only for embedding
 # Define which models support temp (and their allowed ranges, if you like)
 _MODEL_TEMPERATURE_CONFIG = {
     # no-temperature models
-    "o4-mini":      {"supports_temperature": False},
-    "gpt-4o-mini":  {"supports_temperature": False},
+    "o4-mini": {"supports_temperature": False},
+    "gpt-4o-mini": {"supports_temperature": False},
     # temperature-capable models
     "gpt-4.1-nano": {"supports_temperature": True, "min": 0.0, "max": 2.0},
 }
@@ -42,13 +49,20 @@ _MODEL_TEMPERATURE_CONFIG = {
 logger = logging.getLogger(__name__)
 
 # Initialize Redis sync client for pub/sub
-REDIS_LABS_URL = 'redis://default:' + os.getenv("REDIS_PASSWORD") + '@' + os.getenv("REDIS_PUBLIC_ENDPOINT")
+REDIS_LABS_URL = (
+    "redis://default:"
+    + os.getenv("REDIS_PASSWORD")
+    + "@"
+    + os.getenv("REDIS_PUBLIC_ENDPOINT")
+)
 redis_sync = redis.Redis.from_url(REDIS_LABS_URL, decode_responses=True)
+
 
 class BaseTaskWithRetry(Task):
     """
     Base Celery Task class enabling automatic retries on exceptions.
     """
+
     autoretry_for = (Exception,)
     retry_backoff = True
     retry_kwargs = {"max_retries": 5}
@@ -63,10 +77,12 @@ def publish_token(chat_session_id: str, token: str):
     # Example: redis_sync.publish(f"chat:{chat_session_id}", token)
     pass
 
+
 class StreamToClientHandler(BaseCallbackHandler):
     """
     LangChain callback handler that emits each new LLM token via publish_token().
     """
+
     def __init__(self, session_id: str):
         self.session_id = session_id
 
@@ -86,14 +102,13 @@ def get_chat_llm(
 
     (default) OpenAI o4-mini model
     """
-    from langchain_openai import ChatOpenAI     # Lazy-import to reduce startup footprint
-
+    from langchain_openai import ChatOpenAI  # Lazy-import to reduce startup footprint
 
     cfg = _MODEL_TEMPERATURE_CONFIG.get(model_name, {"supports_temperature": True})
     llm_kwargs = {
         "api_key": OPENAI_API_KEY,
         "model": model_name,
-        "streaming": False,     # Disable streaming by default
+        "streaming": False,  # Disable streaming by default
     }
     # Only include temperature if this model supports it
     if cfg.get("supports_temperature", False):
@@ -122,18 +137,19 @@ def new_chat_session(self, user_id, project_id):
         response = create_new_chat_session(
             supabase_client,
             table_name="chat_sessions",
-            user_id=user_id, 
+            user_id=user_id,
             project_id=project_id,
         )
         new_chat_session_id = response.data[0]["id"]
 
         # Step 2) UPDATE/REPLACE public.projects, chat_session_id column
         try:
-            _ = supabase_client \
-            .table("projects") \
-            .update({"chat_session_id": new_chat_session_id}) \
-            .eq("id", project_id) \
-            .execute()
+            _ = (
+                supabase_client.table("projects")
+                .update({"chat_session_id": new_chat_session_id})
+                .eq("id", project_id)
+                .execute()
+            )
         except Exception as e:
             raise Exception(f"Error saving to public.projects: {e}")
         return None
@@ -142,6 +158,7 @@ def new_chat_session(self, user_id, project_id):
         logger.error(f"Create new_chat_session task failed: {e}", exc_info=True)
         # Retry on failure according to BaseTaskWithRetry policies
         raise self.retry(exc=e)
+
 
 # def create_new_conversation(user_id, project_id):
 #     """
@@ -155,17 +172,17 @@ def new_chat_session(self, user_id, project_id):
 #     response = supabase_client.table("chat_session").insert(new_chat_session).execute()
 #     return response.data[0]["id"]
 
+
 def restart_chat_session(user_id: str, project_id: str) -> str:
     """
-    🔃 Creates a new chat session in public.chat_sessions, updates the 
+    🔃 Creates a new chat session in public.chat_sessions, updates the
     chat_session_id in public.projects, then deletes the old session.
-    
+
     Returns the new chat_session_id.
     """
     # 1) Fetch the old session id for this project
     proj_res = (
-        supabase_client
-        .table("projects")
+        supabase_client.table("projects")
         .select("chat_session_id")
         .eq("id", project_id)
         .single()
@@ -173,9 +190,9 @@ def restart_chat_session(user_id: str, project_id: str) -> str:
     )
     if proj_res.error:
         raise RuntimeError(f"Error fetching project: {proj_res.error.message}")
-    
+
     old_session_id = proj_res.data["chat_session_id"]
-    
+
     # 2) Insert a new chat_sessions row
     new_chat_session = {
         "user_id": user_id,
@@ -183,43 +200,39 @@ def restart_chat_session(user_id: str, project_id: str) -> str:
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
     insert_res = (
-        supabase_client
-        .table("chat_sessions")
-        .insert(new_chat_session)
-        .execute()
+        supabase_client.table("chat_sessions").insert(new_chat_session).execute()
     )
     if insert_res.error:
         raise RuntimeError(f"Error creating chat session: {insert_res.error.message}")
-    
+
     # Supabase returns a list of inserted rows
     new_session_id = insert_res.data[0]["id"]
-    
+
     # 3) Update the project to point to the new session
     update_res = (
-        supabase_client
-        .table("projects")
+        supabase_client.table("projects")
         .update({"chat_session_id": new_session_id})
         .eq("id", project_id)
         .execute()
     )
     if update_res.error:
         raise RuntimeError(f"Error updating project: {update_res.error.message}")
-    
+
     # 4) Delete the old chat session
     #    (only if it existed in the first place)
     if old_session_id:
         delete_res = (
-            supabase_client
-            .table("chat_sessions")
+            supabase_client.table("chat_sessions")
             .delete()
             .eq("id", old_session_id)
             .execute()
         )
         if delete_res.error:
-            raise RuntimeError(f"Error deleting old session: {delete_res.error.message}")
-    
-    return new_session_id
+            raise RuntimeError(
+                f"Error deleting old session: {delete_res.error.message}"
+            )
 
+    return new_session_id
 
 
 @celery_app.task(bind=True, base=BaseTaskWithRetry)
@@ -230,10 +243,7 @@ def persist_user_query(self, user_id, chat_session_id, query, project_id, model_
     try:
         # Set explicit start time metadata
         self.update_state(
-            state="STARTED",
-            meta={
-                "start_time": datetime.now(timezone.utc).isoformat()
-            }
+            state="STARTED", meta={"start_time": datetime.now(timezone.utc).isoformat()}
         )
 
         # Step 1) Persist user query to public.messages
@@ -245,7 +255,7 @@ def persist_user_query(self, user_id, chat_session_id, query, project_id, model_
             dialogue_role="user",
             message_content=query,
             query_response_status="PENDING",
-            created_at=datetime.now(timezone.utc).isoformat()
+            created_at=datetime.now(timezone.utc).isoformat(),
         )
 
         # Step 2) Return inserted record ID for downstream tasks
@@ -254,17 +264,25 @@ def persist_user_query(self, user_id, chat_session_id, query, project_id, model_
 
     except Exception as e:
         logger.error(f"RAG Chat Task failed: {e}", exc_info=True)
+        log_llm_error(
+            supabase_client,
+            "llm_error_logs",
+            "rag_chat_task",
+            str(e),
+            project_id=project_id,
+            user_id=user_id,
+        )
         raise self.retry(exc=e)
 
 
 @celery_app.task(bind=True, base=BaseTaskWithRetry)
 def rag_chat_task(
-    self, 
-    message_id,     # ← note: passed in first by chained task
-    user_id, 
-    chat_session_id, 
-    query, 
-    project_id, 
+    self,
+    message_id,  # ← note: passed in first by chained task
+    user_id,
+    chat_session_id,
+    query,
+    project_id,
     provider: str,  # ← “openai”, “anthropic”, etc.
     model_name: str,
     temperature: float = 0.7,
@@ -279,8 +297,7 @@ def rag_chat_task(
     try:
         # Set explicit start time metadata
         self.update_state(
-            state="STARTED",
-            meta={"start_time": datetime.now(timezone.utc).isoformat()}
+            state="STARTED", meta={"start_time": datetime.now(timezone.utc).isoformat()}
         )
 
         if not model_name:
@@ -290,6 +307,7 @@ def rag_chat_task(
         # from langchain_openai import OpenAIEmbeddings       # Lazy-import heavy modules
         # from langchain.embeddings.openai import OpenAIEmbeddings    # Lazy-import heavy modules
         from langchain_community.embeddings import OpenAIEmbeddings
+
         embedding_model = OpenAIEmbeddings(
             model="text-embedding-ada-002",
             api_key=OPENAI_API_KEY,
@@ -300,11 +318,10 @@ def rag_chat_task(
         relevant_chunks = fetch_relevant_chunks(query_embedding, project_id)
 
         # Step 3) Generate llm client from factory
-        from utils.llm_factory import LLMFactory       # Lazy-import heavy modules
+        from utils.llm_factory import LLMFactory  # Lazy-import heavy modules
+
         llm_client = LLMFactory.get_client(
-            provider=provider,
-            model_name=model_name,
-            temperature=temperature
+            provider=provider, model_name=model_name, temperature=temperature
         )
 
         # Step 3.1) Generate answer for client
@@ -312,7 +329,7 @@ def rag_chat_task(
             llm_client=llm_client,
             query=query,
             chat_session_id=chat_session_id,
-            relevant_chunks=relevant_chunks
+            relevant_chunks=relevant_chunks,
         )
 
         # Step 4) Insert assistant response
@@ -324,16 +341,17 @@ def rag_chat_task(
             dialogue_role="assistant",
             message_content=assistant_response,
             query_response_status="COMPLETE",
-            created_at=datetime.now(timezone.utc).isoformat()
+            created_at=datetime.now(timezone.utc).isoformat(),
         )
 
         # Step 5) UPDATE public.messages status
         try:
-            _ = supabase_client \
-                .table("messages") \
-                .update({"query_response_status": "COMPLETE"}) \
-                .eq("id", message_id) \
+            _ = (
+                supabase_client.table("messages")
+                .update({"query_response_status": "COMPLETE"})
+                .eq("id", message_id)
                 .execute()
+            )
         except Exception as e:
             raise Exception(f"Error updating public.messages status: {e}")
 
@@ -355,11 +373,14 @@ def fetch_relevant_chunks(query_embedding, project_id, match_count=10):
     Calls Supabase RPC to retrieve the nearest neighbor chunks using HNSW index.
     """
     try:
-        response = supabase_client.rpc("match_document_chunks_hnsw", {
-            "p_project_id": project_id,
-            "p_query": query_embedding,
-            "p_k": match_count
-        }).execute()
+        response = supabase_client.rpc(
+            "match_document_chunks_hnsw",
+            {
+                "p_project_id": project_id,
+                "p_query": query_embedding,
+                "p_k": match_count,
+            },
+        ).execute()
         return response.data
     except Exception as e:
         logger.error(f"Error fetching relevant chunks: {e}", exc_info=True)
@@ -376,7 +397,7 @@ def generate_rag_answer(
     """
     Build prompt, invoke LLM, return the full generated answer at completion.
     """
-    
+
     # # Build conversational context
     # chat_history = fetch_chat_history(chat_session_id)[-max_chat_history:]
     # formatted_history = format_chat_history(chat_history) if chat_history else ""
@@ -394,7 +415,9 @@ def generate_rag_answer(
         sys_msgs: list = build_chat_messages_from_yaml(yaml_dict)
         # sys_msgs is a list of {"role": "system", "content": "..."}
         # We only care about content (each is already a block of text)
-        system_instructions = "\n\n".join(msg["content"] for msg in sys_msgs if msg["role"] == "system")
+        system_instructions = "\n\n".join(
+            msg["content"] for msg in sys_msgs if msg["role"] == "system"
+        )
     except Exception as e:
         # If anything goes wrong loading YAML, fallback to empty system instructions
         logger.warning(f"Unable to load system instructions YAML: {e}")
@@ -419,7 +442,7 @@ def generate_rag_answer(
         query=query,
         relevant_chunks=relevant_chunks,
         model_name=llm_client.model_name,
-        max_tokens=127999
+        max_tokens=127999,
     )
 
     # Then, prepend the un‐trimmed system instructions in front
@@ -431,19 +454,33 @@ def generate_rag_answer(
         answer = llm_client.chat(prompt_body)
         return answer
     except Exception as e:
-        logger.error(f"Error in LLM call (model={llm_client.model_name}): {e}", exc_info=True)
+        logger.error(
+            f"Error in LLM call (model={llm_client.model_name}): {e}", exc_info=True
+        )
+        log_llm_error(
+            supabase_client,
+            "llm_error_logs",
+            "generate_rag_answer",
+            str(e),
+        )
         raise
 
+
 def fetch_chat_history(chat_session_id):
-    response = supabase_client.table("messages") \
-        .select("*") \
-        .eq("chat_session_id", chat_session_id) \
-        .order("created_at").execute()
+    response = (
+        supabase_client.table("messages")
+        .select("*")
+        .eq("chat_session_id", chat_session_id)
+        .order("created_at")
+        .execute()
+    )
     return response.data
 
 
 def format_chat_history(chat_history):
-    return "".join(f"{m['role'].capitalize()}: {m['content']}\n" for m in chat_history).strip()
+    return "".join(
+        f"{m['role'].capitalize()}: {m['content']}\n" for m in chat_history
+    ).strip()
 
 
 def trim_context_length(full_context, query, relevant_chunks, model_name, max_tokens):
@@ -465,5 +502,7 @@ def trim_context_length(full_context, query, relevant_chunks, model_name, max_to
     while len(tokenizer.encode(history)) > max_tokens and relevant_chunks:
         relevant_chunks.pop()
         chunk_context = "\n\n".join(c["content"] for c in relevant_chunks)
-        history = f"Relevant Context:\n{chunk_context}\n\nUser Query: {query}\nAssistant:"
+        history = (
+            f"Relevant Context:\n{chunk_context}\n\nUser Query: {query}\nAssistant:"
+        )
     return history

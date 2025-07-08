@@ -1,0 +1,2 @@
+ticket,title,description,affected_files,timestamp
+MT-001,Configure environment variables,"Set OPENAI_API_KEY, SUPABASE_PROJECT_URL, SUPABASE_SERVICE_ROLE_KEY, AWS credentials, and other environment variables in a .env file","utils/*;tasks/*;test/api_health.py",2025-06-18T03:40:10Z

@@ -1,0 +1,11 @@
+Ticket,Date,Time,Author,Description,Files Affected,Notes
+CL-001,2025-06-17,22:00,LinDon Harris,"Initial clone of LegalCaseAIApp by Dominic Dawes to create new repository legalcaseaiapp-lhcodex.","All files","Source repo was LegalCaseAIApp (Dominic Dawes)."
+CL-002,2025-06-18,02:58,LinDon Harris,"Add product spec doc","dev guides/product_spec.md",""
+CL-003,2025-06-18,03:08,LinDon Harris,"Add AGENTS file with commit guidelines","AGENTS.md",""
+CL-004,2025-06-18,03:16,LinDon Harris,"Clarify changelog instructions link in AGENTS","AGENTS.md",""
+CL-005,2025-06-18,03:32,LinDon Harris,"Add manual tasks log instructions","AGENTS.md;dev guides/manual_tasks.csv",""
+CL-006,2025-06-18,03:40,LinDon Harris,"Add ticket field to manual tasks log and record first manual task","AGENTS.md;dev guides/manual_tasks.csv",""
+CL-007,2025-06-18,02:24,LinDon Harris,"Add 1L essential cases JSON file in new resource_hub folder","resource_hub/1L_essential_cases.json",""
+CL-008,2025-06-18,04:20,LinDon Harris,"Add error logging for LLM failures and new unit tests","utils/supabase_utils.py;tasks/chat_tasks.py;tasks/note_tasks.py;tasks/upload_tasks.py;test/test_app.py;test/test_tasks_error.py",""
+CL-009,2025-07-01,22:48,OpenAI Codex,"Document requirement that changelog descriptions use at least two sentences. This ensures each entry adequately summarizes the change.","AGENTS.md;CHANGELOG_INSTRUCTIONS.md",""
+CL-010,2025-07-01,22:55,OpenAI Codex,"Revised example entry to demonstrate two-sentence changelog descriptions. This clarifies expectations for future contributions.","CHANGELOG_INSTRUCTIONS.md",""

@@ -1,0 +1,1262 @@
+{
+  "metadata": {
+    "title": "Essential 1L Law School Cases - Expanded Edition",
+    "description": "Comprehensive collection of landmark cases taught in first-year law school courses at T50 and T20 institutions",
+    "version": "2.0.0",
+    "last_updated": "2025-06-18",
+    "total_cases": 40,
+    "subjects": ["civil_procedure", "contracts", "torts", "criminal_law", "constitutional_law", "property_law"],
+    "source": "Research compilation from T50/T20 law school curricula with substantial additions"
+  },
+  "cases": [
+    {
+      "id": "pennoyer_v_neff_1878",
+      "case_name": "Pennoyer v. Neff",
+      "short_name": "Pennoyer",
+      "citation": "95 U.S. 714 (1878)",
+      "year": 1878,
+      "court": "U.S. Supreme Court",
+      "subject": "civil_procedure",
+      "subcategory": "personal_jurisdiction",
+      "importance_level": "foundational",
+      "semester_typically_taught": "1L_fall",
+      "urls": {
+        "primary": "https://supreme.justia.com/cases/federal/us/95/714/",
+        "pdf": "https://tile.loc.gov/storage-services/service/ll/usrep/usrep095/usrep095714/usrep095714.pdf",
+        "alternative": "https://caselaw.findlaw.com/court/us-supreme-court/95/714.html"
+      },
+      "learning_objectives": [
+        "Understand historical territorial theory of personal jurisdiction",
+        "Learn foundation for modern jurisdiction doctrine",
+        "Analyze due process requirements for court proceedings",
+        "Compare with modern minimum contacts standard"
+      ],
+      "key_principles": [
+        "Territorial theory of jurisdiction",
+        "Due process in court proceedings",
+        "Personal service requirements"
+      ],
+      "tags": ["jurisdiction", "due_process", "historical", "foundational"],
+      "difficulty": "intermediate",
+      "estimated_reading_time": 45,
+      "related_cases": ["international_shoe_v_washington_1945"],
+      "famous_quotes": ["Proceedings that affect the rights and obligations of parties over whom a court does not have personal jurisdiction violate due process"],
+      "cultural_significance": "Historical foundation case largely superseded by International Shoe"
+    },
+    {
+      "id": "international_shoe_v_washington_1945",
+      "case_name": "International Shoe Co. v. Washington",
+      "short_name": "International Shoe",
+      "citation": "326 U.S. 310 (1945)",
+      "year": 1945,
+      "court": "U.S. Supreme Court",
+      "subject": "civil_procedure",
+      "subcategory": "personal_jurisdiction",
+      "importance_level": "essential",
+      "semester_typically_taught": "1L_fall",
+      "urls": {
+        "primary": "https://supreme.justia.com/cases/federal/us/326/310/",
+        "pdf": "https://tile.loc.gov/storage-services/service/ll/usrep/usrep326/usrep326310/usrep326310.pdf",
+        "alternative": "https://websites.umich.edu/~jdlitman/classes/cyber/cases/Shoe.pdf",
+        "analysis": "https://supreme.findlaw.com/supreme-court-insights/international-shoe-co--v--washington-case-summary.html"
+      },
+      "learning_objectives": [
+        "Master the minimum contacts test for personal jurisdiction",
+        "Understand fair play and substantial justice standard",
+        "Apply jurisdiction analysis to out-of-state defendants",
+        "Learn constitutional basis under 14th Amendment Due Process",
+        "Understand foundation for long-arm statutes"
+      ],
+      "key_principles": [
+        "Minimum contacts test",
+        "Fair play and substantial justice",
+        "Systematic and continuous business activities",
+        "Modern personal jurisdiction doctrine"
+      ],
+      "tags": ["jurisdiction", "minimum_contacts", "due_process", "essential", "modern_doctrine"],
+      "difficulty": "intermediate",
+      "estimated_reading_time": 60,
+      "related_cases": ["pennoyer_v_neff_1878", "world_wide_volkswagen_v_woodson_1980"],
+      "famous_quotes": ["Traditional notions of fair play and substantial justice"],
+      "cultural_significance": "Foundation of modern personal jurisdiction law"
+    },
+    {
+      "id": "erie_railroad_v_tompkins_1938",
+      "case_name": "Erie Railroad Co. v. Tompkins",
+      "short_name": "Erie",
+      "citation": "304 U.S. 64 (1938)",
+      "year": 1938,
+      "court": "U.S. Supreme Court",
+      "subject": "civil_procedure",
+      "subcategory": "choice_of_law",
+      "importance_level": "essential",
+      "semester_typically_taught": "1L_fall",
+      "urls": {
+        "primary": "https://supreme.justia.com/cases/federal/us/304/64/",
+        "pdf": "https://tile.loc.gov/storage-services/service/ll/usrep/usrep304/usrep304064/usrep304064.pdf",
+        "alternative": "https://www.fjc.gov/sites/default/files/cases-that-shaped-the-federal-courts/pdf/Erie_0.pdf",
+        "analysis": "https://opencasebook.org/casebooks/9188-civil-procedure-2024/resources/9.2.1.2-erie-railroad-v-tompkins/"
+      },
+      "learning_objectives": [
+        "Understand Erie doctrine and choice of law in federal courts",
+        "Learn when federal courts must apply state law",
+        "Analyze federalism and separation of powers",
+        "Apply Erie analysis to substantive vs. procedural law"
+      ],
+      "key_principles": [
+        "Federal courts must apply state substantive law",
+        "No federal general common law",
+        "Erie doctrine and choice of law",
+        "Federalism in judicial system"
+      ],
+      "tags": ["choice_of_law", "federalism", "erie_doctrine", "essential", "federal_courts"],
+      "difficulty": "advanced",
+      "estimated_reading_time": 55,
+      "related_cases": ["hanna_v_plumer_1965", "guaranty_trust_v_york_1945"],
+      "famous_quotes": ["There is no federal general common law"],
+      "cultural_significance": "Fundamental change in federal court practice"
+    },
+    {
+      "id": "world_wide_volkswagen_v_woodson_1980",
+      "case_name": "World-Wide Volkswagen Corp. v. Woodson",
+      "short_name": "World-Wide Volkswagen",
+      "citation": "444 U.S. 286 (1980)",
+      "year": 1980,
+      "court": "U.S. Supreme Court",
+      "subject": "civil_procedure",
+      "subcategory": "personal_jurisdiction",
+      "importance_level": "essential",
+      "semester_typically_taught": "1L_fall",
+      "urls": {
+        "primary": "https://supreme.justia.com/cases/federal/us/444/286/",
+        "pdf": "https://tile.loc.gov/storage-services/service/ll/usrep/usrep444/usrep444286/usrep444286.pdf",
+        "alternative": "https://caselaw.findlaw.com/court/us-supreme-court/444/286.html"
+      },
+      "learning_objectives": [
+        "Understand limits on personal jurisdiction",
+        "Learn purposeful availment requirement",
+        "Distinguish foreseeability from purposeful conduct",
+        "Apply jurisdiction limits in product liability cases"
+      ],
+      "key_principles": [
+        "Purposeful availment requirement",
+        "Limits on foreseeability-based jurisdiction",
+        "Stream of commerce limitations",
+        "Defendant's reasonable expectations"
+      ],
+      "tags": ["jurisdiction", "purposeful_availment", "limits", "product_liability"],
+      "difficulty": "intermediate",
+      "estimated_reading_time": 50,
+      "related_cases": ["international_shoe_v_washington_1945", "asahi_metal_v_superior_court_1987"],
+      "famous_quotes": ["Foreseeability alone has never been a sufficient benchmark for personal jurisdiction"],
+      "cultural_significance": "Limits expansion of personal jurisdiction doctrine"
+    },
+    {
+      "id": "asahi_metal_v_superior_court_1987",
+      "case_name": "Asahi Metal Industry Co. v. Superior Court",
+      "short_name": "Asahi",
+      "citation": "480 U.S. 102 (1987)",
+      "year": 1987,
+      "court": "U.S. Supreme Court",
+      "subject": "civil_procedure",
+      "subcategory": "personal_jurisdiction",
+      "importance_level": "important",
+      "semester_typically_taught": "1L_fall",
+      "urls": {
+        "primary": "https://supreme.justia.com/cases/federal/us/480/102/",
+        "pdf": "https://tile.loc.gov/storage-services/service/ll/usrep/usrep480/usrep480102/usrep480102.pdf",
+        "alternative": "https://caselaw.findlaw.com/court/us-supreme-court/480/102.html"
+      },
+      "learning_objectives": [
+        "Understand stream of commerce theory refinements",
+        "Learn purposeful direction requirement",
+        "Analyze jurisdiction in international commerce",
+        "Apply reasonableness factors in jurisdiction analysis"
+      ],
+      "key_principles": [
+        "Stream of commerce plus purposeful direction",
+        "Reasonableness factors in jurisdiction",
+        "International commerce considerations",
+        "Burden on defendant analysis"
+      ],
+      "tags": ["jurisdiction", "stream_commerce", "international", "reasonableness"],
+      "difficulty": "advanced",
+      "estimated_reading_time": 55,
+      "related_cases": ["world_wide_volkswagen_v_woodson_1980", "gray_v_american_radiator_1961"],
+      "famous_quotes": ["Stream of commerce alone is not enough"],
+      "cultural_significance": "Clarifies limits on stream of commerce jurisdiction"
+    },
+    {
+      "id": "gray_v_american_radiator_1961",
+      "case_name": "Gray v. American Radiator & Standard Sanitary Corp.",
+      "short_name": "Gray",
+      "citation": "22 Ill. 2d 432, 176 N.E.2d 761 (1961)",
+      "year": 1961,
+      "court": "Illinois Supreme Court",
+      "subject": "civil_procedure",
+      "subcategory": "personal_jurisdiction",
+      "importance_level": "important",
+      "semester_typically_taught": "1L_fall",
+      "urls": {
+        "primary": "https://law.justia.com/cases/illinois/supreme-court/1961/35958-4.html",
+        "alternative": "https://caselaw.findlaw.com/court/il-supreme-court/1861193.html"
+      },
+      "learning_objectives": [
+        "Understand foreseeability-based jurisdiction",
+        "Learn component manufacturer liability",
+        "Analyze stream of commerce theory origins",
+        "Apply jurisdiction to product liability chains"
+      ],
+      "key_principles": [
+        "Foreseeability-based jurisdiction",
+        "Component manufacturer liability",
+        "Stream of commerce theory",
+        "Product liability jurisdiction"
+      ],
+      "tags": ["jurisdiction", "foreseeability", "product_liability", "component_manufacturer"],
+      "difficulty": "intermediate",
+      "estimated_reading_time": 40,
+      "related_cases": ["world_wide_volkswagen_v_woodson_1980", "asahi_metal_v_superior_court_1987"],
+      "famous_quotes": ["Foreseeability of consequences in the forum state"],
+      "cultural_significance": "Early expansion of personal jurisdiction doctrine"
+    },
+    {
+      "id": "frcp_rule_12b6_motion",
+      "case_name": "Bell Atlantic Corp. v. Twombly",
+      "short_name": "Twombly",
+      "citation": "550 U.S. 544 (2007)",
+      "year": 2007,
+      "court": "U.S. Supreme Court",
+      "subject": "civil_procedure",
+      "subcategory": "pleadings",
+      "importance_level": "essential",
+      "semester_typically_taught": "1L_fall",
+      "urls": {
+        "primary": "https://supreme.justia.com/cases/federal/us/550/544/",
+        "pdf": "https://tile.loc.gov/storage-services/service/ll/usrep/usrep550/usrep550544/usrep550544.pdf",
+        "alternative": "https://caselaw.findlaw.com/court/us-supreme-court/550/544.html"
+      },
+      "learning_objectives": [
+        "Understand modern pleading standards",
+        "Learn plausibility standard for complaints",
+        "Analyze Rule 12(b)(6) motion practice",
+        "Apply Twombly-Iqbal pleading requirements"
+      ],
+      "key_principles": [
+        "Plausibility pleading standard",
+        "Factual allegations must be plausible",
+        "Conclusory allegations insufficient",
+        "Modern notice pleading evolution"
+      ],
+      "tags": ["pleadings", "12b6", "plausibility", "modern", "essential"],
+      "difficulty": "intermediate",
+      "estimated_reading_time": 50,
+      "related_cases": ["ashcroft_v_iqbal_2009", "conley_v_gibson_1957"],
+      "famous_quotes": ["Plausible grounds to infer an agreement"],
+      "cultural_significance": "Changed modern pleading practice significantly"
+    },
+    {
+      "id": "hawkins_v_mcgee_1929",
+      "case_name": "Hawkins v. McGee",
+      "short_name": "Hawkins (Hairy Hand)",
+      "citation": "84 N.H. 114, 146 A. 641 (1929)",
+      "year": 1929,
+      "court": "New Hampshire Supreme Court",
+      "subject": "contracts",
+      "subcategory": "damages",
+      "importance_level": "essential",
+      "semester_typically_taught": "1L_fall",
+      "urls": {
+        "primary": "https://www.quimbee.com/cases/hawkins-v-mcgee",
+        "alternative": "https://www.findlaw.com/legal/law-students/surviving-law-school/hawkins-v--mcgee-case-summary.html",
+        "analysis": "https://vellalundlaw.com/article/4/hawkins-v-mcgee-the-hairy-hand-case"
+      },
+      "learning_objectives": [
+        "Master expectancy damages in contract law",
+        "Distinguish warranty from mere opinion",
+        "Calculate damages for contract breach",
+        "Understand difference between expectancy and reliance damages"
+      ],
+      "key_principles": [
+        "Expectancy damages as primary contract remedy",
+        "Warranty vs. opinion distinction",
+        "Benefit of the bargain damages",
+        "Contract formation and breach"
+      ],
+      "tags": ["contracts", "damages", "warranty", "expectancy", "famous"],
+      "difficulty": "beginner",
+      "estimated_reading_time": 35,
+      "related_cases": ["sullivan_v_oconnor_1973", "hadley_v_baxendale_1854"],
+      "famous_quotes": ["One hundred percent good hand"],
+      "cultural_significance": "Featured in The Paper Chase; classic contracts case"
+    },
+    {
+      "id": "hadley_v_baxendale_1854",
+      "case_name": "Hadley v. Baxendale",
+      "short_name": "Hadley",
+      "citation": "9 Ex. 341, 156 Eng. Rep. 145 (1854)",
+      "year": 1854,
+      "court": "Court of Exchequer",
+      "subject": "contracts",
+      "subcategory": "damages",
+      "importance_level": "essential",
+      "semester_typically_taught": "1L_fall",
+      "urls": {
+        "primary": "https://www.bailii.org/ew/cases/EWHC/Exch/1854/J70.html",
+        "alternative": "https://law.justia.com/cases/england/EWHC/Exch/1854/J70.html"
+      },
+      "learning_objectives": [
+        "Understand foreseeability rule for contract damages",
+        "Learn consequential vs. general damages",
+        "Apply two-part Hadley test",
+        "Analyze remoteness of damages"
+      ],
+      "key_principles": [
+        "Foreseeability rule for contract damages",
+        "General vs. consequential damages distinction",
+        "Two-part Hadley test",
+        "Remoteness limitation on damages"
+      ],
+      "tags": ["contracts", "damages", "foreseeability", "consequential", "foundational"],
+      "difficulty": "intermediate",
+      "estimated_reading_time": 40,
+      "related_cases": ["hawkins_v_mcgee_1929", "sullivan_v_oconnor_1973"],
+      "famous_quotes": ["Such damages as may fairly and reasonably be considered"],
+      "cultural_significance": "Foundation of contract damages law"
+    },
+    {
+      "id": "hamer_v_sidway_1891",
+      "case_name": "Hamer v. Sidway",
+      "short_name": "Hamer",
+      "citation": "124 N.Y. 538, 27 N.E. 256 (1891)",
+      "year": 1891,
+      "court": "New York Court of Appeals",
+      "subject": "contracts",
+      "subcategory": "consideration",
+      "importance_level": "essential",
+      "semester_typically_taught": "1L_fall",
+      "urls": {
+        "primary": "https://nycourts.gov/reporter/archives/hamer_sidway.htm",
+        "pdf": "https://www.uni-trier.de/fileadmin/fb5/FFA/KURSUNTERLAGEN/Anglo-Amerikanisches_Recht/Contract_Law/Siry_WS_2015_16/Hamer_v_Sidway.pdf",
+        "alternative": "https://opencasebook.org/documents/3530/",
+        "analysis": "https://www.americanbar.org/groups/law_students/resources/on-demand/quimbee-hamer-v-sidway/"
+      },
+      "learning_objectives": [
+        "Understand consideration doctrine fundamentals",
+        "Learn legal detriment vs. benefit analysis",
+        "Apply forbearance as consideration",
+        "Analyze bargain theory of consideration"
+      ],
+      "key_principles": [
+        "Legal detriment constitutes consideration",
+        "Forbearance can be valuable consideration",
+        "Bargain theory of consideration",
+        "Consideration need not benefit promisor"
+      ],
+      "tags": ["contracts", "consideration", "detriment", "forbearance", "foundational"],
+      "difficulty": "beginner",
+      "estimated_reading_time": 30,
+      "related_cases": ["mills_v_wyman_1825", "kirksey_v_kirksey_1845"],
+      "famous_quotes": ["Valuable consideration may consist in some forbearance, detriment, loss, or responsibility"],
+      "cultural_significance": "Classic case defining consideration doctrine"
+    },
+    {
+      "id": "lucy_v_zehmer_1954",
+      "case_name": "Lucy v. Zehmer",
+      "short_name": "Lucy",
+      "citation": "196 Va. 493, 84 S.E.2d 516 (1954)",
+      "year": 1954,
+      "court": "Virginia Supreme Court",
+      "subject": "contracts",
+      "subcategory": "formation",
+      "importance_level": "important",
+      "semester_typically_taught": "1L_fall",
+      "urls": {
+        "primary": "https://law.justia.com/cases/virginia/supreme-court/1954/196-va-493-0.html",
+        "alternative": "https://caselaw.findlaw.com/court/va-supreme-court/1861193.html"
+      },
+      "learning_objectives": [
+        "Understand objective theory of contracts",
+        "Learn intent vs. subjective belief",
+        "Apply reasonable person standard to contract formation",
+        "Analyze jest vs. serious offer"
+      ],
+      "key_principles": [
+        "Objective theory of contract formation",
+        "Reasonable person standard for intent",
+        "Outward manifestation controls over subjective intent",
+        "Jest defense limitations"
+      ],
+      "tags": ["contracts", "formation", "objective_theory", "intent", "jest"],
+      "difficulty": "beginner",
+      "estimated_reading_time": 35,
+      "related_cases": ["embry_v_hargadine_1907", "ray_v_william_g_eurice_1952"],
+      "famous_quotes": ["The law imputes to a person an intention corresponding to the reasonable meaning"],
+      "cultural_significance": "Classic case for objective theory of contracts"
+    },
+    {
+      "id": "carlill_v_carbolic_smoke_ball_1893",
+      "case_name": "Carlill v. Carbolic Smoke Ball Co.",
+      "short_name": "Carlill",
+      "citation": "[1893] 1 Q.B. 256",
+      "year": 1893,
+      "court": "Court of Appeal",
+      "subject": "contracts",
+      "subcategory": "unilateral_contracts",
+      "importance_level": "important",
+      "semester_typically_taught": "1L_fall",
+      "urls": {
+        "primary": "https://www.bailii.org/ew/cases/EWCA/Civ/1892/1.html",
+        "alternative": "https://law.justia.com/cases/england/EWCA/Civ/1892/1.html"
+      },
+      "learning_objectives": [
+        "Understand unilateral contract formation",
+        "Learn offer vs. advertisement distinction",
+        "Analyze consideration in unilateral contracts",
+        "Apply acceptance by performance"
+      ],
+      "key_principles": [
+        "Unilateral contract formation",
+        "Advertisement can be offer if specific enough",
+        "Acceptance by performance",
+        "Consideration in reward contracts"
+      ],
+      "tags": ["contracts", "unilateral", "advertisement", "offer", "performance"],
+      "difficulty": "intermediate",
+      "estimated_reading_time": 40,
+      "related_cases": ["lefkowitz_v_great_minneapolis_surplus_1957", "leonard_v_pepsico_1999"],
+      "famous_quotes": ["It is an offer made to all the world"],
+      "cultural_significance": "Classic unilateral contract case"
+    },
+    {
+      "id": "mills_v_wyman_1825",
+      "case_name": "Mills v. Wyman",
+      "short_name": "Mills",
+      "citation": "20 Mass. (3 Pick.) 207 (1825)",
+      "year": 1825,
+      "court": "Massachusetts Supreme Judicial Court",
+      "subject": "contracts",
+      "subcategory": "consideration",
+      "importance_level": "important",
+      "semester_typically_taught": "1L_fall",
+      "urls": {
+        "primary": "https://law.justia.com/cases/massachusetts/supreme-court/1825/20-mass-207-0.html",
+        "alternative": "https://caselaw.findlaw.com/court/ma-supreme-judicial-court/1861193.html"
+      },
+      "learning_objectives": [
+        "Understand past consideration doctrine",
+        "Learn moral obligation vs. legal obligation",
+        "Analyze consideration requirements",
+        "Apply bargain theory of consideration"
+      ],
+      "key_principles": [
+        "Past consideration is no consideration",
+        "Moral obligation insufficient for contract",
+        "Bargain theory of consideration",
+        "Gratuitous promises unenforceable"
+      ],
+      "tags": ["contracts", "consideration", "past_consideration", "moral_obligation", "bargain"],
+      "difficulty": "intermediate",
+      "estimated_reading_time": 35,
+      "related_cases": ["hamer_v_sidway_1891", "kirksey_v_kirksey_1845"],
+      "famous_quotes": ["A moral obligation is insufficient consideration"],
+      "cultural_significance": "Classic case on consideration doctrine"
+    },
+    {
+      "id": "williams_v_walker_thomas_1965",
+      "case_name": "Williams v. Walker-Thomas Furniture Co.",
+      "short_name": "Williams",
+      "citation": "350 F.2d 445 (D.C. Cir. 1965)",
+      "year": 1965,
+      "court": "U.S. Court of Appeals, D.C. Circuit",
+      "subject": "contracts",
+      "subcategory": "unconscionability",
+      "importance_level": "important",
+      "semester_typically_taught": "1L_fall",
+      "urls": {
+        "primary": "https://law.justia.com/cases/federal/appellate-courts/F2/350/445/1563395/",
+        "alternative": "https://caselaw.findlaw.com/court/us-dc-circuit/1563395.html"
+      },
+      "learning_objectives": [
+        "Understand unconscionability doctrine",
+        "Learn procedural vs. substantive unconscionability",
+        "Analyze consumer protection in contracts",
+        "Apply fairness standards in contract enforcement"
+      ],
+      "key_principles": [
+        "Unconscionability doctrine",
+        "Procedural and substantive unconscionability",
+        "Consumer protection principles",
+        "Meaningful choice requirement"
+      ],
+      "tags": ["contracts", "unconscionability", "consumer_protection", "fairness", "modern"],
+      "difficulty": "intermediate",
+      "estimated_reading_time": 45,
+      "related_cases": ["henningsen_v_bloomfield_motors_1960", "campbell_soup_v_wentz_1948"],
+      "famous_quotes": ["Absence of meaningful choice"],
+      "cultural_significance": "Foundation of modern unconscionability doctrine"
+    },
+    {
+      "id": "lefkowitz_v_great_minneapolis_surplus_1957",
+      "case_name": "Lefkowitz v. Great Minneapolis Surplus Store",
+      "short_name": "Lefkowitz",
+      "citation": "251 Minn. 188, 86 N.W.2d 689 (1957)",
+      "year": 1957,
+      "court": "Minnesota Supreme Court",
+      "subject": "contracts",
+      "subcategory": "offer_acceptance",
+      "importance_level": "important",
+      "semester_typically_taught": "1L_fall",
+      "urls": {
+        "primary": "https://law.justia.com/cases/minnesota/supreme-court/1957/251-minn-188-0.html",
+        "alternative": "https://caselaw.findlaw.com/court/mn-supreme-court/1861193.html"
+      },
+      "learning_objectives": [
+        "Distinguish offers from advertisements",
+        "Understand specificity requirements for offers",
+        "Learn when advertisements become binding offers",
+        "Apply objective theory to offer analysis"
+      ],
+      "key_principles": [
+        "Specific advertisements can be offers",
+        "Clear, definite, and explicit language required",
+        "First come, first served creates offer",
+        "Objective manifestation of intent"
+      ],
+      "tags": ["contracts", "offer", "advertisement", "specificity", "acceptance"],
+      "difficulty": "beginner",
+      "estimated_reading_time": 30,
+      "related_cases": ["carlill_v_carbolic_smoke_ball_1893", "leonard_v_pepsico_1999"],
+      "famous_quotes": ["Clear, definite, and explicit, and leaves nothing open for negotiation"],
+      "cultural_significance": "Classic case on advertisements as offers"
+    },
+    {
+      "id": "palsgraf_v_long_island_rr_1928",
+      "case_name": "Palsgraf v. Long Island Railroad Co.",
+      "short_name": "Palsgraf",
+      "citation": "248 N.Y. 339, 162 N.E. 99 (1928)",
+      "year": 1928,
+      "court": "New York Court of Appeals",
+      "subject": "torts",
+      "subcategory": "negligence",
+      "importance_level": "essential",
+      "semester_typically_taught": "1L_spring",
+      "urls": {
+        "primary": "https://law.justia.com/cases/new-york/court-of-appeals/1928/248-n-y-339-1928.html",
+        "alternative": "https://lawlibrarycollections.umn.edu/classic-cases-tort-palsgraf-v-long-island-railroad-co",
+        "pdf": "https://www.law.berkeley.edu/files/Palsgraf_NYCA.pdf"
+      },
+      "learning_objectives": [
+        "Understand proximate cause and foreseeability in negligence",
+        "Learn scope of duty in tort law",
+        "Compare Cardozo vs. Andrews approaches to negligence",
+        "Analyze when liability extends to unforeseeable plaintiffs"
+      ],
+      "key_principles": [
+        "No liability for harm to unforeseeable plaintiff",
+        "Proximate cause limitations",
+        "Duty and foreseeability relationship",
+        "Scope of negligence liability"
+      ],
+      "tags": ["torts", "negligence", "proximate_cause", "foreseeability", "famous"],
+      "difficulty": "intermediate",
+      "estimated_reading_time": 50,
+      "related_cases": ["wagon_mound_no_1_1961", "polemis_1921"],
+      "famous_quotes": ["Proof of negligence in the air, so to speak, will not do"],
+      "cultural_significance": "Most famous case in tort law"
+    },
+    {
+      "id": "vosburg_v_putney_1891",
+      "case_name": "Vosburg v. Putney",
+      "short_name": "Vosburg",
+      "citation": "80 Wis. 523, 50 N.W. 403 (1891)",
+      "year": 1891,
+      "court": "Wisconsin Supreme Court",
+      "subject": "torts",
+      "subcategory": "intentional_torts",
+      "importance_level": "essential",
+      "semester_typically_taught": "1L_spring",
+      "urls": {
+        "primary": "https://lawlibrarycollections.umn.edu/classic-cases-tort-vosburg-v-putney",
+        "pdf": "http://www.2civility.org/wp-content/uploads/Vosburg-v-Putney-8-12.pdf",
+        "alternative": "https://opencasebook.org/casebooks/2566-torts/resources/3.1.1-vosburg-v-putney-the-schoolboy-kicker/",
+        "analysis": "https://www.casebriefs.com/blog/law/torts/torts-keyed-to-epstein/intentionally-inflicted-harm-the-prima-facie-case-and-defenses/vosburg-v-putney/"
+      },
+      "learning_objectives": [
+        "Understand intent in battery cases",
+        "Learn eggshell skull rule in intentional torts",
+        "Analyze liability for unforeseeable consequences",
+        "Apply intent standards to children"
+      ],
+      "key_principles": [
+        "Intent to cause harmful or offensive contact",
+        "Eggshell skull rule applies to intentional torts",
+        "Liable for all consequences of intentional acts",
+        "Children can form intent for battery"
+      ],
+      "tags": ["torts", "intentional_torts", "battery", "intent", "eggshell_skull", "children"],
+      "difficulty": "beginner",
+      "estimated_reading_time": 35,
+      "related_cases": ["garratt_v_dailey_1955", "spivey_v_battaglia_1972"],
+      "famous_quotes": ["The wrongdoer is liable for all injuries resulting directly from the wrongful act"],
+      "cultural_significance": "Classic schoolyard battery case; teaches intent and consequences"
+    },
+    {
+      "id": "summers_v_tice_1948",
+      "case_name": "Summers v. Tice",
+      "short_name": "Summers",
+      "citation": "33 Cal. 2d 80, 199 P.2d 1 (1948)",
+      "year": 1948,
+      "court": "California Supreme Court",
+      "subject": "torts",
+      "subcategory": "causation",
+      "importance_level": "important",
+      "semester_typically_taught": "1L_spring",
+      "urls": {
+        "primary": "https://law.justia.com/cases/california/supreme-court/2d/33/80.html",
+        "alternative": "https://caselaw.findlaw.com/court/ca-supreme-court/1780516.html"
+      },
+      "learning_objectives": [
+        "Understand burden shifting in tort law",
+        "Learn alternative liability theory",
+        "Analyze joint and several liability",
+        "Apply causation analysis when multiple defendants"
+      ],
+      "key_principles": [
+        "Alternative liability theory",
+        "Burden shifting to defendants",
+        "Joint and several liability",
+        "Causation uncertainty resolution"
+      ],
+      "tags": ["torts", "causation", "alternative_liability", "burden_shifting"],
+      "difficulty": "intermediate",
+      "estimated_reading_time": 40,
+      "related_cases": ["sindell_v_abbott_labs_1980", "ybarra_v_spangard_1944"],
+      "famous_quotes": ["When both defendants are negligent but causation unclear"],
+      "cultural_significance": "Foundation for market share liability doctrine"
+    },
+    {
+      "id": "macpherson_v_buick_1916",
+      "case_name": "MacPherson v. Buick Motor Co.",
+      "short_name": "MacPherson",
+      "citation": "217 N.Y. 382, 111 N.E. 1050 (1916)",
+      "year": 1916,
+      "court": "New York Court of Appeals",
+      "subject": "torts",
+      "subcategory": "product_liability",
+      "importance_level": "essential",
+      "semester_typically_taught": "1L_spring",
+      "urls": {
+        "primary": "https://law.justia.com/cases/new-york/court-of-appeals/1916/217-n-y-382-1916.html",
+        "alternative": "https://caselaw.findlaw.com/court/ny-court-of-appeals/1589605.html"
+      },
+      "learning_objectives": [
+        "Understand elimination of privity requirement",
+        "Learn duty of care in manufacturing",
+        "Analyze evolution from contract to tort theory",
+        "Apply modern product liability foundations"
+      ],
+      "key_principles": [
+        "Elimination of privity requirement",
+        "Manufacturer duty beyond direct purchaser",
+        "Negligence in product design/manufacture",
+        "Foreseeability of harm to users"
+      ],
+      "tags": ["torts", "product_liability", "privity", "negligence", "foundational"],
+      "difficulty": "intermediate",
+      "estimated_reading_time": 45,
+      "related_cases": ["winterbottom_v_wright_1842", "escola_v_coca_cola_1944"],
+      "famous_quotes": ["If the nature of a thing is such that it is reasonably certain to place life and limb in peril"],
+      "cultural_significance": "Foundation of modern product liability law"
+    },
+    {
+      "id": "garratt_v_dailey_1955",
+      "case_name": "Garratt v. Dailey",
+      "short_name": "Garratt",
+      "citation": "46 Wash. 2d 197, 279 P.2d 1091 (1955)",
+      "year": 1955,
+      "court": "Washington Supreme Court",
+      "subject": "torts",
+      "subcategory": "intentional_torts",
+      "importance_level": "important",
+      "semester_typically_taught": "1L_spring",
+      "urls": {
+        "primary": "https://law.justia.com/cases/washington/supreme-court/1955/46-wash-2d-197-0.html",
+        "alternative": "https://caselaw.findlaw.com/court/wa-supreme-court/1861193.html"
+      },
+      "learning_objectives": [
+        "Understand intent in tort law",
+        "Learn substantial certainty test",
+        "Analyze liability of minors",
+        "Apply intent standards to battery claims"
+      ],
+      "key_principles": [
+        "Substantial certainty test for intent",
+        "Intent can be inferred from circumstances",
+        "Minor's capacity for intent",
+        "Battery requires intent or substantial certainty"
+      ],
+      "tags": ["torts", "intentional_torts", "intent", "battery", "minors"],
+      "difficulty": "beginner",
+      "estimated_reading_time": 30,
+      "related_cases": ["vosburg_v_putney_1891", "spivey_v_battaglia_1972"],
+      "famous_quotes": ["Substantial certainty that harm will result"],
+      "cultural_significance": "Classic case for teaching intent in torts"
+    },
+    {
+      "id": "carroll_towing_1947",
+      "case_name": "United States v. Carroll Towing Co.",
+      "short_name": "Carroll Towing",
+      "citation": "159 F.2d 169 (2d Cir. 1947)",
+      "year": 1947,
+      "court": "U.S. Court of Appeals, 2nd Circuit",
+      "subject": "torts",
+      "subcategory": "negligence",
+      "importance_level": "important",
+      "semester_typically_taught": "1L_spring",
+      "urls": {
+        "primary": "https://law.justia.com/cases/federal/appellate-courts/F2/159/169/1563395/",
+        "alternative": "https://caselaw.findlaw.com/court/us-2nd-circuit/1563395.html"
+      },
+      "learning_objectives": [
+        "Understand economic analysis of law",
+        "Learn Hand Formula (B < PL)",
+        "Apply cost-benefit analysis in negligence",
+        "Analyze efficiency in tort law"
+      ],
+      "key_principles": [
+        "Hand Formula for negligence (B < PL)",
+        "Economic efficiency in tort law",
+        "Cost-benefit analysis of precautions",
+        "Reasonable care standard"
+      ],
+      "tags": ["torts", "negligence", "hand_formula", "economic_analysis", "efficiency"],
+      "difficulty": "advanced",
+      "estimated_reading_time": 40,
+      "related_cases": ["brown_v_kendall_1850", "vaughan_v_menlove_1837"],
+      "famous_quotes": ["Burden of adequate precautions less than probability times loss"],
+      "cultural_significance": "Foundation of law and economics movement"
+    },
+    {
+      "id": "brown_v_kendall_1850",
+      "case_name": "Brown v. Kendall",
+      "short_name": "Brown",
+      "citation": "60 Mass. (6 Cush.) 292 (1850)",
+      "year": 1850,
+      "court": "Massachusetts Supreme Judicial Court",
+      "subject": "torts",
+      "subcategory": "negligence",
+      "importance_level": "foundational",
+      "semester_typically_taught": "1L_spring",
+      "urls": {
+        "primary": "https://law.justia.com/cases/massachusetts/supreme-court/1850/60-mass-292-0.html",
+        "alternative": "https://caselaw.findlaw.com/court/ma-supreme-judicial-court/1861193.html"
+      },
+      "learning_objectives": [
+        "Understand historical development of negligence",
+        "Learn reasonable care standard origins",
+        "Analyze fault-based liability emergence",
+        "Compare with strict liability regimes"
+      ],
+      "key_principles": [
+        "Reasonable care standard",
+        "Fault-based liability",
+        "Negligence as distinct tort",
+        "Burden of proof on plaintiff"
+      ],
+      "tags": ["torts", "negligence", "reasonable_care", "historical", "foundational"],
+      "difficulty": "intermediate",
+      "estimated_reading_time": 35,
+      "related_cases": ["carroll_towing_1947", "vaughan_v_menlove_1837"],
+      "famous_quotes": ["Ordinary care and prudence"],
+      "cultural_significance": "Establishes modern negligence doctrine"
+    },
+    {
+      "id": "rylands_v_fletcher_1868",
+      "case_name": "Rylands v. Fletcher",
+      "short_name": "Rylands",
+      "citation": "L.R. 3 H.L. 330 (1868)",
+      "year": 1868,
+      "court": "House of Lords",
+      "subject": "torts",
+      "subcategory": "strict_liability",
+      "importance_level": "important",
+      "semester_typically_taught": "1L_spring",
+      "urls": {
+        "primary": "https://www.bailii.org/uk/cases/UKHL/1868/1.html",
+        "alternative": "https://law.justia.com/cases/england/UKHL/1868/1.html"
+      },
+      "learning_objectives": [
+        "Understand strict liability doctrine",
+        "Learn abnormally dangerous activities",
+        "Analyze non-natural use of land",
+        "Apply strict liability vs. negligence"
+      ],
+      "key_principles": [
+        "Strict liability for abnormally dangerous activities",
+        "Non-natural use of land",
+        "Liability without fault",
+        "Escape of dangerous substances"
+      ],
+      "tags": ["torts", "strict_liability", "abnormally_dangerous", "non_natural_use"],
+      "difficulty": "intermediate",
+      "estimated_reading_time": 40,
+      "related_cases": ["fletcher_v_rylands_1866", "cambridge_water_v_eastern_counties_1994"],
+      "famous_quotes": ["Person who brings on his land anything likely to do mischief if it escapes"],
+      "cultural_significance": "Foundation of strict liability doctrine"
+    },
+    {
+      "id": "pierson_v_post_1805",
+      "case_name": "Pierson v. Post",
+      "short_name": "Pierson (Fox Case)",
+      "citation": "3 Cai. R. 175, 2 Am. Dec. 264 (N.Y. 1805)",
+      "year": 1805,
+      "court": "New York Supreme Court",
+      "subject": "property_law",
+      "subcategory": "acquisition",
+      "importance_level": "essential",
+      "semester_typically_taught": "1L_spring",
+      "urls": {
+        "primary": "https://www.nycourts.gov/reporter/archives/pierson_post.htm",
+        "pdf": "http://www.law.harvard.edu/faculty/cdonahue/courses/prop/mat/Mats_c01.pdf",
+        "alternative": "https://history.nycourts.gov/case/pierson-v-post/",
+        "analysis": "https://lawlibrarycollections.umn.edu/classic-cases-property-pierson-v-post"
+      },
+      "learning_objectives": [
+        "Understand first possession doctrine",
+        "Learn acquisition of property rights in wild animals",
+        "Apply rule of capture",
+        "Analyze competing theories of property acquisition"
+      ],
+      "key_principles": [
+        "First possession doctrine",
+        "Physical control requirement for ownership",
+        "Rule of capture for wild animals",
+        "Mere pursuit insufficient for ownership"
+      ],
+      "tags": ["property", "acquisition", "first_possession", "wild_animals", "famous"],
+      "difficulty": "beginner",
+      "estimated_reading_time": 25,
+      "related_cases": ["ghen_v_rich_1881", "keeble_v_hickeringill_1707"],
+      "famous_quotes": ["Mere pursuit gave Post no legal right to the fox"],
+      "cultural_significance": "Classic first case in property law courses"
+    },
+    {
+      "id": "johnson_v_mcintosh_1823",
+      "case_name": "Johnson & Graham's Lessee v. M'Intosh",
+      "short_name": "Johnson v. M'Intosh",
+      "citation": "21 U.S. (8 Wheat.) 543 (1823)",
+      "year": 1823,
+      "court": "U.S. Supreme Court",
+      "subject": "property_law",
+      "subcategory": "land_rights",
+      "importance_level": "essential",
+      "semester_typically_taught": "1L_spring",
+      "urls": {
+        "primary": "https://supreme.justia.com/cases/federal/us/21/543/",
+        "pdf": "https://tile.loc.gov/storage-services/service/ll/usrep/usrep021/usrep021543/usrep021543.pdf",
+        "alternative": "https://caselaw.findlaw.com/court/us-supreme-court/21/543.html"
+      },
+      "learning_objectives": [
+        "Understand discovery doctrine",
+        "Learn Native American land rights history",
+        "Analyze colonial property law foundations",
+        "Examine property law and conquest"
+      ],
+      "key_principles": [
+        "Discovery doctrine",
+        "European conquest extinguished Native title",
+        "Federal government exclusive power over Indian lands",
+        "Colonial property law foundations"
+      ],
+      "tags": ["property", "discovery_doctrine", "native_american", "colonial", "controversial"],
+      "difficulty": "intermediate",
+      "estimated_reading_time": 50,
+      "related_cases": ["cherokee_nation_v_georgia_1831", "worcester_v_georgia_1832"],
+      "famous_quotes": ["Discovery gave title to the government by whose subjects it was made"],
+      "cultural_significance": "Controversial foundation of American property law"
+    },
+    {
+      "id": "ghen_v_rich_1881",
+      "case_name": "Ghen v. Rich",
+      "short_name": "Ghen",
+      "citation": "8 F. 159 (D. Mass. 1881)",
+      "year": 1881,
+      "court": "U.S. District Court, Massachusetts",
+      "subject": "property_law",
+      "subcategory": "acquisition",
+      "importance_level": "important",
+      "semester_typically_taught": "1L_spring",
+      "urls": {
+        "primary": "https://law.justia.com/cases/federal/district-courts/F/8/159/1563395/",
+        "alternative": "https://caselaw.findlaw.com/court/us-district-court-massachusetts/1563395.html"
+      },
+      "learning_objectives": [
+        "Understand industry custom in property law",
+        "Learn constructive possession concept",
+        "Analyze maritime property rights",
+        "Apply custom-based property rules"
+      ],
+      "key_principles": [
+        "Industry custom determines possession",
+        "Constructive possession concept",
+        "Maritime property law",
+        "Custom-based property rights"
+      ],
+      "tags": ["property", "custom", "constructive_possession", "maritime", "whaling"],
+      "difficulty": "intermediate",
+      "estimated_reading_time": 35,
+      "related_cases": ["pierson_v_post_1805", "popov_v_hayashi_2002"],
+      "famous_quotes": ["Industry custom can determine possession"],
+      "cultural_significance": "Demonstrates role of custom in property law"
+    },
+    {
+      "id": "causby_v_united_states_1946",
+      "case_name": "United States v. Causby",
+      "short_name": "Causby",
+      "citation": "328 U.S. 256 (1946)",
+      "year": 1946,
+      "court": "U.S. Supreme Court",
+      "subject": "property_law",
+      "subcategory": "airspace_rights",
+      "importance_level": "important",
+      "semester_typically_taught": "1L_spring",
+      "urls": {
+        "primary": "https://supreme.justia.com/cases/federal/us/328/256/",
+        "pdf": "https://tile.loc.gov/storage-services/service/ll/usrep/usrep328/usrep328256/usrep328256.pdf",
+        "alternative": "https://caselaw.findlaw.com/court/us-supreme-court/328/256.html"
+      },
+      "learning_objectives": [
+        "Understand airspace rights limitations",
+        "Learn government takings doctrine",
+        "Analyze modern property boundaries",
+        "Apply takings analysis to airspace"
+      ],
+      "key_principles": [
+        "No absolute ownership of airspace",
+        "Government flights can constitute taking",
+        "Reasonable use of airspace",
+        "Modern property boundaries"
+      ],
+      "tags": ["property", "airspace", "takings", "government", "modern"],
+      "difficulty": "intermediate",
+      "estimated_reading_time": 40,
+      "related_cases": ["lucas_v_south_carolina_1992", "penn_central_v_new_york_1978"],
+      "famous_quotes": ["The airspace is a public highway"],
+      "cultural_significance": "Defines modern airspace property rights"
+    },
+    {
+      "id": "kelo_v_city_of_new_london_2005",
+      "case_name": "Kelo v. City of New London",
+      "short_name": "Kelo",
+      "citation": "545 U.S. 469 (2005)",
+      "year": 2005,
+      "court": "U.S. Supreme Court",
+      "subject": "property_law",
+      "subcategory": "eminent_domain",
+      "importance_level": "important",
+      "semester_typically_taught": "1L_spring",
+      "urls": {
+        "primary": "https://supreme.justia.com/cases/federal/us/545/469/",
+        "pdf": "https://tile.loc.gov/storage-services/service/ll/usrep/usrep545/usrep545469/usrep545469.pdf",
+        "alternative": "https://caselaw.findlaw.com/court/us-supreme-court/545/469.html"
+      },
+      "learning_objectives": [
+        "Understand public use requirement in eminent domain",
+        "Learn economic development as public use",
+        "Analyze Fifth Amendment takings clause",
+        "Apply modern eminent domain doctrine"
+      ],
+      "key_principles": [
+        "Economic development can satisfy public use",
+        "Broad interpretation of public use",
+        "Deference to local government decisions",
+        "Just compensation requirement"
+      ],
+      "tags": ["property", "eminent_domain", "public_use", "economic_development", "controversial"],
+      "difficulty": "intermediate",
+      "estimated_reading_time": 45,
+      "related_cases": ["hawaii_housing_v_midkiff_1984", "berman_v_parker_1954"],
+      "famous_quotes": ["Public use requirement is coterminous with the scope of a sovereign's police powers"],
+      "cultural_significance": "Controversial expansion of eminent domain power"
+    },
+    {
+      "id": "marbury_v_madison_1803",
+      "case_name": "Marbury v. Madison",
+      "short_name": "Marbury",
+      "citation": "5 U.S. (1 Cranch) 137 (1803)",
+      "year": 1803,
+      "court": "U.S. Supreme Court",
+      "subject": "constitutional_law",
+      "subcategory": "judicial_review",
+      "importance_level": "essential",
+      "semester_typically_taught": "1L_spring",
+      "urls": {
+        "primary": "https://supreme.justia.com/cases/federal/us/5/137/",
+        "pdf": "https://tile.loc.gov/storage-services/service/ll/usrep/usrep005/usrep005137/usrep005137.pdf",
+        "alternative": "https://www.fjc.gov/sites/default/files/cases-that-shaped-the-federal-courts/pdf/Marbury_0.pdf"
+      },
+      "learning_objectives": [
+        "Understand establishment of judicial review",
+        "Learn separation of powers principles",
+        "Analyze court's power to declare laws unconstitutional",
+        "Examine Marshall Court's assertion of judicial authority"
+      ],
+      "key_principles": [
+        "Judicial review power",
+        "Constitution as supreme law",
+        "Separation of powers",
+        "Judicial independence"
+      ],
+      "tags": ["constitutional", "judicial_review", "separation_powers", "foundational", "essential"],
+      "difficulty": "intermediate",
+      "estimated_reading_time": 60,
+      "related_cases": ["mcculloch_v_maryland_1819", "gibbons_v_ogden_1824"],
+      "famous_quotes": ["It is emphatically the province and duty of the judicial department to say what the law is"],
+      "cultural_significance": "Foundation of American constitutional law"
+    },
+    {
+      "id": "mcculloch_v_maryland_1819",
+      "case_name": "McCulloch v. Maryland",
+      "short_name": "McCulloch",
+      "citation": "17 U.S. (4 Wheat.) 316 (1819)",
+      "year": 1819,
+      "court": "U.S. Supreme Court",
+      "subject": "constitutional_law",
+      "subcategory": "federalism",
+      "importance_level": "essential",
+      "semester_typically_taught": "1L_spring",
+      "urls": {
+        "primary": "https://supreme.justia.com/cases/federal/us/17/316/",
+        "pdf": "https://tile.loc.gov/storage-services/service/ll/usrep/usrep017/usrep017316/usrep017316.pdf",
+        "alternative": "https://caselaw.findlaw.com/court/us-supreme-court/17/316.html"
+      },
+      "learning_objectives": [
+        "Understand Necessary and Proper Clause",
+        "Learn federal vs. state power balance",
+        "Analyze implied powers doctrine",
+        "Apply broad interpretation of federal powers"
+      ],
+      "key_principles": [
+        "Necessary and Proper Clause interpretation",
+        "Implied powers doctrine",
+        "Federal supremacy over states",
+        "Broad construction of federal authority"
+      ],
+      "tags": ["constitutional", "federalism", "necessary_proper", "implied_powers", "supremacy"],
+      "difficulty": "intermediate",
+      "estimated_reading_time": 55,
+      "related_cases": ["marbury_v_madison_1803", "gibbons_v_ogden_1824"],
+      "famous_quotes": ["The power to tax involves the power to destroy"],
+      "cultural_significance": "Establishes broad federal power interpretation"
+    },
+    {
+      "id": "gibbons_v_ogden_1824",
+      "case_name": "Gibbons v. Ogden",
+      "short_name": "Gibbons",
+      "citation": "22 U.S. (9 Wheat.) 1 (1824)",
+      "year": 1824,
+      "court": "U.S. Supreme Court",
+      "subject": "constitutional_law",
+      "subcategory": "commerce_clause",
+      "importance_level": "essential",
+      "semester_typically_taught": "1L_spring",
+      "urls": {
+        "primary": "https://supreme.justia.com/cases/federal/us/22/1/",
+        "pdf": "https://tile.loc.gov/storage-services/service/ll/usrep/usrep022/usrep022001/usrep022001.pdf",
+        "alternative": "https://caselaw.findlaw.com/court/us-supreme-court/22/1.html"
+      },
+      "learning_objectives": [
+        "Understand Commerce Clause interpretation",
+        "Learn interstate commerce regulation power",
+        "Analyze federal supremacy in commerce",
+        "Apply broad federal commerce authority"
+      ],
+      "key_principles": [
+        "Broad federal commerce power",
+        "Interstate commerce regulation",
+        "Federal supremacy over state commerce laws",
+        "Commerce includes navigation"
+      ],
+      "tags": ["constitutional", "commerce_clause", "interstate_commerce", "federal_power", "supremacy"],
+      "difficulty": "intermediate",
+      "estimated_reading_time": 50,
+      "related_cases": ["mcculloch_v_maryland_1819", "wickard_v_filburn_1942"],
+      "famous_quotes": ["Commerce among the states cannot stop at the external boundary line"],
+      "cultural_significance": "Foundation of federal commerce power"
+    },
+    {
+      "id": "youngstown_sheet_tube_v_sawyer_1952",
+      "case_name": "Youngstown Sheet & Tube Co. v. Sawyer",
+      "short_name": "Youngstown (Steel Seizure)",
+      "citation": "343 U.S. 579 (1952)",
+      "year": 1952,
+      "court": "U.S. Supreme Court",
+      "subject": "constitutional_law",
+      "subcategory": "separation_of_powers",
+      "importance_level": "essential",
+      "semester_typically_taught": "1L_spring",
+      "urls": {
+        "primary": "https://supreme.justia.com/cases/federal/us/343/579/",
+        "pdf": "https://tile.loc.gov/storage-services/service/ll/usrep/usrep343/usrep343579/usrep343579.pdf",
+        "alternative": "https://caselaw.findlaw.com/court/us-supreme-court/343/579.html"
+      },
+      "learning_objectives": [
+        "Understand limits on executive power",
+        "Learn separation of powers in wartime",
+        "Analyze Jackson's concurrence framework",
+        "Apply executive power analysis"
+      ],
+      "key_principles": [
+        "Limits on executive power",
+        "Separation of powers framework",
+        "Jackson's three-part test",
+        "Congressional vs. executive authority"
+      ],
+      "tags": ["constitutional", "separation_powers", "executive_power", "jackson_framework", "wartime"],
+      "difficulty": "advanced",
+      "estimated_reading_time": 60,
+      "related_cases": ["marbury_v_madison_1803", "ex_parte_milligan_1866"],
+      "famous_quotes": ["Presidential power is at its maximum when acting with Congressional authorization"],
+      "cultural_significance": "Defines modern separation of powers analysis"
+    },
+    {
+      "id": "r_v_dudley_stephens_1884",
+      "case_name": "R. v. Dudley and Stephens",
+      "short_name": "Dudley & Stephens",
+      "citation": "14 Q.B.D. 273 (1884)",
+      "year": 1884,
+      "court": "Queen's Bench Division",
+      "subject": "criminal_law",
+      "subcategory": "necessity_defense",
+      "importance_level": "essential",
+      "semester_typically_taught": "1L_fall",
+      "urls": {
+        "primary": "https://www.bailii.org/ew/cases/EWHC/QB/1884/273.html",
+        "alternative": "https://law.justia.com/cases/england/EWHC/QB/1884/273.html"
+      },
+      "learning_objectives": [
+        "Understand necessity defense limitations",
+        "Learn moral vs. legal justification",
+        "Analyze limits on self-preservation",
+        "Examine extreme circumstances in criminal law"
+      ],
+      "key_principles": [
+        "Necessity cannot justify murder",
+        "Moral justification vs. legal excuse",
+        "Limits on self-preservation defense",
+        "Sanctity of human life"
+      ],
+      "tags": ["criminal", "necessity", "murder", "cannibalism", "famous"],
+      "difficulty": "intermediate",
+      "estimated_reading_time": 40,
+      "related_cases": ["people_v_goetz_1986", "nelson_v_state_1978"],
+      "famous_quotes": ["Necessity cannot justify the taking of innocent life"],
+      "cultural_significance": "Famous cannibalism case; limits of necessity defense"
+    },
+    {
+      "id": "mcnaghten_case_1843",
+      "case_name": "M'Naghten's Case",
+      "short_name": "M'Naghten",
+      "citation": "10 Cl. & F. 200, 8 Eng. Rep. 718 (1843)",
+      "year": 1843,
+      "court": "House of Lords",
+      "subject": "criminal_law",
+      "subcategory": "insanity_defense",
+      "importance_level": "essential",
+      "semester_typically_taught": "1L_fall",
+      "urls": {
+        "primary": "https://www.bailii.org/uk/cases/UKHL/1843/J16.html",
+        "alternative": "https://law.justia.com/cases/england/UKHL/1843/J16.html"
+      },
+      "learning_objectives": [
+        "Understand insanity defense standards",
+        "Learn mental capacity and criminal responsibility",
+        "Apply right vs. wrong test",
+        "Analyze cognitive incapacity defense"
+      ],
+      "key_principles": [
+        "Right vs. wrong test for insanity",
+        "Cognitive incapacity defense",
+        "Mental disease or defect requirement",
+        "Burden of proof for insanity"
+      ],
+      "tags": ["criminal", "insanity", "mental_capacity", "defense", "foundational"],
+      "difficulty": "intermediate",
+      "estimated_reading_time": 45,
+      "related_cases": ["durham_v_united_states_1954", "united_states_v_brawner_1972"],
+      "famous_quotes": ["To establish a defence on the ground of insanity"],
+      "cultural_significance": "Foundation of modern insanity defense"
+    },
+    {
+      "id": "lawrence_v_texas_2003",
+      "case_name": "Lawrence v. Texas",
+      "short_name": "Lawrence",
+      "citation": "539 U.S. 558 (2003)",
+      "year": 2003,
+      "court": "U.S. Supreme Court",
+      "subject": "criminal_law",
+      "subcategory": "constitutional_limits",
+      "importance_level": "important",
+      "semester_typically_taught": "1L_fall",
+      "urls": {
+        "primary": "https://supreme.justia.com/cases/federal/us/539/558/",
+        "pdf": "https://tile.loc.gov/storage-services/service/ll/usrep/usrep539/usrep539558/usrep539558.pdf",
+        "alternative": "https://caselaw.findlaw.com/court/us-supreme-court/539/558.html"
+      },
+      "learning_objectives": [
+        "Understand constitutional limits on criminal law",
+        "Learn privacy rights and criminal liability",
+        "Analyze due process and substantive rights",
+        "Examine limits on morality-based criminal laws"
+      ],
+      "key_principles": [
+        "Privacy rights limit criminal law",
+        "Substantive due process protection",
+        "Limits on morality-based criminalization",
+        "Individual liberty and autonomy"
+      ],
+      "tags": ["criminal", "privacy", "due_process", "constitutional_limits", "modern"],
+      "difficulty": "intermediate",
+      "estimated_reading_time": 50,
+      "related_cases": ["bowers_v_hardwick_1986", "griswold_v_connecticut_1965"],
+      "famous_quotes": ["The petitioners are entitled to respect for their private lives"],
+      "cultural_significance": "Landmark LGBTQ+ rights and privacy case"
+    },
+    {
+      "id": "regina_v_cunningham_1957",
+      "case_name": "R. v. Cunningham",
+      "short_name": "Cunningham",
+      "citation": "[1957] 2 Q.B. 396",
+      "year": 1957,
+      "court": "Court of Criminal Appeal",
+      "subject": "criminal_law",
+      "subcategory": "mens_rea",
+      "importance_level": "important",
+      "semester_typically_taught": "1L_fall",
+      "urls": {
+        "primary": "https://www.bailii.org/ew/cases/EWCA/Crim/1957/1.html",
+        "alternative": "https://law.justia.com/cases/england/EWCA/Crim/1957/1.html"
+      },
+      "learning_objectives": [
+        "Understand mens rea requirements",
+        "Learn specific vs. general intent",
+        "Analyze recklessness standards",
+        "Apply intent requirements to specific crimes"
+      ],
+      "key_principles": [
+        "Specific intent requirements",
+        "Recklessness as mens rea",
+        "Subjective vs. objective standards",
+        "Intent for specific crimes"
+      ],
+      "tags": ["criminal", "mens_rea", "intent", "recklessness", "specific_intent"],
+      "difficulty": "intermediate",
+      "estimated_reading_time": 35,
+      "related_cases": ["people_v_ceballos_1973", "morissette_v_united_states_1952"],
+      "famous_quotes": ["Must have intent for specific crime committed"],
+      "cultural_significance": "Clarifies mens rea requirements in criminal law"
+    }
+  ]
+}
+
