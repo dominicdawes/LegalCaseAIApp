@@ -230,9 +230,11 @@ def update_table_realtime_status_log(
 
 
 def update_document_sources_realtime_status_log(
-    status: str, source_id: str, error_message: str = None
+    status: str, 
+    source_id: str, 
+    error_message: str = None
 ):
-    """Helper function to update the status in document_sources."""
+    """Helper function to update the status in `public.document_sources` table in Supabase."""
     try:
         payload = {"vector_embed_status": status}
         if error_message:
@@ -264,16 +266,25 @@ def update_document_sources_realtime_status_log(
 
 
 def log_llm_error(
-    client, table_name, task_name, error_message, project_id=None, user_id=None
+    client, table_name, task_name, error_message, project_id=None, chat_session_id=None, user_id=None
 ):
-    """Insert a log row for LLM related errors."""
-    payload = {
-        "task_name": task_name,
-        "error_message": error_message,
-        "project_id": project_id,
-        "user_id": user_id,
-        "created_at": datetime.now(timezone.utc).isoformat(),
-    }
+    """Insert a log row for LLM related errors for `public.messages` and `public.notes`"""
+    if table_name == "messages":
+        payload = {
+            "task_name": task_name,
+            "error_message": error_message,
+            "chat_session_id": chat_session_id,
+            "user_id": user_id,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+    elif table_name == "notes":
+        payload = {
+            "task_name": task_name,
+            "error_message": error_message,
+            "project_id": project_id,
+            "user_id": user_id,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
     try:
         client.table(table_name).insert(payload).execute()
     except Exception as e:

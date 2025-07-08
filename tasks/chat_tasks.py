@@ -265,11 +265,12 @@ def persist_user_query(self, user_id, chat_session_id, query, project_id, model_
     except Exception as e:
         logger.error(f"RAG Chat Task failed: {e}", exc_info=True)
         log_llm_error(
-            supabase_client,
-            "llm_error_logs",
-            "rag_chat_task",
-            str(e),
+            client=supabase_client,
+            table_name="messages",
+            task_name="rag_chat_task",
+            error_message=str(e),
             project_id=project_id,
+            chat_session_id=chat_session_id,
             user_id=user_id,
         )
         raise self.retry(exc=e)
@@ -328,6 +329,7 @@ def rag_chat_task(
         assistant_response = generate_rag_answer(
             llm_client=llm_client,
             query=query,
+            user_id=user_id,
             chat_session_id=chat_session_id,
             relevant_chunks=relevant_chunks,
         )
@@ -390,6 +392,7 @@ def fetch_relevant_chunks(query_embedding, project_id, match_count=10):
 def generate_rag_answer(
     llm_client,
     query: str,
+    user_id,
     chat_session_id: str,
     relevant_chunks: list,
     max_chat_history: int = 10,
@@ -457,11 +460,19 @@ def generate_rag_answer(
         logger.error(
             f"Error in LLM call (model={llm_client.model_name}): {e}", exc_info=True
         )
+        # log_llm_error(
+        #     supabase_client,
+        #     "llm_error_logs",
+        #     "generate_rag_answer",
+        #     str(e),
+        # )
         log_llm_error(
-            supabase_client,
-            "llm_error_logs",
-            "generate_rag_answer",
-            str(e),
+            client=supabase_client,
+            table_name="messages",
+            task_name="generate_rag_answer",
+            error_message=str(e),
+            chat_session_id=chat_session_id,
+            user_id=user_id,
         )
         raise
 

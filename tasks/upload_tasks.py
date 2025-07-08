@@ -29,7 +29,7 @@ from utils.supabase_utils import (
     update_document_sources_realtime_status_log,
     update_table_realtime_status_log,
     supabase_client,
-    log_llm_error,
+    # log_llm_error,
 )
 from utils.cloudfront_utils import get_cloudfront_url
 from utils.document_loaders.loader_factory import get_loader_for
@@ -56,37 +56,6 @@ except KeyError:
     tokenizer = tiktoken.get_encoding("cl100k_base")
 
 logger = logging.getLogger(__name__)
-
-# === PRODUCTION CELERY TASKS === #
-# def update_document_sources_realtime_status_log(
-#         status: str,
-#         source_id: str,
-#         error_message: str = None
-# ):
-#     """Helper function to update the status in document_sources."""
-#     try:
-#         payload = {"vector_embed_status": status}
-#         if error_message:
-#             payload["error_message"] = error_message[:255]  # if you have that column
-#             logger.error(f"[DB] Setting status={status} for {source_id} w/ error: {error_message}")
-
-#         logger.debug(f"[DB] update document_sources set status={status} where id={source_id}")
-#         update_resp = (
-#             supabase_client
-#                 .table("document_sources")
-#                 .update(payload)
-#                 .eq("id", source_id)
-#                 .execute()
-#         )
-
-#         # **New**: inspect the Supabase response
-#         if hasattr(update_resp, "data"):
-#             logger.debug(f"[DB] Update returned data: {update_resp.data}")
-#         if hasattr(update_resp, "status_code"):
-#             logger.debug(f"[DB] HTTP status code: {update_resp.status_code}")
-
-#     except Exception as db_e:
-#         logger.critical(f"[DB] Failed to update status for {source_id}: {db_e}", exc_info=True)
 
 
 @celery_app.task(
@@ -196,7 +165,9 @@ def process_document_task(self, files, metadata=None):
                             f"[file loop] Failed downloading '{file_url}': {err_msg}"
                         )
                         update_document_sources_realtime_status_log(
-                            "FAILED", error_message=err_msg
+                            status="FAILED",
+                            source_id=None, # source_id not assigned yet
+                            error_message=err_msg
                         )
                         failed_files += 1
                         continue
@@ -204,7 +175,9 @@ def process_document_task(self, files, metadata=None):
                         err_msg = f"Download exception for {file_url}: {e}"
                         logger.error(f"[file loop] {err_msg}", exc_info=True)
                         update_document_sources_realtime_status_log(
-                            "FAILED", error_message=err_msg
+                            status="FAILED",
+                            source_id=None, # source_id not assigned yet
+                            error_message=err_msg
                         )
                         failed_files += 1
                         continue
@@ -1107,15 +1080,17 @@ def chunk_and_embed_task(
     except Exception as e:
         logger.error(f"Failed chunk/embed for {doc_url}: {e}", exc_info=True)
         update_document_sources_realtime_status_log(
-            "FAILED", source_id, error_message=str(e)
+            status="FAILED", 
+            source_id=source_id, 
+            error_message=str(e)
         )
-        log_llm_error(
-            supabase_client,
-            "llm_error_logs",
-            "chunk_and_embed_task",
-            str(e),
-            project_id=project_id,
-        )
+        # log_llm_error(
+        #     supabase_client,
+        #     "llm_error_logs",
+        #     "chunk_and_embed_task",
+        #     str(e),
+        #     project_id=project_id,
+        # )
         raise
     except OpenAIError as e:
         # Catch specific OpenAI errors for more targeted logging/handling if needed
@@ -1123,15 +1098,17 @@ def chunk_and_embed_task(
             f"OpenAI API error during embedding for {doc_url}: {e}", exc_info=True
         )
         update_document_sources_realtime_status_log(
-            "FAILED", source_id, error_message=str(e)
+            status="FAILED", 
+            source_id=source_id, 
+            error_message=str(e)
         )
-        log_llm_error(
-            supabase_client,
-            "llm_error_logs",
-            "chunk_and_embed_task",
-            str(e),
-            project_id=project_id,
-        )
+        # log_llm_error(
+        #     supabase_client,
+        #     "llm_error_logs",
+        #     "chunk_and_embed_task",
+        #     str(e),
+        #     project_id=project_id,
+        # )
         raise self.retry(exc=e)
     finally:
         # 7) Cleanup temp file
