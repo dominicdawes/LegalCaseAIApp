@@ -227,7 +227,7 @@ def rag_note_task(
         logger.error(f"RAG Note Task failed: {e}", exc_info=True)
         log_llm_error(
             client=supabase_client,
-            table_name="notes",
+            table_name="notes", # ← public.notes
             task_name="rag_note_task",
             error_message=str(e),
             project_id=project_id,
@@ -266,7 +266,7 @@ def save_note(project_id, user_id, note_type, note_title, content):
     """
     insert_note_supabase_record(
         client=supabase_client,
-        table_name="notes",
+        table_name="notes", # ← public.notes
         user_id=user_id,
         project_id=project_id,
         note_title=note_title,

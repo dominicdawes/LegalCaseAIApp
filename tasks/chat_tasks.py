@@ -249,7 +249,7 @@ def persist_user_query(self, user_id, chat_session_id, query, project_id, model_
         # Step 1) Persist user query to public.messages
         response = insert_chat_message_supabase_record(
             supabase_client,
-            table_name="messages",
+            table_name="messages", # ← public.messages
             user_id=user_id,
             chat_session_id=chat_session_id,
             dialogue_role="user",
@@ -266,7 +266,7 @@ def persist_user_query(self, user_id, chat_session_id, query, project_id, model_
         logger.error(f"RAG Chat Task failed: {e}", exc_info=True)
         log_llm_error(
             client=supabase_client,
-            table_name="messages",
+            table_name="messages", # ← public.messages
             task_name="rag_chat_task",
             error_message=str(e),
             project_id=project_id,
@@ -337,7 +337,7 @@ def rag_chat_task(
         # Step 4) Insert assistant response
         _ = insert_chat_message_supabase_record(
             supabase_client,
-            table_name="messages",
+            table_name="messages", # ← public.messages
             user_id=user_id,
             chat_session_id=chat_session_id,
             dialogue_role="assistant",
@@ -468,7 +468,7 @@ def generate_rag_answer(
         # )
         log_llm_error(
             client=supabase_client,
-            table_name="messages",
+            table_name="messages", # ← public.messages
             task_name="generate_rag_answer",
             error_message=str(e),
             chat_session_id=chat_session_id,
@@ -479,7 +479,7 @@ def generate_rag_answer(
 
 def fetch_chat_history(chat_session_id):
     response = (
-        supabase_client.table("messages")
+        supabase_client.table("messages") # ← public.messages
         .select("*")
         .eq("chat_session_id", chat_session_id)
         .order("created_at")
