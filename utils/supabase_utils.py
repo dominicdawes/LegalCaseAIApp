@@ -236,28 +236,31 @@ def update_document_sources_realtime_status_log(
 ):
     """Helper function to update the status in `public.document_sources` table in Supabase."""
     try:
-        payload = {"vector_embed_status": status}
-        if error_message:
-            payload["error_message"] = error_message[:255]  # if you have that column
-            logger.error(
-                f"[DB] Setting status={status} for {source_id} w/ error: {error_message}"
+        if source_id == None:
+            return 
+        else:
+            payload = {"vector_embed_status": status}
+            if error_message:
+                payload["error_message"] = error_message[:255]  # if you have that column
+                logger.error(
+                    f"[DB] Setting status={status} for {source_id} w/ error: {error_message}"
+                )
+
+            logger.debug(
+                f"[DB] update document_sources set status={status} where id={source_id}"
+            )
+            update_resp = (
+                supabase_client.table("document_sources")
+                .update(payload)
+                .eq("id", source_id)
+                .execute()
             )
 
-        logger.debug(
-            f"[DB] update document_sources set status={status} where id={source_id}"
-        )
-        update_resp = (
-            supabase_client.table("document_sources")
-            .update(payload)
-            .eq("id", source_id)
-            .execute()
-        )
-
-        # **New**: inspect the Supabase response
-        if hasattr(update_resp, "data"):
-            logger.debug(f"[DB] Update returned data: {update_resp.data}")
-        if hasattr(update_resp, "status_code"):
-            logger.debug(f"[DB] HTTP status code: {update_resp.status_code}")
+            # **New**: inspect the Supabase response
+            if hasattr(update_resp, "data"):
+                logger.debug(f"[DB] Update returned data: {update_resp.data}")
+            if hasattr(update_resp, "status_code"):
+                logger.debug(f"[DB] HTTP status code: {update_resp.status_code}")
 
     except Exception as db_e:
         logger.critical(
