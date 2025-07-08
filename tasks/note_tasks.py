@@ -226,10 +226,10 @@ def rag_note_task(
     except Exception as e:
         logger.error(f"RAG Note Task failed: {e}", exc_info=True)
         log_llm_error(
-            supabase_client,
-            "llm_error_logs",
-            "rag_note_task",
-            str(e),
+            client=supabase_client,
+            table_name="notes",
+            task_name="rag_note_task",
+            error_message=str(e),
             project_id=project_id,
             user_id=user_id,
         )
@@ -258,48 +258,6 @@ def fetch_relevant_chunks(query_embedding, project_id, match_count=10):
     except Exception as e:
         logger.error(f"Error fetching relevant chunks: {e}", exc_info=True)
         raise
-
-
-# def generate_rag_answer(
-#         llm_client,
-#         query,
-#         relevant_chunks: list,
-#         max_chat_history: int = 10,
-#     ):
-#     """
-#     [Replaced by llm_client.chat(llm_input)]
-#     Build prompt, invoke streaming LLM, publish tokens in real-time,
-#     and return the full generated answer at completion.
-
-#     Q: **Why no `chat_session_id` ?
-#     A: because this is going to a project not a chat histoty
-#     """
-#     # Build conversational context
-#     # chat_history = fetch_chat_history(chat_session_id)[-max_chat_history:]
-#     # formatted_history = format_chat_history(chat_history) if chat_history else ""
-#     chunk_context = "\n\n".join(c["content"] for c in relevant_chunks)
-#     full_context = (
-#         f"Relevant Context:\n{chunk_context}\n\n"
-#         f"User Query: {query}\nAssistant:"
-#     )
-
-#     trimmed_context = trim_context_length(
-#         full_context=full_context,
-#         query=query,
-#         relevant_chunks=relevant_chunks,
-#         model_name=llm_client.model_name,
-#         max_tokens=127999
-#     )
-
-#     # 5) Finally, call the LLM client once
-#     try:
-#         # All of your LLMClient implementations expose `.chat(prompt: str) -> str`
-#         answer = llm_client.chat(trimmed_context)
-#         # llm_client = get_chat_llm(model_name) # being SUNSET !!!
-#         return answer
-#     except Exception as e:
-#         logger.error(f"Error in LLM call (model={llm_client.model_name}): {e}", exc_info=True)
-#         raise
 
 
 def save_note(project_id, user_id, note_type, note_title, content):
