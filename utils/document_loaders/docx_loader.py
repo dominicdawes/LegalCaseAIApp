@@ -3,7 +3,7 @@
 import os
 import subprocess
 import tempfile
-from typing import List
+from typing import List, Iterator
 
 import textract
 from langchain.schema import Document
@@ -52,3 +52,20 @@ class DocxLoader(BaseDocumentLoader):
             )
 
         return docs
+
+    def stream_documents(self, path: str) -> Iterator[Document]:
+        if not os.path.isfile(path):
+            raise FileNotFoundError(f"File not found: '{path}'")
+
+        document = docx.Document(path)
+        for idx, para in enumerate(document.paragraphs):
+            text = para.text.strip()
+            if not text:
+                continue
+            yield Document(
+                page_content=text,
+                metadata={
+                    "source_path": os.path.basename(path),
+                    "paragraph_index": idx,
+                },
+            )

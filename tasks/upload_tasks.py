@@ -166,8 +166,8 @@ def process_document_task(self, files, metadata=None):
                         )
                         update_document_sources_realtime_status_log(
                             status="FAILED",
-                            source_id=None, # source_id not assigned yet
-                            error_message=err_msg
+                            source_id=None,  # source_id not assigned yet
+                            error_message=err_msg,
                         )
                         failed_files += 1
                         continue
@@ -176,8 +176,8 @@ def process_document_task(self, files, metadata=None):
                         logger.error(f"[file loop] {err_msg}", exc_info=True)
                         update_document_sources_realtime_status_log(
                             status="FAILED",
-                            source_id=None, # source_id not assigned yet
-                            error_message=err_msg
+                            source_id=None,  # source_id not assigned yet
+                            error_message=err_msg,
                         )
                         failed_files += 1
                         continue
@@ -981,91 +981,74 @@ def chunk_and_embed_task(
         temp_file.close()
         local_path = temp_file.name
 
-        # 2) Use factory to get correct loader and load “documents”
+        # 2) Use factory to get correct loader
         try:
             loader = get_loader_for(local_path)
         except ValueError as e:
-            # Mark as failed in DB and raise so the task can retry or fail cleanly
             update_document_sources_realtime_status_log(
                 "FAILED", source_id, error_message=str(e)
             )
             raise
 
-        all_docs = loader.load_documents(local_path)
-        if not all_docs:
-            raise RuntimeError(f"No pages extracted from {local_path}")
-
-        # 3) Split into chunks using CharacterTextSplitter
         text_splitter = CharacterTextSplitter(
             chunk_size=chunk_size, chunk_overlap=chunk_overlap
         )
-        chunks = text_splitter.split_documents(all_docs)
-
-        # 4) Prepare texts & metadata for embedding
-        texts = [chunk.page_content for chunk in chunks]
-        metadatas = [
-            {
-                "source": doc_url,
-                # If your loader gave a “page” or “chapter” in metadata, preserve that:
-                **{k: chunk.metadata.get(k) for k in chunk.metadata},
-            }
-            for chunk in chunks
-        ]
-
-        # 4) Batch embed all chunks in one call
         embedding_model = OpenAIEmbeddings(
-            model="text-embedding-ada-002",
-            api_key=OPENAI_API_KEY,
+            model="text-embedding-ada-002", api_key=OPENAI_API_KEY
         )
-        embeddings = embedding_model.embed_documents(texts)
 
-        # Guard against any mis-shaped vector dimensions (ada-002 produces dim-1536)
         expected_embedding_length = 1536
-        for i, vec in enumerate(embeddings):
-            if len(vec) != expected_embedding_length:
-                raise ValueError(
-                    f"Embedding #{i} has length {len(vec)}; expected {expected_embedding_length}"
+        BATCH = 200
+        batch_texts: list[str] = []
+        batch_metas: list[dict] = []
+        total_vectors = 0
+
+        def flush_batch():
+            if not batch_texts:
+                return
+            embeddings = embedding_model.embed_documents(batch_texts)
+            for i, vec in enumerate(embeddings):
+                if len(vec) != expected_embedding_length:
+                    raise ValueError(
+                        f"Embedding #{i} has length {len(vec)}; expected {expected_embedding_length}"
+                    )
+
+            def _clean(s: str) -> str:
+                return s.replace("\x00", "")
+
+            vector_rows = []
+            for text, meta, vector in zip(batch_texts, batch_metas, embeddings):
+                clean_text = _clean(text)
+                num_tokens = len(tokenizer.encode(clean_text))
+                clean_meta = {
+                    k: _clean(v) if isinstance(v, str) else v for k, v in meta.items()
+                }
+                vector_rows.append(
+                    {
+                        "source_id": str(source_id),
+                        "content": clean_text,
+                        "metadata": clean_meta,
+                        "embedding": vector,
+                        "project_id": str(project_id),
+                        "num_tokens": num_tokens,
+                    }
                 )
 
-        # 5) Build rows for bulk insert
-        def _clean(s: str) -> str:
-            """Helper to remove literal NULLs and other problematic control characters if needed"""
-            # For this specific error, '\x00' is the key.
-            return s.replace("\x00", "")
-
-        vector_rows = []
-        for text, meta, vector in zip(texts, metadatas, embeddings):
-            clean_text = _clean(text)
-            num_tokens = len(
-                tokenizer.encode(clean_text)
-            )  # tokenizer declared globally
-
-            # Clean metadata values that are strings
-            clean_meta = {}
-            for k, v in meta.items():
-                if isinstance(v, str):
-                    clean_meta[k] = _clean(v)
-                else:
-                    clean_meta[k] = v
-
-            vector_rows.append(
-                {
-                    "source_id": str(source_id),
-                    "content": clean_text,
-                    "metadata": clean_meta,  # Use the cleaned metadata
-                    "embedding": vector,
-                    "project_id": str(project_id),
-                    "num_tokens": num_tokens,
-                }
-            )
-
-        # 6) Bulk insert into Supabase
-        logger.debug(
-            "Attempting Supabase bulk vector insert into public.document_vector_store."
-        )
-        response = (
             supabase_client.table("document_vector_store").insert(vector_rows).execute()
-        )
+            nonlocal total_vectors
+            total_vectors += len(vector_rows)
+            batch_texts.clear()
+            batch_metas.clear()
+
+        # 3) Stream docs → chunks → embeddings in batches
+        for doc in loader.stream_documents(local_path):
+            for chunk in text_splitter.split_documents([doc]):
+                batch_texts.append(chunk.page_content)
+                batch_metas.append({"source": doc_url, **chunk.metadata})
+                if len(batch_texts) >= BATCH:
+                    flush_batch()
+
+        flush_batch()
 
         # Update status to COMPLETE after successful vector insert
         update_document_sources_realtime_status_log(
@@ -1074,15 +1057,13 @@ def chunk_and_embed_task(
             # Do not pass an error
         )
         logger.info(
-            f"Bulk inserted {len(vector_rows)} embeddings into public.document_vector_store for source_id={source_id}"
+            f"Bulk inserted {total_vectors} embeddings into public.document_vector_store for source_id={source_id}"
         )
 
     except Exception as e:
         logger.error(f"Failed chunk/embed for {doc_url}: {e}", exc_info=True)
         update_document_sources_realtime_status_log(
-            status="FAILED", 
-            source_id=source_id, 
-            error_message=str(e)
+            status="FAILED", source_id=source_id, error_message=str(e)
         )
         # log_llm_error(
         #     supabase_client,
@@ -1098,9 +1079,7 @@ def chunk_and_embed_task(
             f"OpenAI API error during embedding for {doc_url}: {e}", exc_info=True
         )
         update_document_sources_realtime_status_log(
-            status="FAILED", 
-            source_id=source_id, 
-            error_message=str(e)
+            status="FAILED", source_id=source_id, error_message=str(e)
         )
         # log_llm_error(
         #     supabase_client,
