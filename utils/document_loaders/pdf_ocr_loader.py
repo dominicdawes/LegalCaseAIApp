@@ -2,14 +2,15 @@
 
 # utils/document_loaders/pdf_ocr_loader.py
 
-from typing import List
+from typing import List, Iterator
 from langchain.schema import Document
 from .base import BaseDocumentLoader
 
-import fitz                # pip install pymupdf
-import pytesseract         # pip install pytesseract
+import fitz  # pip install pymupdf
+import pytesseract  # pip install pytesseract
 from PIL import Image
 import io
+
 
 class PDFOCRLoader(BaseDocumentLoader):
     """
@@ -54,3 +55,18 @@ class PDFOCRLoader(BaseDocumentLoader):
 
         pdf.close()
         return documents
+
+    def stream_documents(self, path: str) -> Iterator[Document]:
+        pdf = fitz.open(path)
+        try:
+            for page_number in range(len(pdf)):
+                page = pdf.load_page(page_number)
+                pix = page.get_pixmap(dpi=300)
+                img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+                text = pytesseract.image_to_string(img)
+                yield Document(
+                    page_content=text,
+                    metadata={"source": path, "page": page_number + 1, "ocr": True},
+                )
+        finally:
+            pdf.close()
