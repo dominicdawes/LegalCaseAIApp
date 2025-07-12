@@ -937,6 +937,8 @@ async def _process_and_embed(
 ):
     """Asynchronously process a document and insert embeddings."""
     loader = get_loader_for(local_path)
+    
+    # Paragraph-based splits (Semantic chunking)
     splitter = RecursiveCharacterTextSplitter(
         separators=["\n\n", "\n", " "],
         chunk_size=chunk_size,
@@ -987,7 +989,8 @@ async def _process_and_embed(
         total_vectors += len(vector_rows)
         batch_texts.clear()
         batch_metas.clear()
-
+    
+    # 3) Pure streaming: parse page/paragraph → chunk → embed immediately
     for doc in loader.stream_documents(local_path):
         for chunk in splitter.split_documents([doc]):
             batch_texts.append(chunk.page_content)
@@ -1060,86 +1063,7 @@ def chunk_and_embed_task(
             )
             raise
 
-        # text_splitter = CharacterTextSplitter(
-        #     chunk_size=chunk_size, chunk_overlap=chunk_overlap
-        # )
-        # paragraph-based splits (semantic chunking)
-        text_splitter = RecursiveCharacterTextSplitter(
-            separators=["\n\n","\n"," "],
-            hunk_size=chunk_size,
-            chunk_overlap=chunk_overlap,
-        )
-        embedding_model = OpenAIEmbeddings(
-            model="text-embedding-ada-002", api_key=OPENAI_API_KEY
-        )
-
-        expected_embedding_length = 1536
-        BATCH = 50  # lower batch size to reduce mem footprint 
-        batch_texts: list[str] = []
-        batch_metas: list[dict] = []
-        total_vectors = 0
-
-        def flush_batch():
-            if not batch_texts:
-                return
-            embeddings = embedding_model.embed_documents(batch_texts)
-            for i, vec in enumerate(embeddings):
-                if len(vec) != expected_embedding_length:
-                    raise ValueError(
-                        f"Embedding #{i} has length {len(vec)}; expected {expected_embedding_length}"
-                    )
-
-            def _clean(s: str) -> str:
-                return s.replace("\x00", "")
-
-            vector_rows = []
-            for text, meta, vector in zip(batch_texts, batch_metas, embeddings):
-                clean_text = _clean(text)
-                num_tokens = len(tokenizer.encode(clean_text))
-                clean_meta = {
-                    k: _clean(v) if isinstance(v, str) else v for k, v in meta.items()
-                }
-                vector_rows.append(
-                    {
-                        "source_id": str(source_id),
-                        "content": clean_text,
-                        "metadata": clean_meta,
-                        "embedding": vector,
-                        "project_id": str(project_id),
-                        "num_tokens": num_tokens,
-                    }
-                )
-
-            supabase_client.table("document_vector_store").insert(vector_rows).execute()
-            nonlocal total_vectors
-            total_vectors += len(vector_rows)
-            batch_texts.clear()
-            batch_metas.clear()
-
-        # # 3) Stream docs → chunks → embeddings in batches
-        # for doc in loader.stream_documents(local_path):
-        #     for chunk in text_splitter.split_documents([doc]):
-        #         batch_texts.append(chunk.page_content)
-        #         batch_metas.append({"source": doc_url, **chunk.metadata})
-        #         if len(batch_texts) >= BATCH:
-        #             flush_batch()
-
-        # 3) Pure streaming: parse page/paragraph → chunk → embed immediately
-        for doc in loader.stream_documents(local_path):
-            for chunk in text_splitter.split_documents([doc]):
-                batch_texts.append(chunk.page_content)
-                batch_metas.append({"source": doc_url, **chunk.metadata})
-                if len(batch_texts) >= BATCH:
-                    flush_batch()
-
-        flush_batch()
-
-        # Update status to COMPLETE after successful vector inser
-        update_document_sources_realtime_status_log(
-            "COMPLETE",
-            source_id,
-            # Do not pass an error
-        )
+        update_document_sources_realtime_status_log("COMPLETE", source_id)
         logger.info(
             f"Bulk inserted {total_vectors} embeddings into public.document_vector_store for source_id={source_id}"
         )
