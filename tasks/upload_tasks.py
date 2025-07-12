@@ -15,6 +15,7 @@ import tempfile
 import tiktoken
 import mimetypes
 from typing import List
+import asyncio
 from tasks.note_tasks import rag_note_task
 from tasks.celery_app import (
     celery_app,
@@ -926,6 +927,78 @@ def append_document_task(self, files, metadata=None):
             ) from e
 
 
+async def _process_and_embed(
+    local_path: str,
+    doc_url: str,
+    source_id: str,
+    project_id: str,
+    chunk_size: int,
+    chunk_overlap: int,
+):
+    """Asynchronously process a document and insert embeddings."""
+    loader = get_loader_for(local_path)
+    splitter = RecursiveCharacterTextSplitter(
+        separators=["\n\n", "\n", " "],
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap,
+    )
+    embedding_model = OpenAIEmbeddings(
+        model="text-embedding-ada-002",
+        api_key=OPENAI_API_KEY,
+    )
+
+    expected_embedding_length = 1536
+    BATCH = 50
+    batch_texts: list[str] = []
+    batch_metas: list[dict] = []
+    total_vectors = 0
+
+    def _clean(s: str) -> str:
+        return s.replace("\x00", "")
+
+    async def flush_batch() -> None:
+        nonlocal total_vectors
+        if not batch_texts:
+            return
+        embeddings = await embedding_model.aembed_documents(batch_texts)
+        for i, vec in enumerate(embeddings):
+            if len(vec) != expected_embedding_length:
+                raise ValueError(
+                    f"Embedding #{i} has length {len(vec)}; expected {expected_embedding_length}"
+                )
+        vector_rows = []
+        for text, meta, vector in zip(batch_texts, batch_metas, embeddings):
+            clean_text = _clean(text)
+            num_tokens = len(tokenizer.encode(clean_text))
+            clean_meta = {
+                k: _clean(v) if isinstance(v, str) else v for k, v in meta.items()
+            }
+            vector_rows.append(
+                {
+                    "source_id": str(source_id),
+                    "content": clean_text,
+                    "metadata": clean_meta,
+                    "embedding": vector,
+                    "project_id": str(project_id),
+                    "num_tokens": num_tokens,
+                }
+            )
+        supabase_client.table("document_vector_store").insert(vector_rows).execute()
+        total_vectors += len(vector_rows)
+        batch_texts.clear()
+        batch_metas.clear()
+
+    for doc in loader.stream_documents(local_path):
+        for chunk in splitter.split_documents([doc]):
+            batch_texts.append(chunk.page_content)
+            batch_metas.append({"source": doc_url, **chunk.metadata})
+            if len(batch_texts) >= BATCH:
+                await flush_batch()
+
+    await flush_batch()
+    return total_vectors
+
+
 @celery_app.task(
     bind=True, autoretry_for=(Exception,), retry_backoff=True, max_retries=5
 )
@@ -949,43 +1022,38 @@ def chunk_and_embed_task(
         None
     """
     temp_file = None
-
     try:
         logger.info(
             f"Starting chunk_and_embed_task for URL: {doc_url}, source_id: {str(source_id)}"
         )
         update_document_sources_realtime_status_log("EMBEDDING", source_id)
 
-        # 1) Download the file
         resp = requests.get(doc_url)
         resp.raise_for_status()
 
-        # Use suffix based on the URL’s extension so factory can pick loader
-        # --- fix “.19437”‐style arXiv URLs by sniffing Content‐Type first ---
         VALID = {".pdf", ".docx", ".doc", ".epub"}
-
-        # 1) sniff Content-Type
         ctype = resp.headers.get("Content-Type", "").split(";")[0]
         suffix = mimetypes.guess_extension(ctype) or ""
-
-        # 2) fall back to URL if header gave nothing useful
         if suffix not in VALID:
             ext = os.path.splitext(doc_url)[1].lower()
-            if ext in VALID:
-                suffix = ext
-            else:
-                # 3) default PDF instead of raising
-                suffix = ".pdf"
+            suffix = ext if ext in VALID else ".pdf"
 
-        # Write and save the downloaded temp file
         temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
         temp_file.write(resp.content)
         temp_file.close()
         local_path = temp_file.name
 
-        # 2) Use factory to get correct loader
         try:
-            loader = get_loader_for(local_path)
+            total_vectors = asyncio.run(
+                _process_and_embed(
+                    local_path,
+                    doc_url,
+                    source_id,
+                    project_id,
+                    chunk_size,
+                    chunk_overlap,
+                )
+            )
         except ValueError as e:
             update_document_sources_realtime_status_log(
                 "FAILED", source_id, error_message=str(e)
