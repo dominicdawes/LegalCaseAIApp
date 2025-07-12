@@ -2,6 +2,7 @@
 This file runs Celery tasks, for handling RAG document upload, and vector embedding tasks
 """
 
+import asyncio
 from celery import Celery, chain, chord
 from celery.exceptions import MaxRetriesExceededError
 from celery import states
@@ -936,6 +937,8 @@ async def _process_and_embed(
 ):
     """Asynchronously process a document and insert embeddings."""
     loader = get_loader_for(local_path)
+    
+    # Paragraph-based splits (Semantic chunking)
     splitter = RecursiveCharacterTextSplitter(
         separators=["\n\n", "\n", " "],
         chunk_size=chunk_size,
@@ -986,7 +989,8 @@ async def _process_and_embed(
         total_vectors += len(vector_rows)
         batch_texts.clear()
         batch_metas.clear()
-
+    
+    # 3) Pure streaming: parse page/paragraph → chunk → embed immediately
     for doc in loader.stream_documents(local_path):
         for chunk in splitter.split_documents([doc]):
             batch_texts.append(chunk.page_content)
