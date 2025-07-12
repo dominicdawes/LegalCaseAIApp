@@ -3,6 +3,7 @@ python-dotenv
 pandas
 loguru
 psutil
+postgrest-py
 
 # Document parsing dependencies
 textract

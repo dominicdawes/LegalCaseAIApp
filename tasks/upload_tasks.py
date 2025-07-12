@@ -2,7 +2,6 @@
 This file runs Celery tasks, for handling RAG document upload, and vector embedding tasks
 """
 
-import asyncio
 from celery import Celery, chain, chord
 from celery.exceptions import MaxRetriesExceededError
 from celery import states
@@ -16,6 +15,7 @@ import tiktoken
 import mimetypes
 from typing import List
 import asyncio
+from postgrest.exceptions import APIError
 from tasks.note_tasks import rag_note_task
 from tasks.celery_app import (
     celery_app,
@@ -959,9 +959,11 @@ async def _process_and_embed(
         return s.replace("\x00", "")
 
     async def flush_batch() -> None:
-        nonlocal total_vectors
+        nonlocal total_vectors, BATCH
         if not batch_texts:
             return
+        
+        # 1) Embed
         embeddings = await embedding_model.aembed_documents(batch_texts)
         for i, vec in enumerate(embeddings):
             if len(vec) != expected_embedding_length:
@@ -985,10 +987,30 @@ async def _process_and_embed(
                     "num_tokens": num_tokens,
                 }
             )
-        supabase_client.table("document_vector_store").insert(vector_rows).execute()
-        total_vectors += len(vector_rows)
-        batch_texts.clear()
-        batch_metas.clear()
+        # 2) insert with minimal return to speed things up
+        try:
+            supabase_client.table("document_vector_store") \
+                .insert(vector_rows, returning="minimal") \
+                .execute()
+            total_vectors += len(vector_rows)
+            batch_texts.clear()
+            batch_metas.clear()
+
+        except APIError as api_err:
+            err = api_err.args[0] if api_err.args else {}
+            if err.get("code") == "57014":
+                # shrink and retry
+                old_batch = BATCH
+                BATCH = max(1, BATCH // 2)
+                logger.warning(
+                    f"Insert timed out with batch={old_batch}. "
+                    f"Reducing to {BATCH} and retrying."
+                )
+                # recursively retry; this will re-run with smaller batch
+                await flush_batch()
+            else:
+                # some other error—bubble it up
+                raise
     
     # 3) Pure streaming: parse page/paragraph → chunk → embed immediately
     for doc in loader.stream_documents(local_path):
@@ -1045,6 +1067,9 @@ def chunk_and_embed_task(
         temp_file.write(resp.content)
         temp_file.close()
         local_path = temp_file.name
+
+        # bump the Postgres statement_timeout to 30 s for this session
+        supabase_client.rpc("set_statement_timeout", {"timeout": 30000}).execute()
 
         try:
             total_vectors = asyncio.run(
