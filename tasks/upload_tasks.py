@@ -2,6 +2,7 @@
 This file runs Celery tasks, for handling RAG document upload, and vector embedding tasks
 """
 
+import asyncio
 from celery import Celery, chain, chord
 from celery.exceptions import MaxRetriesExceededError
 from celery import states
@@ -1054,7 +1055,7 @@ def chunk_and_embed_task(
         #         batch_metas.append({"source": doc_url, **chunk.metadata})
         #         if len(batch_texts) >= BATCH:
         #             flush_batch()
-        
+
         # 3) Pure streaming: parse page/paragraph → chunk → embed immediately
         for doc in loader.stream_documents(local_path):
             for chunk in text_splitter.split_documents([doc]):
