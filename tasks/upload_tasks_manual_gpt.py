@@ -85,7 +85,7 @@ def process_document_task(self, file_urls: list[str], metadata: dict):
     """
     new_rows, new_paths, existing_ids = [], {}, []
 
-    # --- download & dedupe ---
+    # ——— Step 1: download & dedupe ---
     for url in file_urls:
         tmp = download_stream_to_temp(url)
         new_paths[url] = tmp
@@ -123,22 +123,23 @@ def process_document_task(self, file_urls: list[str], metadata: dict):
             'error_message': None
         })
 
-    # --- insert new docs ---
+    # ——— Step 2: insert & collect generated IDs
     inserted_ids = []
     if new_rows:
         resp = supabase_client.table('document_sources') \
             .insert(new_rows, returning='id').execute()
         new_ids = [r['id'] for r in resp.data]
 
-        # mark new as pending
+        # update all to PENDING
         supabase_client.table('document_sources') \
             .update({'vector_embed_status': 'PENDING'}) \
             .in_('id', new_ids).execute()
         inserted_ids = new_ids
 
-    # combine all doc_ids
+    # combine all doc_ids (dedeuped & newly inserted)
     all_doc_ids = existing_ids + inserted_ids
-    # schedule parsing for new docs only
+
+    # ——— Step 3: Schedule parsing for new docs only (fire off one Celery task per-document)
     for idx, doc_id in enumerate(inserted_ids):
         parse_document_task.apply_async(
             (doc_id, new_rows[idx]['cdn_url'], new_rows[idx]['project_id']),
@@ -156,7 +157,7 @@ def process_document_task(self, file_urls: list[str], metadata: dict):
 @celery_app.task(bind=True, queue=PARSE_QUEUE)
 def parse_document_task(self, source_id: str, cdn_url: str, project_id: str):
     """
-    Stream, chunk, then schedule embed_batch_task per chunk-batch
+    (Per-document) Streams, chunks, then schedules embed_batch_task per chunk-batch
     Also records total_batches & total_chunks for telemetry
 
     Step by step:
@@ -193,17 +194,27 @@ def parse_document_task(self, source_id: str, cdn_url: str, project_id: str):
                 total_batches += 1
                 headers.append(
                     # Signature for per-batch Celery task
-                    embed_batch_task.s(source_id, project_id, batch_texts, batch_metas)
+                    embed_batch_task.s(
+                        source_id, 
+                        project_id, 
+                        batch_texts, 
+                        batch_metas
+                    )
                 )
                 batch_texts, batch_metas = [], []
 
-    # final partial batch
+    # final partial batch (usually less than BATCH_SIZE)
     if batch_texts:
         total_chunks += len(batch_texts)
         total_batches += 1
         headers.append(
             # Signature for per-batch Celery task
-            embed_batch_task.s(source_id, project_id, batch_texts, batch_metas)
+            embed_batch_task.s(
+                source_id, 
+                project_id, 
+                batch_texts, 
+                batch_metas
+            )
         )
 
     # UPDATE TELEMETRY: expected workload
@@ -243,7 +254,7 @@ async def embed_batch_task(self, source_id: str, project_id: str, texts: list[st
     start = datetime.now(timezone.utc)
     try:
         # 1) call OpenAI asynchronously
-        embeddings = await embedding_model.aembed_documents(texts)
+        embeddings = await embedding_model.aembed_documents(texts) # ← note to self: aembed is the syntax for async embedding function
 
         rows = []
         for txt, meta, vec in zip(texts, metas, embeddings):
@@ -284,6 +295,7 @@ async def embed_batch_task(self, source_id: str, project_id: str, texts: list[st
         return source_id
 
     except MaxRetriesExceededError:
+        # terminal failure block: update doc status and error
         supabase_client.table('document_sources') \
             .update({
                 'vector_embed_status': 'FAILED_EMBEDDING',
