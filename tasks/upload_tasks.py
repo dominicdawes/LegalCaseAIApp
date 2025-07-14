@@ -1,1242 +1,412 @@
-"""
-This file runs Celery tasks, for handling RAG document upload, and vector embedding tasks
-"""
-
-from celery import Celery, chain, chord
-from celery.exceptions import MaxRetriesExceededError
-from celery import states
-import logging
 import os
-import json
-import psutil
-import requests
-import tempfile
-import tiktoken
-import mimetypes
-from typing import List
-import asyncio
-from postgrest.exceptions import APIError
-from tasks.note_tasks import rag_note_task
-from tasks.celery_app import (
-    celery_app,
-)  # Import the Celery app instance (see celery_app.py for LocalHost config)
-from utils.audio_utils import generate_audio, generate_only_dialogue_text
-from utils.s3_utils import (
-    upload_to_s3,
-    generate_presigned_url,
-    s3_client,
-    s3_bucket_name,
-)
-from utils.supabase_utils import (
-    update_document_sources_realtime_status_log,
-    update_table_realtime_status_log,
-    supabase_client,
-    # log_llm_error,
-)
-from utils.cloudfront_utils import get_cloudfront_url
-from utils.document_loaders.loader_factory import get_loader_for
-from utils.instruction_templates import INSTRUCTION_TEMPLATES
-from time import sleep
-from datetime import datetime, timezone
-from dotenv import load_dotenv
 import uuid
+import asyncio
+import tempfile
+import requests
+from datetime import datetime, timezone
+import logging
 
-# langchain dependencies
-from langchain.text_splitter import CharacterTextSplitter
+# Celery imports
+from collections import deque
+from celery import chord, group
+from celery.exceptions import MaxRetriesExceededError
+
+# Langchain imports
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_openai import OpenAIEmbeddings
-from langchain_community.document_loaders import PyPDFLoader
-from openai import OpenAIError
+import tiktoken
 
-# API Keys
-load_dotenv()
-OPENAI_API_KEY = os.environ.get("OPENAI_API_PROD_KEY")
+# Project modules
+from tasks.celery_app import celery_app
+from utils.s3_utils import upload_to_s3, s3_client
+from utils.cloudfront_utils import get_cloudfront_url
+from utils.supabase_utils import supabase_client
+from utils.document_loaders.loader_factory import get_loader_for    # → module contains document streaming ability
 
-# Initialize the tokenizer globally, for token counting
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+
+# ——— Configuration —————————————————————————————————————————————————————————
+
+# Retry policy for embedding tasks
+MAX_RETRIES = 3
+DEFAULT_RETRY_DELAY = 10  # seconds
+
+# How many text chunks to send in one batch to OpenAI
+BATCH_SIZE = 20  # break into smaller per-batch tasks
+
+# Semantic chunker settings
+CHUNK_SIZE = 1000
+CHUNK_OVERLAP = 200
+
+# Ada-002 embeddings are 1,536-dimensional
+EXPECTED_EMBEDDING_LEN = 1536
+
+# Instantiate once per worker process
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+embedding_model = OpenAIEmbeddings(
+    model="text-embedding-ada-002",
+    api_key=OPENAI_API_KEY,
+)
+
+# Tokenizer for token counting
 try:
     tokenizer = tiktoken.encoding_for_model("text-embedding-ada-002")
 except KeyError:
     tokenizer = tiktoken.get_encoding("cl100k_base")
 
-logger = logging.getLogger(__name__)
+# ——— Helper: download any URL to a temp file ——————————————————————————————————————
 
+def _clean(s: str) -> str:
+    """Remove problematic nulls and control chars from text."""
+    return s.replace("\x00", "")
 
-@celery_app.task(
-    bind=True, autoretry_for=(Exception,), retry_backoff=True, max_retries=5
-)
-def process_document_task(self, files, metadata=None):
+def download_stream_to_temp(url: str, chunk_size: int = 1024*1024) -> str:
     """
-    Main Celery task to:
-        1) upload docs (.pdf, docx, doc, epub, md, txt) to S3,
-        2) save to Supabase,
-        3) and trigger vector embedding tasks.
-    Includes enhanced status tracking.
-
-    Args:
-        files (List): Containing file CDN urls (created by WeWeb's document upload element)
-        metadata (json): {
-            'user_id': UUID,
-            'project_id': UUID,
-            'provider': 'anthropic...', 'meta'...,
-            'model_name': 'gpt-4o-mini', 'llama3.1'...,
-            'temparature': '0.7', ...,
-            'note_type': 'case_summary'
-    Return:
-        ???
+    Stream a remote URL (HTTP or CloudFront) into a NamedTemporaryFile.
+    Returns the local filepath.
     """
-    try:
-        # Initialize task-level state that will be accessible via results = AsyncResult(task_id)
-        # result.state → "PENDING"
-        # result.info → {"start_time": "..."}
-        task_start_time = datetime.now(timezone.utc).isoformat()
-        self.update_state(
-            state="PROCESSING",
-            meta={
-                "start_time": task_start_time,
-                "total_files": len(files),
-                "processed_files": 0,
-                "stage": "INITIALIZING",
-                "message": "Starting document processing workflow",
-            },
-        )
-
-        # === RENDER RESOURCE LOGGING (MB) === #
-        process = psutil.Process(os.getpid())
-        mem_before = process.memory_info().rss
-        logger.info(
-            f"Starting {self.name} with {len(files)} files and metadata: {metadata}"
-        )
-        logger.info(f"Memory usage before task: {mem_before / (1024 * 1024)} MB")
-
-        if not files:
-            logger.warning("No files provided for processing.")
-            raise ValueError("Please upload at least one PDF file before processing.")
-
-        rows_to_insert = []
-        temp_paths = []  # keep track of temps for cleanup
-        successful_files = 0
-        failed_files = 0
-
-        # === 1) Download from WeWeb CDN & upload each file to AWS S3===
-        self.update_state(
-            state="PROCESSING",
-            meta={
-                "start_time": task_start_time,
-                "stage": "DOWNLOADING_AND_UPLOADING",
-                "message": f"Downloading and uploading {len(files)} files to S3",
-                "processed_files": 0,
-                "total_files": len(files),
-            },
-        )
-
-        for idx, file_url in enumerate(files):
-            try:
-                # download or read locally
-                if file_url.lower().startswith(("http://", "https://")):
-                    self.update_state(
-                        state="PROCESSING",
-                        meta={
-                            "stage": "DOWNLOADING",
-                            "current_file": file_url.split("/")[-1],
-                            "current_file_index": idx + 1,
-                            "total_files": len(files),
-                            "message": f"Downloading file {idx + 1}/{len(files)}",
-                        },
-                    )
-
-                    # GET/ Request and server "spoofing"
-                    # resp = requests.get( file_url )
-                    # resp.raise_for_status()
-                    try:
-                        headers = {
-                            "User-Agent": (
-                                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                                "Chrome/114.0.0.0 Safari/537.36"
-                            )
-                        }
-                        resp = requests.get(file_url, headers=headers, timeout=30)
-                        resp.raise_for_status()
-                    except requests.exceptions.HTTPError as he:
-                        status = (
-                            he.response.status_code
-                            if he.response is not None
-                            else "N/A"
-                        )
-                        err_msg = f"{status} error downloading {file_url}"
-                        logger.error(
-                            f"[file loop] Failed downloading '{file_url}': {err_msg}"
-                        )
-                        update_document_sources_realtime_status_log(
-                            status="FAILED",
-                            source_id=None,  # source_id not assigned yet
-                            error_message=err_msg,
-                        )
-                        failed_files += 1
-                        continue
-                    except Exception as e:
-                        err_msg = f"Download exception for {file_url}: {e}"
-                        logger.error(f"[file loop] {err_msg}", exc_info=True)
-                        update_document_sources_realtime_status_log(
-                            status="FAILED",
-                            source_id=None,  # source_id not assigned yet
-                            error_message=err_msg,
-                        )
-                        failed_files += 1
-                        continue
-
-                    ext = os.path.splitext(file_url)[
-                        1
-                    ].lower()  # <-- persisted in DB & used in loader_factory
-                    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=ext)
-                    tmp.write(resp.content)
-                    tmp.close()
-                    file_path = tmp.name
-                else:
-                    file_path = file_url
-
-                # upload to S3
-                self.update_state(
-                    state="PROCESSING",
-                    meta={
-                        "start_time": task_start_time,
-                        "stage": "UPLOADING_TO_S3",
-                        "current_file": file_url.split("/")[-1],
-                        "current_file_index": idx + 1,
-                        "total_files": len(files),
-                        "message": f"Uploading file {idx + 1}/{len(files)} to S3",
-                    },
-                )
-                ext = os.path.splitext(file_path)[1]
-                key = f"{uuid.uuid4()}{ext}"
-                upload_to_s3(s3_client, file_path, key)
-
-                # get CloudFront URL
-                url = get_cloudfront_url(key)
-
-                # Define rows to insert into document_sources table
-                rows_to_insert.append(
-                    {
-                        "cdn_url": url,
-                        "project_id": str(metadata["project_id"]),
-                        "content_tags": ["Fitness", "Health", "Wearables"],
-                        "uploaded_by": str(metadata["user_id"]),
-                        "vector_embed_status": "INITIALIZING",  # New initial status
-                        "filename": file_url.split("/")[-1],  # Store original filename
-                        "file_size_bytes": os.path.getsize(
-                            file_path
-                        ),  # Store file size for reference
-                        "file_extension": ext,
-                        "created_at": datetime.now(timezone.utc).isoformat(),
-                    }
-                )
-                temp_paths.append(file_path)
-                successful_files += 1
-
-                logger.info(f"Prepared upload row for {file_path} → {url}")
-
-            except Exception as e:
-                update_table_realtime_status_log(
-                    client=supabase_client,
-                    table_name="projects",
-                    project_uuid=metadata["project_id"],
-                    log="FILE_PROCESSING_ERROR",
-                )
-                failed_files += 1
-                logger.error(
-                    f"[file loop] Failed processing '{file_url}': {e}", exc_info=True
-                )
-                # Update the task state with error information
-                self.update_state(
-                    state="PROCESSING",
-                    meta={
-                        "start_time": task_start_time,
-                        "stage": "FILE_PROCESSING_ERROR",
-                        "current_file": (
-                            file_url.split("/")[-1] if "/" in file_url else file_url
-                        ),
-                        "error_message": str(e),
-                        "successful_files": successful_files,
-                        "failed_files": failed_files,
-                        "message": f"Error processing file {idx + 1}/{len(files)}: {str(e)[:100]}...",
-                    },
-                )
-                # skip this file and continue
-                continue
-
-        if not rows_to_insert:
-            logger.error("No successful uploads; aborting task.")
-            raise RuntimeError("All file uploads failed.")
-
-        # === 2) Bulk insert into Supabase ===
-        update_table_realtime_status_log(
-            client=supabase_client,
-            table_name="projects",
-            project_uuid=metadata["project_id"],
-            log="DATABASE_INSERTION",
-        )
-        self.update_state(
-            state="PROCESSING",
-            meta={
-                "start_time": task_start_time,
-                "stage": "DATABASE_INSERTION",
-                "message": f"Inserting {len(rows_to_insert)} document records into database",
-                "successful_files": successful_files,
-                "failed_files": failed_files,
-            },
-        )
-
-        source_ids = []  # Initialize source_ids list
-        try:
-            # First, insert with INITIALIZING status
-            response = (
-                supabase_client.table("document_sources")
-                .insert(rows_to_insert)
-                .execute()
-            )
-
-            # Extract source_ids from the insert response
-            source_ids = [r["id"] for r in response.data]
-
-            # Update status to PENDING for embedding
-            self.update_state(
-                state="PROCESSING",
-                meta={
-                    "start_time": task_start_time,
-                    "stage": "UPDATING_STATUS",
-                    "message": f"Setting {len(source_ids)} documents to PENDING status",
-                    "successful_files": successful_files,
-                    "failed_files": failed_files,
-                    "source_ids": source_ids,  # Include source_ids in state for reference
-                },
-            )
-
-            # Update all document statuses to PENDING
-            update_payload = [
-                {"id": sid, "vector_embed_status": "PENDING"} for sid in source_ids
-            ]
-            update_resp = (
-                supabase_client.table("document_sources")
-                .upsert(update_payload)
-                .execute()
-            )
-
-        except Exception as e:
-            logger.error(f"[Supabase] Bulk insert failed: {e}", exc_info=True)
-            # Cleanup temp files before re-raising the exception for Celery retry
-            for p in temp_paths:
-                try:
-                    os.unlink(p)
-                    logger.debug(
-                        f"Deleted temp file {p} after Supabase insert failure."
-                    )
-                except:
-                    logger.warning(
-                        f"[CELERY] Could not delete temp file {p} during Supabase failure cleanup.",
-                        exc_info=True,
-                    )
-
-            # Update task state
-            update_table_realtime_status_log(
-                client=supabase_client,
-                table_name="projects",
-                project_uuid=metadata["project_id"],
-                log="FAILURE",
-            )
-            self.update_state(
-                state="FAILURE",
-                meta={
-                    "exc_type": type(e).__name__,
-                    "exc_module": e.__class__.__module__,
-                    "exc_message": str(e),
-                    "error": f"Initial DB insert failed: {str(e)}",
-                    "stage": "DATABASE_ERROR",
-                    "message": f"Database insertion failed: {str(e)[:100]}...",
-                },
-            )
-            raise
-
-        # === 3) Cleanup temp files ===
-        self.update_state(
-            state="PROCESSING",
-            meta={
-                "stage": "CLEANUP",
-                "message": "Cleaning up temporary files",
-                "successful_files": successful_files,
-                "failed_files": failed_files,
-                "source_ids": source_ids,
-            },
-        )
-
-        for path in temp_paths:
-            try:
-                os.unlink(path)
-                logger.debug(f"Deleted temp file {path}")
-            except Exception:
-                logger.warning(
-                    f"[CELERY] Could not delete temp file {path}", exc_info=True
-                )
-
-        # === 4) Kick off the Chord (Embedding Tasks + Final Callback) ===
-        update_table_realtime_status_log(
-            client=supabase_client,
-            table_name="projects",
-            project_uuid=metadata["project_id"],
-            log="INITIATING_EMBEDDING",
-        )
-        self.update_state(
-            state="PROCESSING",
-            meta={
-                "stage": "INITIATING_EMBEDDING",
-                "message": f"Starting embedding tasks for {len(source_ids)} documents",
-                "successful_files": successful_files,
-                "failed_files": failed_files,
-                "source_ids": source_ids,
-            },
-        )
-
-        logger.info(
-            f"{self.name} prepared {len(source_ids)} source_ids, launching embedding chord"
-        )
-
-        # Create a list of task signatures for the chord header
-        embedding_tasks = [
-            chunk_and_embed_task.s(
-                row["cdn_url"],  # Pass the CDN URL
-                sid,  # Pass the source_id from the DB insert into public.document_sources
-                metadata["project_id"],  # Pass the project_id
-            )
-            for sid, row in zip(source_ids, rows_to_insert)
-        ]
-
-        # Define the chord body (the callback task)
-        callback = finalize_document_processing_workflow.s(
-            metadata["user_id"],
-            source_ids,
-            metadata["project_id"],
-            metadata.get("note_title", ""),  # note title
-            metadata.get("note_type", "None"),  # fallback to "None" if missing
-            metadata.get("provider", "openai"),
-            metadata.get("model_name", "gpt-4o-mini"),  # fallback to gpt-4o-mini
-            metadata.get("temperature", "0.7"),
-            metadata.get("addtl_params", {}),
-        )
-        chord_result = chord(embedding_tasks)(callback)
-        workflow_id = chord_result.id
-        logger.info(f"Chord launched; callback task ID = {workflow_id}")
-
-        # Update final state with success and result information
-        update_table_realtime_status_log(
-            client=supabase_client,
-            table_name="projects",
-            project_uuid=metadata["project_id"],
-            log="SUCCESS",
-        )
-        self.update_state(
-            state="SUCCESS",
-            meta={
-                "stage": "COMPLETED",
-                "message": "Document upload complete, embedding in progress...",
-                "successful_files": successful_files,
-                "failed_files": failed_files,
-                "source_ids": source_ids,
-            },
-        )
-
-        # Return the ID of the FINAL callback so you can poll it:
-        return {
-            "source_ids": source_ids,
-            "successful": successful_files,
-            "failed": failed_files,
-            "total": len(files),
-            "workflow_task_id": workflow_id,
-        }
-
-    except Exception as e:
-        # this catches anything that bubbled out of your inner logic
-        logger.error(f"Overall process_document_task failed: {e}", exc_info=True)
-
-        try:
-            # Update state before retry
-            update_table_realtime_status_log(
-                client=supabase_client,
-                table_name="projects",
-                project_uuid=metadata["project_id"],
-                log="RETRY",
-            )
-            self.update_state(
-                state="RETRY",
-                meta={
-                    "error": str(e),
-                    "retry_count": self.request.retries,
-                    "max_retries": self.max_retries,
-                    "message": f"Task failed, attempting retry {self.request.retries + 1}/{self.max_retries + 1}",
-                },
-            )
-            # schedule a retry if we haven't hit max_retries yet
-            raise self.retry(exc=e)
-        except MaxRetriesExceededError:
-            # once retries are exhausted, raise a clear runtime error
-            logger.critical(
-                f"[CELERY] process_document_task failed permanently after {self.max_retries} retries: {e}"
-            )
-
-            # Update final failure state
-            update_table_realtime_status_log(
-                client=supabase_client,
-                table_name="projects",
-                project_uuid=metadata["project_id"],
-                log="FAILURE",
-            )
-            self.update_state(
-                state="FAILURE",
-                meta={
-                    "exc_type": type(e).__name__,
-                    "exc_module": e.__class__.__module__,
-                    "exc_message": str(e),
-                    "error": str(e),
-                    "retry_count": self.max_retries,
-                    "max_retries": self.max_retries,
-                    "message": f"Task failed after {self.max_retries} retries",
-                },
-            )
-            raise RuntimeError(
-                f"[CELERY] process_document_task failed permanently after {self.max_retries} retries: {e}"
-            ) from e
-
-
-@celery_app.task(
-    bind=True, autoretry_for=(Exception,), retry_backoff=True, max_retries=5
-)
-def append_document_task(self, files, metadata=None):
-    """
-    Main Celery task to add additional documents to an ALREADY existing project:
-        1) upload docs (.pdf, docx, doc, epub, md, txt) to S3,
-        2) save to Supabase,
-        3) and trigger vector embedding tasks.
-    Includes enhanced status tracking.
-
-    Args:
-        files (List): Containing file CDN urls (created by WeWeb's document upload element)
-        metadata (json): {
-            'user_id': UUID,
-            'project_id': UUID,
-            ... no other vars
-    Return:
-        ???
-    """
-    try:
-        # Initialize task-level state that will be accessible via results = AsyncResult(task_id)
-        # result.state → "PENDING"
-        # result.info → {"start_time": "..."}
-        task_start_time = datetime.now(timezone.utc).isoformat()
-        self.update_state(
-            state="PROCESSING",
-            meta={
-                "start_time": task_start_time,
-                "total_files": len(files),
-                "processed_files": 0,
-                "stage": "INITIALIZING",
-                "message": "Starting document processing workflow",
-            },
-        )
-
-        # === RENDER RESOURCE LOGGING (MB) === #
-        process = psutil.Process(os.getpid())
-        mem_before = process.memory_info().rss
-        logger.info(
-            f"Starting {self.name} with {len(files)} files and metadata: {metadata}"
-        )
-        logger.info(f"Memory usage before task: {mem_before / (1024 * 1024)} MB")
-
-        if not files:
-            logger.warning("No files provided for processing.")
-            raise ValueError("Please upload at least one PDF file before processing.")
-
-        rows_to_insert = []
-        temp_paths = []  # keep track of temps for cleanup
-        successful_files = 0
-        failed_files = 0
-
-        # === 1) Download from WeWeb CDN & upload each file to AWS S3===
-        self.update_state(
-            state="PROCESSING",
-            meta={
-                "start_time": task_start_time,
-                "stage": "DOWNLOADING_AND_UPLOADING",
-                "message": f"Downloading and uploading {len(files)} files to S3",
-                "processed_files": 0,
-                "total_files": len(files),
-            },
-        )
-
-        for idx, file_url in enumerate(files):
-            try:
-                # download or read locally
-                if file_url.lower().startswith(("http://", "https://")):
-                    self.update_state(
-                        state="PROCESSING",
-                        meta={
-                            "stage": "DOWNLOADING",
-                            "current_file": file_url.split("/")[-1],
-                            "current_file_index": idx + 1,
-                            "total_files": len(files),
-                            "message": f"Downloading file {idx + 1}/{len(files)}",
-                        },
-                    )
-
-                    # GET/ Request and server "spoofing"
-                    # resp = requests.get( file_url )
-                    # resp.raise_for_status()
-                    try:
-                        headers = {
-                            "User-Agent": (
-                                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                                "Chrome/114.0.0.0 Safari/537.36"
-                            )
-                        }
-                        resp = requests.get(file_url, headers=headers, timeout=30)
-                        resp.raise_for_status()
-                    except requests.exceptions.HTTPError as he:
-                        status = (
-                            he.response.status_code
-                            if he.response is not None
-                            else "N/A"
-                        )
-                        err_msg = f"{status} error downloading {file_url}"
-                        logger.error(
-                            f"[file loop] Failed downloading '{file_url}': {err_msg}"
-                        )
-                        update_document_sources_realtime_status_log(
-                            "FAILED", error_message=err_msg
-                        )
-                        failed_files += 1
-                        continue
-                    except Exception as e:
-                        err_msg = f"Download exception for {file_url}: {e}"
-                        logger.error(f"[file loop] {err_msg}", exc_info=True)
-                        update_document_sources_realtime_status_log(
-                            "FAILED", error_message=err_msg
-                        )
-                        failed_files += 1
-                        continue
-
-                    ext = os.path.splitext(file_url)[
-                        1
-                    ].lower()  # <-- persisted in DB & used in loader_factory
-                    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=ext)
-                    tmp.write(resp.content)
-                    tmp.close()
-                    file_path = tmp.name
-                else:
-                    file_path = file_url
-
-                # upload to S3
-                self.update_state(
-                    state="PROCESSING",
-                    meta={
-                        "start_time": task_start_time,
-                        "stage": "UPLOADING_TO_S3",
-                        "current_file": file_url.split("/")[-1],
-                        "current_file_index": idx + 1,
-                        "total_files": len(files),
-                        "message": f"Uploading file {idx + 1}/{len(files)} to S3",
-                    },
-                )
-                ext = os.path.splitext(file_path)[1]
-                key = f"{uuid.uuid4()}{ext}"
-                upload_to_s3(s3_client, file_path, key)
-
-                # get CloudFront URL
-                url = get_cloudfront_url(key)
-
-                # Define rows to insert into document_sources table
-                rows_to_insert.append(
-                    {
-                        "cdn_url": url,
-                        "project_id": str(metadata["project_id"]),
-                        "content_tags": ["Fitness", "Health", "Wearables"],
-                        "uploaded_by": str(metadata["user_id"]),
-                        "vector_embed_status": "INITIALIZING",  # New initial status
-                        "filename": file_url.split("/")[-1],  # Store original filename
-                        "file_size_bytes": os.path.getsize(
-                            file_path
-                        ),  # Store file size for reference
-                        "file_extension": ext,
-                        "created_at": datetime.now(timezone.utc).isoformat(),
-                    }
-                )
-                temp_paths.append(file_path)
-                successful_files += 1
-
-                logger.info(f"Prepared upload row for {file_path} → {url}")
-
-            except Exception as e:
-                update_table_realtime_status_log(
-                    client=supabase_client,
-                    table_name="projects",
-                    project_uuid=metadata["project_id"],
-                    log="FILE_PROCESSING_ERROR",
-                )
-                failed_files += 1
-                logger.error(
-                    f"[file loop] Failed processing '{file_url}': {e}", exc_info=True
-                )
-                # Update the task state with error information
-                self.update_state(
-                    state="PROCESSING",
-                    meta={
-                        "start_time": task_start_time,
-                        "stage": "FILE_PROCESSING_ERROR",
-                        "current_file": (
-                            file_url.split("/")[-1] if "/" in file_url else file_url
-                        ),
-                        "error_message": str(e),
-                        "successful_files": successful_files,
-                        "failed_files": failed_files,
-                        "message": f"Error processing file {idx + 1}/{len(files)}: {str(e)[:100]}...",
-                    },
-                )
-                # skip this file and continue
-                continue
-
-        if not rows_to_insert:
-            logger.error("No successful uploads; aborting task.")
-            raise RuntimeError("All file uploads failed.")
-
-        # === 2) Bulk insert into Supabase ===
-        self.update_state(
-            state="PROCESSING",
-            meta={
-                "start_time": task_start_time,
-                "stage": "DATABASE_INSERTION",
-                "message": f"Inserting {len(rows_to_insert)} document records into database",
-                "successful_files": successful_files,
-                "failed_files": failed_files,
-            },
-        )
-
-        source_ids = []  # Initialize source_ids list
-        try:
-            # First, insert with INITIALIZING status
-            response = (
-                supabase_client.table("document_sources")
-                .insert(rows_to_insert)
-                .execute()
-            )
-
-            # Extract source_ids from the insert response
-            source_ids = [r["id"] for r in response.data]
-
-            # Update status to PENDING for embedding
-            self.update_state(
-                state="PROCESSING",
-                meta={
-                    "start_time": task_start_time,
-                    "stage": "UPDATING_STATUS",
-                    "message": f"Setting {len(source_ids)} documents to PENDING status",
-                    "successful_files": successful_files,
-                    "failed_files": failed_files,
-                    "source_ids": source_ids,  # Include source_ids in state for reference
-                },
-            )
-
-            # Update all document statuses to PENDING
-            update_table_realtime_status_log(
-                client=supabase_client,
-                table_name="projects",
-                project_uuid=metadata["project_id"],
-                log="PENDING",
-            )
-            update_payload = [
-                {"id": sid, "vector_embed_status": "PENDING"} for sid in source_ids
-            ]
-            update_resp = (
-                supabase_client.table("document_sources")
-                .upsert(update_payload)
-                .execute()
-            )
-
-        except Exception as e:
-            logger.error(f"[Supabase] Bulk insert failed: {e}", exc_info=True)
-            # Cleanup temp files before re-raising the exception for Celery retry
-            for p in temp_paths:
-                try:
-                    os.unlink(p)
-                    logger.debug(
-                        f"Deleted temp file {p} after Supabase insert failure."
-                    )
-                except:
-                    logger.warning(
-                        f"[CELERY] Could not delete temp file {p} during Supabase failure cleanup.",
-                        exc_info=True,
-                    )
-
-            # Update task state
-            update_table_realtime_status_log(
-                client=supabase_client,
-                table_name="projects",
-                project_uuid=metadata["project_id"],
-                log="FAILURE",
-            )
-            self.update_state(
-                state="FAILURE",
-                meta={
-                    "exc_type": type(e).__name__,
-                    "exc_module": e.__class__.__module__,
-                    "exc_message": str(e),
-                    "error": f"Initial DB insert failed: {str(e)}",
-                    "stage": "DATABASE_ERROR",
-                    "message": f"Database insertion failed: {str(e)[:100]}...",
-                },
-            )
-            raise
-
-        # === 3) Cleanup temp files ===
-        self.update_state(
-            state="PROCESSING",
-            meta={
-                "stage": "CLEANUP",
-                "message": "Cleaning up temporary files",
-                "successful_files": successful_files,
-                "failed_files": failed_files,
-                "source_ids": source_ids,
-            },
-        )
-
-        for path in temp_paths:
-            try:
-                os.unlink(path)
-                logger.debug(f"Deleted temp file {path}")
-            except Exception:
-                logger.warning(
-                    f"[CELERY] Could not delete temp file {path}", exc_info=True
-                )
-
-        # === 4) Kick off embedding tasks (no final callback) ===
-        self.update_state(
-            state="PROCESSING",
-            meta={
-                "stage": "INITIATING_EMBEDDING",
-                "message": f"Starting embedding tasks for {len(source_ids)} documents",
-                "successful_files": successful_files,
-                "failed_files": failed_files,
-                "source_ids": source_ids,
-            },
-        )
-
-        logger.info(
-            f"{self.name} prepared {len(source_ids)} source_ids, launching embedding chord"
-        )
-
-        # Create a list of task signatures for our embedding “group”
-        embedding_tasks = [
-            chunk_and_embed_task.s(
-                row["cdn_url"],  # Pass the CDN URL
-                sid,  # Pass the source_id from the DB insert into public.document_sources
-                metadata["project_id"],  # Pass the project_id
-            )
-            for sid, row in zip(source_ids, rows_to_insert)
-        ]
-
-        from celery import group
-
-        # fire off all embedding tasks as a group
-        embedding_job = group(embedding_tasks).apply_async()
-        embedding_group_id = embedding_job.id
-        logger.info(f"Embedding tasks launched as group {embedding_group_id}")
-
-        # Update final state with success; embeddings are in progress
-        update_table_realtime_status_log(
-            client=supabase_client,
-            table_name="projects",
-            project_uuid=metadata["project_id"],
-            log="COMPLETED",
-        )
-        self.update_state(
-            state="COMPLETED",
-            meta={
-                "stage": "COMPLETED",
-                "message": "Document upload complete, embedding in progress...",
-                "successful_files": successful_files,
-                "failed_files": failed_files,
-                "source_ids": source_ids,
-            },
-        )
-
-        # Return the group ID so you can track embedding progress via polling:
-        return {
-            "source_ids": source_ids,
-            "successful": successful_files,
-            "failed": failed_files,
-            "total": len(files),
-            "workflow_task_id": embedding_group_id,
-        }
-
-    except Exception as e:
-        # this catches anything that bubbled out of your inner logic
-        logger.error(f"Overall process_document_task failed: {e}", exc_info=True)
-
-        try:
-            # Update state before retry
-            update_table_realtime_status_log(
-                client=supabase_client,
-                table_name="projects",
-                project_uuid=metadata["project_id"],
-                log="RETRY",
-            )
-            self.update_state(
-                state="RETRY",
-                meta={
-                    "error": str(e),
-                    "retry_count": self.request.retries,
-                    "max_retries": self.max_retries,
-                    "message": f"Task failed, attempting retry {self.request.retries + 1}/{self.max_retries + 1}",
-                },
-            )
-            # schedule a retry if we haven't hit max_retries yet
-            raise self.retry(exc=e)
-        except MaxRetriesExceededError:
-            # once retries are exhausted, raise a clear runtime error
-            logger.critical(
-                f"[CELERY] process_document_task failed permanently after {self.max_retries} retries: {e}"
-            )
-
-            # Update final failure state
-            update_table_realtime_status_log(
-                client=supabase_client,
-                table_name="projects",
-                project_uuid=metadata["project_id"],
-                log="FAILURE",
-            )
-            self.update_state(
-                state="FAILURE",
-                meta={
-                    "exc_type": type(e).__name__,
-                    "exc_module": e.__class__.__module__,
-                    "exc_message": str(e),
-                    "error": str(e),
-                    "retry_count": self.max_retries,
-                    "max_retries": self.max_retries,
-                    "message": f"Task failed after {self.max_retries} retries",
-                },
-            )
-            raise RuntimeError(
-                f"[CELERY] process_document_task failed permanently after {self.max_retries} retries: {e}"
-            ) from e
-
-
-async def _process_and_embed(
-    local_path: str,
-    doc_url: str,
-    source_id: str,
-    project_id: str,
-    chunk_size: int,
-    chunk_overlap: int,
-):
-    """Asynchronously process a document and insert embeddings."""
-    loader = get_loader_for(local_path)
-    
-    # Paragraph-based splits (Semantic chunking)
-    splitter = RecursiveCharacterTextSplitter(
-        separators=["\n\n", "\n", " "],
-        chunk_size=chunk_size,
-        chunk_overlap=chunk_overlap,
-    )
-    embedding_model = OpenAIEmbeddings(
-        model="text-embedding-ada-002",
-        api_key=OPENAI_API_KEY,
-    )
-
-    expected_embedding_length = 1536
-    BATCH = 50
-    batch_texts: list[str] = []
-    batch_metas: list[dict] = []
-    total_vectors = 0
-
-    def _clean(s: str) -> str:
-        return s.replace("\x00", "")
-
-    async def flush_batch() -> None:
-        nonlocal total_vectors, BATCH
-        if not batch_texts:
-            return
-        
-        # 1) Embed
-        embeddings = await embedding_model.aembed_documents(batch_texts)
-        for i, vec in enumerate(embeddings):
-            if len(vec) != expected_embedding_length:
-                raise ValueError(
-                    f"Embedding #{i} has length {len(vec)}; expected {expected_embedding_length}"
-                )
-        vector_rows = []
-        for text, meta, vector in zip(batch_texts, batch_metas, embeddings):
-            clean_text = _clean(text)
-            num_tokens = len(tokenizer.encode(clean_text))
-            clean_meta = {
-                k: _clean(v) if isinstance(v, str) else v for k, v in meta.items()
-            }
-            vector_rows.append(
-                {
-                    "source_id": str(source_id),
-                    "content": clean_text,
-                    "metadata": clean_meta,
-                    "embedding": vector,
-                    "project_id": str(project_id),
-                    "num_tokens": num_tokens,
-                }
-            )
-        # 2) insert with minimal return to speed things up
-        try:
-            supabase_client.table("document_vector_store") \
-                .insert(vector_rows, returning="minimal") \
-                .execute()
-            total_vectors += len(vector_rows)
-            batch_texts.clear()
-            batch_metas.clear()
-
-        except APIError as api_err:
-            err = api_err.args[0] if api_err.args else {}
-            if err.get("code") == "57014":
-                # shrink and retry
-                old_batch = BATCH
-                BATCH = max(1, BATCH // 2)
-                logger.warning(
-                    f"Insert timed out with batch={old_batch}. "
-                    f"Reducing to {BATCH} and retrying."
-                )
-                # recursively retry; this will re-run with smaller batch
-                await flush_batch()
-            else:
-                # some other error—bubble it up
-                raise
-    
-    # 3) Pure streaming: parse page/paragraph → chunk → embed immediately
-    for doc in loader.stream_documents(local_path):
-        for chunk in splitter.split_documents([doc]):
-            batch_texts.append(chunk.page_content)
-            batch_metas.append({"source": doc_url, **chunk.metadata})
-            if len(batch_texts) >= BATCH:
-                await flush_batch()
-
-    await flush_batch()
-    return total_vectors
-
-
-@celery_app.task(
-    bind=True, autoretry_for=(Exception,), retry_backoff=True, max_retries=5
-)
-def chunk_and_embed_task(
-    self, doc_url, source_id, project_id, chunk_size=1000, chunk_overlap=100
-):
-    """
-    Celery task to:
-        - download ANY document (pdf, docx, epub, etc.)
-        - load & split into chunks
-        - embed & store embeddings
-
-    Args:
-        pdf_url (str): weweb upload element cdn utl
-        source_id (str): uuid generated by insert into public.document_sources
-        project_id (str): uuid for project_id
-        chunk_size (int): size of document chunks in characters (token count should be similar)
-        chunk_overlap (int): overlap between document chunks
-
-    Returns:
-        None
-    """
-    temp_file = None
-    try:
-        logger.info(
-            f"Starting chunk_and_embed_task for URL: {doc_url}, source_id: {str(source_id)}"
-        )
-        update_document_sources_realtime_status_log("EMBEDDING", source_id)
-
-        resp = requests.get(doc_url)
-        resp.raise_for_status()
-
-        VALID = {".pdf", ".docx", ".doc", ".epub"}
-        ctype = resp.headers.get("Content-Type", "").split(";")[0]
-        suffix = mimetypes.guess_extension(ctype) or ""
-        if suffix not in VALID:
-            ext = os.path.splitext(doc_url)[1].lower()
-            suffix = ext if ext in VALID else ".pdf"
-
-        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
-        temp_file.write(resp.content)
-        temp_file.close()
-        local_path = temp_file.name
-
-        # bump the Postgres statement_timeout to 30 s for this session
-        supabase_client.rpc("set_statement_timeout", {"timeout": 30000}).execute()
-
-        try:
-            total_vectors = asyncio.run(
-                _process_and_embed(
-                    local_path,
-                    doc_url,
-                    source_id,
-                    project_id,
-                    chunk_size,
-                    chunk_overlap,
-                )
-            )
-        except ValueError as e:
-            update_document_sources_realtime_status_log(
-                "FAILED", source_id, error_message=str(e)
-            )
-            raise
-
-        update_document_sources_realtime_status_log("COMPLETE", source_id)
-        logger.info(
-            f"Bulk inserted {total_vectors} embeddings into public.document_vector_store for source_id={source_id}"
-        )
-
-    except Exception as e:
-        logger.error(f"Failed chunk/embed for {doc_url}: {e}", exc_info=True)
-        update_document_sources_realtime_status_log(
-            status="FAILED", source_id=source_id, error_message=str(e)
-        )
-
-        raise
-    except OpenAIError as e:
-        # Catch specific OpenAI errors for more targeted logging/handling if needed
-        logger.error(
-            f"OpenAI API error during embedding for {doc_url}: {e}", exc_info=True
-        )
-        update_document_sources_realtime_status_log(
-            status="FAILED", source_id=source_id, error_message=str(e)
-        )
-
-        raise self.retry(exc=e)
-    finally:
-        # 7) Cleanup temp file
-        if temp_file is not None:
-            try:
-                os.unlink(temp_file.name)
-            except OSError:
-                pass
-
-    return None
-
+    resp = requests.get(url, stream=True)
+    resp.raise_for_status()
+
+    suffix = os.path.splitext(url)[1] or ""
+    tf = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+    with open(tf.name, "wb") as f:
+        for chunk in resp.iter_content(chunk_size):
+            if chunk:
+                f.write(chunk)
+    return tf.name
+
+# ——— Task 1: Ingestion → dedupe, S3 + Supabase + schedule parsing —————————————————————
 
 @celery_app.task(bind=True)
-def finalize_document_processing_workflow(
-    self,
-    results,  # ← Celery chord injects the list of chunk_and_embed_task results
-    user_id: str,
-    source_ids: List[str],
-    project_id: str,
-    note_title: str,
-    note_type: str,
-    provider: str,
-    model_name: str,
-    temperature: float,
-    addtl_params: dict,
-):
+def process_document_task(self, file_urls: list[str], metadata: dict):
     """
-    Celery callback after all chunk_and_embed_task tasks in a chord complete.
-    Contains enhanced with detailed reporting, and automatic rag_note_task firing once embeddings are done.
+    1) Download each file_url → upload_to_s3 → get_cloudfront_url
+    2) Bulk-insert rows into public.document_sources with INITIALIZING → PENDING
+    3) Kick off chunk_and_embed_task for each document via a Celery chord
+    """
+    rows_to_insert = []
+    tmp_paths = {}
+
+    for file_url in file_urls:
+        # ——— Step 1a:  download locally —————————————————————
+        tmp_path = download_stream_to_temp(file_url)
+        tmp_paths[file_url] = tmp_path
+
+        # file metadata
+        ext = os.path.splitext(file_url)[1].lower()
+        key = f"{metadata['project_id']}/{uuid.uuid4()}{ext}"
+
+        # ——— Step 1b: upload to S3 & get CloudFront URL
+        upload_to_s3(s3_client, tmp_path, key)
+        cdn_url = get_cloudfront_url(key)
+
+        # prepare Supabase row `public.document_sources`
+        rows_to_insert.append({
+            "cdn_url":          cdn_url,
+            "project_id":       str(metadata["project_id"]),
+            "content_tags":     metadata.get("content_tags", []),
+            "uploaded_by":      str(metadata["user_id"]),
+            "vector_embed_status": "INITIALIZING",
+            "filename":         os.path.basename(file_url),
+            "file_size_bytes":  os.path.getsize(tmp_path),
+            "file_extension":   ext,
+            "created_at":       datetime.now(timezone.utc).isoformat(),
+        })
+
+    # ——— Step 2a: insert & collect generated IDs
+    insert_resp = supabase_client.table("document_sources") \
+        .insert(rows_to_insert, returning="id") \
+        .execute()
+    source_ids = [r["id"] for r in insert_resp.data]
+
+    # ——— Step 2b: update all to PENDING
+    supabase_client.table("document_sources") \
+        .update({ "vector_embed_status": "PENDING" }) \
+        .in_("id", source_ids) \
+        .execute()
+    
+    # ——— Step 3: Schedule parsing (fire off one Celery task per-document)
+    for i, source_id in enumerate(source_ids):
+        parse_document_task.apply_async(
+            (
+                source_id, 
+                rows_to_insert[i]['cdn_url'], 
+                rows_to_insert[i]['project_id']
+            ),
+            queue='parsing'
+        )
+
+    # clean up local temp files
+    for p in tmp_paths.values():
+        try:
+            os.remove(p)
+        except OSError:
+            pass
+
+    return { "submitted_ids": source_ids }
+
+
+# ——— Task 2: for one document → load, chunk, batch-embed & insert ——————————————————
+
+@celery_app.task(bind=True)
+def parse_document_task(self, source_id: str, cdn_url: str, project_id: str):
+    """
+    Stream, chunk, then schedule embed_batch_task per chunk-batch
+    
+    Step by step:
+        - Download → local temp
+        - get_loader_for (PDF/DOCX/EPUB/etc) → stream_documents()
+        - split into semantic chunks
+        - accumulate batches up to BATCH_SIZE → enque `embed_batch_task` to embed & insert into Supabase
+    """
+    # status update
+    supabase_client.table('document_sources') \
+        .update({'vector_embed_status': 'PARSING'}).eq('id', source_id).execute()
+
+    # prepare splitter & loader
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=CHUNK_SIZE,
+        chunk_overlap=CHUNK_OVERLAP
+    )
+    local_path = download_stream_to_temp(cdn_url)
+    loader = get_loader_for(local_path)
+    pages = loader.stream_documents(local_path)
+
+    # accumulate batches
+    batch_texts, batch_metas = [], []
+    headers = []
+    for page in pages:
+        for chunk in splitter.split_documents([page]):
+            batch_texts.append(chunk.page_content)
+            batch_metas.append(chunk.metadata)
+            # for exact batches of BATCH_SIZE
+            if len(batch_texts) >= BATCH_SIZE:
+                headers.append(
+                    embed_batch_task.s(
+                        source_id, 
+                        project_id, 
+                        batch_texts, 
+                        batch_metas
+                    )
+                )
+                # reset for the next batch
+                batch_texts, batch_metas = [], []
+    # For a final partial batch (if the total number of chunks isn’t an exact multiple of BATCH_SIZE)
+    if batch_texts:
+        headers.append(
+            # Per-batch Celery tasks
+            embed_batch_task.s(
+                source_id, 
+                project_id, 
+                batch_texts, 
+                batch_metas
+            )
+        )
+
+    # schedule batches as a chord → finalize per-document
+    chord(headers)(
+        finalize_embeddings.s([source_id])
+    )
+
+    # cleanup
+    try: os.remove(local_path)
+    except: pass
+
+# @celery_app.task(
+#     bind=True,
+#     max_retries=MAX_RETRIES,
+#     default_retry_delay=DEFAULT_RETRY_DELAY,
+#     name="chunk_and_embed_task"
+# )
+# def chunk_and_embed_task(self, source_id: str, cdn_url: str, project_id: str):
+#     """
+#     DEPRECATED: Downloads the document, picks the right loader (PDF/DOCX/EPUB/etc),
+#     streams pages → semantic chunks → batches → embed → insert into Supabase.
+    
+#     Per-document task:
+#         - Download → local temp
+#         - get_loader_for → stream_documents()
+#         - split into semantic chunks
+#         - batch up to BATCH_SIZE → embed & insert into Supabase
+
+#     Retries on any error, with MAX_RETRIES.
+
+#     Returns `source_id` on success.
+#     """
+#     local_path = None
+#     try:
+#         local_path = download_stream_to_temp(cdn_url)
+#         # pick the correct loader (and OCR vs. text-based PDF)
+#         loader = get_loader_for(local_path)
+#         doc_iter = loader.stream_documents(local_path)
+
+#         # LangChain splitter for semantic chunks
+#         splitter = RecursiveCharacterTextSplitter(
+#             chunk_size=CHUNK_SIZE,
+#             chunk_overlap=CHUNK_OVERLAP
+#         )
+
+#         batch_texts: list[str] = []
+
+#         for page_doc in doc_iter:
+#             # split each page-level Document into smaller chunks
+#             chunk_docs = splitter.split_documents([page_doc])
+#             for chunk in chunk_docs:
+#                 batch_texts.append(chunk.page_content)
+
+#                 # once we hit BATCH_SIZE, send off to OpenAI & DB
+#                 if len(batch_texts) >= BATCH_SIZE:
+#                     _embed_and_store(source_id, project_id, batch_texts)
+#                     batch_texts.clear()
+
+#         # embed any remaining chunks
+#         if batch_texts:
+#             _embed_and_store(source_id, project_id, batch_texts)
+
+#         # return source_id so chord callback knows which docs succeeded
+#         return source_id
+    
+#     except MaxRetriesExceededError as mre:
+#         logger.critical(
+#             f"[CELERY] chunk_and_embed_task for {source_id} "
+#             f"failed after {MAX_RETRIES} retries: {mre}"
+#         )
+#         # mark document as failed in Supabase
+#         supabase_client.table("document_sources") \
+#             .update({"vector_embed_status": "FAILED_EMBEDDING"}) \
+#             .eq("id", source_id).execute()
+#         raise
+
+#     except Exception as e:
+#         logger.exception(f"[CELERY] error in chunk_and_embed_task for {source_id}, retrying...")
+#         # will raise Retry exception
+#         raise self.retry(exc=e)
+    
+#     finally:
+#         # ensure we always clean up
+#         try:
+#             if local_path and os.path.exists(local_path):
+#                 os.remove(local_path)
+#         except OSError:
+#             pass
+
+# ——— Task 3: Embed a batch —————————————————————————————————————————————
+
+# def _embed_and_store(source_id: str, project_id: str, chunks: list):
+#     """
+#     DEPRECATED: calls OpenAIEmbeddings asynchronously, checks dims,
+#     then bulk-inserts into document_vector_store.
+    
+#     Steps:
+#     1) call OpenAIEmbeddings via asyncio.run
+#     2) clean text & metadata, count tokens
+#     3) bulk-insert into document_vector_store
+#     """
+#     texts = [doc.page_content for doc in chunks]
+#     metas = [doc.metadata for doc in chunks]
+
+#     # 1) Embed via asyncio.run
+#     embeddings = asyncio.run(embedding_model.embed_documents(texts))
+
+#     # 2) validate & build rows
+#     vector_rows = []
+#     for txt, meta, vec in zip(texts, metas, embeddings):
+#         if len(vec) != EXPECTED_EMBEDDING_LEN:
+#             raise ValueError(
+#                 f"Embedding len {len(vec)} != expected {EXPECTED_EMBEDDING_LEN}"
+#             )
+#         clean_txt = _clean(txt)
+#         num_tokens = len(tokenizer.encode(clean_txt))
+
+#         clean_meta = {
+#             k: (_clean(v) if isinstance(v, str) else v)
+#             for k, v in meta.items()
+#         }
+
+#         vector_rows.append({
+#             "source_id":   str(source_id),
+#             "content":     clean_txt,
+#             "metadata":    clean_meta,
+#             "embedding":   vec,
+#             "project_id":  str(project_id),
+#             "num_tokens":  num_tokens,
+#         })
+
+#     # 3) insert vectors
+#     supabase_client.table("document_vector_store") \
+#         .insert(vector_rows).execute()
+
+@celery_app.task(
+    bind=True,
+    max_retries=MAX_RETRIES,
+    default_retry_delay=DEFAULT_RETRY_DELAY
+)
+def embed_batch_task(self, source_id: str, project_id: str, texts: list[str], metas: list[dict]):
+    """
+    Celery task: Embed a small batch (20 chunks per task), insert vectors, update on error
+    1) call OpenAIEmbeddings via asyncio.run
+    2) clean text & metadata, count tokens
+    3) bulk-insert into document_vector_store
     """
     try:
-        logger.info(f"All embedding tasks in the workflow have completed.")
+        # 1) Embed via OpenAI using asyncio.run
+        embeddings = asyncio.run(embedding_model.embed_documents(texts))
+        rows = []
+        for txt, meta, vec in zip(texts, metas, embeddings):
+            if len(vec) != EXPECTED_EMBEDDING_LEN:
+                raise ValueError(f"Embedding len {len(vec)} != expected {EXPECTED_EMBEDDING_LEN}")
+            
+            # Clean rogue chars and blank spaces
+            clean_txt = _clean(txt)
+            num_tokens = len(tokenizer.encode(clean_txt))
+            clean_meta = {
+                k: (_clean(v) if isinstance(v, str) else v)
+                for k, v in meta.items()
+            }
 
-        # Calculate statistics about the completed workflow
-        completed_tasks = len(results) if isinstance(results, list) else 0
-        source_count = len(source_ids) if source_ids else 0
+            # Insert into document vector store
+            rows.append({
+                'source_id': source_id,
+                'content': clean_txt,
+                'metadata': clean_meta,
+                'embedding': vec,
+                'project_id': project_id,
+                'num_tokens': num_tokens,
+            })
+        supabase_client.table('document_vector_store').insert(rows).execute()
+        return source_id
 
-        # Query the database to get final statistics
-        if source_ids:
-            # Get the status of all sources
-            sources_data = (
-                supabase_client.table("document_sources")
-                .select("id, vector_embed_status")
-                .in_("id", source_ids)
-                .execute()
-            )
-
-            # Get the count of vector embeddings created for document (source_id)
-            vectors_data = (
-                supabase_client.table("document_vector_store")
-                .select("*", count="exact")  # count flag goes in select() method
-                .in_("source_id", source_ids)
-                .execute()  # no count parameter here
-            )
-
-            # Get vector count
-            vector_count = vectors_data.count if hasattr(vectors_data, "count") else 0
-
-            # Process status counts
-            sources = sources_data.data if hasattr(sources_data, "data") else []
-            status_counts = {}
-            for source in sources:
-                status = source.get("vector_embed_status", "UNKNOWN")
-                status_counts[status] = status_counts.get(status, 0) + 1
-
-            # Log detailed completion information
-            logger.info(
-                f"Document processing workflow completed with:\n"
-                f"- Sources: {source_count}\n"
-                f"- Status counts: {status_counts}\n"
-                f"- Total vectors: {vector_count}"
-            )
-
-            # 4) Determine overall embedding status
-            statuses = set(status_counts.keys())
-            if "FAILED" in statuses:
-                workflow_status = "ERROR"
-            elif statuses - {"COMPLETE"}:
-                workflow_status = "IN_PROGRESS"
-            else:
-                workflow_status = "COMPLETE"
-
-            # 5) Fire the note‐generation as soon as everything’s COMPLETE
-            # `note_type` is a string, and can be set to "summary", "flashcards", "compare_contrast"
-            # depending on that type of note the user wants generated
-            if (
-                workflow_status == "COMPLETE" and note_type != "None"
-            ):  # quick_action is a string not a bool
-                logger.info(
-                    f"All embeddings DONE—queuing rag_note_task(project_id={project_id})"
-                )
-                rag_note_task.apply_async(
-                    args=[
-                        user_id,
-                        note_type,
-                        project_id,
-                        note_title,
-                        provider,
-                        model_name,
-                        temperature,
-                        addtl_params,
-                    ]
-                )
-
-            # Update a workflow status record if needed
-            # This could be useful for tracking overall workflow status in a separate table
-            # if you want to implement that
-
-        # Log the final success message
-        logger.info(f"Document processing workflow completed successfully.")
-
-        return {
-            "status": "COMPLETE",
-            "source_count": source_count,
-            "source_ids": source_ids,
-            "vector_count": vector_count if "vector_count" in locals() else None,
-            "status_counts": status_counts if "status_counts" in locals() else None,
-            "note_type": note_type,
-            "completion_time": datetime.now(timezone.utc).isoformat(),
-        }
-
+    except MaxRetriesExceededError:
+        # terminal failure: update doc status and error
+        supabase_client.table('document_sources') \
+            .update({
+                'vector_embed_status': 'FAILED_EMBEDDING',
+                'error_message': f"Batch failed after {MAX_RETRIES} retries"
+            }).eq('id', source_id).execute()
+        raise
     except Exception as e:
-        logger.error(
-            f"Error in finalize_document_processing_workflow: {e}", exc_info=True
-        )
-        return {
-            "status": "ERROR",
-            "error": str(e),
-            "source_ids": source_ids,
-            "error_time": datetime.now(timezone.utc).isoformat(),
-        }
+        logger.exception(f"Error in embed_batch_task for {source_id}, retrying...")
+        raise self.retry(exc=e)
+
+# ——— Task 4: callback after all documents’ embeddings finish —————————————————————
+@celery_app.task(bind=True)
+def finalize_embeddings(self, header_results: list[str], all_source_ids: list[str]):
+    """
+    Celery chord callback: header_results is a list of returned source_ids
+    from chunk_and_embed_task. Mark all those docs in DB as COMPLETE.
+    """
+    for source_id in all_source_ids:
+        successes = [r for r in header_results if r == source_id]
+        if len(successes) == len([r for r in header_results if r == source_id]):
+            supabase_client.table('document_sources') \
+                .update({'vector_embed_status': 'COMPLETE'}) \
+                .eq('id', source_id).execute()
+        else:
+            supabase_client.table('document_sources') \
+                .update({
+                    'vector_embed_status': 'PARTIAL',
+                    'error_message': 'Some batches failed'
+                }).eq('id', source_id).execute()
+    return {'completed_ids': header_results}
