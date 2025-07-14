@@ -5,20 +5,23 @@ import requests
 import logging
 import asyncio
 
+# Celery imports
 from datetime import datetime, timezone
 from celery import chord, group
 from celery.exceptions import MaxRetriesExceededError
 
+# Langchain imports
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_openai import OpenAIEmbeddings
 import httpx
 import tiktoken
 
+# Project modules
 from tasks.celery_app import celery_app
 from utils.s3_utils import upload_to_s3, s3_client
 from utils.cloudfront_utils import get_cloudfront_url
 from utils.supabase_utils import supabase_client
-from utils.document_loaders.loader_factory import get_loader_for
+from utils.document_loaders.loader_factory import get_loader_for # → module contains document streaming ability
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
