@@ -12,6 +12,7 @@ import hashlib
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import List, Dict, Any, Optional, AsyncGenerator, Tuple
+from enum import Enum
 from datetime import datetime, timezone, timedelta
 import psutil
 import time
