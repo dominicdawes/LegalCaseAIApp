@@ -53,6 +53,17 @@ celery_app.conf.update(
     timezone="UTC",
     enable_utc=True,
     broker_connection_retry_on_startup=True,  # Added setting
+
+    # NEW: Async support configuration for Celery 5.4
+    task_protocol=2,  # Enable async task protocol
+    worker_pool='gevent',  # Use gevent for async compatibility
+    # worker_concurrency=10,  # 2 to 200 Adjust based on your server capacity
+    worker_prefetch_multiplier=1,  # Good for async tasks
+    
+    # Additional async-friendly settings
+    task_acks_late=True,  # Acknowledge tasks after completion
+    worker_disable_rate_limits=False,  # Keep rate limits for API calls
+    task_reject_on_worker_lost=True,  # Reject tasks if worker dies
 )
 
 # Import tasks to register them with Celery (THIS WORKS!!!)
