@@ -140,14 +140,19 @@ db_pool: Optional[asyncpg.Pool] = None
 async def get_db_pool() -> asyncpg.Pool:
     """Initializes and returns the asyncpg connection pool."""
     global db_pool
-    if db_pool is None:
-        if not DB_DSN:
-            raise ValueError("POSTGRES_DSN environment variable not set.")
-        db_pool = await asyncpg.create_pool(
-            dsn=DB_DSN,
-            min_size=DB_POOL_MIN_SIZE,
-            max_size=DB_POOL_MAX_SIZE
-        )
+    try:
+        if db_pool is None:
+            if not DB_DSN:
+                raise ValueError("POSTGRES_DSN environment variable not set.")
+            db_pool = await asyncpg.create_pool(
+                dsn=DB_DSN,
+                min_size=DB_POOL_MIN_SIZE,
+                max_size=DB_POOL_MAX_SIZE
+            )
+            logger.info("✅ Database pool ready")
+    except Exception as e:
+        logger.error(f"❌ DB pool failed: {e}")
+        raise
     return db_pool
 
 # OpenAI Embeddings Client
@@ -189,6 +194,7 @@ def _calculate_stream_hash(stream: io.BytesIO) -> str:
 
 async def _update_document_status(doc_id: str, status: ProcessingStatus, error_message: Optional[str] = None):
     """Async helper to update a document's status in the database."""
+    logger.info(f"📋 Doc {doc_id[:8]}... → {status.value}")
     pool = await get_db_pool()
     async with pool.acquire() as conn:
         await conn.execute(
@@ -200,7 +206,7 @@ async def _update_document_status(doc_id: str, status: ProcessingStatus, error_m
             status.value, error_message, uuid.UUID(doc_id)
         )
 
-# ——— Task 1: Ingest (v6 - Fully Async) ———————————————————————————————————————————
+# ——— Task 1: Ingest (Fully Async) ———————————————————————————————————————————
 
 @celery_app.task(bind=True, queue=INGEST_QUEUE, acks_late=True)
 def process_document_task(self, file_urls: List[str], metadata: Dict[str, Any]) -> Dict[str, Any]:
@@ -210,7 +216,7 @@ def process_document_task(self, file_urls: List[str], metadata: Dict[str, Any]) 
 
 async def _process_document_async(file_urls: List[str], metadata: Dict[str, Any]) -> Dict[str, Any]:
     """
-    v6 Ingest Task:
+    Ingest Task:
     - Concurrent downloads directly into memory using httpx.
     - Async deduplication against the database using asyncpg.
     - Streams content to S3 without writing to local disk.
@@ -254,6 +260,7 @@ async def _process_document_async(file_urls: List[str], metadata: Dict[str, Any]
     # Bulk insert new documents using asyncpg
     inserted_ids = []
     if new_docs_to_insert:
+        logger.info(f"💾 Inserting {len(new_docs_to_insert)} new docs...")
         records_to_insert = [
             (
                 doc['id'], doc['cdn_url'], doc['content_hash'], uuid.UUID(doc['project_id']),
@@ -279,6 +286,7 @@ async def _process_document_async(file_urls: List[str], metadata: Dict[str, Any]
         
         inserted_ids = [str(doc['id']) for doc in new_docs_to_insert]
         # Schedule parsing tasks for newly inserted documents
+        logger.info("🗂️ Scheduling [celery] parse tasks...")
         for doc in new_docs_to_insert:
             parse_document_task.apply_async(
                 (str(doc['id']), doc['cdn_url'], doc['project_id']), queue=PARSE_QUEUE

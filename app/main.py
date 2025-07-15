@@ -327,9 +327,6 @@ async def create_new_rag_project(
             raise HTTPException(status_code=400, detail="user_id is required in metadata")
         
         # Apply async job to process PDFs → finalize_document_processing_workflow() → rag_note_task()
-        # job = process_pdf_task.apply_async(
-        #     args=[request.files, request.metadata]
-        # )
         job = process_document_task.apply_async(
             args=[
                 request.files, 
