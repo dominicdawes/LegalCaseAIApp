@@ -326,7 +326,10 @@ async def _download_and_prep_doc(client: httpx.AsyncClient, url: str, project_id
 # ——— Task 2: For one document → Parse, batch, dispatch to emmbed (v6 - In-Memory & Token-Aware) ————————————————————————————————
 
 @celery_app.task(bind=True, queue=PARSE_QUEUE, acks_late=True)
-async def parse_document_task(self, source_id: str, cdn_url: str, project_id: str) -> Dict[str, Any]:
+def parse_document_task(self, source_id: str, cdn_url: str, project_id: str) -> Dict[str, Any]:
+    return asyncio.run(_parse_document_async(self, source_id, cdn_url, project_id))
+
+async def _parse_document_async(self, source_id: str, cdn_url: str, project_id: str) -> Dict[str, Any]:
     """
     v6 Parsing Task:
     - Streams document directly into an in-memory buffer (NO temp file).
@@ -439,7 +442,10 @@ async def parse_document_task(self, source_id: str, cdn_url: str, project_id: st
     bind=True, queue=EMBED_QUEUE, max_retries=MAX_RETRIES, acks_late=True,
     default_retry_delay=DEFAULT_RETRY_DELAY, rate_limit=RATE_LIMIT
 )
-async def embed_batch_task(self, source_id: str, project_id: str, texts: List[str], metadatas: List[Dict]):
+def embed_batch_task(self, source_id: str, project_id: str, texts: List[str], metadatas: List[Dict]):
+    return asyncio.run(_embed_batch_async(self, source_id, project_id, texts, metadatas))
+
+async def _embed_batch_async(self, source_id: str, project_id: str, texts: List[str], metadatas: List[Dict]):
     """
     v6 Embedding Task:
     - Fully async with non-blocking DB calls via asyncpg.
@@ -499,7 +505,10 @@ async def _embed_with_retry(texts: List[str]) -> List[List[float]]:
 # ——— Task 4: Finalize (v6 - Fully Async DB) ————————————————————————————————————————
 
 @celery_app.task(bind=True, queue=FINAL_QUEUE, acks_late=True)
-async def finalize_embeddings(self, batch_results: List[Dict[str, Any]], source_id: str) -> Dict[str, Any]:
+def finalize_embeddings(self, batch_results: List[Dict[str, Any]], source_id: str) -> Dict[str, Any]:
+    return asyncio.run(_finalize_embeddings_async(self, batch_results, source_id))
+
+async def _finalize_embeddings_async(self, batch_results: List[Dict[str, Any]], source_id: str) -> Dict[str, Any]:
     """
     v6 Finalization Task:
     - Uses asyncpg for all database reads and writes.
