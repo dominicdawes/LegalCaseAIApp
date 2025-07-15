@@ -204,6 +204,8 @@ async def _update_document_status(doc_id: str, status: ProcessingStatus, error_m
 
 @celery_app.task(bind=True, queue=INGEST_QUEUE, acks_late=True)
 def process_document_task(self, file_urls: List[str], metadata: Dict[str, Any]) -> Dict[str, Any]:
+    task_id = self.request.id
+    logger.info(f"🚀 Starting document processing task {task_id} with {len(file_urls)} URLs")
     return asyncio.run(_process_document_async(file_urls, metadata))
 
 async def _process_document_async(file_urls: List[str], metadata: Dict[str, Any]) -> Dict[str, Any]:
@@ -218,12 +220,14 @@ async def _process_document_async(file_urls: List[str], metadata: Dict[str, Any]
     user_id = metadata['user_id']
     
     # Download document, hash, send to S3/CloudFront
+    logger.info("🌐 Initiating concurrent downloads...")
     async with httpx.AsyncClient(timeout=60.0) as client:
         download_tasks = [
             _download_and_prep_doc(client, url, project_id, user_id) for url in file_urls
         ]
         results = await asyncio.gather(*download_tasks, return_exceptions=True)
-
+    logger.info(f"⬇️  Downloads completed...")
+    
     new_docs_to_insert = []
     existing_doc_ids = []
     
