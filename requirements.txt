@@ -41,8 +41,8 @@ boto3
 botocore
 
 # Supabase & PG dependencies
-supabase==2.5.0 # supabase 
-postgrest-py
+supabase==2.5.0 # supabase (will auto-install compatible postgrest-py)
+# postgrest-py
 asyncpg    
 
 # RAG dependencies
