@@ -51,20 +51,22 @@ FINAL_QUEUE = 'finalize'
 MAX_RETRIES = 5
 RETRY_BACKOFF_MULTIPLIER = 2
 DEFAULT_RETRY_DELAY = 5
-RATE_LIMIT = '1000/m' # Increased rate limit for higher throughput
+RATE_LIMIT = '150/m' # Tuned for a 2-CPU / 4GB RAM instance instead of 1000/m
 
 # OpenAI configuration
 OPENAI_EMBEDDING_MODEL = "text-embedding-ada-002"
 OPENAI_MAX_TOKENS_PER_BATCH = 8190 # Safety margin below the 8192 limit
 EXPECTED_EMBEDDING_LEN = 1536
-MAX_CONCURRENT_DOWNLOADS = 10
+MAX_CONCURRENT_DOWNLOADS = 3 # A modest limit instead of 10
 CHUNK_SIZE = 1000
 CHUNK_OVERLAP = 200
 
 # Database (asyncpg)
 DB_DSN = os.getenv("POSTGRES_DSN") # e.g., Supabase -> Connection -> Get Direct URL
-DB_POOL_MIN_SIZE = 5
-DB_POOL_MAX_SIZE = 20
+# DB_POOL_MIN_SIZE = 5  # <-- if i had more compute
+# DB_POOL_MAX_SIZE = 20
+DB_POOL_MIN_SIZE = 2
+DB_POOL_MAX_SIZE = 5
 
 # ——— Data Structures (Unchanged from v5) ——————————————————————————————————————————
 
