@@ -10,7 +10,7 @@ pybreaker
 # Document parsing dependencies
 textract
 pytesseract
-tenacity
+tenacity==8.5.0 # tenacity
 python-docx
 pypdf
 pymupdf    # import fitz
@@ -22,31 +22,31 @@ mimetype
 # PyPDF2==3.0.1
 
 # AI dependencies
-openai
-tiktoken
-anthropic
-google-cloud-aiplatform
+openai==1.35.13 # openai
+tiktoken==0.7.0 # tiktoken
+anthropic==0.29.0 # anthropic
+google-cloud-aiplatform==1.56.0 #  google-cloud-aiplatform
 google-auth
 
 # RENDER.io dependencies
-fastapi
-uvicorn
-celery
+fastapi==0.111.0 # fastapi
+uvicorn==0.30.1 # uvicorn
+celery==5.4.0 # celery
 gevent==23.9.1
 redis 
-websockets 
+websockets==12.0 # websockets 
 
 # AWS dependencies
 boto3
 botocore
 
 # Supabase & PG dependencies
-supabase 
+supabase==2.5.0 # supabase 
 postgrest-py
 asyncpg    
 
 # RAG dependencies
-langchain 
-langchain-community
-langchain-openai
+langchain==0.2.5 # langchain 
+langchain-community==0.2.5 # langchain-community
+langchain-openai==0.1.8 # langchain-openai
 promptic
