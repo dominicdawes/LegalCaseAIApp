@@ -3,7 +3,9 @@ python-dotenv
 pandas
 loguru
 psutil
-postgrest-py
+httpx       
+pybreaker     
+
 
 # Document parsing dependencies
 textract
@@ -11,7 +13,7 @@ pytesseract
 tenacity
 python-docx
 pypdf
-pymupdf
+pymupdf    # import fitz
 PyPDF2
 pillow
 ebooklib
@@ -38,8 +40,10 @@ websockets
 boto3
 botocore
 
-# Supadase dependencies
+# Supabase & PG dependencies
 supabase 
+postgrest-py
+asyncpg    
 
 # RAG dependencies
 langchain 

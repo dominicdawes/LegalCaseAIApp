@@ -1,3 +1,5 @@
+"""v6 By Claude but Claude hit rate/context limits"""
+
 import os
 import uuid
 import tempfile
@@ -28,7 +30,7 @@ from langchain_openai import OpenAIEmbeddings
 import aiofiles
 import asyncpg
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
-from pybreaker import CircuitBreaker
+from pybreaker import CircuitBreaker    # ← pip install pybreaker
 
 # Project modules
 from tasks.celery_app import celery_app

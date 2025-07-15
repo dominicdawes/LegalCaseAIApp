@@ -1,3 +1,5 @@
+"""Gemini's bare bones suggestinons for Claude_v5, dubbed 'managers comments' """
+
 import os
 import uuid
 import asyncio

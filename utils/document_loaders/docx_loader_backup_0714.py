@@ -1,42 +1,19 @@
-"""For the new 'True In-Memory Streaming' method"""
-
 # utils/document_loaders/docx_loader.py
 
-import io
-from typing import Iterator, Union, List
+import os
+import subprocess
+import tempfile
+from typing import List, Iterator
+
+import textract
 from langchain.schema import Document
 from .base import BaseDocumentLoader
-import docx # python-docx
+import docx  # python-docx
 
-## OLD IMPORTS
-import os
-import textract
 
 class DocxLoader(BaseDocumentLoader):
     """
-    ### MODIFIED: A loader for .docx files that operates on in-memory streams.
-    This loader does NOT support the old binary .doc format for in-memory processing.
-    """
-    def stream_documents(self, source: Union[str, io.BytesIO]) -> Iterator[Document]:
-        """
-        ### CHANGE: Uses docx.Document() with a file-like object.
-        """
-        try:
-            document = docx.Document(source)
-            for i, para in enumerate(document.paragraphs):
-                text = para.text.strip()
-                if not text:
-                    continue
-                yield Document(
-                    page_content=text,
-                    metadata={"paragraph_index": i},
-                )
-        except Exception as e:
-            raise RuntimeError(f"Failed to process DOCX stream: {e}")
-
-class DocxLoader_deprecated(BaseDocumentLoader):
-    """
-    OLD VERSION: A loader for Microsoft Word files (.doc and .docx) that uses Textract
+    A loader for Microsoft Word files (.doc and .docx) that uses Textract
     under the hood to extract plain text. Textract auto-detects whether the
     file is binary .doc or XML-based .docx and invokes the correct converter.
     """

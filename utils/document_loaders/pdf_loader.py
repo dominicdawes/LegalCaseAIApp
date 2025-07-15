@@ -1,30 +1,35 @@
+"""For the new 'True In-Memory Streaming' method"""
+
 # utils/document_loaders/pdf_loader.py
 
-from langchain_community.document_loaders import PyPDFLoader
-from typing import List, Iterator
+from typing import List, Iterator, Union
+import io
 from langchain.schema import Document
 import fitz
 from .base import BaseDocumentLoader
 
-
 class PDFLoader(BaseDocumentLoader):
-    def load_documents(self, path: str) -> List:
-        """
-        Use PyPDFLoader to read a PDF from `path`.
-        Returns a list of langchain.schema.Document (with page_content + metadata.page).
-        """
-        loader = PyPDFLoader(path)
-        return loader.load()
+    """
+    ### MODIFIED: This loader now primarily works with in-memory streams.
+    """
+    def load_documents(self, source: Union[str, io.BytesIO]) -> List:
+        # This method is less used in streaming pipelines but is updated for consistency.
+        docs = []
+        for doc in self.stream_documents(source):
+            docs.append(doc)
+        return docs
 
-    def stream_documents(self, path: str) -> Iterator[Document]:
-        pdf = fitz.open(path)
+    def stream_documents(self, source: Union[str, io.BytesIO]) -> Iterator[Document]:
+        # ### CHANGE: The core logic now opens the PDF from a stream.
+        # It can still accept a path for backward compatibility.
+        pdf = fitz.open(stream=source, filetype="pdf") if isinstance(source, io.BytesIO) else fitz.open(source)
+        
         try:
-            for i in range(len(pdf)):
-                page = pdf.load_page(i)
-                text = page.get_text()
+            for i, page in enumerate(pdf):
                 yield Document(
-                    page_content=text,
-                    metadata={"source": path, "page": i + 1},
+                    page_content=page.get_text(),
+                    # If it's a stream, we don't have a source path, which is expected.
+                    metadata={"page": i + 1},
                 )
         finally:
             pdf.close()
