@@ -203,7 +203,10 @@ async def _update_document_status(doc_id: str, status: ProcessingStatus, error_m
 # ——— Task 1: Ingest (v6 - Fully Async) ———————————————————————————————————————————
 
 @celery_app.task(bind=True, queue=INGEST_QUEUE, acks_late=True)
-async def process_document_task(self, file_urls: List[str], metadata: Dict[str, Any]) -> Dict[str, Any]:
+def process_document_task(self, file_urls: List[str], metadata: Dict[str, Any]) -> Dict[str, Any]:
+    return asyncio.run(_process_document_async(file_urls, metadata))
+
+async def _process_document_async(file_urls: List[str], metadata: Dict[str, Any]) -> Dict[str, Any]:
     """
     v6 Ingest Task:
     - Concurrent downloads directly into memory using httpx.
