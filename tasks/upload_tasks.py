@@ -481,7 +481,8 @@ async def embed_batch_task(self, source_id: str, project_id: str, texts: List[st
         logger.warning(f"Embedding batch for {source_id} failed (attempt {self.request.retries + 1}), retrying: {exc}")
         raise self.retry(exc=exc, countdown=DEFAULT_RETRY_DELAY * (RETRY_BACKOFF_MULTIPLIER ** self.request.retries))
 
-@CircuitBreaker(failure_threshold=5, recovery_timeout=60, expected_exception=Exception)
+# optional remove the exclude arg
+@CircuitBreaker(fail_max=5, reset_timeout=60, exclude=[Exception])
 @retry(
     stop=stop_after_attempt(3), 
     wait=wait_exponential(multiplier=1, min=4, max=10),
