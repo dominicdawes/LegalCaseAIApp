@@ -54,6 +54,27 @@ def setup_loggers(logger, **kwargs):
     This function is triggered after Celery sets up its logger.
     We can add our own handlers here.
     """
+    # Create a formatter
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    
+    # Create stdout handler
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(formatter)
+    
+    # Add handler to logger
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+    
+    # Also configure the root logger
+    root_logger = logging.getLogger()
+    root_logger.addHandler(handler)
+    root_logger.setLevel(logging.INFO)
+
+@after_setup_task_logger.connect
+def setup_task_loggers(logger, **kwargs):
+    """
+    Configure task-specific loggers
+    """
     formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
     handler = logging.StreamHandler(sys.stdout)
     handler.setFormatter(formatter)
@@ -79,6 +100,11 @@ celery_app.conf.update(
     task_acks_late=True,  # Acknowledge tasks after completion
     worker_disable_rate_limits=False,  # Keep rate limits for API calls
     task_reject_on_worker_lost=True,  # Reject tasks if worker dies
+
+    # CRITICAL: Logging configuration for Render
+    worker_log_format='[%(asctime)s: %(levelname)s/%(processName)s] %(message)s',
+    worker_task_log_format='[%(asctime)s: %(levelname)s/%(processName)s][%(task_name)s(%(task_id)s)] %(message)s',
+    worker_hijack_root_logger=False,  # Don't hijack root logger
 )
 
 # Import tasks to register them with Celery (THIS WORKS!!!)

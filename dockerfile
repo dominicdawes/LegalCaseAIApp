@@ -33,7 +33,12 @@ RUN pip install pip==24.0 \
 # 5) Copy in your application code
 COPY . /app
 
-# 6) Tell Render how to launch your worker
+# 6) Set environment variables for better logging
+ENV PYTHONUNBUFFERED=1
+ENV CELERY_HIJACK_ROOT_LOGGER=0
+ENV CELERY_LOG_LEVEL=INFO
+
+# 7) Tell Render how to launch your worker with explicit logging
 #    (For example, if you run a Celery worker named `celery_worker.py`)
-# CMD ["sh", "-c", "celery -A tasks.celery_app worker --loglevel=info --concurrency=2"]
-CMD ["sh", "-c", "celery -A tasks.celery_app worker --loglevel=info --concurrency=2 -Q celery,ingest,parsing,embedding,finalize"]
+#    CMD ["sh", "-c", "celery -A tasks.celery_app worker --loglevel=info --concurrency=2"]
+CMD ["sh", "-c", "celery -A tasks.celery_app worker --loglevel=info --concurrency=2 -Q celery,ingest,parsing,embedding,finalize --without-gossip --without-mingle --without-heartbeat"]
