@@ -130,7 +130,7 @@ class NewRagPipelineResponse(BaseModel):
         "embedding_task_id": "some_task_id"
     }
     '''
-    logging_test_task_id: str      # from vector embedding task
+    embedding_task_id: str      # from vector embedding task
 
 class RagPipelineNewDocumentsRequest(BaseModel):
     ''' 
@@ -328,24 +328,23 @@ async def create_new_rag_project(
         if not request.metadata.get('user_id'):
             raise HTTPException(status_code=400, detail="user_id is required in metadata")
         
-        # TEST LOGS 
-        job = test_celery_log_task.apply_async()
+        # [DEBUG] TEST LOGS 
+        # job = test_celery_log_task.apply_async()
 
-        # # Apply async job to process PDFs → finalize_document_processing_workflow() → rag_note_task()
-        # job = process_document_task.apply_async(
-        #     args=[
-        #         request.files, 
-        #         request.metadata
-        #     ]
-        # )
+        # Apply async job to process PDFs → finalize_document_processing_workflow() → rag_note_task()
+        job = process_document_task.apply_async(
+            args=[
+                request.files, 
+                request.metadata
+            ]
+        )
         
         # The task will return the job ID for immediate status monitoring
         logger.info(f"🚀 Started RAG project task with ID: {job.id}")
-        
         return {
-            "logging_test_task_id": job.id
-            # "embedding_task_id": job.id
-            # "message": f"Processing {len(request.files)} files, check status with job ID"
+            # "logging_test_task_id": job.id
+            "embedding_task_id": job.id,
+            "message": f"Processing {len(request.files)} files, check status with job ID"
         }
     except Exception as e:
         logger.error(f"Error creating new RAG project: {e}", exc_info=True)
