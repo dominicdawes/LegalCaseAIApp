@@ -25,8 +25,8 @@ from celery import chord, group
 from celery.exceptions import MaxRetriesExceededError, Retry
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_openai import OpenAIEmbeddings
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type   # ← pip install tenacity
-from pybreaker import CircuitBreaker    # ← pip install pybreaker
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type 
+from pybreaker import CircuitBreaker   
 
 # Project modules
 from tasks.celery_app import celery_app
@@ -39,8 +39,16 @@ from utils.connection_pool import ConnectionPoolManager
 from utils.memory_manager import MemoryManager # Kept for health checks
 
 # ——— Configuration & Constants ————————————————————————————————————————————————————
+
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
+
+# Add a console handler if not already present
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
 
 # Queue configuration
 INGEST_QUEUE = 'ingest'
@@ -206,12 +214,17 @@ async def _update_document_status(doc_id: str, status: ProcessingStatus, error_m
             status.value, error_message, uuid.UUID(doc_id)
         )
 
+# Global Metrics Collector
+logger.info("📊 Initializing metrics collector...")
+metrics_collector = MetricsCollector()
+logger.info("✅ Metrics collector initialized")
+
 # ——— Task 1: Ingest (Fully Async) ———————————————————————————————————————————
 
 @celery_app.task(bind=True, queue=INGEST_QUEUE, acks_late=True)
 def process_document_task(self, file_urls: List[str], metadata: Dict[str, Any]) -> Dict[str, Any]:
     task_id = self.request.id
-    logger.info(f"🚀 Starting document processing task {task_id} with {len(file_urls)} URLs")
+    logger.info(f"🚀 Starting document processing task URLs")
     return asyncio.run(_process_document_async(file_urls, metadata))
 
 async def _process_document_async(file_urls: List[str], metadata: Dict[str, Any]) -> Dict[str, Any]:

@@ -315,7 +315,7 @@ async def create_new_rag_project(
     '''
     try:
         # Log request information
-        logger.info(f"Starting new RAG project with {len(request.files)} files for project {request.metadata.get('project_id')}")
+        logger.info(f"🚀 Starting new RAG project with {len(request.files)} files for project {request.metadata.get('project_id')}")
         
         # Data validation
         if not request.files:
@@ -337,7 +337,7 @@ async def create_new_rag_project(
         
         # The task will return source_ids when it completes initial DB insertion
         # But for now, return the job ID for immediate status monitoring
-        logger.info(f"Started RAG project task with ID: {job.id}")
+        logger.info(f"🚀 Started RAG project task with ID: {job.id}")
         
         return {
             "embedding_task_id": job.id,
