@@ -92,7 +92,7 @@ celery_app.conf.update(
 
     # NEW: Async support configuration for Celery 5.4
     task_protocol=2,  # Enable async task protocol
-    worker_pool='gevent',  # Use gevent for async compatibility
+    # worker_pool='gevent',  # Use gevent for async compatibility
     # worker_concurrency=10,  # 2 to 200 Adjust based on your server capacity
     worker_prefetch_multiplier=1,  # Good for async tasks
     
@@ -119,7 +119,8 @@ import tasks.sample_tasks
 # # This allows Celery to find tasks in modules like `generate_tasks.py` and `other_tasks.py`
 celery_app.autodiscover_tasks(["tasks"])
 
-# Sanity check print statement
-print("Registered tasks:")
-print(celery_app.tasks.keys())
-print(" ")
+# Sanity check print statement - these should show up in Render logs
+print("🚀 Celery app initialized successfully!")
+print("📋 Registered tasks:")
+print(list(celery_app.tasks.keys()))
+print("✅ Ready to process tasks")
