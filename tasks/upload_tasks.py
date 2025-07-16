@@ -1,6 +1,7 @@
 """v6 By Gemini 2.5 Pro bc Claude hit rate/context limits"""
 
 import os
+import sys
 import uuid
 import tempfile
 import asyncio
@@ -39,6 +40,13 @@ from utils.connection_pool import ConnectionPoolManager
 from utils.memory_manager import MemoryManager # Kept for health checks
 
 # ——— Configuration & Constants ————————————————————————————————————————————————————
+
+# Force logger configuration for Celery worker
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    stream=sys.stdout
+)
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
