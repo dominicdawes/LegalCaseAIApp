@@ -343,7 +343,8 @@ async def create_new_rag_project(
         logger.info(f"🚀 Started RAG project task with ID: {job.id}")
         
         return {
-            "embedding_task_id": job.id
+            "logging_test_task_id": job.id
+            # "embedding_task_id": job.id
             # "message": f"Processing {len(request.files)} files, check status with job ID"
         }
     except Exception as e:
