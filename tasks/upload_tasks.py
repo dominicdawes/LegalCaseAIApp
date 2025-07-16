@@ -41,19 +41,16 @@ from utils.connection_pool import ConnectionPoolManager
 from utils.memory_manager import MemoryManager # Kept for health checks
 
 # ——— Logging ————————————————————————————————————————————————————
-
-# logger = get_task_logger(__name__)
-# logger.setLevel(logging.INFO)
-
-# Configure multiple loggers
 logger = get_task_logger(__name__)
-root_logger = logging.getLogger()
-console_handler = logging.StreamHandler(sys.stdout)
-console_handler.setLevel(logging.INFO)
-formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-console_handler.setFormatter(formatter)
-root_logger.addHandler(console_handler)
-root_logger.setLevel(logging.INFO)
+
+# --- REMOVE FOR SIMPLICITY --- #
+# logger.setLevel(logging.INFO)
+# console_handler = logging.StreamHandler(sys.stdout)
+# console_handler.setLevel(logging.INFO)
+# formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+# console_handler.setFormatter(formatter)
+# root_logger.addHandler(console_handler)
+# root_logger.setLevel(logging.INFO)
 
 # ——— Configuration & Constants ————————————————————————————————————————————————————
 
@@ -228,47 +225,19 @@ logger.info("✅ Metrics collector initialized")
 
 # ——— Task 1: Ingest (Fully Async) ———————————————————————————————————————————
 
-# @celery_app.task(bind=True)
-# def test_celery_log_task(self) -> None:
-#     task_id = self.request.id
-#     logger.warning(f"[LOG] Can you see this !!! ??? {task_id}")
-#     logger.warning(f"🚀 Starting document processing task URLs")
-#     logger.info(f"🚀 Starting document processing task URLs")
-#     print(f"🚀 Starting document processing task URLs")
-#     return None
-
 @celery_app.task(bind=True)
 def test_celery_log_task(self) -> str:
     """Test task with multiple logging methods to ensure visibility"""
     task_id = self.request.id
     
-    # Method 1: Direct print to stdout (should always work)
-    print(f"🚀 [PRINT] Task {task_id} started successfully!")
-    print(f"📋 [PRINT] Can you see this direct print statement?")
-    
     # Method 2: Celery task logger
-    logger.info(f"📊 [TASK_LOGGER] Task {task_id} - Celery task logger working")
+    logger.info(f"📊 [TASK_LOGGER] Task {task_id} - testing Info level task logger working")
     logger.warning(f"⚠️  [TASK_LOGGER] Task {task_id} - Warning level message")
     logger.error(f"❌ [TASK_LOGGER] Task {task_id} - Error level message (not a real error)")
-    
-    # Method 3: Root logger
-    root_logger.info(f"🌍 [ROOT_LOGGER] Task {task_id} - Root logger working")
-    
-    # Method 4: Standard logging
-    logging.info(f"📝 [LOGGING] Task {task_id} - Standard logging working")
-    
-    # Method 5: Write to stderr (alternative output stream)
-    sys.stderr.write(f"🔴 [STDERR] Task {task_id} - Writing to stderr\n")
-    sys.stderr.flush()
-    
-    # Method 6: Write to stdout directly
-    sys.stdout.write(f"🟢 [STDOUT] Task {task_id} - Writing to stdout directly\n")
-    sys.stdout.flush()
     
     # Return a success message
     result = f"Task {task_id} completed successfully with all logging methods tested"
     print(f"✅ [PRINT] {result}")
-    logger.info(f"✅ [TASK_LOGGER] {result}")
     
     return result
 

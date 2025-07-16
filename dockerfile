@@ -38,8 +38,8 @@ ENV PYTHONUNBUFFERED=1
 ENV CELERY_HIJACK_ROOT_LOGGER=0
 ENV CELERY_LOG_LEVEL=INFO
 
-# 7) Tell Render how to launch your worker with explicit logging
+# 7) Tell Render how to launch your worker with explicit logging (Purge queues on startup && Start worker + queues)
 #    (For example, if you run a Celery worker named `celery_worker.py`)
 #    CMD ["sh", "-c", "celery -A tasks.celery_app worker --loglevel=info --concurrency=2"]
-CMD ["sh", "-c", "echo '🧹 Purging queues on startup...' && celery -A tasks.celery_app purge -f -Q celery,ingest,parsing,embedding,finalize && echo '✅ Queues purged, starting worker...' && celery -A tasks.celery_app worker --loglevel=info --concurrency=100 -Q celery,ingest,parsing,embedding,finalize -P gevent"]
+CMD ["sh", "-c", "echo '🧹 Purging queues on startup...' && celery -A tasks.celery_app purge -f && echo '✅ Queues purged, starting worker...' && celery -A tasks.celery_app worker --loglevel=info --concurrency=100 -Q celery,ingest,parsing,embedding,finalize -P gevent"]
 # CMD ["sh", "-c", "celery -A tasks.celery_app worker --loglevel=info -P gevent --concurrency=2 -Q celery,ingest,parsing,embedding,finalize --without-gossip --without-mingle --without-heartbeat"]
