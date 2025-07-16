@@ -35,4 +35,5 @@ COPY . /app
 
 # 6) Tell Render how to launch your worker
 #    (For example, if you run a Celery worker named `celery_worker.py`)
-CMD ["sh", "-c", "celery -A tasks.celery_app worker --loglevel=info --concurrency=2"]
+# CMD ["sh", "-c", "celery -A tasks.celery_app worker --loglevel=info --concurrency=2"]
+CMD ["sh", "-c", "celery -A tasks.celery_app worker --loglevel=info --concurrency=2 -Q celery,ingest,parsing,embedding,finalize"]
