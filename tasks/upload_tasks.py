@@ -52,12 +52,13 @@ from utils.memory_manager import MemoryManager # Kept for health checks
 logger = get_task_logger(__name__)
 logger.setLevel(logging.INFO)
 
-# Add a console handler if not already present
-if not logger.handlers:
-    handler = logging.StreamHandler()
-    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-    handler.setFormatter(formatter)
-    logger.addHandler(handler)
+# --- REMOVE THIS ENTIRE BLOCK ---
+# if not logger.handlers:
+#     handler = logging.StreamHandler()
+#     formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+#     handler.setFormatter(formatter)
+#     logger.addHandler(handler)
+# --- END REMOVE BLOCK ---
 
 # Queue configuration
 INGEST_QUEUE = 'ingest'
@@ -233,6 +234,9 @@ logger.info("✅ Metrics collector initialized")
 @celery_app.task(bind=True, queue=INGEST_QUEUE, acks_late=True)
 def test_celery_log_task(self) -> None:
     logger.warning(f"[LOG] Can you see this !!! ???")
+    logger.warning(f"🚀 Starting document processing task URLs")
+    logger.info(f"🚀 Starting document processing task URLs")
+    print(f"🚀 Starting document processing task URLs")
     return
 
 @celery_app.task(bind=True, queue=INGEST_QUEUE, acks_late=True)
