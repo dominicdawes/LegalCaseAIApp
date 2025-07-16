@@ -230,6 +230,11 @@ logger.info("✅ Metrics collector initialized")
 # ——— Task 1: Ingest (Fully Async) ———————————————————————————————————————————
 
 @celery_app.task(bind=True, queue=INGEST_QUEUE, acks_late=True)
+def test_celery_log_task(self) -> None:
+    logger.warning(f"[LOG] Can you see this !!! ???")
+    return
+
+@celery_app.task(bind=True, queue=INGEST_QUEUE, acks_late=True)
 def process_document_task(self, file_urls: List[str], metadata: Dict[str, Any]) -> Dict[str, Any]:
     task_id = self.request.id
     logger.warning(f"🚀 Starting document processing task URLs")

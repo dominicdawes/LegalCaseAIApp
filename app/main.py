@@ -22,6 +22,7 @@ from celery import chain, chord, group, states
 from celery.result import AsyncResult
 from tasks.podcast_generate_tasks import validate_and_generate_audio_task, generate_dialogue_only_task
 from tasks.upload_tasks import process_document_task
+from tasks.upload_tasks import test_celery_log_task
 # from tasks.upload_tasks import append_document_task  <-- need to revive this later
 from tasks.sample_tasks import addition_task
 from tasks.chat_streaming_tasks import rag_chat_streaming_task
@@ -327,21 +328,23 @@ async def create_new_rag_project(
         if not request.metadata.get('user_id'):
             raise HTTPException(status_code=400, detail="user_id is required in metadata")
         
-        # Apply async job to process PDFs → finalize_document_processing_workflow() → rag_note_task()
-        job = process_document_task.apply_async(
-            args=[
-                request.files, 
-                request.metadata
-            ]
-        )
+        # TEST LOGS 
+        job = test_celery_log_task.apply_async()
+
+        # # Apply async job to process PDFs → finalize_document_processing_workflow() → rag_note_task()
+        # job = process_document_task.apply_async(
+        #     args=[
+        #         request.files, 
+        #         request.metadata
+        #     ]
+        # )
         
-        # The task will return source_ids when it completes initial DB insertion
-        # But for now, return the job ID for immediate status monitoring
+        # The task will return the job ID for immediate status monitoring
         logger.info(f"🚀 Started RAG project task with ID: {job.id}")
         
         return {
-            "embedding_task_id": job.id,
-            "message": f"Processing {len(request.files)} files, check status with job ID"
+            "embedding_task_id": job.id
+            # "message": f"Processing {len(request.files)} files, check status with job ID"
         }
     except Exception as e:
         logger.error(f"Error creating new RAG project: {e}", exc_info=True)
