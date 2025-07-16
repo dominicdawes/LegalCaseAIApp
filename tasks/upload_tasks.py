@@ -353,8 +353,8 @@ async def _download_and_prep_doc(client: httpx.AsyncClient, url: str, project_id
             ext = os.path.splitext(url)[1].lower() or '.bin'
             s3_key = f"{project_id}/{uuid.uuid4()}{ext}"
             
-            # Stream directly to S3 from the in-memory buffer
-            upload_to_s3(s3_client, content_stream, s3_key, is_file_like_object=True)
+            # Stream directly to S3 && AWS CloudFront from the in-memory buffer
+            upload_to_s3(s3_client, content_stream, s3_key)
             cdn_url = get_cloudfront_url(s3_key)
             
             return {
