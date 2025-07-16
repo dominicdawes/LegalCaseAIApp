@@ -239,6 +239,8 @@ def test_celery_log_task(self) -> None:
 def process_document_task(self, file_urls: List[str], metadata: Dict[str, Any]) -> Dict[str, Any]:
     task_id = self.request.id
     logger.warning(f"🚀 Starting document processing task URLs")
+    logger.info(f"🚀 Starting document processing task URLs")
+    print(f"🚀 Starting document processing task URLs")
     return asyncio.run(_process_document_async(file_urls, metadata))
 
 async def _process_document_async(file_urls: List[str], metadata: Dict[str, Any]) -> Dict[str, Any]:
