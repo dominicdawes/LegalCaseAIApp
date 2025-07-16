@@ -4,6 +4,7 @@ import os
 import sys
 import uuid
 import tempfile
+from dotenv import load_dotenv
 import asyncio
 import logging
 import threading
@@ -53,6 +54,9 @@ logger = get_task_logger(__name__)
 # root_logger.setLevel(logging.INFO)
 
 # ——— Configuration & Constants ————————————————————————————————————————————————————
+
+# Environment variables
+load_dotenv()
 
 # Queue configuration
 INGEST_QUEUE = 'ingest'
