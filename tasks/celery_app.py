@@ -7,6 +7,7 @@ and the cloud hosted (Render) version.
 import logging
 import sys
 from celery import Celery
+from celery.utils.log import get_task_logger
 from celery.signals import after_setup_logger
 from datetime import datetime, timezone
 import os

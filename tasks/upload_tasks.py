@@ -23,6 +23,7 @@ import httpx
 import tiktoken
 import asyncpg
 from celery import chord, group
+from celery.utils.log import get_task_logger
 from celery.exceptions import MaxRetriesExceededError, Retry
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_openai import OpenAIEmbeddings
@@ -48,7 +49,7 @@ from utils.memory_manager import MemoryManager # Kept for health checks
 #     stream=sys.stdout
 # )
 
-logger = logging.getLogger(__name__)
+logger = get_task_logger(__name__)
 logger.setLevel(logging.INFO)
 
 # Add a console handler if not already present

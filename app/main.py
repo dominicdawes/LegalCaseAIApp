@@ -19,7 +19,6 @@ from utils.pdf_utils import extract_text_from_pdf
 
 # Celery task imports
 from celery import chain, chord, group, states
-from celery.utils.logs import get_task_logger
 from celery.result import AsyncResult
 from tasks.podcast_generate_tasks import validate_and_generate_audio_task, generate_dialogue_only_task
 from tasks.upload_tasks import process_document_task
@@ -32,7 +31,7 @@ from tasks.note_tasks import rag_note_task
 
 # Configure logging (basic example, adjust as needed)
 logging.basicConfig(level=logging.INFO)
-logger = get_task_logger(__name__)
+logger = logging.getLogger(__name__)
 
 # FastAPI
 from fastapi import FastAPI, BackgroundTasks, HTTPException, WebSocket, WebSocketDisconnect
