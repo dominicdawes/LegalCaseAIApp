@@ -130,7 +130,7 @@ class NewRagPipelineResponse(BaseModel):
         "embedding_task_id": "some_task_id"
     }
     '''
-    embedding_task_id: str      # from vector embedding task
+    logging_test_task_id: str      # from vector embedding task
 
 class RagPipelineNewDocumentsRequest(BaseModel):
     ''' 
