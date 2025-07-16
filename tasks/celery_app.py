@@ -4,8 +4,10 @@ and the cloud hosted (Render) version.
 """
 
 # celery_app.py
-
+import logging
+import sys
 from celery import Celery
+from celery.signals import after_setup_logger
 from datetime import datetime, timezone
 import os
 from dotenv import load_dotenv
@@ -44,6 +46,18 @@ celery_app = Celery(
     result_serializer="pickle",
     accept_content=["json", "pickle"],  # Accept JSON and pickle content
 )
+
+@after_setup_logger.connect
+def setup_loggers(logger, **kwargs):
+    """
+    This function is triggered after Celery sets up its logger.
+    We can add our own handlers here.
+    """
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
 
 # Optional: Load configuration from a separate config file or object
 celery_app.conf.update(

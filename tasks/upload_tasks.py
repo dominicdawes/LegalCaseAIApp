@@ -41,12 +41,12 @@ from utils.memory_manager import MemoryManager # Kept for health checks
 
 # ——— Configuration & Constants ————————————————————————————————————————————————————
 
-# Force logger configuration for Celery worker
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    stream=sys.stdout
-)
+# # Force logger configuration for Celery worker
+# logging.basicConfig(
+#     level=logging.INFO,
+#     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+#     stream=sys.stdout
+# )
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -232,7 +232,7 @@ logger.info("✅ Metrics collector initialized")
 @celery_app.task(bind=True, queue=INGEST_QUEUE, acks_late=True)
 def process_document_task(self, file_urls: List[str], metadata: Dict[str, Any]) -> Dict[str, Any]:
     task_id = self.request.id
-    logger.info(f"🚀 Starting document processing task URLs")
+    logger.warning(f"🚀 Starting document processing task URLs")
     return asyncio.run(_process_document_async(file_urls, metadata))
 
 async def _process_document_async(file_urls: List[str], metadata: Dict[str, Any]) -> Dict[str, Any]:
