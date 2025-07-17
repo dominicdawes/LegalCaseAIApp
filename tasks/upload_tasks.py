@@ -566,10 +566,21 @@ async def _download_and_prep_doc(client: httpx.AsyncClient, url: str, project_id
 
 # ——— Task 2: For one document → Parse, batch, dispatch to emmbed (v6 - In-Memory & Token-Aware) ————————————————————————————————
 
+# @celery_app.task(bind=True, queue=PARSE_QUEUE, acks_late=True)
+# def parse_document_task(self, source_id: str, cdn_url: str, project_id: str) -> Dict[str, Any]:
+#     return asyncio.run(_parse_document_async(self, source_id, cdn_url, project_id))
+    
 @celery_app.task(bind=True, queue=PARSE_QUEUE, acks_late=True)
 def parse_document_task(self, source_id: str, cdn_url: str, project_id: str) -> Dict[str, Any]:
-    return asyncio.run(_parse_document_async(self, source_id, cdn_url, project_id))
-
+    # Get or create event loop
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+    
+    return loop.run_until_complete(_parse_document_async(self, source_id, cdn_url, project_id))
+    
 async def _parse_document_async(self, source_id: str, cdn_url: str, project_id: str) -> Dict[str, Any]:
     """
     v6 Parsing Task:
