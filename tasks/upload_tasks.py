@@ -5,6 +5,8 @@ import sys
 import uuid
 import tempfile
 from dotenv import load_dotenv
+import atexit
+import signal
 import asyncio
 import logging
 import threading
@@ -24,6 +26,7 @@ import httpx
 import tiktoken
 import asyncpg
 from celery import chord, group
+from celery.signals import worker_init, worker_shutdown
 from celery.utils.log import get_task_logger
 from celery.exceptions import MaxRetriesExceededError, Retry
 from langchain.text_splitter import RecursiveCharacterTextSplitter
@@ -139,10 +142,75 @@ class DocumentMetrics:
             'retry_count': self.retry_count
         }
 
-# ——— Global Production Instances (Initialized once per worker) —————————————————————
+# ——— DB Pool Instances (Initialized once per worker) —————————————————————
 
-# Async DB Connection Pool
+# Global pool variable
 db_pool: Optional[asyncpg.Pool] = None
+
+# ——— 1. POOL CLEANUP FUNCTIONS ————————————————————————————————
+
+async def close_db_pool():
+    """Safely close the database pool"""
+    global db_pool
+    if db_pool is not None:
+        logger.info("🔄 Closing database pool...")
+        try:
+            await db_pool.close()
+            logger.info("✅ Database pool closed successfully")
+        except Exception as e:
+            logger.error(f"❌ Error closing database pool: {e}")
+        finally:
+            db_pool = None
+
+def sync_close_db_pool():
+    """Synchronous wrapper for closing the pool"""
+    try:
+        if db_pool is not None:
+            # Create new event loop if none exists
+            try:
+                loop = asyncio.get_event_loop()
+            except RuntimeError:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+            
+            # Close the pool
+            loop.run_until_complete(close_db_pool())
+    except Exception as e:
+        logger.error(f"❌ Error in sync pool cleanup: {e}")
+
+# ——— 2. CELERY SIGNAL HANDLERS ————————————————————————————————
+
+@worker_init.connect
+def worker_init_handler(sender=None, **kwargs):
+    """Called when Celery worker starts"""
+    global db_pool
+    logger.info("🚀 Celery worker initializing...")
+    
+    # Force reset the global pool variable
+    db_pool = None
+    logger.info("🔄 Database pool reset on worker init")
+
+@worker_shutdown.connect
+def worker_shutdown_handler(sender=None, **kwargs):
+    """Called when Celery worker shuts down"""
+    logger.info("🛑 Celery worker shutting down...")
+    sync_close_db_pool()
+
+# ——— 3. SYSTEM SIGNAL HANDLERS ————————————————————————————————
+
+def signal_handler(signum, frame):
+    """Handle system signals (SIGTERM, SIGINT)"""
+    logger.info(f"🛑 Received signal {signum}, cleaning up...")
+    sync_close_db_pool()
+
+# Register signal handlers
+signal.signal(signal.SIGTERM, signal_handler)
+signal.signal(signal.SIGINT, signal_handler)
+
+# Register atexit handler as last resort
+atexit.register(sync_close_db_pool)
+
+# ——— 4. UPDATED get_db_pool FUNCTION ————————————————————————————————
 
 async def get_db_pool() -> asyncpg.Pool:
     """Initializes and returns the asyncpg connection pool with connection testing."""
@@ -207,7 +275,7 @@ async def get_db_pool() -> asyncpg.Pool:
                 'application_name': 'celery_worker_render',
             },
             timeout=60,  # Connection timeout
-            statement_cache_size=0  # Disable prepared statement caching for pgBouncer compatibility
+            statement_cache_size=0  # 🔑 CRITICAL: Disable prepared statement caching for pgBouncer compatibility
         )
         logger.info("✅ Database pool created successfully")
         
@@ -276,6 +344,20 @@ async def get_db_pool() -> asyncpg.Pool:
         raise
     
     return db_pool
+
+# ——— 5. OPTIONAL: MANUAL POOL RESET TASK ————————————————————————————————
+
+@celery_app.task(bind=True)
+def reset_db_pool_task(self):
+    """Manual task to reset the database pool"""
+    try:
+        sync_close_db_pool()
+        return {"status": "success", "message": "Database pool reset successfully"}
+    except Exception as e:
+        logger.error(f"❌ Failed to reset database pool: {e}")
+        return {"status": "error", "message": str(e)}
+
+# ——— Global Production Instances (Initialized once per worker) —————————————————————
 
 # OpenAI Embeddings Client
 embedding_model = OpenAIEmbeddings(
