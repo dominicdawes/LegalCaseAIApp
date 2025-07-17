@@ -184,7 +184,7 @@ def sync_close_db_pool():
 def worker_init_handler(sender=None, **kwargs):
     """Called when Celery worker starts"""
     global db_pool
-    logger.info("🚀 Celery worker initializing...")
+    logger.info("🚀 Celery worker initializing && db pool resetting...")
     
     # Force reset the global pool variable
     db_pool = None
