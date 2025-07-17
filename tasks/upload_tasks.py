@@ -44,15 +44,6 @@ from utils.memory_manager import MemoryManager # Kept for health checks
 # ——— Logging ————————————————————————————————————————————————————
 logger = get_task_logger(__name__)
 
-# --- REMOVE FOR SIMPLICITY --- #
-# logger.setLevel(logging.INFO)
-# console_handler = logging.StreamHandler(sys.stdout)
-# console_handler.setLevel(logging.INFO)
-# formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-# console_handler.setFormatter(formatter)
-# root_logger.addHandler(console_handler)
-# root_logger.setLevel(logging.INFO)
-
 # ——— Configuration & Constants ————————————————————————————————————————————————————
 
 # Environment variables
@@ -153,22 +144,140 @@ class DocumentMetrics:
 # Async DB Connection Pool
 db_pool: Optional[asyncpg.Pool] = None
 
+# async def get_db_pool() -> asyncpg.Pool:
+#     """Initializes and returns the asyncpg connection pool."""
+#     global db_pool
+#     try:
+#         if db_pool is None:
+#             if not DB_DSN:
+#                 raise ValueError("POSTGRES_DSN environment variable not set.")
+#             db_pool = await asyncpg.create_pool(
+#                 dsn=DB_DSN,
+#                 min_size=DB_POOL_MIN_SIZE,
+#                 max_size=DB_POOL_MAX_SIZE
+#             )
+#             logger.info("✅ Database pool ready")
+#     except Exception as e:
+#         logger.error(f"❌ DB pool failed: {e}")
+#         raise
+#     return db_pool
+
 async def get_db_pool() -> asyncpg.Pool:
-    """Initializes and returns the asyncpg connection pool."""
+    """Initializes and returns the asyncpg connection pool with connection testing."""
     global db_pool
     try:
         if db_pool is None:
             if not DB_DSN:
                 raise ValueError("POSTGRES_DSN environment variable not set.")
+            
+            # Log connection attempt (mask sensitive info)
+            masked_dsn = DB_DSN
+            if '@' in masked_dsn:
+                parts = masked_dsn.split('@')
+                if len(parts) == 2:
+                    # Show only host:port/db part
+                    masked_dsn = f"postgresql://***:***@{parts[1]}"
+            logger.info(f"🔗 Attempting to connect to: {masked_dsn}")
+            
+            # Extract host and port for ping test
+            import urllib.parse
+            parsed = urllib.parse.urlparse(DB_DSN)
+            host = parsed.hostname
+            port = parsed.port or 5432
+            logger.info(f"🎯 Target host: {host}:{port}")
+            
+            # Test basic network connectivity first
+            try:
+                import socket
+                logger.info(f"🔍 Testing network connectivity to {host}:{port}...")
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(10)  # 10 second timeout
+                result = sock.connect_ex((host, port))
+                sock.close()
+                
+                if result == 0:
+                    logger.info(f"✅ Network connectivity OK to {host}:{port}")
+                else:
+                    logger.error(f"❌ Network connectivity FAILED to {host}:{port} - Error code: {result}")
+                    if result == 111:
+                        logger.error("❌ Connection refused - database service may not be running")
+                    elif result == 110:
+                        logger.error("❌ Connection timeout - check firewall/network rules")
+                    elif result == 101:
+                        logger.error("❌ Network unreachable - check network configuration")
+            except Exception as net_error:
+                logger.error(f"❌ Network test failed: {net_error}")
+            
+            # Create the connection pool
+            logger.info("🏊 Creating asyncpg connection pool...")
             db_pool = await asyncpg.create_pool(
                 dsn=DB_DSN,
                 min_size=DB_POOL_MIN_SIZE,
-                max_size=DB_POOL_MAX_SIZE
+                max_size=DB_POOL_MAX_SIZE,
+                command_timeout=30,
+                server_settings={
+                    'application_name': 'celery_worker_render',
+                },
+                timeout=60  # Connection timeout
             )
-            logger.info("✅ Database pool ready")
-    except Exception as e:
-        logger.error(f"❌ DB pool failed: {e}")
+            logger.info("✅ Database pool created successfully")
+            
+            # Test the connection with a ping
+            logger.info("🏓 Testing database connection with ping...")
+            async with db_pool.acquire() as conn:
+                # Simple ping query
+                ping_result = await conn.fetchval('SELECT 1 as ping')
+                logger.info(f"🏓 Database ping result: {ping_result}")
+                
+                # Get database info
+                db_version = await conn.fetchval('SELECT version()')
+                logger.info(f"🗄️  Database version: {db_version[:100]}...")  # Truncate long version strings
+                
+                # Test current timestamp
+                current_time = await conn.fetchval('SELECT NOW()')
+                logger.info(f"🕐 Database time: {current_time}")
+                
+                # Check if our main table exists
+                table_exists = await conn.fetchval(
+                    "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'document_sources')"
+                )
+                logger.info(f"📋 Table 'document_sources' exists: {table_exists}")
+                
+            logger.info("✅ Database connection verified and working!")
+            
+    except socket.gaierror as e:
+        logger.error(f"❌ DNS resolution failed for {host}: {e}")
+        logger.error("💡 Check if the database hostname is correct and reachable")
         raise
+    except OSError as e:
+        if e.errno == 101:
+            logger.error(f"❌ Network unreachable to {host}:{port}")
+            logger.error("💡 Possible causes:")
+            logger.error("   - Database server is down")
+            logger.error("   - Firewall blocking connection")
+            logger.error("   - Wrong host/port in connection string")
+            logger.error("   - Network routing issues")
+        elif e.errno == 111:
+            logger.error(f"❌ Connection refused by {host}:{port}")
+            logger.error("💡 Database service may not be running or not accepting connections")
+        elif e.errno == 110:
+            logger.error(f"❌ Connection timeout to {host}:{port}")
+            logger.error("💡 Database may be overloaded or firewall is dropping packets")
+        logger.error(f"❌ OS-level connection error: {e}")
+        raise
+    except asyncpg.InvalidAuthorizationSpecificationError as e:
+        logger.error(f"❌ Database authentication failed: {e}")
+        logger.error("💡 Check username/password in POSTGRES_DSN")
+        raise
+    except asyncpg.InvalidCatalogNameError as e:
+        logger.error(f"❌ Database does not exist: {e}")
+        logger.error("💡 Check database name in POSTGRES_DSN")
+        raise
+    except Exception as e:
+        logger.error(f"❌ Database connection failed: {e}")
+        logger.error(f"❌ Error type: {type(e).__name__}")
+        raise
+    
     return db_pool
 
 # OpenAI Embeddings Client
