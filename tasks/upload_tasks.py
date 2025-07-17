@@ -70,7 +70,7 @@ CHUNK_SIZE = 1000
 CHUNK_OVERLAP = 200
 
 # Database (asyncpg)
-DB_DSN = os.getenv("POSTGRES_DS_POOL") # e.g., Supabase -> Connection -> Get Direct URL
+DB_DSN = os.getenv("POSTGRES_DSN_POOL") # e.g., Supabase -> Connection -> Get Direct URL
 # DB_POOL_MIN_SIZE = 5  # <-- if i had more compute
 # DB_POOL_MAX_SIZE = 20
 DB_POOL_MIN_SIZE = 2
