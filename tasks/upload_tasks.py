@@ -22,10 +22,11 @@ from datetime import datetime, timezone, timedelta
 # ===== ENVIRONMENT & CONFIGURATION =====
 from dotenv import load_dotenv
 
-# ===== ASYNC & CONCURRENCY =====
+# ===== ASYNC & CONCURRENCY & SOCKET =====
 import asyncio
 import gevent
 import gevent.socket
+import socket
 
 # ===== NETWORKING & HTTP =====
 import requests
@@ -280,7 +281,6 @@ async def get_db_pool() -> asyncpg.Pool:
         
         # Test basic network connectivity first
         try:
-            import socket
             logger.info(f"🔍 Testing network connectivity to {host}:{port}...")
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.settimeout(10)  # 10 second timeout
