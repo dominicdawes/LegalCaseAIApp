@@ -67,6 +67,7 @@ from tasks.celery_app import celery_app
 from utils.s3_utils import upload_to_s3, s3_client
 from utils.cloudfront_utils import get_cloudfront_url
 from utils.supabase_utils import supabase_client
+from utils.document_loaders.base import BaseDocumentLoader
 from utils.document_loaders.loader_factory import get_loader_for        # The loader factory is now expected to handle in-memory file-like objects
 from utils.metrics import MetricsCollector, Timer
 from utils.connection_pool import ConnectionPoolManager
@@ -176,6 +177,47 @@ class DocumentMetrics:
             'embedding_calls': self.embedding_calls,
             'retry_count': self.retry_count
         }
+
+class StreamingDocumentProcessor:
+    """
+    Wrapper class to encapsulate streaming document processing
+    Maintains the TRUE IN-MEMORY STREAMING architecture
+    """
+    
+    def __init__(self, file_buffer: io.BytesIO, filename: str):
+        self.file_buffer = file_buffer
+        self.filename = filename
+        self.loader = None
+        
+    def get_loader(self) -> BaseDocumentLoader:
+        """Get the appropriate loader for this document"""
+        if self.loader is None:
+            self.loader = get_loader_for(filename=self.filename, file_like_object=self.file_buffer)
+        return self.loader
+    
+    def stream_chunks(self, splitter: RecursiveCharacterTextSplitter) -> Iterator[Tuple[str, Dict]]:
+        """
+        Generator that yields (text, metadata) tuples for each chunk
+        Maintains true streaming - never loads entire document into memory at once
+        """
+        loader = self.get_loader()
+        
+        # Reset buffer position
+        self.file_buffer.seek(0)
+        
+        for page_num, page in enumerate(loader.stream_documents(self.file_buffer)):
+            # Split page into chunks
+            chunks = splitter.split_documents([page])
+            
+            for chunk_idx, chunk in enumerate(chunks):
+                cleaned_content = _clean_text(chunk.page_content)
+                if cleaned_content:
+                    metadata = {
+                        **chunk.metadata,
+                        'page_number': page_num,
+                        'chunk_index': chunk_idx
+                    }
+                    yield cleaned_content, metadata
 
 # ——— DB Pool Instances (Initialized once per worker) —————————————————————
 
@@ -1018,7 +1060,9 @@ async def _process_document_async(file_urls: List[str], metadata: Dict[str, Any]
     }
 
 async def _download_and_prep_doc(client: httpx.AsyncClient, url: str, project_id: str, user_id: str) -> Optional[Dict]:
-    """Helper to download to memory, hash, stream to S3, and prep data."""
+    """
+    Helper to download to memory, hash, stream to S3 & Store in AWS CLoudfront, and prep data.
+    """
     try:
         # Define headers for anti-bot detection
         headers = DEFAULT_HEADERS
@@ -1041,7 +1085,7 @@ async def _download_and_prep_doc(client: httpx.AsyncClient, url: str, project_id
 
             # ext = get_file_extension_from_url(url)   # os.path.splitext(url)[1].lower() or '.bin'
             # s3_key = f"{project_id}/{uuid.uuid4()}{ext}"
-            # Enhanced detection
+            # Enhanced file extension detection
             ext = get_file_extension_from_url(url)
             filename = get_clean_filename_from_url(url, ext)
             s3_key = f"{project_id}/{uuid.uuid4()}{ext}"
@@ -1054,7 +1098,7 @@ async def _download_and_prep_doc(client: httpx.AsyncClient, url: str, project_id
                 'cdn_url': cdn_url,
                 'project_id': project_id,
                 'uploaded_by': user_id,
-                'filename': os.path.basename(url),
+                'filename': filename,
                 'file_size_bytes': file_size,
                 'content_hash': content_hash,
             }
