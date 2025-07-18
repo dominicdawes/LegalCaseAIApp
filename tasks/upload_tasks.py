@@ -17,7 +17,7 @@ import hashlib
 import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from typing import List, Dict, Any, Optional, AsyncGenerator, Tuple
+from typing import List, Dict, Any, Iterator, Optional, AsyncGenerator, Tuple
 from enum import Enum
 from datetime import datetime, timezone, timedelta
 
