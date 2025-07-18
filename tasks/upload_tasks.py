@@ -686,7 +686,7 @@ async def _process_document_async(file_urls: List[str], metadata: Dict[str, Any]
                 logger.info(f"📋 Document already exists in this project: {res['content_hash'][:8]} -> {same_project_doc}")
                 continue
             
-            # Second: Check if content exists in ANY project and is fully processed
+            # Second: Check if content exists in ANY project and is fully processed ♻️ 
             existing_processed_doc = await conn.fetchrow(
                 '''
                 SELECT id, project_id, total_chunks, total_batches
@@ -719,7 +719,8 @@ async def _process_document_async(file_urls: List[str], metadata: Dict[str, Any]
                     datetime.now(timezone.utc)
                 )
                 
-                # Copy embeddings to the new project
+                # ♻️ Copy embeddings to the new project
+                logger.info(f"♻️  Copying found embeddings...")
                 copy_result = await copy_embeddings_for_project(
                     str(existing_processed_doc['id']), 
                     str(new_doc_id), 
