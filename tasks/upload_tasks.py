@@ -5,6 +5,8 @@ import os
 import sys
 import uuid
 import tempfile
+import urllib.parse
+import re
 import atexit
 import signal
 import logging
@@ -460,6 +462,10 @@ except KeyError:
 # Global Metrics Collector
 metrics_collector = MetricsCollector()
 
+# Global Metrics Collector
+logger.info("📊 Initializing metrics collector...")
+metrics_collector = MetricsCollector()
+logger.info("✅ Metrics collector initialized")
 
 # ——— Helpers & Utilities ——————————————————————————————————————————————————————————
 
@@ -547,10 +553,221 @@ async def get_embedding_reuse_stats(project_id: str) -> Dict[str, Any]:
             'recent_chunks': stats['recent_chunks'] or 0
         }
 
-# Global Metrics Collector
-logger.info("📊 Initializing metrics collector...")
-metrics_collector = MetricsCollector()
-logger.info("✅ Metrics collector initialized")
+def get_file_extension_from_url(url: str) -> str:
+    """
+    Comprehensive file extension detection for URLs
+    Handles academic repositories, government sites, publishers, and more
+    """
+    url_lower = url.lower()
+    
+    # ===== ACADEMIC & RESEARCH REPOSITORIES =====
+    
+    # ArXiv (all variants)
+    if 'arxiv.org' in url_lower and '/pdf/' in url_lower:
+        return '.pdf'
+    
+    # ResearchGate
+    if 'researchgate.net' in url_lower:
+        if 'publication' in url_lower or 'profile' in url_lower:
+            return '.pdf'
+    
+    # Academia.edu
+    if 'academia.edu' in url_lower:
+        return '.pdf'
+    
+    # Semantic Scholar
+    if 'semanticscholar.org' in url_lower or 'pdfs.semanticscholar.org' in url_lower:
+        return '.pdf'
+    
+    # SSRN
+    if 'ssrn.com' in url_lower or 'papers.ssrn.com' in url_lower:
+        if 'abstract' in url_lower or 'papers.cfm' in url_lower:
+            return '.pdf'
+    
+    # ===== GOVERNMENT & INSTITUTIONAL =====
+    
+    # US Congress & Government
+    if any(domain in url_lower for domain in [
+        'congress.gov', 'govinfo.gov', 'cbo.gov', 'gao.gov', 
+        'federalregister.gov', 'supremecourt.gov', 'uscourts.gov'
+    ]):
+        return '.pdf'
+    
+    # ===== UNIVERSITY REPOSITORIES =====
+    
+    # Common university repository patterns
+    university_patterns = [
+        'dspace', 'repository', 'dash', 'ecommons', 'scholarworks', 
+        'deepblue', 'handle', 'bitstream', 'viewcontent.cgi'
+    ]
+    if any(pattern in url_lower for pattern in university_patterns):
+        return '.pdf'
+    
+    # ===== PUBLISHERS & JOURNALS =====
+    
+    # Major academic publishers
+    publisher_domains = [
+        'springer.com', 'wiley.com', 'nature.com', 'sciencemag.org',
+        'plos.org', 'mdpi.com', 'frontiersin.org', 'elsevier.com',
+        'tandfonline.com', 'sagepub.com', 'ieee.org'
+    ]
+    if any(domain in url_lower for domain in publisher_domains):
+        return '.pdf'
+    
+    # ===== MEDICAL & BIOMEDICAL =====
+    
+    # NCBI, PubMed, PMC
+    if any(domain in url_lower for domain in ['ncbi.nlm.nih.gov', 'pubmed.ncbi.nlm.nih.gov']):
+        return '.pdf'
+    
+    # ===== INTERNATIONAL REPOSITORIES =====
+    
+    # European and international
+    international_patterns = [
+        'hal.archives-ouvertes.fr', 'orbit.dtu.dk', 'pure.', 'research-repository',
+        'eprints.', 'ir.library.', 'digitalcommons.'
+    ]
+    if any(pattern in url_lower for pattern in international_patterns):
+        return '.pdf'
+    
+    # ===== CLOUD STORAGE & CDNs =====
+    
+    # Google Drive
+    if 'drive.google.com' in url_lower:
+        # Try to detect from URL parameters or context
+        if 'export=download' in url_lower:
+            return '.pdf'  # Default assumption
+        return '.pdf'  # Most shared academic docs are PDFs
+    
+    # Dropbox
+    if 'dropbox.com' in url_lower:
+        # Extract filename from URL
+        match = re.search(r'/([^/]+\.[a-zA-Z]{2,5})', url)
+        if match:
+            filename = match.group(1)
+            ext = os.path.splitext(filename)[1].lower()
+            if ext in ['.pdf', '.docx', '.doc', '.epub', '.txt']:
+                return ext
+        return '.pdf'  # Default
+    
+    # OneDrive
+    if 'onedrive.live.com' in url_lower or '1drv.ms' in url_lower:
+        return '.pdf'  # Default assumption
+    
+    # ===== DIRECT FILE EXTENSIONS =====
+    
+    # Check for direct file extensions
+    direct_extensions = ['.pdf', '.docx', '.doc', '.epub', '.txt', '.rtf', '.odt']
+    for ext in direct_extensions:
+        if url_lower.endswith(ext):
+            return ext
+        # Also check with query parameters
+        if f'{ext}?' in url_lower or f'{ext}#' in url_lower:
+            return ext
+    
+    # ===== CONTENT-TYPE GUESSING FROM URL PATTERNS =====
+    
+    # PDF indicators in URL
+    pdf_indicators = [
+        '/pdf/', '.pdf', 'format=pdf', 'type=pdf', 'download=pdf',
+        'export=pdf', 'view=pdf', 'filetype/pdf', 'document.pdf'
+    ]
+    if any(indicator in url_lower for indicator in pdf_indicators):
+        return '.pdf'
+    
+    # Word document indicators
+    doc_indicators = ['/doc/', '.docx', '.doc', 'format=docx', 'type=docx']
+    if any(indicator in url_lower for indicator in doc_indicators):
+        return '.docx'
+    
+    # ===== FALLBACK: PARSE URL PATH =====
+    
+    try:
+        parsed_url = urllib.parse.urlparse(url)
+        path = parsed_url.path
+        
+        if path:
+            # Get the last segment that looks like a filename
+            segments = [seg for seg in path.split('/') if seg]
+            for segment in reversed(segments):
+                if '.' in segment:
+                    # Extract potential extension
+                    potential_ext = os.path.splitext(segment)[1].lower()
+                    if potential_ext in ['.pdf', '.docx', '.doc', '.epub', '.txt', '.rtf']:
+                        return potential_ext
+                    
+        # Check query parameters for filename
+        query_params = urllib.parse.parse_qs(parsed_url.query)
+        for param_name, param_values in query_params.items():
+            for value in param_values:
+                if '.' in value:
+                    potential_ext = os.path.splitext(value)[1].lower()
+                    if potential_ext in ['.pdf', '.docx', '.doc', '.epub', '.txt', '.rtf']:
+                        return potential_ext
+                        
+    except Exception as e:
+        logger.debug(f"URL parsing failed for {url}: {e}")
+    
+    # ===== ULTIMATE FALLBACK =====
+    
+    # If it's an academic/research domain, assume PDF
+    academic_tlds = ['.edu', '.gov', '.org']
+    research_keywords = [
+        'research', 'academic', 'scholar', 'journal', 'paper', 'publication',
+        'article', 'conference', 'proceedings', 'thesis', 'dissertation'
+    ]
+    
+    if (any(tld in url_lower for tld in academic_tlds) or 
+        any(keyword in url_lower for keyword in research_keywords)):
+        return '.pdf'
+    
+    # Final fallback - assume PDF for unknown academic content
+    return '.pdf'
+
+
+def get_clean_filename_from_url(url: str, extension: str) -> str:
+    """
+    Generate a clean filename from URL
+    """
+    try:
+        parsed_url = urllib.parse.urlparse(url)
+        path = parsed_url.path
+        
+        # Try to extract meaningful filename
+        if path:
+            segments = [seg for seg in path.split('/') if seg and not seg.isdigit()]
+            
+            # Look for segments that look like filenames
+            for segment in reversed(segments):
+                if len(segment) > 3 and ('.' in segment or '_' in segment or '-' in segment):
+                    # Clean the segment
+                    clean_name = re.sub(r'[^\w\-_.]', '_', segment)
+                    clean_name = re.sub(r'_+', '_', clean_name).strip('_')
+                    if len(clean_name) > 3:
+                        # Remove existing extension and add detected one
+                        base_name = os.path.splitext(clean_name)[0]
+                        return f"{base_name}{extension}"
+            
+            # Use the last meaningful segment
+            if segments:
+                last_segment = segments[-1]
+                clean_name = re.sub(r'[^\w\-_]', '_', last_segment)
+                clean_name = re.sub(r'_+', '_', clean_name).strip('_')
+                if len(clean_name) > 3:
+                    return f"{clean_name}{extension}"
+        
+        # Extract from domain
+        domain = parsed_url.netloc.split('.')[0]
+        if domain and len(domain) > 2:
+            return f"{domain}_document_{uuid.uuid4().hex[:8]}{extension}"
+            
+    except Exception:
+        pass
+    
+    # Final fallback
+    return f"document_{uuid.uuid4().hex[:8]}{extension}"
+
+
 
 # ——— Task 1: Ingest (Fully Async) ———————————————————————————————————————————
 
@@ -821,8 +1038,12 @@ async def _download_and_prep_doc(client: httpx.AsyncClient, url: str, project_id
                 return None
 
             content_hash = _calculate_stream_hash(content_stream)
-            
-            ext = os.path.splitext(url)[1].lower() or '.bin'
+
+            # ext = get_file_extension_from_url(url)   # os.path.splitext(url)[1].lower() or '.bin'
+            # s3_key = f"{project_id}/{uuid.uuid4()}{ext}"
+            # Enhanced detection
+            ext = get_file_extension_from_url(url)
+            filename = get_clean_filename_from_url(url, ext)
             s3_key = f"{project_id}/{uuid.uuid4()}{ext}"
             
             # Stream directly to S3 && AWS CloudFront from the in-memory buffer
@@ -915,20 +1136,65 @@ async def _parse_document_async(self, source_id: str, cdn_url: str, project_id: 
             splitter = RecursiveCharacterTextSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)
             
             all_texts, all_metadatas = [], []
-            # stream_documents is a custom method assumed on the loader
-            for page_num, page in enumerate(loader.stream_documents()):
-                for chunk_idx, chunk in enumerate(splitter.split_documents([page])):
-                    cleaned_content = _clean_text(chunk.page_content)
-                    if not cleaned_content:
-                        continue
+
+            # Pass the file_buffer as the source parameter
+            logger.info(f"🔄 Starting document streaming for {source_id}")
+            try:
+                # Reset buffer position before streaming
+                file_buffer.seek(0)
+                
+                # CORRECT CALL: Pass file_buffer to stream_documents
+                for page_num, page in enumerate(loader.stream_documents(file_buffer)):
+                    gevent.sleep(0)  # Yield control during processing
                     
-                    all_texts.append(cleaned_content)
-                    all_metadatas.append({
-                        **chunk.metadata,
-                        'page_number': page_num,
-                        'chunk_index': chunk_idx
-                    })
-            # update telemetry
+                    # Split each page into chunks
+                    for chunk_idx, chunk in enumerate(splitter.split_documents([page])):
+                        cleaned_content = _clean_text(chunk.page_content)
+                        if not cleaned_content:
+                            continue
+                        
+                        all_texts.append(cleaned_content)
+                        all_metadatas.append({
+                            **chunk.metadata,
+                            'page_number': page_num,
+                            'chunk_index': chunk_idx
+                        })
+                        
+                        # Periodic yield for very large documents
+                        if len(all_texts) % 50 == 0:
+                            gevent.sleep(0)
+                
+                logger.info(f"✅ Successfully streamed {len(all_texts)} chunks from {page_num + 1} pages")
+                
+            except Exception as loader_error:
+                logger.error(f"❌ Streaming failed: {loader_error}")
+                
+                # Fallback: Try load_documents method if streaming fails
+                logger.info("🔄 Falling back to load_documents method")
+                file_buffer.seek(0)
+                
+                try:
+                    documents = loader.load_documents(file_buffer)
+                    for doc_idx, doc in enumerate(documents):
+                        chunks = splitter.split_documents([doc])
+                        for chunk_idx, chunk in enumerate(chunks):
+                            cleaned_content = _clean_text(chunk.page_content)
+                            if not cleaned_content:
+                                continue
+                            
+                            all_texts.append(cleaned_content)
+                            all_metadatas.append({
+                                **chunk.metadata,
+                                'page_number': doc_idx,
+                                'chunk_index': chunk_idx
+                            })
+                    
+                    logger.info(f"✅ Fallback successful: {len(all_texts)} chunks")
+                    
+                except Exception as fallback_error:
+                    logger.error(f"❌ Both streaming and fallback failed: {fallback_error}")
+                    raise loader_error  # Re-raise original error
+            
             doc_metrics.parse_time_ms = parse_timer.elapsed_ms
             doc_metrics.total_chunks = len(all_texts)
 

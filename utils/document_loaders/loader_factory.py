@@ -1,5 +1,3 @@
-"""For the new 'True In-Memory Streaming' method"""
-
 # utils/document_loaders/loader_factory.py
 
 import os
