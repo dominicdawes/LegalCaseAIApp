@@ -1334,7 +1334,7 @@ def _parse_document_gevent(self, source_id: str, cdn_url: str, project_id: str) 
             splitter = RecursiveCharacterTextSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)
             
             all_texts, all_metadatas = [], []
-            for page_num, page in enumerate(loader.stream_documents()):
+            for page_num, page in enumerate(loader.stream_documents(file_buffer)):
                 # Yield control during processing
                 gevent.sleep(0)
                 
