@@ -79,6 +79,15 @@ DB_DSN = os.getenv("POSTGRES_DSN_POOL") # e.g., Supabase -> Connection -> Get Di
 DB_POOL_MIN_SIZE = 2
 DB_POOL_MAX_SIZE = 5
 
+DEFAULT_HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+    'Accept': 'application/pdf,text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+    'Accept-Language': 'en-US,en;q=0.5',
+    'Accept-Encoding': 'gzip, deflate',
+    'Connection': 'keep-alive',
+    'Upgrade-Insecure-Requests': '1'
+}
+
 # ——— Data Structures (Unchanged from v5) ——————————————————————————————————————————
 
 class ProcessingStatus(Enum):
@@ -530,7 +539,11 @@ async def _process_document_async(file_urls: List[str], metadata: Dict[str, Any]
 async def _download_and_prep_doc(client: httpx.AsyncClient, url: str, project_id: str, user_id: str) -> Optional[Dict]:
     """Helper to download to memory, hash, stream to S3, and prep data."""
     try:
-        async with client.stream("GET", url) as response:
+        # Define headers for anti-bot detection
+        headers = DEFAULT_HEADERS
+
+        # Define client stream
+        async with client.stream("GET", url, headers=headers) as response:
             response.raise_for_status()
             
             # Stream response into an in-memory buffer
@@ -583,7 +596,7 @@ def parse_document_task(self, source_id: str, cdn_url: str, project_id: str) -> 
     
 async def _parse_document_async(self, source_id: str, cdn_url: str, project_id: str) -> Dict[str, Any]:
     """
-    v6 Parsing Task:
+    Parsing Task:
     - Streams document directly into an in-memory buffer (NO temp file).
     - Splits parsed text into semantic chunks
     - Uses token-aware adaptive batching to maximize embedding efficiency.
@@ -597,8 +610,11 @@ async def _parse_document_async(self, source_id: str, cdn_url: str, project_id: 
     try:
         # Phase 1: True In-Memory Streaming (No Disk I/O)
         with Timer() as download_timer:
+            # Define headers for anti-bot detection
+            headers = DEFAULT_HEADERS
+
             async with httpx.AsyncClient(timeout=120.0) as client:
-                async with client.stream("GET", cdn_url) as response:
+                async with client.stream("GET", cdn_url, headers=headers) as response:
                     response.raise_for_status()
                     async for chunk in response.aiter_bytes():
                         file_buffer.write(chunk)
@@ -639,6 +655,7 @@ async def _parse_document_async(self, source_id: str, cdn_url: str, project_id: 
             current_batch_texts, current_batch_metas = [], []
             current_batch_tokens = 0
 
+            logger.info(f"💾 Kicking off embedding task for source_id {source_id} ...")
             for i, text in enumerate(all_texts):
                 token_count = len(tokenizer.encode(text))
                 
@@ -699,13 +716,14 @@ def embed_batch_task(self, source_id: str, project_id: str, texts: List[str], me
 
 async def _embed_batch_async(self, source_id: str, project_id: str, texts: List[str], metadatas: List[Dict]):
     """
-    v6 Embedding Task:
+    Embedding Task:
     - Fully async with non-blocking DB calls via asyncpg.
     - Uses a shared connection pool and highly efficient `copy_records_to_table`.
     - Retries with exponential backoff and uses a circuit breaker for OpenAI calls.
     """
     try:
         # 1. Generate Embeddings (with retry and circuit breaker)
+        logger.info(f"🤖 Genrating embeddings...")
         embeddings = await _embed_with_retry(texts)
         
         # 2. Prepare Data for DB
