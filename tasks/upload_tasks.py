@@ -1,40 +1,65 @@
 """v6 By Gemini 2.5 Pro bc Claude hit rate/context limits"""
 
+# ===== STANDARD LIBRARY IMPORTS =====
 import os
 import sys
 import uuid
 import tempfile
-from dotenv import load_dotenv
 import atexit
 import signal
-import asyncio
 import logging
 import threading
 import io
 import json
 import hashlib
+import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import List, Dict, Any, Optional, AsyncGenerator, Tuple
 from enum import Enum
 from datetime import datetime, timezone, timedelta
-import psutil
-import time
 
-# Third-party imports
+# ===== ENVIRONMENT & CONFIGURATION =====
+from dotenv import load_dotenv
+
+# ===== ASYNC & CONCURRENCY =====
+import asyncio
+import gevent
+import gevent.socket
+
+# ===== NETWORKING & HTTP =====
+import requests
+from requests.adapters import HTTPAdapter
 import httpx
-import tiktoken
+
+# ===== RETRY & RESILIENCE (with aliases to avoid conflicts) =====
+from urllib3.util.retry import Retry as UrllibRetry
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type 
+from pybreaker import CircuitBreaker
+# Note: Celery's Retry is imported separately below to avoid naming conflicts
+
+# ===== DATABASE =====
 import asyncpg
+import psycopg2
+from psycopg2.pool import ThreadedConnectionPool
+from psycopg2.extras import execute_batch
+
+# ===== CELERY & TASK QUEUE =====
 from celery import chord, group
 from celery.signals import worker_init, worker_shutdown
 from celery.utils.log import get_task_logger
-from celery.exceptions import MaxRetriesExceededError, Retry
+from celery.exceptions import MaxRetriesExceededError
+from celery.exceptions import Retry as CeleryRetry
+
+# ===== MACHINE LEARNING & TEXT PROCESSING =====
+import tiktoken
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_openai import OpenAIEmbeddings
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type 
-from pybreaker import CircuitBreaker   
 
-# Project modules
+# ===== MONITORING & METRICS =====
+import psutil
+
+# ===== PROJECT MODULES =====
 from tasks.celery_app import celery_app
 from utils.s3_utils import upload_to_s3, s3_client
 from utils.cloudfront_utils import get_cloudfront_url
@@ -44,13 +69,11 @@ from utils.metrics import MetricsCollector, Timer
 from utils.connection_pool import ConnectionPoolManager
 from utils.memory_manager import MemoryManager # Kept for health checks
 
-# ——— Logging ————————————————————————————————————————————————————
+# ——— Logging & Env Load ————————————————————————————————————————————————————
 logger = get_task_logger(__name__)
+load_dotenv()
 
 # ——— Configuration & Constants ————————————————————————————————————————————————————
-
-# Environment variables
-load_dotenv()
 
 # Queue configuration
 INGEST_QUEUE = 'ingest'
@@ -224,6 +247,7 @@ atexit.register(sync_close_db_pool)
 
 # ——— 4. UPDATED get_db_pool FUNCTION ————————————————————————————————
 
+# Get Asynchronous DB pool
 async def get_db_pool() -> asyncpg.Pool:
     """Initializes and returns the asyncpg connection pool with connection testing."""
     global db_pool
@@ -357,6 +381,28 @@ async def get_db_pool() -> asyncpg.Pool:
     
     return db_pool
 
+# Create a sync database connection pool for gevent
+sync_db_pool = None
+
+# Get Synchronous DB pool
+def get_sync_db_pool():
+    """Get or create a synchronous database connection pool for gevent"""
+    global sync_db_pool
+    if sync_db_pool is None:
+        import urllib.parse
+        parsed = urllib.parse.urlparse(DB_DSN)
+        sync_db_pool = ThreadedConnectionPool(
+            minconn=DB_POOL_MIN_SIZE,
+            maxconn=DB_POOL_MAX_SIZE,
+            host=parsed.hostname,
+            port=parsed.port or 5432,
+            database=parsed.path[1:],  # Remove leading slash
+            user=parsed.username,
+            password=parsed.password,
+            application_name='celery_worker_gevent'
+        )
+    return sync_db_pool
+
 # ——— 5. OPTIONAL: MANUAL POOL RESET TASK ————————————————————————————————
 
 @celery_app.task(bind=True)
@@ -368,6 +414,32 @@ def reset_db_pool_task(self):
     except Exception as e:
         logger.error(f"❌ Failed to reset database pool: {e}")
         return {"status": "error", "message": str(e)}
+
+# ——— 6. Retry Strategies ————————————————————————————————
+
+# HTTP Retry Strategy (for requests library)
+HTTP_RETRY_STRATEGY = UrllibRetry(
+    total=3,
+    backoff_factor=1,
+    status_forcelist=[429, 500, 502, 503, 504],
+    allowed_methods=["GET", "POST"]  # Be explicit about retry methods
+)
+
+# Celery Task Retry Configuration
+CELERY_RETRY_CONFIG = {
+    'max_retries': 5,
+    'default_retry_delay': 5,
+    'retry_backoff': True,
+    'retry_backoff_max': 300,  # 5 minutes max
+    'retry_jitter': True
+}
+
+# Tenacity Retry Decorator
+embedding_retry = retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=4, max=10),
+    retry=retry_if_exception_type((httpx.RequestError, httpx.HTTPStatusError))
+)
 
 # ——— Global Production Instances (Initialized once per worker) —————————————————————
 
@@ -409,7 +481,7 @@ def _calculate_stream_hash(stream: io.BytesIO) -> str:
     return sha256_hash.hexdigest()
 
 async def _update_document_status(doc_id: str, status: ProcessingStatus, error_message: Optional[str] = None):
-    """Async helper to update a document's status in the database."""
+    """Async helper to update a document's status in the database (for asyncio)"""
     logger.info(f"📋 Doc {doc_id[:8]}... → {status.value}")
     pool = await get_db_pool()
     async with pool.acquire() as conn:
@@ -421,6 +493,34 @@ async def _update_document_status(doc_id: str, status: ProcessingStatus, error_m
             """,
             status.value, error_message, uuid.UUID(doc_id)
         )
+
+def _update_document_status_sync(doc_id: str, status: ProcessingStatus, error_message: str = None):
+    """Synchronous version of document status update helper (for gevent)"""
+    logger.info(f"📋 Doc {doc_id[:8]}... → {status.value}")
+    pool = get_sync_db_pool()
+    conn = pool.getconn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE document_sources
+                SET vector_embed_status = %s, error_message = %s, updated_at = NOW()
+                WHERE id = %s
+                """,
+                (status.value, error_message, doc_id)
+            )
+            conn.commit()
+    finally:
+        pool.putconn(conn)
+
+def create_http_session() -> requests.Session:
+    """Helper to create a requests session with retry strategy"""
+    session = requests.Session()
+    adapter = HTTPAdapter(max_retries=HTTP_RETRY_STRATEGY)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    return session
+
 
 # Global Metrics Collector
 logger.info("📊 Initializing metrics collector...")
@@ -577,23 +677,36 @@ async def _download_and_prep_doc(client: httpx.AsyncClient, url: str, project_id
         logger.error(f"Failed to download and prep {url}: {e}")
         return None
 
-# ——— Task 2: For one document → Parse, batch, dispatch to emmbed (v6 - In-Memory & Token-Aware) ————————————————————————————————
-
+# ——— Task 2: For one document → Parse, batch, dispatch to emmbed (In-Memory & Token-Aware) ————————————————————————————————
+    
 # @celery_app.task(bind=True, queue=PARSE_QUEUE, acks_late=True)
 # def parse_document_task(self, source_id: str, cdn_url: str, project_id: str) -> Dict[str, Any]:
-#     return asyncio.run(_parse_document_async(self, source_id, cdn_url, project_id))
+#     # Get or create event loop
+#     try:
+#         loop = asyncio.get_event_loop()
+#     except RuntimeError:
+#         loop = asyncio.new_event_loop()
+#         asyncio.set_event_loop(loop)
     
-@celery_app.task(bind=True, queue=PARSE_QUEUE, acks_late=True)
+#     return loop.run_until_complete(_parse_document_async(self, source_id, cdn_url, project_id))
+
+@celery_app.task(bind=True, queue=PARSE_QUEUE, acks_late=True, **CELERY_RETRY_CONFIG)
 def parse_document_task(self, source_id: str, cdn_url: str, project_id: str) -> Dict[str, Any]:
-    # Get or create event loop
+    """
+    Gevent-optimized Parsing Task:
+    - Uses gevent for concurrent I/O operations
+    - Streams document directly into an in-memory buffer (NO temp file)
+    - Splits parsed text into semantic chunks
+    - Uses token-aware adaptive batching to maximize embedding efficiency
+    - Synchronous database updates optimized for gevent
+    - Fire off embed task celery group
+    """
     try:
-        loop = asyncio.get_event_loop()
-    except RuntimeError:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-    
-    return loop.run_until_complete(_parse_document_async(self, source_id, cdn_url, project_id))
-    
+        return _parse_document_gevent(self, source_id, cdn_url, project_id)
+    except Exception as exc:
+        logger.error(f"Parse task failed for {source_id}: {exc}")
+        raise  # Let Celery handle the retry automatically with CELERY_RETRY_CONFIG
+
 async def _parse_document_async(self, source_id: str, cdn_url: str, project_id: str) -> Dict[str, Any]:
     """
     Parsing Task:
@@ -601,6 +714,7 @@ async def _parse_document_async(self, source_id: str, cdn_url: str, project_id: 
     - Splits parsed text into semantic chunks
     - Uses token-aware adaptive batching to maximize embedding efficiency.
     - Fully async database updates.
+    - Dispatch embed task celery group
     """
     await _update_document_status(source_id, ProcessingStatus.PARSING)
     
@@ -705,14 +819,139 @@ async def _parse_document_async(self, source_id: str, cdn_url: str, project_id: 
         await _update_document_status(source_id, ProcessingStatus.FAILED_PARSING, str(e))
         raise
 
-# ——— Task 3: Embed (v6 - Fully Async DB) ——————————————————————————————————————————
+def _parse_document_gevent(self, source_id: str, cdn_url: str, project_id: str) -> Dict[str, Any]:
+    """
+    Gevent-based parsing implementation
+    """
+    _update_document_status_sync(source_id, ProcessingStatus.PARSING)
+    
+    file_buffer = io.BytesIO()
+    doc_metrics = DocumentMetrics(doc_id=source_id)
+
+    try:
+        # Phase 1: Gevent-optimized streaming download
+        with Timer() as download_timer:
+            # Helper to create HTTP request sessions with retry strategy
+            session = create_http_session()
+            
+            # Stream the file with gevent-friendly requests
+            response = session.get(cdn_url, headers=DEFAULT_HEADERS, stream=True, timeout=120)
+            response.raise_for_status()
+            
+            # Stream into memory buffer
+            for chunk in response.iter_content(chunk_size=8192):
+                if chunk:
+                    file_buffer.write(chunk)
+                    # Yield control to other greenlets occasionally
+                    gevent.sleep(0)
+            
+            file_buffer.seek(0)
+            doc_metrics.download_time_ms = download_timer.elapsed_ms
+            doc_metrics.file_size_bytes = file_buffer.getbuffer().nbytes
+
+        # Phase 2: Process with Loader and Splitter (CPU-bound, but fast)
+        with Timer() as parse_timer:
+            loader = get_loader_for(filename=cdn_url, file_like_object=file_buffer)
+            splitter = RecursiveCharacterTextSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)
+            
+            all_texts, all_metadatas = [], []
+            for page_num, page in enumerate(loader.stream_documents()):
+                # Yield control during processing
+                gevent.sleep(0)
+                
+                for chunk_idx, chunk in enumerate(splitter.split_documents([page])):
+                    cleaned_content = _clean_text(chunk.page_content)
+                    if not cleaned_content:
+                        continue
+                    
+                    all_texts.append(cleaned_content)
+                    all_metadatas.append({
+                        **chunk.metadata,
+                        'page_number': page_num,
+                        'chunk_index': chunk_idx
+                    })
+            
+            doc_metrics.parse_time_ms = parse_timer.elapsed_ms
+            doc_metrics.total_chunks = len(all_texts)
+
+        # Phase 3: Token-Aware Adaptive Batching
+        with Timer() as batch_timer:
+            embedding_tasks = []
+            current_batch_texts, current_batch_metas = [], []
+            current_batch_tokens = 0
+
+            logger.info(f"💾 Kicking off embedding task for source_id {source_id}...")
+            
+            for i, text in enumerate(all_texts):
+                token_count = len(tokenizer.encode(text))
+                
+                # If adding the next chunk exceeds the token limit, dispatch the current batch
+                if current_batch_tokens + token_count > OPENAI_MAX_TOKENS_PER_BATCH and current_batch_texts:
+                    task_sig = embed_batch_task.s(source_id, project_id, current_batch_texts, current_batch_metas)
+                    embedding_tasks.append(task_sig)
+                    current_batch_texts, current_batch_metas, current_batch_tokens = [], [], 0
+
+                current_batch_texts.append(text)
+                current_batch_metas.append(all_metadatas[i])
+                current_batch_tokens += token_count
+                
+                # Yield control during batching
+                if i % 100 == 0:
+                    gevent.sleep(0)
+            
+            # Dispatch the final batch if it exists
+            if current_batch_texts:
+                task_sig = embed_batch_task.s(source_id, project_id, current_batch_texts, current_batch_metas)
+                embedding_tasks.append(task_sig)
+            
+            doc_metrics.total_batches = len(embedding_tasks)
+            doc_metrics.chunk_time_ms = batch_timer.elapsed_ms
+
+        # Phase 4: Database Update & Task Scheduling
+        pool = get_sync_db_pool()
+        conn = pool.getconn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE document_sources
+                    SET vector_embed_status = %s, total_chunks = %s, total_batches = %s, 
+                        processing_metadata = processing_metadata || %s::jsonb
+                    WHERE id = %s
+                    """,
+                    (ProcessingStatus.EMBEDDING.value, doc_metrics.total_chunks, 
+                        doc_metrics.total_batches, json.dumps(doc_metrics.to_dict()), source_id)
+                )
+                conn.commit()
+        finally:
+            pool.putconn(conn)
+        
+        # Schedule embedding tasks
+        if embedding_tasks:
+            chord(group(embedding_tasks), queue=EMBED_QUEUE)(finalize_embeddings.s(source_id).set(queue=FINAL_QUEUE))
+        else:
+            finalize_embeddings.apply_async(([], source_id), queue=FINAL_QUEUE)
+
+        logger.info(f"Parsing complete for {source_id}: {doc_metrics.total_chunks} chunks in {doc_metrics.total_batches} token-aware batches.")
+        return {'source_id': source_id, 'status': 'SUCCESS', 'batches_created': doc_metrics.total_batches}
+
+    except Exception as e:
+        logger.error(f"Parsing failed for {source_id}: {e}", exc_info=True)
+        _update_document_status_sync(source_id, ProcessingStatus.FAILED_PARSING, str(e))
+        raise
+
+# ——— Task 3: Embed (Fully Async DB) ——————————————————————————————————————————
 
 @celery_app.task(
     bind=True, queue=EMBED_QUEUE, max_retries=MAX_RETRIES, acks_late=True,
-    default_retry_delay=DEFAULT_RETRY_DELAY, rate_limit=RATE_LIMIT
+    default_retry_delay=DEFAULT_RETRY_DELAY, rate_limit=RATE_LIMIT, **CELERY_RETRY_CONFIG
 )
 def embed_batch_task(self, source_id: str, project_id: str, texts: List[str], metadatas: List[Dict]):
-    return asyncio.run(_embed_batch_async(self, source_id, project_id, texts, metadatas))
+    try:
+        return asyncio.run(_embed_batch_async(self, source_id, project_id, texts, metadatas))
+    except Exception as exc:
+        logger.warning(f"Embedding batch for {source_id} failed, letting Celery handle retry: {exc}")
+        raise  # Let Celery handle the retry automatically
 
 async def _embed_batch_async(self, source_id: str, project_id: str, texts: List[str], metadatas: List[Dict]):
     """
@@ -761,12 +1000,8 @@ async def _embed_batch_async(self, source_id: str, project_id: str, texts: List[
         raise self.retry(exc=exc, countdown=DEFAULT_RETRY_DELAY * (RETRY_BACKOFF_MULTIPLIER ** self.request.retries))
 
 # optional remove the exclude arg
-@CircuitBreaker(fail_max=5, reset_timeout=60, exclude=[Exception])
-@retry(
-    stop=stop_after_attempt(3), 
-    wait=wait_exponential(multiplier=1, min=4, max=10),
-    retry=retry_if_exception_type(httpx.RequestError)
-)
+@CircuitBreaker(fail_max=5, reset_timeout=60) # EDIT: Removed the exclude parameter
+@embedding_retry
 async def _embed_with_retry(texts: List[str]) -> List[List[float]]:
     """Wrapper for OpenAI embedding call with circuit breaker and tenacity retry."""
     return await embedding_model.aembed_documents(texts)
@@ -780,7 +1015,7 @@ def finalize_embeddings(self, batch_results: List[Dict[str, Any]], source_id: st
 
 async def _finalize_embeddings_async(self, batch_results: List[Dict[str, Any]], source_id: str) -> Dict[str, Any]:
     """
-    v6 Finalization Task:
+    Finalization Task:
     - Uses asyncpg for all database reads and writes.
     - Preserves the detailed completion metrics and performance analysis from v5.
     """
