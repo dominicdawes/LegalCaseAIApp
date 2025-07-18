@@ -43,7 +43,8 @@ botocore
 # Supabase & PG dependencies
 supabase==2.5.0 # supabase (will auto-install compatible postgrest-py)
 # postgrest-py
-asyncpg    
+asyncpg
+psycopg2-binary==2.9.9
 
 # RAG dependencies
 langchain==0.2.5 # langchain 
