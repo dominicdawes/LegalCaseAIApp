@@ -426,13 +426,13 @@ HTTP_RETRY_STRATEGY = UrllibRetry(
 )
 
 # Celery Task Retry Configuration
-CELERY_RETRY_CONFIG = {
-    'max_retries': 5,
-    'default_retry_delay': 5,
-    'retry_backoff': True,
-    'retry_backoff_max': 300,  # 5 minutes max
-    'retry_jitter': True
-}
+# CELERY_RETRY_CONFIG = {
+#     'max_retries': 5,
+#     'default_retry_delay': 5,
+#     'retry_backoff': True,
+#     'retry_backoff_max': 300,  # 5 minutes max
+#     'retry_jitter': True
+# }
 
 # Tenacity Retry Decorator
 embedding_retry = retry(
@@ -690,7 +690,13 @@ async def _download_and_prep_doc(client: httpx.AsyncClient, url: str, project_id
     
 #     return loop.run_until_complete(_parse_document_async(self, source_id, cdn_url, project_id))
 
-@celery_app.task(bind=True, queue=PARSE_QUEUE, acks_late=True, **CELERY_RETRY_CONFIG)
+@celery_app.task(
+    bind=True, 
+    queue=PARSE_QUEUE, 
+    acks_late=True,
+    autoretry_for=(Exception,),
+    retry_kwargs={'max_retries': MAX_RETRIES, 'countdown': DEFAULT_RETRY_DELAY}
+)
 def parse_document_task(self, source_id: str, cdn_url: str, project_id: str) -> Dict[str, Any]:
     """
     Gevent-optimized Parsing Task:
@@ -943,8 +949,12 @@ def _parse_document_gevent(self, source_id: str, cdn_url: str, project_id: str) 
 # ——— Task 3: Embed (Fully Async DB) ——————————————————————————————————————————
 
 @celery_app.task(
-    bind=True, queue=EMBED_QUEUE, max_retries=MAX_RETRIES, acks_late=True,
-    default_retry_delay=DEFAULT_RETRY_DELAY, rate_limit=RATE_LIMIT, **CELERY_RETRY_CONFIG
+    bind=True, 
+    queue=EMBED_QUEUE, 
+    acks_late=True,
+    rate_limit=RATE_LIMIT,
+    autoretry_for=(Exception,),
+    retry_kwargs={'max_retries': MAX_RETRIES, 'countdown': DEFAULT_RETRY_DELAY}
 )
 def embed_batch_task(self, source_id: str, project_id: str, texts: List[str], metadatas: List[Dict]):
     try:
