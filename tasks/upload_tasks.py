@@ -1433,10 +1433,15 @@ def _parse_document_gevent(self, source_id: str, cdn_url: str, project_id: str) 
 )
 def embed_batch_task(self, source_id: str, project_id: str, texts: List[str], metadatas: List[Dict]):
     try:
-        return asyncio.run(_embed_batch_async(self, source_id, project_id, texts, metadatas))
+        return _embed_batch_gevent(self, source_id, project_id, texts, metadatas)
     except Exception as exc:
         logger.warning(f"Embedding batch for {source_id} failed, letting Celery handle retry: {exc}")
-        raise  # Let Celery handle the retry automatically
+        raise
+    # try:
+    #     return asyncio.run(_embed_batch_async(self, source_id, project_id, texts, metadatas))
+    # except Exception as exc:
+    #     logger.warning(f"Embedding batch for {source_id} failed, letting Celery handle retry: {exc}")
+    #     raise  # Let Celery handle the retry automatically
 
 async def _embed_batch_async(self, source_id: str, project_id: str, texts: List[str], metadatas: List[Dict]):
     """
@@ -1468,15 +1473,7 @@ async def _embed_batch_async(self, source_id: str, project_id: str, texts: List[
         if not records_to_insert:
             return {'processed_count': 0, 'token_count': 0}
 
-        # # 3. Fully Async Bulk Insert using copy_records_to_table for max performance
-        # pool = await get_async_db_pool()      # BULK insert use ASYNC pgbouncer pool
-        # async with pool.acquire() as conn:
-        #     await conn.copy_records_to_table(
-        #         'document_vector_store',
-        #         records=records_to_insert,
-        #         columns=('id', 'source_id', 'project_id', 'content', 'metadata', 'embedding', 'num_tokens', 'created_at'),
-        #         timeout=120
-        #     )
+
         # 3. CHANGE: Use executemany instead of copy_records_to_table
         pool = await get_async_db_pool()
         async with pool.acquire() as conn:
@@ -1492,6 +1489,57 @@ async def _embed_batch_async(self, source_id: str, project_id: str, texts: List[
         logger.warning(f"Embedding batch for {source_id} failed (attempt {self.request.retries + 1}), retrying: {exc}")
         raise self.retry(exc=exc, countdown=DEFAULT_RETRY_DELAY * (RETRY_BACKOFF_MULTIPLIER ** self.request.retries))
 
+def _embed_batch_gevent(self, source_id: str, project_id: str, texts: List[str], metadatas: List[Dict]):
+    """
+    Gevent-based embedding implementation - more reliable with Celery
+    """
+    try:
+        # 1. Generate Embeddings using sync OpenAI client
+        logger.info(f"🤖 Generating embeddings...")
+        
+        # Use synchronous OpenAI client instead of async
+        embeddings = embedding_model.embed_documents(texts)  # ← SYNC method (no await)
+        
+        # 2. Prepare Data for DB
+        records_to_insert = []
+        total_tokens = 0
+        for text, meta, vec in zip(texts, metadatas, embeddings):
+            if len(vec) != EXPECTED_EMBEDDING_LEN:
+                logger.warning(f"Skipping malformed embedding for source {source_id}")
+                continue
+            
+            token_count = len(tokenizer.encode(text))
+            total_tokens += token_count
+            records_to_insert.append((
+                uuid.uuid4(), uuid.UUID(source_id), uuid.UUID(project_id), text, 
+                json.dumps(meta), vec, token_count, datetime.now(timezone.utc)
+            ))
+
+        if not records_to_insert:
+            return {'processed_count': 0, 'token_count': 0}
+
+        # 3. Use sync database pool (like Task 2)
+        pool = get_sync_db_pool()
+        conn = pool.getconn()
+        try:
+            with conn.cursor() as cur:
+                # Use executemany for bulk insert
+                cur.executemany(
+                    '''INSERT INTO document_vector_store 
+                    (id, source_id, project_id, content, metadata, embedding, num_tokens, created_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)''',
+                    records_to_insert
+                )
+                conn.commit()
+        finally:
+            pool.putconn(conn)
+        
+        return {'processed_count': len(records_to_insert), 'token_count': total_tokens}
+
+    except Exception as exc:
+        logger.warning(f"Embedding batch for {source_id} failed (attempt {self.request.retries + 1}), retrying: {exc}")
+        raise self.retry(exc=exc, countdown=DEFAULT_RETRY_DELAY * (RETRY_BACKOFF_MULTIPLIER ** self.request.retries))
+    
 # optional remove the exclude arg
 @CircuitBreaker(fail_max=5, reset_timeout=60) # EDIT: Removed the exclude parameter
 @embedding_retry
