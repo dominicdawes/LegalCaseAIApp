@@ -1552,7 +1552,7 @@ async def _embed_with_retry(texts: List[str]) -> List[List[float]]:
 
 @celery_app.task(bind=True, queue=FINAL_QUEUE, acks_late=True)
 def finalize_embeddings(self, batch_results: List[Dict[str, Any]], source_id: str) -> Dict[str, Any]:
-    return asyncio.run(_finalize_embeddings_async(self, batch_results, source_id))
+    return _finalize_embeddings_sync(self, batch_results, source_id)
 
 def _finalize_embeddings_sync(self, batch_results: List[Dict[str, Any]], source_id: str) -> Dict[str, Any]:
     """
