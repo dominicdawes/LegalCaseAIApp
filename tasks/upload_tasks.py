@@ -872,14 +872,14 @@ async def copy_embeddings_for_project(existing_source_id: str, new_source_id: st
         
         for embedding_row in existing_embeddings:
             records_to_insert.append((
-                uuid.uuid4(),                    # id
-                uuid.UUID(new_source_id),        # source_id (new document)
-                uuid.UUID(project_id),           # project_id (target project)
+                str(uuid.uuid4()),                    # MAKE a new id
+                str(uuid.UUID(new_source_id)),        # source_id (new document)
+                str(uuid.UUID(project_id)),           # project_id (target project)
                 embedding_row['content'],        # content
                 embedding_row['metadata'],       # metadata (keep original)
                 embedding_row['embedding'],      # embedding (reuse existing)
                 embedding_row['num_tokens'],     # num_tokens
-                uuid.UUID(user_id),             # user_id
+                str(uuid.UUID(user_id)),             # user_id
                 datetime.now(timezone.utc)      # created_at
             ))
             total_tokens += embedding_row['num_tokens'] or 0
@@ -1466,7 +1466,7 @@ async def _embed_batch_async(self, source_id: str, project_id: str, texts: List[
             token_count = len(tokenizer.encode(text))
             total_tokens += token_count
             records_to_insert.append((
-                uuid.uuid4(), uuid.UUID(source_id), uuid.UUID(project_id), text, 
+                str(uuid.uuid4()), str(uuid.UUID(source_id)), str(uuid.UUID(project_id)), text, 
                 json.dumps(meta), vec, token_count, datetime.now(timezone.utc)
             ))
 
