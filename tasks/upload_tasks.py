@@ -977,7 +977,7 @@ async def _process_document_async(file_urls: List[str], metadata: Dict[str, Any]
                         total_chunks, total_batches, created_at)
                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)''',
                     new_doc_id, res['cdn_url'], res['content_hash'], 
-                    uuid.UUID(project_id), res.get('content_tags', []), user_id,
+                    str(uuid.UUID(project_id)), res.get('content_tags', []), user_id,
                     ProcessingStatus.COMPLETE.value, res['filename'], 
                     res['file_size_bytes'], os.path.splitext(res['filename'])[1].lower(),
                     existing_processed_doc['total_chunks'], existing_processed_doc['total_batches'],
@@ -1014,7 +1014,7 @@ async def _process_document_async(file_urls: List[str], metadata: Dict[str, Any]
         logger.info(f"💾 Inserting {len(new_docs_to_insert)} new docs for full processing...")
         records_to_insert = [
             (
-                doc['id'], doc['cdn_url'], doc['content_hash'], uuid.UUID(doc['project_id']),
+                doc['id'], doc['cdn_url'], doc['content_hash'], str(uuid.UUID(doc['project_id'])),
                 doc.get('content_tags', []), doc['uploaded_by'], ProcessingStatus.PENDING.value,
                 doc['filename'], doc['file_size_bytes'], os.path.splitext(doc['filename'])[1].lower(),
                 datetime.now(timezone.utc)
@@ -1511,7 +1511,7 @@ def _embed_batch_gevent(self, source_id: str, project_id: str, texts: List[str],
             token_count = len(tokenizer.encode(text))
             total_tokens += token_count
             records_to_insert.append((
-                uuid.uuid4(), uuid.UUID(source_id), uuid.UUID(project_id), text, 
+                str(uuid.uuid4()), str(uuid.UUID(source_id)), str(uuid.UUID(project_id)), text, 
                 json.dumps(meta), vec, token_count, datetime.now(timezone.utc)
             ))
 
@@ -1639,7 +1639,7 @@ async def _finalize_embeddings_async(self, batch_results: List[Dict[str, Any]], 
                 WHERE id = $6
                 """,
                 final_status.value, actual_vector_count, chunk_completion_rate, status_message,
-                json.dumps(final_metadata), uuid.UUID(source_id)
+                json.dumps(final_metadata), str(uuid.UUID(source_id))
             )
 
         logger.info(f"Document {source_id} finalization complete. Status: {final_status.value}")
