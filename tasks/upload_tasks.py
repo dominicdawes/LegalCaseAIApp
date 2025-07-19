@@ -1554,19 +1554,19 @@ async def _embed_with_retry(texts: List[str]) -> List[List[float]]:
 def finalize_embeddings(self, batch_results: List[Dict[str, Any]], source_id: str) -> Dict[str, Any]:
     return asyncio.run(_finalize_embeddings_async(self, batch_results, source_id))
 
-async def _finalize_embeddings_async(self, batch_results: List[Dict[str, Any]], source_id: str) -> Dict[str, Any]:
+def _finalize_embeddings_sync(self, batch_results: List[Dict[str, Any]], source_id: str) -> Dict[str, Any]:
     """
-    Finalization Task:
-    - Uses asyncpg for all database reads and writes.
-    - Preserves the detailed completion metrics and performance analysis from v5.
+    Sync implementation of finalization logic
     """
-    pool = await get_async_db_pool()
     final_status = ProcessingStatus.FAILED_FINALIZATION
+    pool = get_sync_db_pool()
+    conn = pool.getconn()
     
     try:
-        # ——— Phase 1: Fetch Current Document State Asynchronously ——————————————————
-        async with pool.acquire() as conn:
-            doc_data = await conn.fetchrow("SELECT * FROM document_sources WHERE id = $1", uuid.UUID(source_id))
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            # ——— Phase 1: Fetch Current Document State ——————————————————
+            cur.execute("SELECT * FROM document_sources WHERE id = %s", (source_id,))
+            doc_data = cur.fetchone()
         
         if not doc_data:
             raise ValueError(f"Document {source_id} not found during finalization.")
@@ -1574,13 +1574,14 @@ async def _finalize_embeddings_async(self, batch_results: List[Dict[str, Any]], 
         # ——— Phase 2: Validate Processing Completion ——————————————————————————————
         expected_chunks = doc_data.get('total_chunks', 0)
         
-        async with pool.acquire() as conn:
-            actual_vector_count = await conn.fetchval("SELECT COUNT(*) FROM document_vector_store WHERE source_id = $1", uuid.UUID(source_id))
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM document_vector_store WHERE source_id = %s", (source_id,))
+            actual_vector_count = cur.fetchone()[0]
         
         chunk_completion_rate = (actual_vector_count / expected_chunks * 100) if expected_chunks > 0 else 100 if actual_vector_count > 0 else 0
 
-        # ——— Phase 3: Determine Final Status
-        if abs(actual_vector_count - expected_chunks) <= 1: # Allow for minor discrepancy
+        # ——— Phase 3: Determine Final Status ————————————————————————————————————
+        if abs(actual_vector_count - expected_chunks) <= 1:  # Allow for minor discrepancy
             final_status = ProcessingStatus.COMPLETE
             status_message = "Processing completed successfully."
         elif actual_vector_count > 0:
@@ -1622,33 +1623,148 @@ async def _finalize_embeddings_async(self, batch_results: List[Dict[str, Any]], 
             recommendations.append(f"Investigate {failed_batches} failed batches for reliability issues")
 
         # ——— Phase 6: Final Database Update ————————————————————————————————————
+        # Handle processing_metadata - it comes as JSON string from psycopg2
+        existing_metadata = doc_data.get('processing_metadata', {})
+        if isinstance(existing_metadata, str):
+            try:
+                existing_metadata = json.loads(existing_metadata)
+            except (json.JSONDecodeError, TypeError):
+                existing_metadata = {}
+        elif existing_metadata is None:
+            existing_metadata = {}
+        
         final_metadata = {
-             **(doc_data.get('processing_metadata', {}) or {}),
+            **existing_metadata,
             'completion_timestamp': datetime.now(timezone.utc).isoformat(),
             'final_vector_count': actual_vector_count,
             'chunk_completion_rate': chunk_completion_rate,
-            # Add other aggregated metrics here
+            'performance_insights': performance_insights,
+            'recommendations': recommendations
         }
 
-        async with pool.acquire() as conn:
-            await conn.execute(
+        with conn.cursor() as cur:
+            cur.execute(
                 """
                 UPDATE document_sources
-                SET vector_embed_status = $1, final_vector_count = $2, completion_rate = $3,
-                    status_message = $4, completed_at = NOW(), processing_metadata = $5::jsonb
-                WHERE id = $6
+                SET vector_embed_status = %s, final_vector_count = %s, completion_rate = %s,
+                    status_message = %s, completed_at = NOW(), processing_metadata = %s::jsonb
+                WHERE id = %s
                 """,
-                final_status.value, actual_vector_count, chunk_completion_rate, status_message,
-                json.dumps(final_metadata), str(uuid.UUID(source_id))
+                (final_status.value, actual_vector_count, chunk_completion_rate, status_message,
+                json.dumps(final_metadata), source_id)
             )
+            conn.commit()
 
         logger.info(f"Document {source_id} finalization complete. Status: {final_status.value}")
         return {'source_id': source_id, 'final_status': final_status.value}
 
     except Exception as e:
         logger.error(f"Finalization failed for document {source_id}: {e}", exc_info=True)
-        await _update_document_status(source_id, ProcessingStatus.FAILED_FINALIZATION, f"Finalization failed: {str(e)}")
+        # Use sync version of status update
+        _update_document_status_sync(source_id, ProcessingStatus.FAILED_FINALIZATION, f"Finalization failed: {str(e)}")
         raise
+    finally:
+        pool.putconn(conn)
+
+# @celery_app.task(bind=True, queue=FINAL_QUEUE, acks_late=True)
+# def finalize_embeddings(self, batch_results: List[Dict[str, Any]], source_id: str) -> Dict[str, Any]:
+#     return asyncio.run(_finalize_embeddings_async(self, batch_results, source_id))
+
+# async def _finalize_embeddings_async(self, batch_results: List[Dict[str, Any]], source_id: str) -> Dict[str, Any]:
+#     """
+#     Finalization Task:
+#     - Uses asyncpg for all database reads and writes.
+#     - Preserves the detailed completion metrics and performance analysis from v5.
+#     """
+#     pool = await get_async_db_pool()
+#     final_status = ProcessingStatus.FAILED_FINALIZATION
+    
+#     try:
+#         # ——— Phase 1: Fetch Current Document State Asynchronously ——————————————————
+#         async with pool.acquire() as conn:
+#             doc_data = await conn.fetchrow("SELECT * FROM document_sources WHERE id = $1", uuid.UUID(source_id))
+        
+#         if not doc_data:
+#             raise ValueError(f"Document {source_id} not found during finalization.")
+            
+#         # ——— Phase 2: Validate Processing Completion ——————————————————————————————
+#         expected_chunks = doc_data.get('total_chunks', 0)
+        
+#         async with pool.acquire() as conn:
+#             actual_vector_count = await conn.fetchval("SELECT COUNT(*) FROM document_vector_store WHERE source_id = $1", uuid.UUID(source_id))
+        
+#         chunk_completion_rate = (actual_vector_count / expected_chunks * 100) if expected_chunks > 0 else 100 if actual_vector_count > 0 else 0
+
+#         # ——— Phase 3: Determine Final Status
+#         if abs(actual_vector_count - expected_chunks) <= 1: # Allow for minor discrepancy
+#             final_status = ProcessingStatus.COMPLETE
+#             status_message = "Processing completed successfully."
+#         elif actual_vector_count > 0:
+#             final_status = ProcessingStatus.PARTIAL
+#             status_message = f"Partial completion: {actual_vector_count}/{expected_chunks} chunks processed."
+#         else:
+#             final_status = ProcessingStatus.FAILED_EMBEDDING
+#             status_message = "Embedding failed: No chunks were successfully processed."
+
+#         # ——— Phase 4: Calculate Final Metrics ———————————————————————————————————
+#         # Aggregate batch results
+#         successful_batches = [r for r in batch_results if r and r.get('processed_count', 0) > 0]
+#         failed_batches = len(batch_results) - len(successful_batches)
+        
+#         total_processing_time = sum(r.get('total_time_ms', 0) for r in successful_batches)
+#         total_embedding_time = sum(r.get('embedding_time_ms', 0) for r in successful_batches)
+#         total_storage_time = sum(r.get('storage_time_ms', 0) for r in successful_batches)
+#         total_tokens = sum(r.get('token_count', 0) for r in successful_batches)
+        
+#         avg_batch_time = total_processing_time / len(successful_batches) if successful_batches else 0
+#         tokens_per_second = total_tokens / (total_processing_time / 1000) if total_processing_time > 0 else 0
+        
+#         # ——— Phase 5: Generate Performance Insights ————————————————————————————
+#         performance_insights = {
+#             'avg_batch_processing_time_ms': avg_batch_time,
+#             'tokens_per_second': tokens_per_second,
+#             'embedding_efficiency_pct': (total_embedding_time / total_processing_time * 100) if total_processing_time > 0 else 0,
+#             'storage_efficiency_pct': (total_storage_time / total_processing_time * 100) if total_processing_time > 0 else 0,
+#             'successful_batch_rate': len(successful_batches) / len(batch_results) * 100 if batch_results else 0
+#         }
+        
+#         # Generate optimization recommendations
+#         recommendations = []
+#         if performance_insights['tokens_per_second'] < 1000:
+#             recommendations.append("Consider increasing batch size for better throughput")
+#         if performance_insights['embedding_efficiency_pct'] > 80:
+#             recommendations.append("Embedding time is dominant - consider batch optimization")
+#         if failed_batches > 0:
+#             recommendations.append(f"Investigate {failed_batches} failed batches for reliability issues")
+
+#         # ——— Phase 6: Final Database Update ————————————————————————————————————
+#         final_metadata = {
+#              **(doc_data.get('processing_metadata', {}) or {}),
+#             'completion_timestamp': datetime.now(timezone.utc).isoformat(),
+#             'final_vector_count': actual_vector_count,
+#             'chunk_completion_rate': chunk_completion_rate,
+#             # Add other aggregated metrics here
+#         }
+
+#         async with pool.acquire() as conn:
+#             await conn.execute(
+#                 """
+#                 UPDATE document_sources
+#                 SET vector_embed_status = $1, final_vector_count = $2, completion_rate = $3,
+#                     status_message = $4, completed_at = NOW(), processing_metadata = $5::jsonb
+#                 WHERE id = $6
+#                 """,
+#                 final_status.value, actual_vector_count, chunk_completion_rate, status_message,
+#                 json.dumps(final_metadata), str(uuid.UUID(source_id))
+#             )
+
+#         logger.info(f"Document {source_id} finalization complete. Status: {final_status.value}")
+#         return {'source_id': source_id, 'final_status': final_status.value}
+
+#     except Exception as e:
+#         logger.error(f"Finalization failed for document {source_id}: {e}", exc_info=True)
+#         await _update_document_status(source_id, ProcessingStatus.FAILED_FINALIZATION, f"Finalization failed: {str(e)}")
+#         raise
 
 
 # ——— Advanced Monitoring & Maintenance Tasks (Unchanged from v5) —————————————————
