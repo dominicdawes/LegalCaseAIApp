@@ -290,10 +290,10 @@ signal.signal(signal.SIGINT, signal_handler)
 # Register atexit handler as last resort
 atexit.register(sync_close_db_pool)
 
-# ——— 4. UPDATED get_db_pool FUNCTION ————————————————————————————————
+# ——— 4. UPDATED get_async_db_pool FUNCTION ————————————————————————————————
 
 # Get Asynchronous DB pool
-async def get_db_pool() -> asyncpg.Pool:
+async def get_async_db_pool() -> asyncpg.Pool:
     """Initializes and returns the asyncpg connection pool with connection testing."""
     global db_pool
     try:
@@ -531,7 +531,7 @@ def _calculate_stream_hash(stream: io.BytesIO) -> str:
 async def _update_document_status(doc_id: str, status: ProcessingStatus, error_message: Optional[str] = None):
     """Async helper to update a document's status in the database (for asyncio)"""
     logger.info(f"📋 Doc {doc_id[:8]}... → {status.value}")
-    pool = await get_db_pool()
+    pool = await get_async_db_pool()
     async with pool.acquire() as conn:
         await conn.execute(
             """
@@ -574,7 +574,7 @@ async def get_embedding_reuse_stats(project_id: str) -> Dict[str, Any]:
     """
     Get statistics about embedding reuse for a project
     """
-    pool = await get_db_pool()
+    pool = await get_async_db_pool()
     async with pool.acquire() as conn:
         stats = await conn.fetchrow(
             '''
@@ -838,7 +838,7 @@ def process_document_task(self, file_urls: List[str], metadata: Dict[str, Any]) 
 
 async def copy_embeddings_for_project(existing_source_id: str, new_source_id: str, project_id: str, user_id: str) -> Dict[str, Any]:
     """
-    Copy embeddings from an existing processed document to a new project
+    [ASYNC] Copy embeddings from an existing processed document to a new project
     
     Args:
         existing_source_id: Source ID of the already-processed document
@@ -849,9 +849,9 @@ async def copy_embeddings_for_project(existing_source_id: str, new_source_id: st
     Returns:
         Dict with copy statistics
     """
-    pool = await get_db_pool()
+    pool = await get_async_db_pool()
     async with pool.acquire() as conn:
-        # Get embeddings from the existing document
+        # Get vector embeddings from the existing document (via matching source_id)
         existing_embeddings = await conn.fetch(
             '''
             SELECT content, metadata, embedding, num_tokens 
@@ -885,16 +885,22 @@ async def copy_embeddings_for_project(existing_source_id: str, new_source_id: st
             total_tokens += embedding_row['num_tokens'] or 0
         
         # Bulk insert the copied embeddings
-        await conn.copy_records_to_table(
-            'document_vector_store',
-            records=records_to_insert,
-            columns=(
-                'id', 'source_id', 'project_id', 'content', 'metadata', 
-                'embedding', 'num_tokens', 'user_id', 'created_at'
-            ),
-            timeout=120
+        # await conn.copy_records_to_table(
+        #     'document_vector_store',
+        #     records=records_to_insert,
+        #     columns=(
+        #         'id', 'source_id', 'project_id', 'content', 'metadata', 
+        #         'embedding', 'num_tokens', 'user_id', 'created_at'
+        #     ),
+        #     timeout=120
+        # )
+        # CHANGE: Use executemany instead of copy_records_to_table
+        await conn.executemany(
+            '''INSERT INTO document_vector_store 
+            (id, source_id, project_id, content, metadata, embedding, num_tokens, user_id, created_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)''',
+            records_to_insert
         )
-        
         logger.info(f"✅ Copied {len(records_to_insert)} embeddings from {existing_source_id} to {new_source_id} for project {project_id}")
         
         return {
@@ -904,7 +910,7 @@ async def copy_embeddings_for_project(existing_source_id: str, new_source_id: st
 
 async def _process_document_async(file_urls: List[str], metadata: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Smart Reuse Ingest Task:
+    [ASYNC] Smart Reuse Ingest Task:
     - Concurrent downloads directly into memory using httpx.
     - Smart deduplication: checks for processed content across ALL projects
     - If content exists and is processed, reuse embeddings for new project
@@ -927,7 +933,7 @@ async def _process_document_async(file_urls: List[str], metadata: Dict[str, Any]
     reused_docs = []
     same_project_duplicates = []
     
-    pool = await get_db_pool()
+    pool = await get_async_db_pool()
     async with pool.acquire() as conn:
         for res in results:
             if isinstance(res, Exception) or not res:
@@ -1018,17 +1024,24 @@ async def _process_document_async(file_urls: List[str], metadata: Dict[str, Any]
         
         async with pool.acquire() as conn:
             async with conn.transaction():
-                await conn.copy_records_to_table(
-                    'document_sources',
-                    records=records_to_insert,
-                    columns=(
-                        'id', 'cdn_url', 'content_hash', 'project_id', 'content_tags',
-                        'uploaded_by', 'vector_embed_status', 'filename', 'file_size_bytes',
-                        'file_extension', 'created_at'
-                    ),
-                    timeout=60
-                )
-        
+                # await conn.copy_records_to_table(
+                #     'document_sources',
+                #     records=records_to_insert,
+                #     columns=(
+                #         'id', 'cdn_url', 'content_hash', 'project_id', 'content_tags',
+                #         'uploaded_by', 'vector_embed_status', 'filename', 'file_size_bytes',
+                #         'file_extension', 'created_at'
+                #     ),
+                #     timeout=60
+                # )
+                # CHANGE: Use executemany instead of copy_records_to_table
+                await conn.executemany(
+                    '''INSERT INTO document_sources 
+                    (id, cdn_url, content_hash, project_id, content_tags, uploaded_by, 
+                        vector_embed_status, filename, file_size_bytes, file_extension, created_at)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)''',
+                    records_to_insert
+                )      
         inserted_ids = [str(doc['id']) for doc in new_docs_to_insert]
         
         # Schedule parsing tasks ONLY for new documents
@@ -1107,16 +1120,6 @@ async def _download_and_prep_doc(client: httpx.AsyncClient, url: str, project_id
         return None
 
 # ——— Task 2: For one document → Parse, batch, dispatch to emmbed (In-Memory & Token-Aware) ————————————————————————————————
-    
-# @celery_app.task(bind=True, queue=PARSE_QUEUE, acks_late=True)
-# def parse_document_task(self, source_id: str, cdn_url: str, project_id: str) -> Dict[str, Any]:
-#     # Get or create event loop
-#     try:
-#         loop = asyncio.get_event_loop()
-#     except RuntimeError:
-#         loop = asyncio.new_event_loop()
-#         asyncio.set_event_loop(loop)
-#     return loop.run_until_complete(_parse_document_async(self, source_id, cdn_url, project_id))
 
 @celery_app.task(
     bind=True, 
@@ -1141,162 +1144,162 @@ def parse_document_task(self, source_id: str, cdn_url: str, project_id: str) -> 
         logger.error(f"Parse task failed for {source_id}: {exc}")
         raise  # Let Celery handle the retry automatically with CELERY_RETRY_CONFIG
 
-async def _parse_document_async(self, source_id: str, cdn_url: str, project_id: str) -> Dict[str, Any]:
-    """
-    Parsing Task:
-    - Streams document directly into an in-memory buffer (NO temp file).
-    - Splits parsed text into semantic chunks
-    - Uses token-aware adaptive batching to maximize embedding efficiency.
-    - Fully async database updates.
-    - Dispatch embed task celery group
-    """
-    await _update_document_status(source_id, ProcessingStatus.PARSING)
+# async def _parse_document_async(self, source_id: str, cdn_url: str, project_id: str) -> Dict[str, Any]:
+#     """
+#     LEGACY: Parsing Task:
+#     - Streams document directly into an in-memory buffer (NO temp file).
+#     - Splits parsed text into semantic chunks
+#     - Uses token-aware adaptive batching to maximize embedding efficiency.
+#     - Fully async database updates.
+#     - Dispatch embed task celery group
+#     """
+#     await _update_document_status(source_id, ProcessingStatus.PARSING)
     
-    file_buffer = io.BytesIO()
-    doc_metrics = DocumentMetrics(doc_id=source_id)     # ← TELEMETRY
+#     file_buffer = io.BytesIO()
+#     doc_metrics = DocumentMetrics(doc_id=source_id)     # ← TELEMETRY
 
-    try:
-        # Phase 1: True In-Memory Streaming (No Disk I/O)
-        with Timer() as download_timer:
-            # Define headers for anti-bot detection
-            headers = DEFAULT_HEADERS
+#     try:
+#         # Phase 1: True In-Memory Streaming (No Disk I/O)
+#         with Timer() as download_timer:
+#             # Define headers for anti-bot detection
+#             headers = DEFAULT_HEADERS
 
-            async with httpx.AsyncClient(timeout=120.0) as client:
-                async with client.stream("GET", cdn_url, headers=headers) as response:
-                    response.raise_for_status()
-                    async for chunk in response.aiter_bytes():
-                        file_buffer.write(chunk)
-            file_buffer.seek(0)
-            # update telemetry
-            doc_metrics.download_time_ms = download_timer.elapsed_ms
-            doc_metrics.file_size_bytes = file_buffer.getbuffer().nbytes
+#             async with httpx.AsyncClient(timeout=120.0) as client:
+#                 async with client.stream("GET", cdn_url, headers=headers) as response:
+#                     response.raise_for_status()
+#                     async for chunk in response.aiter_bytes():
+#                         file_buffer.write(chunk)
+#             file_buffer.seek(0)
+#             # update telemetry
+#             doc_metrics.download_time_ms = download_timer.elapsed_ms
+#             doc_metrics.file_size_bytes = file_buffer.getbuffer().nbytes
 
-        # Phase 2: Process with Loader and Splitter
-        with Timer() as parse_timer:
-            # Assumes get_loader_for can take a file-like object
-            loader = get_loader_for(filename=cdn_url, file_like_object=file_buffer)
+#         # Phase 2: Process with Loader and Splitter
+#         with Timer() as parse_timer:
+#             # Assumes get_loader_for can take a file-like object
+#             loader = get_loader_for(filename=cdn_url, file_like_object=file_buffer)
 
-            # Langchain semantic chunking strategy (preserves whole ideas)
-            splitter = RecursiveCharacterTextSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)
+#             # Langchain semantic chunking strategy (preserves whole ideas)
+#             splitter = RecursiveCharacterTextSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)
             
-            all_texts, all_metadatas = [], []
+#             all_texts, all_metadatas = [], []
 
-            # Pass the file_buffer as the source parameter
-            logger.info(f"🔄 Starting document streaming for {source_id}")
-            try:
-                # Reset buffer position before streaming
-                file_buffer.seek(0)
+#             # Pass the file_buffer as the source parameter
+#             logger.info(f"🔄 Starting document streaming for {source_id}")
+#             try:
+#                 # Reset buffer position before streaming
+#                 file_buffer.seek(0)
                 
-                # CORRECT CALL: Pass file_buffer to stream_documents
-                for page_num, page in enumerate(loader.stream_documents(file_buffer)):
-                    gevent.sleep(0)  # Yield control during processing
+#                 # CORRECT CALL: Pass file_buffer to stream_documents
+#                 for page_num, page in enumerate(loader.stream_documents(file_buffer)):
+#                     gevent.sleep(0)  # Yield control during processing
                     
-                    # Split each page into chunks
-                    for chunk_idx, chunk in enumerate(splitter.split_documents([page])):
-                        cleaned_content = _clean_text(chunk.page_content)
-                        if not cleaned_content:
-                            continue
+#                     # Split each page into chunks
+#                     for chunk_idx, chunk in enumerate(splitter.split_documents([page])):
+#                         cleaned_content = _clean_text(chunk.page_content)
+#                         if not cleaned_content:
+#                             continue
                         
-                        all_texts.append(cleaned_content)
-                        all_metadatas.append({
-                            **chunk.metadata,
-                            'page_number': page_num,
-                            'chunk_index': chunk_idx
-                        })
+#                         all_texts.append(cleaned_content)
+#                         all_metadatas.append({
+#                             **chunk.metadata,
+#                             'page_number': page_num,
+#                             'chunk_index': chunk_idx
+#                         })
                         
-                        # Periodic yield for very large documents
-                        if len(all_texts) % 50 == 0:
-                            gevent.sleep(0)
+#                         # Periodic yield for very large documents
+#                         if len(all_texts) % 50 == 0:
+#                             gevent.sleep(0)
                 
-                logger.info(f"✅ Successfully streamed {len(all_texts)} chunks from {page_num + 1} pages")
+#                 logger.info(f"✅ Successfully streamed {len(all_texts)} chunks from {page_num + 1} pages")
                 
-            except Exception as loader_error:
-                logger.error(f"❌ Streaming failed: {loader_error}")
+#             except Exception as loader_error:
+#                 logger.error(f"❌ Streaming failed: {loader_error}")
                 
-                # Fallback: Try load_documents method if streaming fails
-                logger.info("🔄 Falling back to load_documents method")
-                file_buffer.seek(0)
+#                 # Fallback: Try load_documents method if streaming fails
+#                 logger.info("🔄 Falling back to load_documents method")
+#                 file_buffer.seek(0)
                 
-                try:
-                    documents = loader.load_documents(file_buffer)
-                    for doc_idx, doc in enumerate(documents):
-                        chunks = splitter.split_documents([doc])
-                        for chunk_idx, chunk in enumerate(chunks):
-                            cleaned_content = _clean_text(chunk.page_content)
-                            if not cleaned_content:
-                                continue
+#                 try:
+#                     documents = loader.load_documents(file_buffer)
+#                     for doc_idx, doc in enumerate(documents):
+#                         chunks = splitter.split_documents([doc])
+#                         for chunk_idx, chunk in enumerate(chunks):
+#                             cleaned_content = _clean_text(chunk.page_content)
+#                             if not cleaned_content:
+#                                 continue
                             
-                            all_texts.append(cleaned_content)
-                            all_metadatas.append({
-                                **chunk.metadata,
-                                'page_number': doc_idx,
-                                'chunk_index': chunk_idx
-                            })
+#                             all_texts.append(cleaned_content)
+#                             all_metadatas.append({
+#                                 **chunk.metadata,
+#                                 'page_number': doc_idx,
+#                                 'chunk_index': chunk_idx
+#                             })
                     
-                    logger.info(f"✅ Fallback successful: {len(all_texts)} chunks")
+#                     logger.info(f"✅ Fallback successful: {len(all_texts)} chunks")
                     
-                except Exception as fallback_error:
-                    logger.error(f"❌ Both streaming and fallback failed: {fallback_error}")
-                    raise loader_error  # Re-raise original error
+#                 except Exception as fallback_error:
+#                     logger.error(f"❌ Both streaming and fallback failed: {fallback_error}")
+#                     raise loader_error  # Re-raise original error
             
-            doc_metrics.parse_time_ms = parse_timer.elapsed_ms
-            doc_metrics.total_chunks = len(all_texts)
+#             doc_metrics.parse_time_ms = parse_timer.elapsed_ms
+#             doc_metrics.total_chunks = len(all_texts)
 
-        # Phase 3: Token-Aware Adaptive Batching (efficient use of every API call, reducing cost and latency)
-        with Timer() as batch_timer:
-            embedding_tasks = []
-            current_batch_texts, current_batch_metas = [], []
-            current_batch_tokens = 0
+#         # Phase 3: Token-Aware Adaptive Batching (efficient use of every API call, reducing cost and latency)
+#         with Timer() as batch_timer:
+#             embedding_tasks = []
+#             current_batch_texts, current_batch_metas = [], []
+#             current_batch_tokens = 0
 
-            logger.info(f"💾 Kicking off embedding task for source_id {source_id} ...")
-            for i, text in enumerate(all_texts):
-                token_count = len(tokenizer.encode(text))
+#             logger.info(f"💾 Kicking off embedding task for source_id {source_id} ...")
+#             for i, text in enumerate(all_texts):
+#                 token_count = len(tokenizer.encode(text))
                 
-                # If adding the next chunk exceeds the token limit, dispatch the current batch
-                if current_batch_tokens + token_count > OPENAI_MAX_TOKENS_PER_BATCH and current_batch_texts:
-                    task_sig = embed_batch_task.s(source_id, project_id, current_batch_texts, current_batch_metas)
-                    embedding_tasks.append(task_sig)
-                    current_batch_texts, current_batch_metas, current_batch_tokens = [], [], 0
+#                 # If adding the next chunk exceeds the token limit, dispatch the current batch
+#                 if current_batch_tokens + token_count > OPENAI_MAX_TOKENS_PER_BATCH and current_batch_texts:
+#                     task_sig = embed_batch_task.s(source_id, project_id, current_batch_texts, current_batch_metas)
+#                     embedding_tasks.append(task_sig)
+#                     current_batch_texts, current_batch_metas, current_batch_tokens = [], [], 0
 
-                current_batch_texts.append(text)
-                current_batch_metas.append(all_metadatas[i])
-                current_batch_tokens += token_count
+#                 current_batch_texts.append(text)
+#                 current_batch_metas.append(all_metadatas[i])
+#                 current_batch_tokens += token_count
             
-            # Dispatch the final batch if it exists
-            if current_batch_texts:
-                task_sig = embed_batch_task.s(source_id, project_id, current_batch_texts, current_batch_metas)
-                embedding_tasks.append(task_sig)
-            # update telemetry
-            doc_metrics.total_batches = len(embedding_tasks)
-            doc_metrics.chunk_time_ms = batch_timer.elapsed_ms
+#             # Dispatch the final batch if it exists
+#             if current_batch_texts:
+#                 task_sig = embed_batch_task.s(source_id, project_id, current_batch_texts, current_batch_metas)
+#                 embedding_tasks.append(task_sig)
+#             # update telemetry
+#             doc_metrics.total_batches = len(embedding_tasks)
+#             doc_metrics.chunk_time_ms = batch_timer.elapsed_ms
 
-        # Phase 4: Database Update & Task Scheduling
-        pool = await get_db_pool()
-        async with pool.acquire() as conn:
-            await conn.execute(
-                """
-                UPDATE document_sources
-                SET vector_embed_status = $1, total_chunks = $2, total_batches = $3, processing_metadata = processing_metadata || $4::jsonb
-                WHERE id = $5
-                """,
-                ProcessingStatus.EMBEDDING.value, doc_metrics.total_chunks, doc_metrics.total_batches,
-                json.dumps(doc_metrics.to_dict()), uuid.UUID(source_id)
-            )
+#         # Phase 4: Database Update & Task Scheduling
+#         pool = await get_async_db_pool()
+#         async with pool.acquire() as conn:
+#             await conn.execute(
+#                 """
+#                 UPDATE document_sources
+#                 SET vector_embed_status = $1, total_chunks = $2, total_batches = $3, processing_metadata = processing_metadata || $4::jsonb
+#                 WHERE id = $5
+#                 """,
+#                 ProcessingStatus.EMBEDDING.value, doc_metrics.total_chunks, doc_metrics.total_batches,
+#                 json.dumps(doc_metrics.to_dict()), uuid.UUID(source_id)
+#             )
         
-        if embedding_tasks:
-            # Use a chord to run all embedding tasks and then call finalization
-            chord(group(embedding_tasks), queue=EMBED_QUEUE)(finalize_embeddings.s(source_id).set(queue=FINAL_QUEUE))
-        else:
-            # Handle empty documents correctly
-            finalize_embeddings.apply_async(([], source_id), queue=FINAL_QUEUE)
+#         if embedding_tasks:
+#             # Use a chord to run all embedding tasks and then call finalization
+#             chord(group(embedding_tasks), queue=EMBED_QUEUE)(finalize_embeddings.s(source_id).set(queue=FINAL_QUEUE))
+#         else:
+#             # Handle empty documents correctly
+#             finalize_embeddings.apply_async(([], source_id), queue=FINAL_QUEUE)
 
-        logger.info(f"Parsing complete for {source_id}: {doc_metrics.total_chunks} chunks in {doc_metrics.total_batches} token-aware batches.")
-        return {'source_id': source_id, 'status': 'SUCCESS', 'batches_created': doc_metrics.total_batches}
+#         logger.info(f"Parsing complete for {source_id}: {doc_metrics.total_chunks} chunks in {doc_metrics.total_batches} token-aware batches.")
+#         return {'source_id': source_id, 'status': 'SUCCESS', 'batches_created': doc_metrics.total_batches}
 
-    except Exception as e:
-        logger.error(f"Parsing failed for {source_id}: {e}", exc_info=True)
-        await _update_document_status(source_id, ProcessingStatus.FAILED_PARSING, str(e))
-        raise
+#     except Exception as e:
+#         logger.error(f"Parsing failed for {source_id}: {e}", exc_info=True)
+#         await _update_document_status(source_id, ProcessingStatus.FAILED_PARSING, str(e))
+#         raise
 
 def _parse_document_gevent(self, source_id: str, cdn_url: str, project_id: str) -> Dict[str, Any]:
     """
@@ -1387,7 +1390,7 @@ def _parse_document_gevent(self, source_id: str, cdn_url: str, project_id: str) 
             doc_metrics.chunk_time_ms = batch_timer.elapsed_ms
 
         # Phase 4: Database Update & Task Scheduling
-        pool = get_sync_db_pool()
+        pool = get_sync_db_pool()   # use SYNC pool since its a simple status update to Supabase
         conn = pool.getconn()
         try:
             with conn.cursor() as cur:
@@ -1396,8 +1399,7 @@ def _parse_document_gevent(self, source_id: str, cdn_url: str, project_id: str) 
                     UPDATE document_sources
                     SET vector_embed_status = %s, total_chunks = %s, total_batches = %s, 
                         processing_metadata = processing_metadata || %s::jsonb
-                    WHERE id = %s
-                    """,
+                    WHERE id = %s""",
                     (ProcessingStatus.EMBEDDING.value, doc_metrics.total_chunks, 
                         doc_metrics.total_batches, json.dumps(doc_metrics.to_dict()), source_id)
                 )
@@ -1438,7 +1440,7 @@ def embed_batch_task(self, source_id: str, project_id: str, texts: List[str], me
 
 async def _embed_batch_async(self, source_id: str, project_id: str, texts: List[str], metadatas: List[Dict]):
     """
-    Embedding Task:
+    [ASYNC] Embedding Task:
     - Fully async with non-blocking DB calls via asyncpg.
     - Uses a shared connection pool and highly efficient `copy_records_to_table`.
     - Retries with exponential backoff and uses a circuit breaker for OpenAI calls.
@@ -1466,16 +1468,24 @@ async def _embed_batch_async(self, source_id: str, project_id: str, texts: List[
         if not records_to_insert:
             return {'processed_count': 0, 'token_count': 0}
 
-        # 3. Fully Async Bulk Insert using copy_records_to_table for max performance
-        pool = await get_db_pool()
+        # # 3. Fully Async Bulk Insert using copy_records_to_table for max performance
+        # pool = await get_async_db_pool()      # BULK insert use ASYNC pgbouncer pool
+        # async with pool.acquire() as conn:
+        #     await conn.copy_records_to_table(
+        #         'document_vector_store',
+        #         records=records_to_insert,
+        #         columns=('id', 'source_id', 'project_id', 'content', 'metadata', 'embedding', 'num_tokens', 'created_at'),
+        #         timeout=120
+        #     )
+        # 3. CHANGE: Use executemany instead of copy_records_to_table
+        pool = await get_async_db_pool()
         async with pool.acquire() as conn:
-            await conn.copy_records_to_table(
-                'document_vector_store',
-                records=records_to_insert,
-                columns=('id', 'source_id', 'project_id', 'content', 'metadata', 'embedding', 'num_tokens', 'created_at'),
-                timeout=120
-            )
-        
+            await conn.executemany(
+                '''INSERT INTO document_vector_store 
+                (id, source_id, project_id, content, metadata, embedding, num_tokens, created_at)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8)''',
+                records_to_insert
+            )    
         return {'processed_count': len(records_to_insert), 'token_count': total_tokens}
 
     except Exception as exc:
@@ -1490,7 +1500,7 @@ async def _embed_with_retry(texts: List[str]) -> List[List[float]]:
     return await embedding_model.aembed_documents(texts)
 
 
-# ——— Task 4: Finalize (v6 - Fully Async DB) ————————————————————————————————————————
+# ——— Task 4: Finalize (Fully Async DB) ————————————————————————————————————————
 
 @celery_app.task(bind=True, queue=FINAL_QUEUE, acks_late=True)
 def finalize_embeddings(self, batch_results: List[Dict[str, Any]], source_id: str) -> Dict[str, Any]:
@@ -1502,7 +1512,7 @@ async def _finalize_embeddings_async(self, batch_results: List[Dict[str, Any]], 
     - Uses asyncpg for all database reads and writes.
     - Preserves the detailed completion metrics and performance analysis from v5.
     """
-    pool = await get_db_pool()
+    pool = await get_async_db_pool()
     final_status = ProcessingStatus.FAILED_FINALIZATION
     
     try:
@@ -1591,7 +1601,6 @@ async def _finalize_embeddings_async(self, batch_results: List[Dict[str, Any]], 
         logger.error(f"Finalization failed for document {source_id}: {e}", exc_info=True)
         await _update_document_status(source_id, ProcessingStatus.FAILED_FINALIZATION, f"Finalization failed: {str(e)}")
         raise
-
 
 
 # ——— Advanced Monitoring & Maintenance Tasks (Unchanged from v5) —————————————————
