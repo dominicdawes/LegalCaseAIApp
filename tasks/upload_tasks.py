@@ -180,46 +180,46 @@ class DocumentMetrics:
             'retry_count': self.retry_count
         }
 
-class StreamingDocumentProcessor:
-    """
-    DEPRECATED: Wrapper class to encapsulate streaming document processing
-    Maintains the TRUE IN-MEMORY STREAMING architecture
-    """
+# class StreamingDocumentProcessor:
+#     """
+#     DEPRECATED: Wrapper class to encapsulate streaming document processing
+#     Maintains the TRUE IN-MEMORY STREAMING architecture
+#     """
     
-    def __init__(self, file_buffer: io.BytesIO, filename: str):
-        self.file_buffer = file_buffer
-        self.filename = filename
-        self.loader = None
+#     def __init__(self, file_buffer: io.BytesIO, filename: str):
+#         self.file_buffer = file_buffer
+#         self.filename = filename
+#         self.loader = None
         
-    def get_loader(self) -> BaseDocumentLoader:
-        """Get the appropriate loader for this document"""
-        if self.loader is None:
-            self.loader = get_loader_for(filename=self.filename, file_like_object=self.file_buffer)
-        return self.loader
+#     def get_loader(self) -> BaseDocumentLoader:
+#         """Get the appropriate loader for this document"""
+#         if self.loader is None:
+#             self.loader = get_loader_for(filename=self.filename, file_like_object=self.file_buffer)
+#         return self.loader
     
-    def stream_chunks(self, splitter: RecursiveCharacterTextSplitter) -> Iterator[Tuple[str, Dict]]:
-        """
-        Generator that yields (text, metadata) tuples for each chunk
-        Maintains true streaming - never loads entire document into memory at once
-        """
-        loader = self.get_loader()
+#     def stream_chunks(self, splitter: RecursiveCharacterTextSplitter) -> Iterator[Tuple[str, Dict]]:
+#         """
+#         Generator that yields (text, metadata) tuples for each chunk
+#         Maintains true streaming - never loads entire document into memory at once
+#         """
+#         loader = self.get_loader()
         
-        # Reset buffer position
-        self.file_buffer.seek(0)
+#         # Reset buffer position
+#         self.file_buffer.seek(0)
         
-        for page_num, page in enumerate(loader.stream_documents(self.file_buffer)):
-            # Split page into chunks
-            chunks = splitter.split_documents([page])
+#         for page_num, page in enumerate(loader.stream_documents(self.file_buffer)):
+#             # Split page into chunks
+#             chunks = splitter.split_documents([page])
             
-            for chunk_idx, chunk in enumerate(chunks):
-                cleaned_content = _clean_text(chunk.page_content)
-                if cleaned_content:
-                    metadata = {
-                        **chunk.metadata,
-                        'page_number': page_num,
-                        'chunk_index': chunk_idx
-                    }
-                    yield cleaned_content, metadata
+#             for chunk_idx, chunk in enumerate(chunks):
+#                 cleaned_content = _clean_text(chunk.page_content)
+#                 if cleaned_content:
+#                     metadata = {
+#                         **chunk.metadata,
+#                         'page_number': page_num,
+#                         'chunk_index': chunk_idx
+#                     }
+#                     yield cleaned_content, metadata
 
 # ——— DB Pool Instances (Initialized once per worker) ————————————————————————————
 
@@ -1540,7 +1540,19 @@ def finalize_embeddings(self, batch_results: List[Dict[str, Any]], source_id: st
 
 def _finalize_embeddings_sync(self, batch_results: List[Dict[str, Any]], source_id: str) -> Dict[str, Any]:
     """
-    Sync implementation of finalization logic
+    Sync implementation finalizes document processing by validating completion, calculating performance metrics,
+    and updating the document status:
+    - Compares expected vs actual chunk counts
+    - generates performance insights and optimization recommendations
+    - Sets the final processing status (COMPLETE, PARTIAL, or FAILED). 
+    Called after all embedding batches finish 🥳.
+
+    Args:
+        batch_results: List of results from completed embedding batch tasks
+        source_id: Document identifier to finalize
+        
+    Returns:
+        Dict containing source_id and final_status
     """
     final_status = ProcessingStatus.FAILED_FINALIZATION
     pool = get_sync_db_pool()

@@ -9,7 +9,7 @@ from langchain.schema import Document
 
 class BaseDocumentLoader:
     """
-    ### MODIFIED: The interface now supports a Union of path or stream.
+    The interface now supports a Union of path or stream.
     Subclasses must implement methods to handle document loading from a source.
     """
     def load_documents(self, source: Union[str, io.BytesIO]) -> List[Any]:
