@@ -1430,12 +1430,22 @@ def _parse_document_gevent(self, source_id: str, cdn_url: str, project_id: str) 
             loader = get_loader_for(filename=cdn_url, file_like_object=file_buffer)
             splitter = RecursiveCharacterTextSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)
             
+            chunk_count = 0
             all_texts, all_metadatas = [], []
             for page_num, page in enumerate(loader.stream_documents(file_buffer)):
                 # Yield control during processing
                 gevent.sleep(0)
+
+                # DEBUG TRACKER
+                if page_num % 20 == 0:  # Log every 10 pages
+                    logger.info(f"📄 Processing page {page_num + 1}...")
                 
                 for chunk_idx, chunk in enumerate(splitter.split_documents([page])):
+                    # DEBUG TRACKER
+                    chunk_count += 1
+                    if chunk_count % 200 == 0:  # Log every 200 chunks
+                        logger.info(f"✂️ Created {chunk_count} chunks so far...")
+
                     cleaned_content = _clean_text(chunk.page_content)
                     if not cleaned_content:
                         continue
