@@ -66,8 +66,8 @@ class MetricsCollector:
             self.ingestion_metrics.append(metric)
     
     def record_batch_metrics(self, batch_id: str, source_id: str, chunk_count: int,
-                           total_time_ms: int, embedding_time_ms: int, 
-                           storage_time_ms: int, token_count: int):
+                            total_time_ms: int, embedding_time_ms: int, 
+                            storage_time_ms: int, token_count: int):
         """Record batch processing metrics"""
         with self._lock:
             metric = {
