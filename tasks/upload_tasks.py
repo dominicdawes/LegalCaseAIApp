@@ -834,9 +834,9 @@ def test_celery_log_task(self) -> str:
 def process_document_task(self, file_urls: List[str], metadata: Dict[str, Any]) -> Dict[str, Any]:
     task_id = self.request.id
     logger.info(f"🚀 Starting task {task_id} asyc document processing task URLs")
-    return asyncio.run(_process_document_async(file_urls, metadata))
+    return asyncio.run(_process_document_hybrid(file_urls, metadata))
 
-async def copy_embeddings_for_project(existing_source_id: str, new_source_id: str, project_id: str, user_id: str) -> Dict[str, Any]:
+async def copy_embeddings_for_project_async(existing_source_id: str, new_source_id: str, project_id: str, user_id: str) -> Dict[str, Any]:
     """
     [ASYNC] Copy embeddings from an existing processed document to a new project
     
@@ -908,19 +908,19 @@ async def copy_embeddings_for_project(existing_source_id: str, new_source_id: st
             'total_tokens': total_tokens
         }
 
-async def _process_document_async(file_urls: List[str], metadata: Dict[str, Any]) -> Dict[str, Any]:
+async def _process_document_hybrid(file_urls: List[str], metadata: Dict[str, Any]) -> Dict[str, Any]:
     """
-    [ASYNC] Smart Reuse Ingest Task:
-    - Concurrent downloads directly into memory using httpx.
-    - Smart deduplication: checks for processed content across ALL projects
-    - If content exists and is processed, reuse embeddings for new project
-    - If content is new or unprocessed, do full processing pipeline
-    - Bulk-inserts new documents and dispatches parsing tasks only when needed
+    [HYBRID] Smart Reuse Ingest Task:
+    - Concurrent downloads directly into memory using httpx (ASYNC)
+    - Smart deduplication: checks for processed content across ALL projects (SYNC DB)
+    - If content exists and is processed, reuse embeddings for new project (SYNC DB)
+    - If content is new or unprocessed, do full processing pipeline (SYNC DB)
+    - Bulk-inserts new documents and dispatches parsing tasks only when needed (SYNC DB)
     """
     project_id = metadata['project_id']
     user_id = metadata['user_id']
     
-    # Download document, hash, send to S3/CloudFront
+    # [UNCHANGED] Download document, hash, send to S3/CloudFront - Keep async for performance
     logger.info("🌐 Initiating concurrent downloads...")
     async with httpx.AsyncClient(timeout=60.0) as client:
         download_tasks = [
@@ -933,125 +933,126 @@ async def _process_document_async(file_urls: List[str], metadata: Dict[str, Any]
     reused_docs = []
     same_project_duplicates = []
     
-    pool = await get_async_db_pool()
-    async with pool.acquire() as conn:
-        for res in results:
-            if isinstance(res, Exception) or not res:
-                logger.error(f"A document failed to download or prep: {res}")
-                continue
-            
-            # First: Check if document already exists in THIS project
-            same_project_doc = await conn.fetchval(
-                'SELECT id FROM document_sources WHERE content_hash = $1 AND project_id = $2',
-                res['content_hash'], uuid.UUID(project_id)
-            )
-            
-            if same_project_doc:
-                same_project_duplicates.append(str(same_project_doc))
-                logger.info(f"📋 Document already exists in this project: {res['content_hash'][:8]} -> {same_project_doc}")
-                continue
-            
-            # Second: Check if content exists in ANY project and is fully processed ♻️ 
-            existing_processed_doc = await conn.fetchrow(
-                '''
-                SELECT id, project_id, total_chunks, total_batches
-                FROM document_sources 
-                WHERE content_hash = $1 
-                AND vector_embed_status = $2 
-                AND total_chunks > 0
-                LIMIT 1''',
-                res['content_hash'], ProcessingStatus.COMPLETE.value
-            )
-            
-            if existing_processed_doc:
-                # Content exists and is fully processed - SMART REUSE!
-                logger.info(f"♻️  Found processed content {res['content_hash'][:8]} with {existing_processed_doc['total_chunks']} chunks")
+    # [CHANGED] Switch to sync database operations for reliability
+    pool = get_sync_db_pool()
+    conn = pool.getconn()
+    
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            for res in results:
+                if isinstance(res, Exception) or not res:
+                    logger.error(f"A document failed to download or prep: {res}")
+                    continue
                 
-                # Create new document entry for this project
-                new_doc_id = uuid.uuid4()
-                await conn.execute(
+                # [CHANGED] First: Check if document already exists in THIS project (sync query)
+                cur.execute(
+                    'SELECT id FROM document_sources WHERE content_hash = %s AND project_id = %s',
+                    (res['content_hash'], project_id)
+                )
+                same_project_doc = cur.fetchone()
+                
+                if same_project_doc:
+                    same_project_duplicates.append(str(same_project_doc['id']))
+                    logger.info(f"📋 Document already exists in this project: {res['content_hash'][:8]} -> {same_project_doc['id']}")
+                    continue
+                
+                # [CHANGED] Second: Check if content exists in ANY project and is fully processed (sync query)
+                cur.execute(
                     '''
-                    INSERT INTO document_sources 
-                    (id, cdn_url, content_hash, project_id, content_tags, uploaded_by, 
-                        vector_embed_status, filename, file_size_bytes, file_extension, 
-                        total_chunks, total_batches, created_at)
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)''',
-                    new_doc_id, res['cdn_url'], res['content_hash'], 
-                    str(uuid.UUID(project_id)), res.get('content_tags', []), user_id,
-                    ProcessingStatus.COMPLETE.value, res['filename'], 
-                    res['file_size_bytes'], os.path.splitext(res['filename'])[1].lower(),
-                    existing_processed_doc['total_chunks'], existing_processed_doc['total_batches'],
+                    SELECT id, project_id, total_chunks, total_batches
+                    FROM document_sources 
+                    WHERE content_hash = %s 
+                    AND vector_embed_status = %s 
+                    AND total_chunks > 0
+                    LIMIT 1''',
+                    (res['content_hash'], ProcessingStatus.COMPLETE.value)
+                )
+                existing_processed_doc = cur.fetchone()
+                
+                if existing_processed_doc:
+                    # Content exists and is fully processed - SMART REUSE!
+                    logger.info(f"♻️  Found processed content {res['content_hash'][:8]} with {existing_processed_doc['total_chunks']} chunks")
+                    
+                    # [CHANGED] Create new document entry for this project (sync insert)
+                    new_doc_id = uuid.uuid4()
+                    cur.execute(
+                        '''
+                        INSERT INTO document_sources 
+                        (id, cdn_url, content_hash, project_id, content_tags, uploaded_by, 
+                            vector_embed_status, filename, file_size_bytes, file_extension, 
+                            total_chunks, total_batches, created_at)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)''',
+                        (str(new_doc_id), res['cdn_url'], res['content_hash'], 
+                         project_id, res.get('content_tags', []), user_id,
+                         ProcessingStatus.COMPLETE.value, res['filename'], 
+                         res['file_size_bytes'], os.path.splitext(res['filename'])[1].lower(),
+                         existing_processed_doc['total_chunks'], existing_processed_doc['total_batches'],
+                         datetime.now(timezone.utc))
+                    )
+                    
+                    # [CHANGED] Copy embeddings to the new project (sync function)
+                    logger.info(f"♻️  Copying found embeddings...")
+                    copy_result = copy_embeddings_for_project_sync(
+                        str(existing_processed_doc['id']), 
+                        str(new_doc_id), 
+                        project_id, 
+                        user_id
+                    )
+                    
+                    reused_docs.append({
+                        'doc_id': str(new_doc_id),
+                        'content_hash': res['content_hash'],
+                        'chunks_reused': copy_result['copied_count'],
+                        'tokens_reused': copy_result['total_tokens']
+                    })
+                    
+                    logger.info(f"🎯 Smart reuse complete: {copy_result['copied_count']} chunks, {copy_result['total_tokens']} tokens")
+                    
+                else:
+                    # New content or unprocessed content - full processing needed
+                    res['id'] = uuid.uuid4()
+                    new_docs_to_insert.append(res)
+                    logger.info(f"🆕 New content {res['content_hash'][:8]} needs full processing")
+        
+        # [CHANGED] Bulk insert new documents that need full processing (sync transaction)
+        inserted_ids = []
+        if new_docs_to_insert:
+            logger.info(f"💾 Inserting {len(new_docs_to_insert)} new docs for full processing...")
+            records_to_insert = [
+                (
+                    str(doc['id']), doc['cdn_url'], doc['content_hash'], doc['project_id'],
+                    doc.get('content_tags', []), doc['uploaded_by'], ProcessingStatus.PENDING.value,
+                    doc['filename'], doc['file_size_bytes'], os.path.splitext(doc['filename'])[1].lower(),
                     datetime.now(timezone.utc)
                 )
-                
-                # ♻️ Copy embeddings to the new project
-                logger.info(f"♻️  Copying found embeddings...")
-                copy_result = await copy_embeddings_for_project(
-                    str(existing_processed_doc['id']), 
-                    str(new_doc_id), 
-                    project_id, 
-                    user_id
-                )
-                
-                reused_docs.append({
-                    'doc_id': str(new_doc_id),
-                    'content_hash': res['content_hash'],
-                    'chunks_reused': copy_result['copied_count'],
-                    'tokens_reused': copy_result['total_tokens']
-                })
-                
-                logger.info(f"🎯 Smart reuse complete: {copy_result['copied_count']} chunks, {copy_result['total_tokens']} tokens")
-                
-            else:
-                # New content or unprocessed content - full processing needed
-                res['id'] = uuid.uuid4()
-                new_docs_to_insert.append(res)
-                logger.info(f"🆕 New content {res['content_hash'][:8]} needs full processing")
-    
-    # Bulk insert new documents that need full processing
-    inserted_ids = []
-    if new_docs_to_insert:
-        logger.info(f"💾 Inserting {len(new_docs_to_insert)} new docs for full processing...")
-        records_to_insert = [
-            (
-                doc['id'], doc['cdn_url'], doc['content_hash'], str(uuid.UUID(doc['project_id'])),
-                doc.get('content_tags', []), doc['uploaded_by'], ProcessingStatus.PENDING.value,
-                doc['filename'], doc['file_size_bytes'], os.path.splitext(doc['filename'])[1].lower(),
-                datetime.now(timezone.utc)
-            )
-            for doc in new_docs_to_insert
-        ]
-        
-        async with pool.acquire() as conn:
-            async with conn.transaction():
-                # await conn.copy_records_to_table(
-                #     'document_sources',
-                #     records=records_to_insert,
-                #     columns=(
-                #         'id', 'cdn_url', 'content_hash', 'project_id', 'content_tags',
-                #         'uploaded_by', 'vector_embed_status', 'filename', 'file_size_bytes',
-                #         'file_extension', 'created_at'
-                #     ),
-                #     timeout=60
-                # )
-                # CHANGE: Use executemany instead of copy_records_to_table
-                await conn.executemany(
+                for doc in new_docs_to_insert
+            ]
+            
+            with conn.cursor() as cur:
+                # [CHANGED] Use sync executemany instead of async
+                cur.executemany(
                     '''INSERT INTO document_sources 
                     (id, cdn_url, content_hash, project_id, content_tags, uploaded_by, 
                         vector_embed_status, filename, file_size_bytes, file_extension, created_at)
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)''',
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)''',
                     records_to_insert
-                )      
-        inserted_ids = [str(doc['id']) for doc in new_docs_to_insert]
+                )
+                conn.commit()  # [CHANGED] Explicit commit for sync transaction
+                    
+            inserted_ids = [str(doc['id']) for doc in new_docs_to_insert]
+            
+            # [UNCHANGED] Schedule parsing tasks ONLY for new documents
+            logger.info("🗂️ Scheduling parse tasks for NEW documents only...")
+            for doc in new_docs_to_insert:
+                parse_document_task.apply_async(
+                    (str(doc['id']), doc['cdn_url'], doc['project_id']), queue=PARSE_QUEUE
+                )
         
-        # Schedule parsing tasks ONLY for new documents
-        logger.info("🗂️ Scheduling parse tasks for NEW documents only...")
-        for doc in new_docs_to_insert:
-            parse_document_task.apply_async(
-                (str(doc['id']), doc['cdn_url'], doc['project_id']), queue=PARSE_QUEUE
-            )
+    finally:
+        # [CHANGED] Proper connection cleanup for sync pool
+        pool.putconn(conn)
     
-    # Comprehensive results
+    # [UNCHANGED] Comprehensive results
     all_doc_ids = same_project_duplicates + [doc['doc_id'] for doc in reused_docs] + inserted_ids
     
     total_reused_chunks = sum(doc['chunks_reused'] for doc in reused_docs)
@@ -1071,6 +1072,78 @@ async def _process_document_async(file_urls: List[str], metadata: Dict[str, Any]
         'total_tokens_reused': total_reused_tokens,
         'openai_cost_saved': total_reused_tokens * 0.0001 / 1000  # Rough estimate
     }
+
+# [CHANGED] New sync version of copy_embeddings_for_project
+def copy_embeddings_for_project_sync(existing_source_id: str, new_source_id: str, project_id: str, user_id: str) -> Dict[str, Any]:
+    """
+    [SYNC] Copy embeddings from an existing processed document to a new project
+    
+    Args:
+        existing_source_id: Source ID of the already-processed document
+        new_source_id: Source ID of the new document entry
+        project_id: Target project ID
+        user_id: User who uploaded the document
+    
+    Returns:
+        Dict with copy statistics
+    """
+    pool = get_sync_db_pool()
+    conn = pool.getconn()
+    
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            # Get vector embeddings from the existing document (via matching source_id)
+            cur.execute(
+                '''
+                SELECT content, metadata, embedding, num_tokens 
+                FROM document_vector_store 
+                WHERE source_id = %s AND embedding IS NOT NULL
+                ORDER BY created_at
+                ''',
+                (existing_source_id,)
+            )
+            existing_embeddings = cur.fetchall()
+            
+            if not existing_embeddings:
+                logger.warning(f"No embeddings found for source_id {existing_source_id}")
+                return {'copied_count': 0, 'total_tokens': 0}
+            
+            # Prepare records for bulk insert
+            records_to_insert = []
+            total_tokens = 0
+            
+            for embedding_row in existing_embeddings:
+                records_to_insert.append((
+                    str(uuid.uuid4()),              # id (converted to string)
+                    new_source_id,                   # source_id (already string)
+                    project_id,                      # project_id (already string)
+                    embedding_row['content'],        # content
+                    embedding_row['metadata'],       # metadata (keep original)
+                    embedding_row['embedding'],      # embedding (reuse existing)
+                    embedding_row['num_tokens'],     # num_tokens
+                    user_id,                         # user_id (already string)
+                    datetime.now(timezone.utc)      # created_at
+                ))
+                total_tokens += embedding_row['num_tokens'] or 0
+            
+            # Bulk insert the copied embeddings
+            cur.executemany(
+                '''INSERT INTO document_vector_store 
+                (id, source_id, project_id, content, metadata, embedding, num_tokens, user_id, created_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)''',
+                records_to_insert
+            )
+            conn.commit()
+            
+            logger.info(f"✅ Copied {len(records_to_insert)} embeddings from {existing_source_id} to {new_source_id} for project {project_id}")
+            
+            return {
+                'copied_count': len(records_to_insert),
+                'total_tokens': total_tokens
+            }
+            
+    finally:
+        pool.putconn(conn)
 
 async def _download_and_prep_doc(client: httpx.AsyncClient, url: str, project_id: str, user_id: str) -> Optional[Dict]:
     """
