@@ -289,13 +289,13 @@ async def create_new_rag_project(
     request: NewRagPipelineRequest, 
     background_tasks: BackgroundTasks
 ):
-    '''LIVE (06-03-2025)
-    Endpoint to create a RAG pipeline for user project:
-        - (prior) WeWeb creates a new project
-        - (prior) WeWeb creates a new chat_session and fkeys it to the project
-        - Uploads PDFs to AWS S3 and Supabase
-        - Initiates chunking and embedding tasks
-        - Returns task_id and source_ids for status monitoring
+    '''LIVE (07-20-2025)
+    Endpoint to start document RAG ingest → New AI Note Creation user project id {ID}:
+    - (prior) WeWeb creates a new project
+    - (prior) WeWeb creates a new chat_session and fkeys it to the project
+    - Uploads PDFs to AWS S3 and Supabase
+    - Initiates chunking and embedding tasks
+    - Returns task_id and source_ids for status monitoring
         
     Request contains:
         request.files (List): list of pdf file links
@@ -318,33 +318,50 @@ async def create_new_rag_project(
         # Log request information
         logger.info(f"🚀 Starting new RAG project with {len(request.files)} files for project {request.metadata.get('project_id')}")
         
-        # Data validation
+        # ——— Data Validation ————————————————————————————————
         if not request.files:
-            raise HTTPException(status_code=400, detail="No files provided in request")
-            
+            raise HTTPException(status_code=400, detail="No files provided in request")     
         if not request.metadata.get('project_id'):
             raise HTTPException(status_code=400, detail="project_id is required in metadata")
-            
         if not request.metadata.get('user_id'):
             raise HTTPException(status_code=400, detail="user_id is required in metadata")
         
+
+
+        # ——— Celery Task Enqueue ————————————————————————————————
+
         # [DEBUG] TEST LOGS 
         # job = test_celery_log_task.apply_async()
+        
+        # # Single job for RAG ingest only (used for primitive DEBUGGING)
+        # job = process_document_task.apply_async(
+        #     args=[
+        #         request.files, 
+        #         request.metadata
+        #     ]
+        # )
 
-        # Apply async job to process PDFs → finalize_document_processing_workflow() → rag_note_task()
-        job = process_document_task.apply_async(
-            args=[
-                request.files, 
-                request.metadata
-            ]
-        )
+        # Chained job for RAG ingest && AI Note generation (PRODUCTION)
+        job = chain(
+            process_document_task.s(request.files, request.metadata),
+            rag_note_task.s(
+                user_id=request.metadata["user_id"],
+                note_type=request.metadata["note_type"],
+                project_id=request.metadata["project_id"],
+                note_title=request.metadata["note_title"],
+                provider=request.metadata["provider"],
+                model_name=request.metadata["model_name"],
+                temperature=request.metadata["temperature"],
+                addtl_params=request.metadata["addtl_params"]
+            )
+        ).apply_async()
         
         # The task will return the job ID for immediate status monitoring
-        logger.info(f"🚀 Started RAG project task with ID: {job.id}")
+        logger.info(f"🚀 Started chained RAG workflow (Ingest → New Note) with ID: {job.id}")
         return {
             # "logging_test_task_id": job.id
             "embedding_task_id": job.id,
-            "message": f"Processing {len(request.files)} files, check status with job ID"
+            "message": f"Processing {len(request.files)} files then generating notes"
         }
     except Exception as e:
         logger.error(f"Error creating new RAG project: {e}", exc_info=True)
@@ -371,6 +388,16 @@ async def generate_ai_note(
         }
     '''
     try:
+        # ——— Data Validation ————————————————————————————————
+
+        if not request.metadata.get('project_id'):
+            raise HTTPException(status_code=400, detail="project_id is required in metadata")
+        if not request.metadata.get('user_id'):
+            raise HTTPException(status_code=400, detail="user_id is required in metadata")
+
+
+        # ——— Celery Task Enqueue ————————————————————————————————
+
         # Apply async job to generate ai notes (grounded w/ RAG)
         job = rag_note_task.apply_async(    
             kwargs={
@@ -410,7 +437,7 @@ async def append_sources_to_project(request: RagPipelineNewDocumentsRequest, bac
 
     try:
         # Apply async job to append new docs to an existing project (grounded w/ RAG)
-        job = append_document_task.apply_async(
+        job = process_document_task.apply_async(
             args=[
                 request.files, 
                 request.metadata
