@@ -1380,7 +1380,7 @@ def _parse_document_gevent(self, source_id: str, cdn_url: str, project_id: str) 
     """
     _update_document_status_sync(source_id, ProcessingStatus.PARSING)
     
-
+    short_id = source_id[:8]
     file_buffer = io.BytesIO()
     doc_metrics = DocumentMetrics(doc_id=source_id)
 
@@ -1391,23 +1391,42 @@ def _parse_document_gevent(self, source_id: str, cdn_url: str, project_id: str) 
             session = create_http_session()
             
             # Stream the file with gevent-friendly requests
-            logger.info(f"🔄 Starting document streaming for {source_id}")
+            logger.info(f"🚀 Starting document streaming for {source_id}, with url: {cdn_url}")
             response = session.get(cdn_url, headers=DEFAULT_HEADERS, stream=True, timeout=120)
             response.raise_for_status()
+
+            # Log response headers for debugging
+            content_length = response.headers.get('content-length')
+            content_type = response.headers.get('content-type', 'unknown')
             
             # Stream into memory buffer
+            # for chunk in response.iter_content(chunk_size=8192):
+            #     if chunk:
+            #         file_buffer.write(chunk)
+            #         # Yield control to other greenlets occasionally
+            #         gevent.sleep(0)
+            downloaded_bytes = 0
+            chunk_count = 0
             for chunk in response.iter_content(chunk_size=8192):
                 if chunk:
                     file_buffer.write(chunk)
-                    # Yield control to other greenlets occasionally
+                    downloaded_bytes += len(chunk)
+                    chunk_count += 1
+                    
+                    # Log progress every 1MB or 100 chunks
+                    if chunk_count % 100 == 0 or downloaded_bytes % (1024 * 1024) == 0:
+                        logger.info(f"📥 [PARSE-{short_id}] Downloaded {downloaded_bytes:,} bytes ({chunk_count} chunks)")
+                    
                     gevent.sleep(0)
-            
+
             file_buffer.seek(0)
             doc_metrics.download_time_ms = download_timer.elapsed_ms
             doc_metrics.file_size_bytes = file_buffer.getbuffer().nbytes
 
         # Phase 2: Process with Loader and Splitter (CPU-bound, but fast)
         with Timer() as parse_timer:
+
+            logger.info(f"✂️ [PARSE-{short_id}] Initializing loader && text splitter (chunk_size={CHUNK_SIZE}, overlap={CHUNK_OVERLAP})")
             loader = get_loader_for(filename=cdn_url, file_like_object=file_buffer)
             splitter = RecursiveCharacterTextSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)
             
