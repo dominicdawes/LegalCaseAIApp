@@ -1380,6 +1380,7 @@ def _parse_document_gevent(self, source_id: str, cdn_url: str, project_id: str) 
     """
     _update_document_status_sync(source_id, ProcessingStatus.PARSING)
     
+
     file_buffer = io.BytesIO()
     doc_metrics = DocumentMetrics(doc_id=source_id)
 
@@ -1390,6 +1391,7 @@ def _parse_document_gevent(self, source_id: str, cdn_url: str, project_id: str) 
             session = create_http_session()
             
             # Stream the file with gevent-friendly requests
+            logger.info(f"🔄 Starting document streaming for {source_id}")
             response = session.get(cdn_url, headers=DEFAULT_HEADERS, stream=True, timeout=120)
             response.raise_for_status()
             
@@ -1428,6 +1430,7 @@ def _parse_document_gevent(self, source_id: str, cdn_url: str, project_id: str) 
             
             doc_metrics.parse_time_ms = parse_timer.elapsed_ms
             doc_metrics.total_chunks = len(all_texts)
+            logger.info(f"⏱️ PARSING task time metrics,  parse time: {doc_metrics.parse_time_ms}, total_chunks: {doc_metrics.total_chunks}...")
 
         # Phase 3: Token-Aware Adaptive Batching
         with Timer() as batch_timer:
@@ -1436,7 +1439,6 @@ def _parse_document_gevent(self, source_id: str, cdn_url: str, project_id: str) 
             current_batch_tokens = 0
 
             logger.info(f"💾 Kicking off embedding task for source_id {source_id}...")
-            
             for i, text in enumerate(all_texts):
                 token_count = len(tokenizer.encode(text))
                 
@@ -1459,6 +1461,7 @@ def _parse_document_gevent(self, source_id: str, cdn_url: str, project_id: str) 
                 task_sig = embed_batch_task.s(source_id, project_id, current_batch_texts, current_batch_metas)
                 embedding_tasks.append(task_sig)
             
+            logger.info(f"✅ Successfully streamed {len(all_texts)} chunks from {page_num + 1} pages")
             doc_metrics.total_batches = len(embedding_tasks)
             doc_metrics.chunk_time_ms = batch_timer.elapsed_ms
 
