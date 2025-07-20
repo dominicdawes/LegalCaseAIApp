@@ -176,8 +176,8 @@ class StreamingTextProcessor:
                         
                         yield chunk.page_content, chunk_metadata
                 
-                # Log progress periodically
-                if (page_num + 1) % 10 == 0:
+                # Log progress periodically (every 20 pages)
+                if (page_num + 1) % 20 == 0:
                     elapsed_ms = (time.time() - start_time) * 1000
                     logger.info(f"Processed {page_num + 1} pages, "
                                 f"{self.metrics.total_chunks} chunks, "

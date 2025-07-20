@@ -1410,8 +1410,8 @@ def _parse_document_gevent(self, source_id: str, cdn_url: str, project_id: str) 
                     downloaded_bytes += len(chunk)
                     chunk_count += 1
                     
-                    # Log progress every 1MB or 100 chunks
-                    if chunk_count % 100 == 0 or downloaded_bytes % (1024 * 1024) == 0:
+                    # Log progress every 5MB or 500 chunks
+                    if chunk_count % 500 == 0 or downloaded_bytes % (1024 * 1024 * 5) == 0:
                         logger.info(f"📥 [PARSE-{short_id}] Downloaded {downloaded_bytes:,} bytes ({chunk_count} chunks)")
                     
                     gevent.sleep(0)
@@ -1464,14 +1464,14 @@ def _parse_document_gevent(self, source_id: str, cdn_url: str, project_id: str) 
                 all_texts.append(chunk_text)
                 all_metadatas.append(chunk_metadata)
                 
-                # Log progress every 100 chunks
-                if len(all_texts) % 100 == 0:
+                # Log progress every 200 chunks
+                if len(all_texts) % 200 == 0:
                     logger.info(f"✂️ [PARSE-{short_id}] Created {len(all_texts)} chunks")
                 
                 gevent.sleep(0)
             
             # [DEBUG] Print statement at the end of document chunking (i.e. the full 13.9MB)
-            logger.info(f"⏱️ PARSE task time metrics,  parse time: {doc_metrics.parse_time_ms}, total_chunks: {doc_metrics.total_chunks}...")
+            logger.info(f"⏱️ PARSING COMPLETE: task time metrics,  parse time: {doc_metrics.parse_time_ms}, total_chunks: {doc_metrics.total_chunks}...")
 
             
             # Get processing performance summary
