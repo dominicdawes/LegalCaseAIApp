@@ -19,7 +19,7 @@ class Timer:
     def __init__(self):
         self.start_time = None
         self.end_time = None
-        self.elapsed_ms = 0
+        self.elapsed_ms = 0.0
     
     def __enter__(self):
         self.start_time = time.perf_counter()
@@ -27,7 +27,7 @@ class Timer:
     
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.end_time = time.perf_counter()
-        self.elapsed_ms = int((self.end_time - self.start_time) * 1000)
+        self.elapsed_ms = (self.end_time - self.start_time) * 1000
 
 class MetricsCollector:
     """Production-grade metrics collection with thread safety"""
