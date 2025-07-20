@@ -68,7 +68,8 @@ from utils.s3_utils import upload_to_s3, s3_client
 from utils.cloudfront_utils import get_cloudfront_url
 from utils.supabase_utils import supabase_client
 from utils.document_loaders.base import BaseDocumentLoader
-from utils.document_loaders.loader_factory import get_loader_for        # The loader factory is now expected to handle in-memory file-like objects
+from utils.document_loaders.loader_factory import get_loader_for, analyze_document_before_processing, get_high_performance_loader
+from utils.document_loaders.performance import create_optimized_processor, BatchTokenCounter
 from utils.metrics import MetricsCollector, Timer
 from utils.connection_pool import ConnectionPoolManager
 from utils.memory_manager import MemoryManager # Kept for health checks
@@ -180,7 +181,7 @@ class DocumentMetrics:
 
 class StreamingDocumentProcessor:
     """
-    Wrapper class to encapsulate streaming document processing
+    DEPRECATED: Wrapper class to encapsulate streaming document processing
     Maintains the TRUE IN-MEMORY STREAMING architecture
     """
     
@@ -1376,13 +1377,14 @@ def parse_document_task(self, source_id: str, cdn_url: str, project_id: str) -> 
 
 def _parse_document_gevent(self, source_id: str, cdn_url: str, project_id: str) -> Dict[str, Any]:
     """
-    Gevent-based parsing implementation
+    Gevent-based parsing implementation, with optimizations
     """
     _update_document_status_sync(source_id, ProcessingStatus.PARSING)
     
     short_id = source_id[:8]
     file_buffer = io.BytesIO()
     doc_metrics = DocumentMetrics(doc_id=source_id)
+    perf_summary = {}
 
     try:
         # Phase 1: Gevent-optimized streaming download
@@ -1400,11 +1402,6 @@ def _parse_document_gevent(self, source_id: str, cdn_url: str, project_id: str) 
             content_type = response.headers.get('content-type', 'unknown')
             
             # Stream into memory buffer
-            # for chunk in response.iter_content(chunk_size=8192):
-            #     if chunk:
-            #         file_buffer.write(chunk)
-            #         # Yield control to other greenlets occasionally
-            #         gevent.sleep(0)
             downloaded_bytes = 0
             chunk_count = 0
             for chunk in response.iter_content(chunk_size=8192):
@@ -1422,91 +1419,236 @@ def _parse_document_gevent(self, source_id: str, cdn_url: str, project_id: str) 
             file_buffer.seek(0)
             doc_metrics.download_time_ms = download_timer.elapsed_ms
             doc_metrics.file_size_bytes = file_buffer.getbuffer().nbytes
+            perf_summary['download_ms'] = download_timer.elapsed_ms
 
-        # Phase 2: Process with Loader and Splitter (CPU-bound, but fast)
-        with Timer() as parse_timer:
+    #     # Phase 2: Process with Loader and Splitter (CPU-bound, but fast)
+    #     with Timer() as parse_timer:
+    #         # [DEBUG] Quick doc analysis
+    #         doc_analysis = analyze_document_before_processing(cdn_url, file_buffer)
 
-            logger.info(f"✂️ [PARSE-{short_id}] Initializing loader && text splitter (chunk_size={CHUNK_SIZE}, overlap={CHUNK_OVERLAP})")
-            loader = get_loader_for(filename=cdn_url, file_like_object=file_buffer)
-            splitter = RecursiveCharacterTextSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)
+    #         logger.info(f"✂️ [PARSE-{short_id}] Initializing loader && text splitter (chunk_size={CHUNK_SIZE}, overlap={CHUNK_OVERLAP})")
+    #         loader = get_loader_for(filename=cdn_url, file_like_object=file_buffer)
+    #         splitter = RecursiveCharacterTextSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)
             
-            chunk_count = 0
-            all_texts, all_metadatas = [], []
-            for page_num, page in enumerate(loader.stream_documents(file_buffer)):
-                # Yield control during processing
-                gevent.sleep(0)
+    #         # Stream processing with real-time metrics
+    #         chunk_count = 0
+    #         all_texts, all_metadatas = [], []
+    #         for page_num, page in enumerate(loader.stream_documents(file_buffer)):
+    #             # Yield control during processing
+    #             gevent.sleep(0)
 
-                # DEBUG TRACKER
-                if page_num % 20 == 0:  # Log every 10 pages
-                    logger.info(f"📄 Processing page {page_num + 1}...")
+    #             # DEBUG TRACKER
+    #             if page_num % 20 == 0:  # Log every 10 pages
+    #                 logger.info(f"📄 Processing page {page_num + 1}...")
                 
-                for chunk_idx, chunk in enumerate(splitter.split_documents([page])):
-                    # DEBUG TRACKER
-                    chunk_count += 1
-                    if chunk_count % 200 == 0:  # Log every 200 chunks
-                        logger.info(f"✂️ Created {chunk_count} chunks so far...")
+    #             for chunk_idx, chunk in enumerate(splitter.split_documents([page])):
+    #                 # DEBUG TRACKER
+    #                 chunk_count += 1
+    #                 if chunk_count % 200 == 0:  # Log every 200 chunks
+    #                     logger.info(f"✂️ Created {chunk_count} chunks so far...")
 
-                    cleaned_content = _clean_text(chunk.page_content)
-                    if not cleaned_content:
-                        continue
+    #                 cleaned_content = _clean_text(chunk.page_content)
+    #                 if not cleaned_content:
+    #                     continue
                     
-                    all_texts.append(cleaned_content)
-                    all_metadatas.append({
-                        **chunk.metadata,
-                        'page_number': page_num,
-                        'chunk_index': chunk_idx
-                    })
+    #                 all_texts.append(cleaned_content)
+    #                 all_metadatas.append({
+    #                     **chunk.metadata,
+    #                     'page_number': page_num,
+    #                     'chunk_index': chunk_idx
+    #                 })
             
-            doc_metrics.parse_time_ms = parse_timer.elapsed_ms
-            doc_metrics.total_chunks = len(all_texts)
-            logger.info(f"⏱️ PARSING task time metrics,  parse time: {doc_metrics.parse_time_ms}, total_chunks: {doc_metrics.total_chunks}...")
+    #         doc_metrics.parse_time_ms = parse_timer.elapsed_ms
+    #         doc_metrics.total_chunks = len(all_texts)
+    #         logger.info(f"⏱️ PARSING task time metrics,  parse time: {doc_metrics.parse_time_ms}, total_chunks: {doc_metrics.total_chunks}...")
 
-        # Phase 3: Token-Aware Adaptive Batching
+    #     # Phase 3: Token-Aware Adaptive Batching
+    #     with Timer() as batch_timer:
+    #         embedding_tasks = []
+    #         current_batch_texts, current_batch_metas = [], []
+    #         current_batch_tokens = 0
+
+    #         logger.info(f"💾 Kicking off embedding task for source_id {source_id}...")
+    #         for i, text in enumerate(all_texts):
+    #             token_count = len(tokenizer.encode(text))
+                
+    #             # If adding the next chunk exceeds the token limit, dispatch the current batch
+    #             if current_batch_tokens + token_count > OPENAI_MAX_TOKENS_PER_BATCH and current_batch_texts:
+    #                 task_sig = embed_batch_task.s(source_id, project_id, current_batch_texts, current_batch_metas)
+    #                 embedding_tasks.append(task_sig)
+    #                 current_batch_texts, current_batch_metas, current_batch_tokens = [], [], 0
+
+    #             current_batch_texts.append(text)
+    #             current_batch_metas.append(all_metadatas[i])
+    #             current_batch_tokens += token_count
+                
+    #             # Yield control during batching
+    #             if i % 100 == 0:
+    #                 gevent.sleep(0)
+            
+    #         # Dispatch the final batch if it exists
+    #         if current_batch_texts:
+    #             task_sig = embed_batch_task.s(source_id, project_id, current_batch_texts, current_batch_metas)
+    #             embedding_tasks.append(task_sig)
+            
+    #         logger.info(f"✅ Successfully streamed {len(all_texts)} chunks from {page_num + 1} pages")
+    #         doc_metrics.total_batches = len(embedding_tasks)
+    #         doc_metrics.chunk_time_ms = batch_timer.elapsed_ms
+
+    #     # Phase 4: Database Update & Task Scheduling
+    #     pool = get_sync_db_pool()   # use SYNC pool since its a simple status update to Supabase
+    #     conn = pool.getconn()
+    #     try:
+    #         with conn.cursor() as cur:
+    #             cur.execute(
+    #                 """
+    #                 UPDATE document_sources
+    #                 SET vector_embed_status = %s, total_chunks = %s, total_batches = %s, 
+    #                     processing_metadata = processing_metadata || %s::jsonb
+    #                 WHERE id = %s""",
+    #                 (ProcessingStatus.EMBEDDING.value, doc_metrics.total_chunks, 
+    #                     doc_metrics.total_batches, json.dumps(doc_metrics.to_dict()), source_id)
+    #             )
+    #             conn.commit()
+    #     finally:
+    #         pool.putconn(conn)
+        
+    #     # Schedule embedding tasks
+    #     if embedding_tasks:
+    #         chord(group(embedding_tasks), queue=EMBED_QUEUE)(finalize_embeddings.s(source_id).set(queue=FINAL_QUEUE))
+    #     else:
+    #         finalize_embeddings.apply_async(([], source_id), queue=FINAL_QUEUE)
+
+    #     logger.info(f"Parsing complete for {source_id}: {doc_metrics.total_chunks} chunks in {doc_metrics.total_batches} token-aware batches.")
+    #     return {'source_id': source_id, 'status': 'SUCCESS', 'batches_created': doc_metrics.total_batches}
+
+    # except Exception as e:
+    #     logger.error(f"Parsing failed for {source_id}: {e}", exc_info=True)
+    #     _update_document_status_sync(source_id, ProcessingStatus.FAILED_PARSING, str(e))
+    #     raise
+
+# NEW BLOCK TO INTEGRATE -------------------------
+        # Phase 2: Document Analysis & Optimal Loader Selection
+        with Timer() as analysis_timer:
+            # Quick analysis to choose best processing strategy
+            doc_analysis = analyze_document_before_processing(cdn_url, file_buffer)
+            
+            logger.info(f"📊 [PARSE-{short_id}] Analysis: {doc_analysis['file_size_mb']:.1f}MB, "
+                        f"complexity: {doc_analysis.get('complexity_score', 'N/A')}, "
+                        f"estimated time: {doc_analysis['processing_time_estimate']:.1f}s")
+            
+            # Choose optimal loader based on analysis
+            if doc_analysis.get('complexity_score', 0) >= 7:
+                loader = get_high_performance_loader(cdn_url, file_buffer)
+                processor_mode = "fast"
+                logger.info(f"⚡ [PARSE-{short_id}] Using HIGH PERFORMANCE mode")
+            else:
+                loader = get_loader_for(cdn_url, file_buffer, performance_mode="auto")
+                processor_mode = "balanced"
+                logger.info(f"⚖️ [PARSE-{short_id}] Using BALANCED mode")
+            
+            # Add to merformance bench summary dict
+            perf_summary['analysis_ms'] = analysis_timer.elapsed_ms
+
+        # Phase 3: Optimized Text Processing
+        with Timer() as process_timer:
+            # Create optimized processor (classe uses "pseudo-Semantic Chunking" using RecursiveCharacterTextSplitter)
+            processor = create_optimized_processor(
+                chunk_size=CHUNK_SIZE,
+                chunk_overlap=CHUNK_OVERLAP,
+                performance_mode=processor_mode
+            )
+            
+            # Stream processing with real-time metrics
+            all_texts, all_metadatas = [], []
+            
+            logger.info(f"🔄 [PARSE-{short_id}] Starting streaming processing...")
+            
+            # Process documents in streaming fashion
+            document_stream = loader.stream_documents(file_buffer)
+            text_stream = processor.process_documents_streaming(document_stream, source_id)
+            
+            for chunk_text, chunk_metadata in text_stream:
+                all_texts.append(chunk_text)
+                all_metadatas.append(chunk_metadata)
+                
+                # Log progress every 100 chunks
+                if len(all_texts) % 100 == 0:
+                    logger.info(f"✂️ [PARSE-{short_id}] Created {len(all_texts)} chunks")
+                
+                gevent.sleep(0)
+                logger.info(f"⏱️ PARSE task time metrics,  parse time: {doc_metrics.parse_time_ms}, total_chunks: {doc_metrics.total_chunks}...")
+
+            
+            # Get processing performance summary
+            processing_summary = processor.get_performance_summary()
+            perf_summary.update({
+                'text_processing_ms': process_timer.elapsed_ms,
+                'total_chunks': len(all_texts),
+                'total_pages': processing_summary['total_pages'],
+                'chars_per_second': processing_summary['chars_per_second'],
+                'chunks_per_second': processing_summary['chunks_per_second']
+            })
+            
+            logger.info(f"✅ [PARSE-{short_id}] Processing complete: {len(all_texts)} chunks from {processing_summary['total_pages']} pages")
+
+        # Phase 4: Optimized Token Counting & Batching
+        with Timer() as token_timer:
+            # Batch token counting for efficiency
+            token_counter = BatchTokenCounter(tokenizer)
+            token_counts = token_counter.count_tokens_batch(all_texts)
+            
+            perf_summary['token_counting_ms'] = token_timer.elapsed_ms
+            total_tokens = sum(token_counts)
+            logger.info(f"🔢 [PARSE-{short_id}] Token counting: {total_tokens:,} tokens in {perf_summary['token_counting_ms']:.1f}ms")
+
         with Timer() as batch_timer:
             embedding_tasks = []
             current_batch_texts, current_batch_metas = [], []
             current_batch_tokens = 0
 
-            logger.info(f"💾 Kicking off embedding task for source_id {source_id}...")
-            for i, text in enumerate(all_texts):
-                token_count = len(tokenizer.encode(text))
-                
-                # If adding the next chunk exceeds the token limit, dispatch the current batch
+            for i, (text, token_count) in enumerate(zip(all_texts, token_counts)):
                 if current_batch_tokens + token_count > OPENAI_MAX_TOKENS_PER_BATCH and current_batch_texts:
                     task_sig = embed_batch_task.s(source_id, project_id, current_batch_texts, current_batch_metas)
                     embedding_tasks.append(task_sig)
+                    
+                    if len(embedding_tasks) % 5 == 0:  # Log every 5 batches
+                        logger.info(f"📦 [PARSE-{short_id}] Created {len(embedding_tasks)} batches")
+                    
                     current_batch_texts, current_batch_metas, current_batch_tokens = [], [], 0
 
                 current_batch_texts.append(text)
                 current_batch_metas.append(all_metadatas[i])
                 current_batch_tokens += token_count
-                
-                # Yield control during batching
-                if i % 100 == 0:
-                    gevent.sleep(0)
-            
-            # Dispatch the final batch if it exists
+
             if current_batch_texts:
                 task_sig = embed_batch_task.s(source_id, project_id, current_batch_texts, current_batch_metas)
                 embedding_tasks.append(task_sig)
-            
-            logger.info(f"✅ Successfully streamed {len(all_texts)} chunks from {page_num + 1} pages")
-            doc_metrics.total_batches = len(embedding_tasks)
-            doc_metrics.chunk_time_ms = batch_timer.elapsed_ms
 
-        # Phase 4: Database Update & Task Scheduling
-        pool = get_sync_db_pool()   # use SYNC pool since its a simple status update to Supabase
+            perf_summary['batching_ms'] = batch_timer.elapsed_ms
+            perf_summary['total_batches'] = len(embedding_tasks)
+
+        # Phase 5: Database Update
+        pool = get_sync_db_pool()
         conn = pool.getconn()
         try:
             with conn.cursor() as cur:
+                # Enhanced metrics for database
+                enhanced_metrics = {
+                    **doc_metrics.to_dict(),
+                    **perf_summary,
+                    'processing_mode': processor_mode,
+                    'loader_type': type(loader).__name__
+                }
+                
                 cur.execute(
                     """
                     UPDATE document_sources
                     SET vector_embed_status = %s, total_chunks = %s, total_batches = %s, 
                         processing_metadata = processing_metadata || %s::jsonb
                     WHERE id = %s""",
-                    (ProcessingStatus.EMBEDDING.value, doc_metrics.total_chunks, 
-                        doc_metrics.total_batches, json.dumps(doc_metrics.to_dict()), source_id)
+                    (ProcessingStatus.EMBEDDING.value, len(all_texts), 
+                        len(embedding_tasks), json.dumps(enhanced_metrics), source_id)
                 )
                 conn.commit()
         finally:
@@ -1514,15 +1656,34 @@ def _parse_document_gevent(self, source_id: str, cdn_url: str, project_id: str) 
         
         # Schedule embedding tasks
         if embedding_tasks:
+            logger.info(f"🚀 [PARSE-{short_id}] Scheduling {len(embedding_tasks)} embedding tasks...")
             chord(group(embedding_tasks), queue=EMBED_QUEUE)(finalize_embeddings.s(source_id).set(queue=FINAL_QUEUE))
         else:
             finalize_embeddings.apply_async(([], source_id), queue=FINAL_QUEUE)
 
-        logger.info(f"Parsing complete for {source_id}: {doc_metrics.total_chunks} chunks in {doc_metrics.total_batches} token-aware batches.")
-        return {'source_id': source_id, 'status': 'SUCCESS', 'batches_created': doc_metrics.total_batches}
+        # Final performance summary
+        total_time = sum([
+            perf_summary['download_ms'],
+            perf_summary['analysis_ms'], 
+            perf_summary['text_processing_ms'],
+            perf_summary['token_counting_ms'],
+            perf_summary['batching_ms']
+        ])
+        
+        logger.info(f"🎉 [PARSE-{short_id}] PARSING COMPLETE!")
+        logger.info(f"   ⏱️ Total: {total_time:.1f}ms | Download: {perf_summary['download_ms']:.1f}ms | Process: {perf_summary['text_processing_ms']:.1f}ms")
+        logger.info(f"   📊 {perf_summary['total_chunks']} chunks, {perf_summary['total_batches']} batches, {perf_summary['chars_per_second']:.0f} chars/sec")
+        
+        return {
+            'source_id': source_id, 
+            'status': 'SUCCESS', 
+            'batches_created': len(embedding_tasks),
+            'total_chunks': len(all_texts),
+            'performance_metrics': perf_summary
+        }
 
     except Exception as e:
-        logger.error(f"Parsing failed for {source_id}: {e}", exc_info=True)
+        logger.error(f"💥 [PARSE-{short_id}] OPTIMIZED PARSING FAILED: {e}", exc_info=True)
         _update_document_status_sync(source_id, ProcessingStatus.FAILED_PARSING, str(e))
         raise
 
