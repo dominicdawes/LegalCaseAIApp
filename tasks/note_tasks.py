@@ -3,55 +3,115 @@ This file runs Celery tasks for handling RAG AI note creation tasks (outlines, s
 Note genereation (with RAG) is done without token streaming. Returns full answer in one go.
 """
 
+# ===== STANDARD LIBRARY IMPORTS =====
 import multiprocessing as mp
 import gc
 import traceback
-from celery import Celery, Task
-from celery.exceptions import MaxRetriesExceededError, TimeoutError
-from tasks.celery_app import (
-    celery_app,
-)  # Import the Celery app instance (see celery_app.py for LocalHost config)
 import logging
 import os
-import redis
-from supabase import create_client, Client
-from utils.supabase_utils import (
-    insert_note_supabase_record,
-    supabase_client,
-    log_llm_error,
-)
-from utils.prompt_utils import load_yaml_prompt, build_prompt_template_from_yaml
 from datetime import datetime, timezone
-import tiktoken
 import requests
 import tempfile
 import uuid
 import json
+import re
+import atexit
+import signal
 from dotenv import load_dotenv
 
-# langchain imports
-from langchain_core.load import dumpd
+# ===== DATABASE =====
+import redis
+from supabase import create_client, Client
+import psycopg2
+from psycopg2.pool import ThreadedConnectionPool
+from psycopg2.extras import execute_batch
 
-# from langchain_openai import OpenAIEmbeddings, ChatOpenAI
+# ===== ASYNC & CONCURRENCY & SOCKET =====
+import asyncio
+import gevent
+import gevent.socket
+import socket
+
+# ===== NETWORKING & HTTP =====
+import requests
+from requests.adapters import HTTPAdapter
+import httpx
+
+# ===== CELERY & TASK QUEUE =====
+from celery import Celery, Task
+from celery.exceptions import MaxRetriesExceededError, TimeoutError
+from celery import chord, group
+from celery.signals import worker_init, worker_shutdown
+from celery.utils.log import get_task_logger
+from celery.exceptions import MaxRetriesExceededError
+from celery.exceptions import Retry as CeleryRetry
+
+# ===== MACHINE LEARNING & TEXT PROCESSING =====
+import tiktoken
+from langchain_core.load import dumpd
 from langchain_community.embeddings import OpenAIEmbeddings
 from langchain.prompts import PromptTemplate
 from langchain.schema import AIMessage
 from langchain.callbacks.base import BaseCallbackHandler
 from langchain.callbacks.manager import CallbackManager
-
-# from langchain.document_loaders import PyPDFLoader
 from langchain_community.document_loaders import PyPDFLoader
 from langchain.text_splitter import CharacterTextSplitter
 
-#### GLOBAL ####
-# API Keys
+# ===== PROJECT MODULES =====
+from tasks.celery_app import (
+    celery_app,
+)  # Import the Celery app instance (see celery_app.py for LocalHost config)
+from utils.prompt_utils import load_yaml_prompt, build_prompt_template_from_yaml
+from utils.supabase_utils import (
+    insert_note_supabase_record,
+    supabase_client,
+    log_llm_error,
+)
+
+
+# ——— Logging & Env Load ———————————————————————————————————————————————————————————
+logger = get_task_logger(__name__)
+logger.propagate = False
 load_dotenv()
-# # OPENAI_API_KEY = os.environ.get("OPENAI_API_PROD_KEY")
+
+# ——— Configuration & Constants ————————————————————————————————————————————————————
+
+# Queue configuration
+INGEST_QUEUE = 'ingest'
+PARSE_QUEUE = 'parsing'
+EMBED_QUEUE = 'embedding'
+FINAL_QUEUE = 'finalize'
+
+# Performance, Retries & Batching
+MAX_RETRIES = 5
+RETRY_BACKOFF_MULTIPLIER = 2
+DEFAULT_RETRY_DELAY = 5
+RATE_LIMIT = '150/m' # Tuned for a 2-CPU / 4GB RAM instance instead of 1000/m
+
+# OpenAI API & Configuration
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()  # ← only for embeddings
+OPENAI_EMBEDDING_MODEL = "text-embedding-ada-002"
+OPENAI_MAX_TOKENS_PER_BATCH = 8190 # Safety margin below the 8192 limit
+EXPECTED_EMBEDDING_LEN = 1536
+MAX_CONCURRENT_DOWNLOADS = 3 # A modest limit instead of 10
+CHUNK_SIZE = 1000
+CHUNK_OVERLAP = 200
 
+# Database (asyncpg)
+DB_DSN = os.getenv("POSTGRES_DSN_POOL") # e.g., Supabase -> Connection -> Get Direct URL
+# DB_POOL_MIN_SIZE = 5  # <-- if i had more compute
+# DB_POOL_MAX_SIZE = 20
+DB_POOL_MIN_SIZE = 2
+DB_POOL_MAX_SIZE = 5
 
-# Logging
-logger = logging.getLogger(__name__)
+DEFAULT_HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+    'Accept': 'application/pdf,text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+    'Accept-Language': 'en-US,en;q=0.5',
+    'Accept-Encoding': 'gzip, deflate',
+    'Connection': 'keep-alive',
+    'Upgrade-Insecure-Requests': '1'
+}
 
 # Initialize Redis sync client for pub/sub
 REDIS_LABS_URL = (
@@ -62,6 +122,89 @@ REDIS_LABS_URL = (
 )
 redis_sync = redis.Redis.from_url(REDIS_LABS_URL, decode_responses=True)
 
+# ——— 1. POOL CLEANUP FUNCTIONS ——————————————————————————————————————————————————
+
+async def close_db_pool():
+    """Safely close the database pool"""
+    global db_pool
+    if db_pool is not None:
+        logger.info("🔄 Closing database pool...")
+        try:
+            await db_pool.close()
+            logger.info("✅ Database pool closed successfully")
+        except Exception as e:
+            logger.error(f"❌ Error closing database pool: {e}")
+        finally:
+            db_pool = None
+
+def sync_close_db_pool():
+    """Synchronous wrapper for closing the pool"""
+    try:
+        if db_pool is not None:
+            # Create new event loop if none exists
+            try:
+                loop = asyncio.get_event_loop()
+            except RuntimeError:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+            
+            # Close the pool
+            loop.run_until_complete(close_db_pool())
+    except Exception as e:
+        logger.error(f"❌ Error in sync pool cleanup: {e}")
+
+# ——— 2. CELERY SIGNAL HANDLERS ————————————————————————————————————————————————————
+
+# @worker_init.connect
+def worker_init_handler(sender=None, **kwargs):
+    """Called when Celery worker starts"""
+    global db_pool
+    logger.info("🚀 Celery worker initializing && db pool resetting...")
+    
+    # Force reset the global pool variable
+    db_pool = None
+    logger.info("🔄 Database pool reset on worker init")
+
+# Global pool reset on worker init
+worker_init.connect(worker_init_handler)
+
+@worker_shutdown.connect
+def worker_shutdown_handler(sender=None, **kwargs):
+    """Called when Celery worker shuts down"""
+    logger.info("🛑 Celery worker shutting down...")
+    sync_close_db_pool()
+
+# ——— 3. SYSTEM SIGNAL HANDLERS ————————————————————————————————————————————————————
+
+def signal_handler(signum, frame):
+    """Handle system signals (SIGTERM, SIGINT)"""
+    logger.info(f"🛑 Received signal {signum}, cleaning up...")
+    sync_close_db_pool()
+
+# Register signal handlers
+signal.signal(signal.SIGTERM, signal_handler)
+signal.signal(signal.SIGINT, signal_handler)
+
+# Register atexit handler as last resort
+atexit.register(sync_close_db_pool)
+
+# ——— Global Production Instances (Initialized once per worker) —————————————————————
+
+# OpenAI Embeddings Client
+embedding_model = OpenAIEmbeddings(
+    model=OPENAI_EMBEDDING_MODEL,
+    api_key=os.getenv("OPENAI_API_KEY"),
+    max_retries=3,
+    request_timeout=60
+)
+
+# Tokenizer
+try:
+    tokenizer = tiktoken.encoding_for_model(OPENAI_EMBEDDING_MODEL)
+except KeyError:
+    tokenizer = tiktoken.get_encoding("cl100k_base")
+
+# ——— HELPER FUNCTIONS ————————————————————————————————————————————————————
 
 class BaseTaskWithRetry(Task):
     """
@@ -95,6 +238,7 @@ class StreamToClientHandler(BaseCallbackHandler):
         # Called by LangChain for every new token in streaming mode
         publish_token(self.session_id, token)
 
+# ——— Task: Naieve RAG ———————————————————————————————————————————
 
 @celery_app.task(bind=True, base=BaseTaskWithRetry)
 def rag_note_task(
@@ -129,6 +273,9 @@ def rag_note_task(
         # This manually sets result = AsyncResult(task_id) when checking on this celery task via job.id
         # result.state → "PENDING"
         # result.info → {"start_time": "..."}
+        task_id = self.request.id
+        logger.info(f"🎯 Starting task {task_id}... Triggered note generation for project: {project_id}")
+
         self.update_state(
             state="STARTED", meta={"start_time": datetime.now(timezone.utc).isoformat()}
         )
@@ -146,8 +293,9 @@ def rag_note_task(
             yaml_file = "flashcards-prompt.yaml"
         else:
             raise ValueError(f"Unknown note_type: {note_type}")
+        logger.info(f"🙋‍♂️ NOTE TYPE: {note_type} generation chosen...")
 
-        # Load YAML and extract “base_prompt” and “template”
+        # Load YAML and extract "base_prompt" and "template"
         yaml_dict = load_yaml_prompt(yaml_file)
         base_query = yaml_dict.get("base_prompt")
         prompt_template = build_prompt_template_from_yaml(yaml_dict)
@@ -155,10 +303,11 @@ def rag_note_task(
             raise KeyError(f"`base_prompt` not found in {yaml_file}")
 
         # Step 2) Embed the short base query using OpenAI Ada embeddings (1536 dims)
-        embedding_model = OpenAIEmbeddings(
-            model="text-embedding-ada-002",
-            api_key=OPENAI_API_KEY,
-        )
+        # embedding_model = OpenAIEmbeddings(
+        #     model="text-embedding-ada-002",
+        #     api_key=OPENAI_API_KEY,
+        # )
+        logger.info(f"🤖 Generating embeddings...")
         query_embedding = embedding_model.embed_query(base_query)
 
         # Step 3) Fetch top-K relevant chunks via Supabase RPC && Format for llm context window
@@ -264,6 +413,7 @@ def save_note(project_id, user_id, note_type, note_title, content):
     """
     Persists generated summary note into Supabase public.notes table.
     """
+    logger.info(f"💾 Inserting {note_type} NOTE into public.notes")
     insert_note_supabase_record(
         client=supabase_client,
         table_name="notes", # ← public.notes
