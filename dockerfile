@@ -13,7 +13,8 @@ RUN apt-get update && \
         libreoffice-core \
         libreoffice-common \
         libreoffice-writer \
-        tesseract-ocr && \
+        tesseract-ocr \
+        redis-tools && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
@@ -37,6 +38,10 @@ COPY . /app
 ENV PYTHONUNBUFFERED=1
 ENV CELERY_HIJACK_ROOT_LOGGER=0
 ENV CELERY_LOG_LEVEL=INFO
+ENV CELERY_HIJACK_ROOT_LOGGER=False
+# ENV CELERY_WORKER_HIJACK_ROOT_LOGGER=False
+# ENV CELERY_WORKER_LOG_FORMAT='[%(asctime)s: %(levelname)s] %(message)s'
+
 
 # 7) Tell Render how to launch your worker with explicit logging (Purge queues on startup && Start worker + queues)
 #    (For example, if you run a Celery worker named `celery_worker.py`)

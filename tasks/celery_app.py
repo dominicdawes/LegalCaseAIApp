@@ -112,6 +112,7 @@ celery_app.conf.update(
 import tasks.chat_tasks
 import tasks.chat_streaming_tasks
 import tasks.upload_tasks
+import tasks.note_tasks
 import tasks.sample_tasks
 
 

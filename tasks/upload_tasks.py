@@ -68,13 +68,15 @@ from utils.s3_utils import upload_to_s3, s3_client
 from utils.cloudfront_utils import get_cloudfront_url
 from utils.supabase_utils import supabase_client
 from utils.document_loaders.base import BaseDocumentLoader
-from utils.document_loaders.loader_factory import get_loader_for        # The loader factory is now expected to handle in-memory file-like objects
+from utils.document_loaders.loader_factory import get_loader_for, analyze_document_before_processing, get_high_performance_loader
+from utils.document_loaders.performance import create_optimized_processor, BatchTokenCounter
 from utils.metrics import MetricsCollector, Timer
 from utils.connection_pool import ConnectionPoolManager
 from utils.memory_manager import MemoryManager # Kept for health checks
 
-# ——— Logging & Env Load ————————————————————————————————————————————————————
+# ——— Logging & Env Load ———————————————————————————————————————————————————————————
 logger = get_task_logger(__name__)
+logger.propagate = False
 load_dotenv()
 
 # ——— Configuration & Constants ————————————————————————————————————————————————————
@@ -178,53 +180,53 @@ class DocumentMetrics:
             'retry_count': self.retry_count
         }
 
-class StreamingDocumentProcessor:
-    """
-    Wrapper class to encapsulate streaming document processing
-    Maintains the TRUE IN-MEMORY STREAMING architecture
-    """
+# class StreamingDocumentProcessor:
+#     """
+#     DEPRECATED: Wrapper class to encapsulate streaming document processing
+#     Maintains the TRUE IN-MEMORY STREAMING architecture
+#     """
     
-    def __init__(self, file_buffer: io.BytesIO, filename: str):
-        self.file_buffer = file_buffer
-        self.filename = filename
-        self.loader = None
+#     def __init__(self, file_buffer: io.BytesIO, filename: str):
+#         self.file_buffer = file_buffer
+#         self.filename = filename
+#         self.loader = None
         
-    def get_loader(self) -> BaseDocumentLoader:
-        """Get the appropriate loader for this document"""
-        if self.loader is None:
-            self.loader = get_loader_for(filename=self.filename, file_like_object=self.file_buffer)
-        return self.loader
+#     def get_loader(self) -> BaseDocumentLoader:
+#         """Get the appropriate loader for this document"""
+#         if self.loader is None:
+#             self.loader = get_loader_for(filename=self.filename, file_like_object=self.file_buffer)
+#         return self.loader
     
-    def stream_chunks(self, splitter: RecursiveCharacterTextSplitter) -> Iterator[Tuple[str, Dict]]:
-        """
-        Generator that yields (text, metadata) tuples for each chunk
-        Maintains true streaming - never loads entire document into memory at once
-        """
-        loader = self.get_loader()
+#     def stream_chunks(self, splitter: RecursiveCharacterTextSplitter) -> Iterator[Tuple[str, Dict]]:
+#         """
+#         Generator that yields (text, metadata) tuples for each chunk
+#         Maintains true streaming - never loads entire document into memory at once
+#         """
+#         loader = self.get_loader()
         
-        # Reset buffer position
-        self.file_buffer.seek(0)
+#         # Reset buffer position
+#         self.file_buffer.seek(0)
         
-        for page_num, page in enumerate(loader.stream_documents(self.file_buffer)):
-            # Split page into chunks
-            chunks = splitter.split_documents([page])
+#         for page_num, page in enumerate(loader.stream_documents(self.file_buffer)):
+#             # Split page into chunks
+#             chunks = splitter.split_documents([page])
             
-            for chunk_idx, chunk in enumerate(chunks):
-                cleaned_content = _clean_text(chunk.page_content)
-                if cleaned_content:
-                    metadata = {
-                        **chunk.metadata,
-                        'page_number': page_num,
-                        'chunk_index': chunk_idx
-                    }
-                    yield cleaned_content, metadata
+#             for chunk_idx, chunk in enumerate(chunks):
+#                 cleaned_content = _clean_text(chunk.page_content)
+#                 if cleaned_content:
+#                     metadata = {
+#                         **chunk.metadata,
+#                         'page_number': page_num,
+#                         'chunk_index': chunk_idx
+#                     }
+#                     yield cleaned_content, metadata
 
-# ——— DB Pool Instances (Initialized once per worker) —————————————————————
+# ——— DB Pool Instances (Initialized once per worker) ————————————————————————————
 
 # Global pool variable
 db_pool: Optional[asyncpg.Pool] = None
 
-# ——— 1. POOL CLEANUP FUNCTIONS ————————————————————————————————
+# ——— 1. POOL CLEANUP FUNCTIONS ——————————————————————————————————————————————————
 
 async def close_db_pool():
     """Safely close the database pool"""
@@ -255,7 +257,7 @@ def sync_close_db_pool():
     except Exception as e:
         logger.error(f"❌ Error in sync pool cleanup: {e}")
 
-# ——— 2. CELERY SIGNAL HANDLERS ————————————————————————————————
+# ——— 2. CELERY SIGNAL HANDLERS ————————————————————————————————————————————————————
 
 # @worker_init.connect
 def worker_init_handler(sender=None, **kwargs):
@@ -276,7 +278,7 @@ def worker_shutdown_handler(sender=None, **kwargs):
     logger.info("🛑 Celery worker shutting down...")
     sync_close_db_pool()
 
-# ——— 3. SYSTEM SIGNAL HANDLERS ————————————————————————————————
+# ——— 3. SYSTEM SIGNAL HANDLERS ————————————————————————————————————————————————————
 
 def signal_handler(signum, frame):
     """Handle system signals (SIGTERM, SIGINT)"""
@@ -290,10 +292,10 @@ signal.signal(signal.SIGINT, signal_handler)
 # Register atexit handler as last resort
 atexit.register(sync_close_db_pool)
 
-# ——— 4. UPDATED get_db_pool FUNCTION ————————————————————————————————
+# ——— 4. UPDATED get_async_db_pool FUNCTION ———————————————————————————————————————
 
 # Get Asynchronous DB pool
-async def get_db_pool() -> asyncpg.Pool:
+async def get_async_db_pool() -> asyncpg.Pool:
     """Initializes and returns the asyncpg connection pool with connection testing."""
     global db_pool
     try:
@@ -469,15 +471,6 @@ HTTP_RETRY_STRATEGY = UrllibRetry(
     allowed_methods=["GET", "POST"]  # Be explicit about retry methods
 )
 
-# Celery Task Retry Configuration
-# CELERY_RETRY_CONFIG = {
-#     'max_retries': 5,
-#     'default_retry_delay': 5,
-#     'retry_backoff': True,
-#     'retry_backoff_max': 300,  # 5 minutes max
-#     'retry_jitter': True
-# }
-
 # Tenacity Retry Decorator
 embedding_retry = retry(
     stop=stop_after_attempt(3),
@@ -529,9 +522,11 @@ def _calculate_stream_hash(stream: io.BytesIO) -> str:
     return sha256_hash.hexdigest()
 
 async def _update_document_status(doc_id: str, status: ProcessingStatus, error_message: Optional[str] = None):
-    """Async helper to update a document's status in the database (for asyncio)"""
+    """
+    [DEPRECATED] Async helper to update a document's status in the database (for asyncio)
+    """
     logger.info(f"📋 Doc {doc_id[:8]}... → {status.value}")
-    pool = await get_db_pool()
+    pool = await get_async_db_pool()
     async with pool.acquire() as conn:
         await conn.execute(
             """
@@ -574,7 +569,7 @@ async def get_embedding_reuse_stats(project_id: str) -> Dict[str, Any]:
     """
     Get statistics about embedding reuse for a project
     """
-    pool = await get_db_pool()
+    pool = await get_async_db_pool()
     async with pool.acquire() as conn:
         stats = await conn.fetchrow(
             '''
@@ -766,7 +761,6 @@ def get_file_extension_from_url(url: str) -> str:
     # Final fallback - assume PDF for unknown academic content
     return '.pdf'
 
-
 def get_clean_filename_from_url(url: str, extension: str) -> str:
     """
     Generate a clean filename from URL
@@ -809,8 +803,6 @@ def get_clean_filename_from_url(url: str, extension: str) -> str:
     # Final fallback
     return f"document_{uuid.uuid4().hex[:8]}{extension}"
 
-
-
 # ——— Task 1: Ingest (Fully Async) ———————————————————————————————————————————
 
 @celery_app.task(bind=True)
@@ -834,11 +826,11 @@ def test_celery_log_task(self) -> str:
 def process_document_task(self, file_urls: List[str], metadata: Dict[str, Any]) -> Dict[str, Any]:
     task_id = self.request.id
     logger.info(f"🚀 Starting task {task_id} asyc document processing task URLs")
-    return asyncio.run(_process_document_async(file_urls, metadata))
+    return asyncio.run(_process_document_hybrid(file_urls, metadata))
 
-async def copy_embeddings_for_project(existing_source_id: str, new_source_id: str, project_id: str, user_id: str) -> Dict[str, Any]:
+async def copy_embeddings_for_project_async(existing_source_id: str, new_source_id: str, project_id: str, user_id: str) -> Dict[str, Any]:
     """
-    Copy embeddings from an existing processed document to a new project
+    [DEPRECATED] Async Copy embeddings from an existing processed document to a new project
     
     Args:
         existing_source_id: Source ID of the already-processed document
@@ -849,9 +841,9 @@ async def copy_embeddings_for_project(existing_source_id: str, new_source_id: st
     Returns:
         Dict with copy statistics
     """
-    pool = await get_db_pool()
+    pool = await get_async_db_pool()
     async with pool.acquire() as conn:
-        # Get embeddings from the existing document
+        # Get vector embeddings from the existing document (via matching source_id)
         existing_embeddings = await conn.fetch(
             '''
             SELECT content, metadata, embedding, num_tokens 
@@ -872,29 +864,25 @@ async def copy_embeddings_for_project(existing_source_id: str, new_source_id: st
         
         for embedding_row in existing_embeddings:
             records_to_insert.append((
-                uuid.uuid4(),                    # id
-                uuid.UUID(new_source_id),        # source_id (new document)
-                uuid.UUID(project_id),           # project_id (target project)
+                str(uuid.uuid4()),                    # MAKE a new id
+                str(uuid.UUID(new_source_id)),        # source_id (new document)
+                str(uuid.UUID(project_id)),           # project_id (target project)
                 embedding_row['content'],        # content
                 embedding_row['metadata'],       # metadata (keep original)
                 embedding_row['embedding'],      # embedding (reuse existing)
                 embedding_row['num_tokens'],     # num_tokens
-                uuid.UUID(user_id),             # user_id
+                str(uuid.UUID(user_id)),             # user_id
                 datetime.now(timezone.utc)      # created_at
             ))
             total_tokens += embedding_row['num_tokens'] or 0
         
-        # Bulk insert the copied embeddings
-        await conn.copy_records_to_table(
-            'document_vector_store',
-            records=records_to_insert,
-            columns=(
-                'id', 'source_id', 'project_id', 'content', 'metadata', 
-                'embedding', 'num_tokens', 'user_id', 'created_at'
-            ),
-            timeout=120
+        # Sync DB Bulk insert the copied embeddings
+        await conn.executemany(
+            '''INSERT INTO document_vector_store 
+            (id, source_id, project_id, content, metadata, embedding, num_tokens, user_id, created_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)''',
+            records_to_insert
         )
-        
         logger.info(f"✅ Copied {len(records_to_insert)} embeddings from {existing_source_id} to {new_source_id} for project {project_id}")
         
         return {
@@ -902,19 +890,19 @@ async def copy_embeddings_for_project(existing_source_id: str, new_source_id: st
             'total_tokens': total_tokens
         }
 
-async def _process_document_async(file_urls: List[str], metadata: Dict[str, Any]) -> Dict[str, Any]:
+async def _process_document_hybrid(file_urls: List[str], metadata: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Smart Reuse Ingest Task:
-    - Concurrent downloads directly into memory using httpx.
-    - Smart deduplication: checks for processed content across ALL projects
-    - If content exists and is processed, reuse embeddings for new project
-    - If content is new or unprocessed, do full processing pipeline
-    - Bulk-inserts new documents and dispatches parsing tasks only when needed
+    [HYBRID] Smart Reuse Ingest Task:
+    - Concurrent downloads directly into memory using httpx (ASYNC)
+    - Smart deduplication: checks for processed content across ALL projects (SYNC DB)
+    - If content exists and is processed, reuse embeddings for new project (SYNC DB)
+    - If content is new or unprocessed, do full processing pipeline (SYNC DB)
+    - Bulk-inserts new documents and dispatches parsing tasks only when needed (SYNC DB)
     """
     project_id = metadata['project_id']
     user_id = metadata['user_id']
     
-    # Download document, hash, send to S3/CloudFront
+    # [UNCHANGED] Download document, hash, send to S3/CloudFront - Keep async for performance
     logger.info("🌐 Initiating concurrent downloads...")
     async with httpx.AsyncClient(timeout=60.0) as client:
         download_tasks = [
@@ -927,118 +915,126 @@ async def _process_document_async(file_urls: List[str], metadata: Dict[str, Any]
     reused_docs = []
     same_project_duplicates = []
     
-    pool = await get_db_pool()
-    async with pool.acquire() as conn:
-        for res in results:
-            if isinstance(res, Exception) or not res:
-                logger.error(f"A document failed to download or prep: {res}")
-                continue
-            
-            # First: Check if document already exists in THIS project
-            same_project_doc = await conn.fetchval(
-                'SELECT id FROM document_sources WHERE content_hash = $1 AND project_id = $2',
-                res['content_hash'], uuid.UUID(project_id)
-            )
-            
-            if same_project_doc:
-                same_project_duplicates.append(str(same_project_doc))
-                logger.info(f"📋 Document already exists in this project: {res['content_hash'][:8]} -> {same_project_doc}")
-                continue
-            
-            # Second: Check if content exists in ANY project and is fully processed ♻️ 
-            existing_processed_doc = await conn.fetchrow(
-                '''
-                SELECT id, project_id, total_chunks, total_batches
-                FROM document_sources 
-                WHERE content_hash = $1 
-                AND vector_embed_status = $2 
-                AND total_chunks > 0
-                LIMIT 1''',
-                res['content_hash'], ProcessingStatus.COMPLETE.value
-            )
-            
-            if existing_processed_doc:
-                # Content exists and is fully processed - SMART REUSE!
-                logger.info(f"♻️  Found processed content {res['content_hash'][:8]} with {existing_processed_doc['total_chunks']} chunks")
+    # [CHANGED] Switch to sync database operations for reliability
+    pool = get_sync_db_pool()
+    conn = pool.getconn()
+    
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            for res in results:
+                if isinstance(res, Exception) or not res:
+                    logger.error(f"A document failed to download or prep: {res}")
+                    continue
                 
-                # Create new document entry for this project
-                new_doc_id = uuid.uuid4()
-                await conn.execute(
+                # [CHANGED] First: Check if document already exists in THIS project (sync query)
+                cur.execute(
+                    'SELECT id FROM document_sources WHERE content_hash = %s AND project_id = %s',
+                    (res['content_hash'], project_id)
+                )
+                same_project_doc = cur.fetchone()
+                
+                if same_project_doc:
+                    same_project_duplicates.append(str(same_project_doc['id']))
+                    logger.info(f"📋 Document already exists in this project: {res['content_hash'][:8]} -> {same_project_doc['id']}")
+                    continue
+                
+                # [CHANGED] Second: Check if content exists in ANY project and is fully processed (sync query)
+                cur.execute(
                     '''
-                    INSERT INTO document_sources 
-                    (id, cdn_url, content_hash, project_id, content_tags, uploaded_by, 
-                        vector_embed_status, filename, file_size_bytes, file_extension, 
-                        total_chunks, total_batches, created_at)
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)''',
-                    new_doc_id, res['cdn_url'], res['content_hash'], 
-                    uuid.UUID(project_id), res.get('content_tags', []), user_id,
-                    ProcessingStatus.COMPLETE.value, res['filename'], 
-                    res['file_size_bytes'], os.path.splitext(res['filename'])[1].lower(),
-                    existing_processed_doc['total_chunks'], existing_processed_doc['total_batches'],
+                    SELECT id, project_id, total_chunks, total_batches
+                    FROM document_sources 
+                    WHERE content_hash = %s 
+                    AND vector_embed_status = %s 
+                    AND total_chunks > 0
+                    LIMIT 1''',
+                    (res['content_hash'], ProcessingStatus.COMPLETE.value)
+                )
+                existing_processed_doc = cur.fetchone()
+                
+                if existing_processed_doc:
+                    # Content exists and is fully processed - SMART REUSE!
+                    logger.info(f"♻️  Found processed content {res['content_hash'][:8]} with {existing_processed_doc['total_chunks']} chunks")
+                    
+                    # [CHANGED] Create new document entry for this project (sync insert)
+                    new_doc_id = uuid.uuid4()
+                    cur.execute(
+                        '''
+                        INSERT INTO document_sources 
+                        (id, cdn_url, content_hash, project_id, content_tags, uploaded_by, 
+                            vector_embed_status, filename, file_size_bytes, file_extension, 
+                            total_chunks, total_batches, created_at)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)''',
+                        (str(new_doc_id), res['cdn_url'], res['content_hash'], 
+                            project_id, res.get('content_tags', []), user_id,
+                            ProcessingStatus.COMPLETE.value, res['filename'], 
+                            res['file_size_bytes'], os.path.splitext(res['filename'])[1].lower(),
+                            existing_processed_doc['total_chunks'], existing_processed_doc['total_batches'],
+                            datetime.now(timezone.utc))
+                    )
+                    
+                    # [CHANGED] Copy embeddings to the new project (sync function)
+                    logger.info(f"♻️  Copying found embeddings...")
+                    copy_result = copy_embeddings_for_project_sync(
+                        str(existing_processed_doc['id']), 
+                        str(new_doc_id), 
+                        project_id, 
+                        user_id
+                    )
+                    
+                    reused_docs.append({
+                        'doc_id': str(new_doc_id),
+                        'content_hash': res['content_hash'],
+                        'chunks_reused': copy_result['copied_count'],
+                        'tokens_reused': copy_result['total_tokens']
+                    })
+                    
+                    logger.info(f"🎯 Smart reuse complete: {copy_result['copied_count']} chunks, {copy_result['total_tokens']} tokens")
+                    
+                else:
+                    # New content or unprocessed content - full processing needed
+                    res['id'] = uuid.uuid4()
+                    new_docs_to_insert.append(res)
+                    logger.info(f"🆕 New content {res['content_hash'][:8]} needs full processing")
+        
+        # [CHANGED] Bulk insert new documents that need full processing (sync transaction)
+        inserted_ids = []
+        if new_docs_to_insert:
+            logger.info(f"💾 Inserting {len(new_docs_to_insert)} new docs for full processing...")
+            records_to_insert = [
+                (
+                    str(doc['id']), doc['cdn_url'], doc['content_hash'], doc['project_id'],
+                    doc.get('content_tags', []), doc['uploaded_by'], ProcessingStatus.PENDING.value,
+                    doc['filename'], doc['file_size_bytes'], os.path.splitext(doc['filename'])[1].lower(),
                     datetime.now(timezone.utc)
                 )
-                
-                # ♻️ Copy embeddings to the new project
-                logger.info(f"♻️  Copying found embeddings...")
-                copy_result = await copy_embeddings_for_project(
-                    str(existing_processed_doc['id']), 
-                    str(new_doc_id), 
-                    project_id, 
-                    user_id
+                for doc in new_docs_to_insert
+            ]
+            
+            with conn.cursor() as cur:
+                # [CHANGED] Use sync executemany instead of async
+                cur.executemany(
+                    '''INSERT INTO document_sources 
+                    (id, cdn_url, content_hash, project_id, content_tags, uploaded_by, 
+                        vector_embed_status, filename, file_size_bytes, file_extension, created_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)''',
+                    records_to_insert
                 )
-                
-                reused_docs.append({
-                    'doc_id': str(new_doc_id),
-                    'content_hash': res['content_hash'],
-                    'chunks_reused': copy_result['copied_count'],
-                    'tokens_reused': copy_result['total_tokens']
-                })
-                
-                logger.info(f"🎯 Smart reuse complete: {copy_result['copied_count']} chunks, {copy_result['total_tokens']} tokens")
-                
-            else:
-                # New content or unprocessed content - full processing needed
-                res['id'] = uuid.uuid4()
-                new_docs_to_insert.append(res)
-                logger.info(f"🆕 New content {res['content_hash'][:8]} needs full processing")
-    
-    # Bulk insert new documents that need full processing
-    inserted_ids = []
-    if new_docs_to_insert:
-        logger.info(f"💾 Inserting {len(new_docs_to_insert)} new docs for full processing...")
-        records_to_insert = [
-            (
-                doc['id'], doc['cdn_url'], doc['content_hash'], uuid.UUID(doc['project_id']),
-                doc.get('content_tags', []), doc['uploaded_by'], ProcessingStatus.PENDING.value,
-                doc['filename'], doc['file_size_bytes'], os.path.splitext(doc['filename'])[1].lower(),
-                datetime.now(timezone.utc)
-            )
-            for doc in new_docs_to_insert
-        ]
-        
-        async with pool.acquire() as conn:
-            async with conn.transaction():
-                await conn.copy_records_to_table(
-                    'document_sources',
-                    records=records_to_insert,
-                    columns=(
-                        'id', 'cdn_url', 'content_hash', 'project_id', 'content_tags',
-                        'uploaded_by', 'vector_embed_status', 'filename', 'file_size_bytes',
-                        'file_extension', 'created_at'
-                    ),
-                    timeout=60
+                conn.commit()  # [CHANGED] Explicit commit for sync transaction
+                    
+            inserted_ids = [str(doc['id']) for doc in new_docs_to_insert]
+            
+            # [UNCHANGED] Schedule parsing tasks ONLY for new documents
+            logger.info("🗂️ Scheduling parse tasks for NEW documents only...")
+            for doc in new_docs_to_insert:
+                parse_document_task.apply_async(
+                    (str(doc['id']), doc['cdn_url'], doc['project_id']), queue=PARSE_QUEUE
                 )
         
-        inserted_ids = [str(doc['id']) for doc in new_docs_to_insert]
-        
-        # Schedule parsing tasks ONLY for new documents
-        logger.info("🗂️ Scheduling parse tasks for NEW documents only...")
-        for doc in new_docs_to_insert:
-            parse_document_task.apply_async(
-                (str(doc['id']), doc['cdn_url'], doc['project_id']), queue=PARSE_QUEUE
-            )
+    finally:
+        # [CHANGED] Proper connection cleanup for sync pool
+        pool.putconn(conn)
     
-    # Comprehensive results
+    # [UNCHANGED] Comprehensive results
     all_doc_ids = same_project_duplicates + [doc['doc_id'] for doc in reused_docs] + inserted_ids
     
     total_reused_chunks = sum(doc['chunks_reused'] for doc in reused_docs)
@@ -1058,6 +1054,78 @@ async def _process_document_async(file_urls: List[str], metadata: Dict[str, Any]
         'total_tokens_reused': total_reused_tokens,
         'openai_cost_saved': total_reused_tokens * 0.0001 / 1000  # Rough estimate
     }
+
+# [CHANGED] New sync version of copy_embeddings_for_project
+def copy_embeddings_for_project_sync(existing_source_id: str, new_source_id: str, project_id: str, user_id: str) -> Dict[str, Any]:
+    """
+    [SYNC] Copy embeddings from an existing processed document to a new project
+    
+    Args:
+        existing_source_id: Source ID of the already-processed document
+        new_source_id: Source ID of the new document entry
+        project_id: Target project ID
+        user_id: User who uploaded the document
+    
+    Returns:
+        Dict with copy statistics
+    """
+    pool = get_sync_db_pool()
+    conn = pool.getconn()
+    
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            # Get vector embeddings from the existing document (via matching source_id)
+            cur.execute(
+                '''
+                SELECT content, metadata, embedding, num_tokens 
+                FROM document_vector_store 
+                WHERE source_id = %s AND embedding IS NOT NULL
+                ORDER BY created_at
+                ''',
+                (existing_source_id,)
+            )
+            existing_embeddings = cur.fetchall()
+            
+            if not existing_embeddings:
+                logger.warning(f"No embeddings found for source_id {existing_source_id}")
+                return {'copied_count': 0, 'total_tokens': 0}
+            
+            # Prepare records for bulk insert
+            records_to_insert = []
+            total_tokens = 0
+            
+            for embedding_row in existing_embeddings:
+                records_to_insert.append((
+                    str(uuid.uuid4()),              # id (converted to string)
+                    new_source_id,                   # source_id (already string)
+                    project_id,                      # project_id (already string)
+                    embedding_row['content'],        # content
+                    embedding_row['metadata'],       # metadata (keep original)
+                    embedding_row['embedding'],      # embedding (reuse existing)
+                    embedding_row['num_tokens'],     # num_tokens
+                    user_id,                         # user_id (already string)
+                    datetime.now(timezone.utc)      # created_at
+                ))
+                total_tokens += embedding_row['num_tokens'] or 0
+            
+            # Bulk insert the copied embeddings
+            cur.executemany(
+                '''INSERT INTO document_vector_store 
+                (id, source_id, project_id, content, metadata, embedding, num_tokens, user_id, created_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)''',
+                records_to_insert
+            )
+            conn.commit()
+            
+            logger.info(f"✅ Copied {len(records_to_insert)} embeddings from {existing_source_id} to {new_source_id} for project {project_id}")
+            
+            return {
+                'copied_count': len(records_to_insert),
+                'total_tokens': total_tokens
+            }
+            
+    finally:
+        pool.putconn(conn)
 
 async def _download_and_prep_doc(client: httpx.AsyncClient, url: str, project_id: str, user_id: str) -> Optional[Dict]:
     """
@@ -1131,283 +1199,216 @@ def parse_document_task(self, source_id: str, cdn_url: str, project_id: str) -> 
         logger.error(f"Parse task failed for {source_id}: {exc}")
         raise  # Let Celery handle the retry automatically with CELERY_RETRY_CONFIG
 
-async def _parse_document_async(self, source_id: str, cdn_url: str, project_id: str) -> Dict[str, Any]:
-    """
-    Parsing Task:
-    - Streams document directly into an in-memory buffer (NO temp file).
-    - Splits parsed text into semantic chunks
-    - Uses token-aware adaptive batching to maximize embedding efficiency.
-    - Fully async database updates.
-    - Dispatch embed task celery group
-    """
-    await _update_document_status(source_id, ProcessingStatus.PARSING)
-    
-    file_buffer = io.BytesIO()
-    doc_metrics = DocumentMetrics(doc_id=source_id)     # ← TELEMETRY
-
-    try:
-        # Phase 1: True In-Memory Streaming (No Disk I/O)
-        with Timer() as download_timer:
-            # Define headers for anti-bot detection
-            headers = DEFAULT_HEADERS
-
-            async with httpx.AsyncClient(timeout=120.0) as client:
-                async with client.stream("GET", cdn_url, headers=headers) as response:
-                    response.raise_for_status()
-                    async for chunk in response.aiter_bytes():
-                        file_buffer.write(chunk)
-            file_buffer.seek(0)
-            # update telemetry
-            doc_metrics.download_time_ms = download_timer.elapsed_ms
-            doc_metrics.file_size_bytes = file_buffer.getbuffer().nbytes
-
-        # Phase 2: Process with Loader and Splitter
-        with Timer() as parse_timer:
-            # Assumes get_loader_for can take a file-like object
-            loader = get_loader_for(filename=cdn_url, file_like_object=file_buffer)
-
-            # Langchain semantic chunking strategy (preserves whole ideas)
-            splitter = RecursiveCharacterTextSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)
-            
-            all_texts, all_metadatas = [], []
-
-            # Pass the file_buffer as the source parameter
-            logger.info(f"🔄 Starting document streaming for {source_id}")
-            try:
-                # Reset buffer position before streaming
-                file_buffer.seek(0)
-                
-                # CORRECT CALL: Pass file_buffer to stream_documents
-                for page_num, page in enumerate(loader.stream_documents(file_buffer)):
-                    gevent.sleep(0)  # Yield control during processing
-                    
-                    # Split each page into chunks
-                    for chunk_idx, chunk in enumerate(splitter.split_documents([page])):
-                        cleaned_content = _clean_text(chunk.page_content)
-                        if not cleaned_content:
-                            continue
-                        
-                        all_texts.append(cleaned_content)
-                        all_metadatas.append({
-                            **chunk.metadata,
-                            'page_number': page_num,
-                            'chunk_index': chunk_idx
-                        })
-                        
-                        # Periodic yield for very large documents
-                        if len(all_texts) % 50 == 0:
-                            gevent.sleep(0)
-                
-                logger.info(f"✅ Successfully streamed {len(all_texts)} chunks from {page_num + 1} pages")
-                
-            except Exception as loader_error:
-                logger.error(f"❌ Streaming failed: {loader_error}")
-                
-                # Fallback: Try load_documents method if streaming fails
-                logger.info("🔄 Falling back to load_documents method")
-                file_buffer.seek(0)
-                
-                try:
-                    documents = loader.load_documents(file_buffer)
-                    for doc_idx, doc in enumerate(documents):
-                        chunks = splitter.split_documents([doc])
-                        for chunk_idx, chunk in enumerate(chunks):
-                            cleaned_content = _clean_text(chunk.page_content)
-                            if not cleaned_content:
-                                continue
-                            
-                            all_texts.append(cleaned_content)
-                            all_metadatas.append({
-                                **chunk.metadata,
-                                'page_number': doc_idx,
-                                'chunk_index': chunk_idx
-                            })
-                    
-                    logger.info(f"✅ Fallback successful: {len(all_texts)} chunks")
-                    
-                except Exception as fallback_error:
-                    logger.error(f"❌ Both streaming and fallback failed: {fallback_error}")
-                    raise loader_error  # Re-raise original error
-            
-            doc_metrics.parse_time_ms = parse_timer.elapsed_ms
-            doc_metrics.total_chunks = len(all_texts)
-
-        # Phase 3: Token-Aware Adaptive Batching (efficient use of every API call, reducing cost and latency)
-        with Timer() as batch_timer:
-            embedding_tasks = []
-            current_batch_texts, current_batch_metas = [], []
-            current_batch_tokens = 0
-
-            logger.info(f"💾 Kicking off embedding task for source_id {source_id} ...")
-            for i, text in enumerate(all_texts):
-                token_count = len(tokenizer.encode(text))
-                
-                # If adding the next chunk exceeds the token limit, dispatch the current batch
-                if current_batch_tokens + token_count > OPENAI_MAX_TOKENS_PER_BATCH and current_batch_texts:
-                    task_sig = embed_batch_task.s(source_id, project_id, current_batch_texts, current_batch_metas)
-                    embedding_tasks.append(task_sig)
-                    current_batch_texts, current_batch_metas, current_batch_tokens = [], [], 0
-
-                current_batch_texts.append(text)
-                current_batch_metas.append(all_metadatas[i])
-                current_batch_tokens += token_count
-            
-            # Dispatch the final batch if it exists
-            if current_batch_texts:
-                task_sig = embed_batch_task.s(source_id, project_id, current_batch_texts, current_batch_metas)
-                embedding_tasks.append(task_sig)
-            # update telemetry
-            doc_metrics.total_batches = len(embedding_tasks)
-            doc_metrics.chunk_time_ms = batch_timer.elapsed_ms
-
-        # Phase 4: Database Update & Task Scheduling
-        pool = await get_db_pool()
-        async with pool.acquire() as conn:
-            await conn.execute(
-                """
-                UPDATE document_sources
-                SET vector_embed_status = $1, total_chunks = $2, total_batches = $3, processing_metadata = processing_metadata || $4::jsonb
-                WHERE id = $5
-                """,
-                ProcessingStatus.EMBEDDING.value, doc_metrics.total_chunks, doc_metrics.total_batches,
-                json.dumps(doc_metrics.to_dict()), uuid.UUID(source_id)
-            )
-        
-        if embedding_tasks:
-            # Use a chord to run all embedding tasks and then call finalization
-            chord(group(embedding_tasks), queue=EMBED_QUEUE)(finalize_embeddings.s(source_id).set(queue=FINAL_QUEUE))
-        else:
-            # Handle empty documents correctly
-            finalize_embeddings.apply_async(([], source_id), queue=FINAL_QUEUE)
-
-        logger.info(f"Parsing complete for {source_id}: {doc_metrics.total_chunks} chunks in {doc_metrics.total_batches} token-aware batches.")
-        return {'source_id': source_id, 'status': 'SUCCESS', 'batches_created': doc_metrics.total_batches}
-
-    except Exception as e:
-        logger.error(f"Parsing failed for {source_id}: {e}", exc_info=True)
-        await _update_document_status(source_id, ProcessingStatus.FAILED_PARSING, str(e))
-        raise
-
 def _parse_document_gevent(self, source_id: str, cdn_url: str, project_id: str) -> Dict[str, Any]:
     """
-    Gevent-based parsing implementation
+    Gevent-based parsing implementation, with optimizations
     """
     _update_document_status_sync(source_id, ProcessingStatus.PARSING)
     
+    short_id = source_id[:8]
     file_buffer = io.BytesIO()
     doc_metrics = DocumentMetrics(doc_id=source_id)
+    perf_summary = {}
 
-    try:
-        # Phase 1: Gevent-optimized streaming download
-        with Timer() as download_timer:
-            # Helper to create HTTP request sessions with retry strategy
-            session = create_http_session()
-            
-            # Stream the file with gevent-friendly requests
-            response = session.get(cdn_url, headers=DEFAULT_HEADERS, stream=True, timeout=120)
-            response.raise_for_status()
-            
-            # Stream into memory buffer
-            for chunk in response.iter_content(chunk_size=8192):
-                if chunk:
-                    file_buffer.write(chunk)
-                    # Yield control to other greenlets occasionally
-                    gevent.sleep(0)
-            
-            file_buffer.seek(0)
-            doc_metrics.download_time_ms = download_timer.elapsed_ms
-            doc_metrics.file_size_bytes = file_buffer.getbuffer().nbytes
+    # Total `_parse_document_gevent` task Timer Wrapper
+    with Timer() as total_timer:
 
-        # Phase 2: Process with Loader and Splitter (CPU-bound, but fast)
-        with Timer() as parse_timer:
-            loader = get_loader_for(filename=cdn_url, file_like_object=file_buffer)
-            splitter = RecursiveCharacterTextSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)
-            
-            all_texts, all_metadatas = [], []
-            for page_num, page in enumerate(loader.stream_documents(file_buffer)):
-                # Yield control during processing
-                gevent.sleep(0)
+        try:
+            # Phase 1: Gevent-optimized streaming download
+            with Timer() as download_timer:
+                # Helper to create HTTP request sessions with retry strategy
+                session = create_http_session()
                 
-                for chunk_idx, chunk in enumerate(splitter.split_documents([page])):
-                    cleaned_content = _clean_text(chunk.page_content)
-                    if not cleaned_content:
-                        continue
+                # Stream the file with gevent-friendly requests
+                logger.info(f"🚀 Starting document streaming for {source_id}, with url: {cdn_url}")
+                response = session.get(cdn_url, headers=DEFAULT_HEADERS, stream=True, timeout=120)
+                response.raise_for_status()
+
+                # Log response headers for debugging
+                content_length = response.headers.get('content-length')
+                content_type = response.headers.get('content-type', 'unknown')
+                
+                # Stream into memory buffer
+                downloaded_bytes = 0
+                chunk_count = 0
+                for chunk in response.iter_content(chunk_size=8192):
+                    if chunk:
+                        file_buffer.write(chunk)
+                        downloaded_bytes += len(chunk)
+                        chunk_count += 1
+                        
+                        # Log progress every 5MB or 500 chunks
+                        if chunk_count % 500 == 0 or downloaded_bytes % (1024 * 1024 * 5) == 0:
+                            logger.info(f"📥 [PARSE-{short_id}] Downloaded {downloaded_bytes:,} bytes ({chunk_count} chunks)")
+                        
+                        gevent.sleep(0)
+
+                file_buffer.seek(0)
+                doc_metrics.download_time_ms = download_timer.elapsed_ms
+                doc_metrics.file_size_bytes = file_buffer.getbuffer().nbytes
+                perf_summary['download_ms'] = download_timer.elapsed_ms
+
+            # Phase 2: Document Analysis & Optimal Loader Selection (CPU-bound, but fast)
+            with Timer() as analysis_timer:
+                # Quick analysis to choose best processing strategy
+                doc_analysis = analyze_document_before_processing(cdn_url, file_buffer)
+                
+                logger.info(f"📊 [PARSE-{short_id}] Analysis: {doc_analysis['file_size_mb']:.1f}MB, "
+                            f"complexity: {doc_analysis.get('complexity_score', 'N/A')}, "
+                            f"estimated time: {doc_analysis['processing_time_estimate']:.1f}s")
+                
+                # Choose optimal loader based on analysis
+                if doc_analysis.get('complexity_score', 0) >= 7:
+                    loader = get_high_performance_loader(cdn_url, file_buffer)
+                    processor_mode = "fast"
+                    logger.info(f"⚡ [PARSE-{short_id}] Using HIGH PERFORMANCE mode")
+                else:
+                    loader = get_loader_for(cdn_url, file_buffer, performance_mode="auto")
+                    processor_mode = "balanced"
+                    logger.info(f"⚖️ [PARSE-{short_id}] Using BALANCED mode")
+                
+                # Add to merformance bench summary dict
+                perf_summary['analysis_ms'] = analysis_timer.elapsed_ms
+
+            # Phase 3: Optimized Text Processing, Cleaning, & Chunking
+            with Timer() as process_timer:
+                # Create optimized processor (classe uses "pseudo-Semantic Chunking" using RecursiveCharacterTextSplitter)
+                processor = create_optimized_processor(
+                    chunk_size=CHUNK_SIZE,
+                    chunk_overlap=CHUNK_OVERLAP,
+                    performance_mode=processor_mode
+                )
+                
+                # Stream processing with real-time metrics
+                all_texts, all_metadatas = [], []
+                
+                logger.info(f"🔄 [PARSE-{short_id}] Starting streaming processing...")
+                
+                # Process document stream into chunks (and associated metadata)
+                document_stream = loader.stream_documents(file_buffer)
+                text_stream = processor.process_documents_streaming(document_stream, source_id)
+                for chunk_text, chunk_metadata in text_stream:
+                    all_texts.append(chunk_text)
+                    all_metadatas.append(chunk_metadata)
                     
-                    all_texts.append(cleaned_content)
-                    all_metadatas.append({
-                        **chunk.metadata,
-                        'page_number': page_num,
-                        'chunk_index': chunk_idx
-                    })
-            
-            doc_metrics.parse_time_ms = parse_timer.elapsed_ms
-            doc_metrics.total_chunks = len(all_texts)
-
-        # Phase 3: Token-Aware Adaptive Batching
-        with Timer() as batch_timer:
-            embedding_tasks = []
-            current_batch_texts, current_batch_metas = [], []
-            current_batch_tokens = 0
-
-            logger.info(f"💾 Kicking off embedding task for source_id {source_id}...")
-            
-            for i, text in enumerate(all_texts):
-                token_count = len(tokenizer.encode(text))
+                    # Log progress every 200 chunks
+                    if len(all_texts) % 200 == 0:
+                        logger.info(f"✂️ [PARSE-{short_id}] Created {len(all_texts)} chunks")
+                    
+                    gevent.sleep(0)
                 
-                # If adding the next chunk exceeds the token limit, dispatch the current batch
-                if current_batch_tokens + token_count > OPENAI_MAX_TOKENS_PER_BATCH and current_batch_texts:
+                # [DEBUG] Print statement at the end of document chunking (i.e. the full 13.9MB)
+                logger.info(f"⏱️ PARSING COMPLETE...")
+
+                
+                # Get processing performance summary
+                processing_summary = processor.get_performance_summary()
+                perf_summary.update({
+                    'text_processing_ms': process_timer.elapsed_ms,
+                    'total_chunks': len(all_texts),
+                    'total_pages': processing_summary['total_pages'],
+                    'chars_per_second': processing_summary['chars_per_second'],
+                    'chunks_per_second': processing_summary['chunks_per_second']
+                })
+                
+                logger.info(f"✅ [PARSE-{short_id}] Processing complete: {len(all_texts)} chunks from {processing_summary['total_pages']} pages")
+
+            # Phase 4: Optimized Token Counting & Embdedding Batching
+            with Timer() as token_timer:
+                # Batch token counting for efficiency
+                token_counter = BatchTokenCounter(tokenizer)
+                token_counts = token_counter.count_tokens_batch(all_texts)
+                
+                perf_summary['token_counting_ms'] = token_timer.elapsed_ms
+                total_tokens = sum(token_counts)
+                logger.info(f"🔢 [PARSE-{short_id}] Token counting: {total_tokens:,} tokens in {perf_summary['token_counting_ms']:.1f}ms")
+
+            with Timer() as batch_timer:
+                embedding_tasks = []
+                current_batch_texts, current_batch_metas = [], []
+                current_batch_tokens = 0
+
+                for i, (text, token_count) in enumerate(zip(all_texts, token_counts)):
+                    if current_batch_tokens + token_count > OPENAI_MAX_TOKENS_PER_BATCH and current_batch_texts:
+                        task_sig = embed_batch_task.s(source_id, project_id, current_batch_texts, current_batch_metas)
+                        embedding_tasks.append(task_sig)
+                        
+                        if len(embedding_tasks) % 5 == 0:  # Log every 5 batches
+                            logger.info(f"📦 [PARSE-{short_id}] Created {len(embedding_tasks)} batches")
+                        
+                        current_batch_texts, current_batch_metas, current_batch_tokens = [], [], 0
+
+                    current_batch_texts.append(text)
+                    current_batch_metas.append(all_metadatas[i])
+                    current_batch_tokens += token_count
+
+                if current_batch_texts:
                     task_sig = embed_batch_task.s(source_id, project_id, current_batch_texts, current_batch_metas)
                     embedding_tasks.append(task_sig)
-                    current_batch_texts, current_batch_metas, current_batch_tokens = [], [], 0
 
-                current_batch_texts.append(text)
-                current_batch_metas.append(all_metadatas[i])
-                current_batch_tokens += token_count
-                
-                # Yield control during batching
-                if i % 100 == 0:
-                    gevent.sleep(0)
+                perf_summary['batching_ms'] = batch_timer.elapsed_ms
+                perf_summary['total_batches'] = len(embedding_tasks)
+
+            # Phase 5: Sychronous Database Update
+            pool = get_sync_db_pool()
+            conn = pool.getconn()
+            try:
+                with conn.cursor() as cur:
+                    # Enhanced metrics for database
+                    enhanced_metrics = {
+                        **doc_metrics.to_dict(),
+                        **perf_summary,
+                        'processing_mode': processor_mode,
+                        'loader_type': type(loader).__name__
+                    }
+                    
+                    cur.execute(
+                        """
+                        UPDATE document_sources
+                        SET vector_embed_status = %s, total_chunks = %s, total_batches = %s, 
+                            processing_metadata = processing_metadata || %s::jsonb
+                        WHERE id = %s""",
+                        (ProcessingStatus.EMBEDDING.value, len(all_texts), 
+                            len(embedding_tasks), json.dumps(enhanced_metrics), source_id)
+                    )
+                    conn.commit()
+            finally:
+                pool.putconn(conn)
             
-            # Dispatch the final batch if it exists
-            if current_batch_texts:
-                task_sig = embed_batch_task.s(source_id, project_id, current_batch_texts, current_batch_metas)
-                embedding_tasks.append(task_sig)
+            # Schedule embedding tasks
+            if embedding_tasks:
+                logger.info(f"🚀 [PARSE-{short_id}] Scheduling {len(embedding_tasks)} embedding tasks...")
+                chord(group(embedding_tasks), queue=EMBED_QUEUE)(finalize_embeddings.s(source_id).set(queue=FINAL_QUEUE))
+            else:
+                finalize_embeddings.apply_async(([], source_id), queue=FINAL_QUEUE)
+
+            # ⏳ Final timer/performance summary
+            measured_time = sum([
+                perf_summary['download_ms'],
+                perf_summary['analysis_ms'], 
+                perf_summary['text_processing_ms'],
+                perf_summary['token_counting_ms'],
+                perf_summary['batching_ms']
+            ])
+            actual_total = total_timer.elapsed_ms
+            missing_time = actual_total - measured_time
             
-            doc_metrics.total_batches = len(embedding_tasks)
-            doc_metrics.chunk_time_ms = batch_timer.elapsed_ms
+            logger.info(f"🎉 [PARSE-{short_id}] PARSING COMPLETE!")
+            logger.info(f"   ⏱️ Total: {actual_total:.1f}ms | Measured: {measured_time:.1f}ms | Missing: {missing_time:.1f}ms")
+            logger.info(f"   📊 {perf_summary['total_chunks']} chunks, {perf_summary['total_batches']} batches")
+            
+            return {
+                'source_id': source_id, 
+                'status': 'SUCCESS', 
+                'batches_created': len(embedding_tasks),
+                'total_chunks': len(all_texts),
+                'performance_metrics': perf_summary
+            }
 
-        # Phase 4: Database Update & Task Scheduling
-        pool = get_sync_db_pool()
-        conn = pool.getconn()
-        try:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    UPDATE document_sources
-                    SET vector_embed_status = %s, total_chunks = %s, total_batches = %s, 
-                        processing_metadata = processing_metadata || %s::jsonb
-                    WHERE id = %s
-                    """,
-                    (ProcessingStatus.EMBEDDING.value, doc_metrics.total_chunks, 
-                        doc_metrics.total_batches, json.dumps(doc_metrics.to_dict()), source_id)
-                )
-                conn.commit()
-        finally:
-            pool.putconn(conn)
-        
-        # Schedule embedding tasks
-        if embedding_tasks:
-            chord(group(embedding_tasks), queue=EMBED_QUEUE)(finalize_embeddings.s(source_id).set(queue=FINAL_QUEUE))
-        else:
-            finalize_embeddings.apply_async(([], source_id), queue=FINAL_QUEUE)
-
-        logger.info(f"Parsing complete for {source_id}: {doc_metrics.total_chunks} chunks in {doc_metrics.total_batches} token-aware batches.")
-        return {'source_id': source_id, 'status': 'SUCCESS', 'batches_created': doc_metrics.total_batches}
-
-    except Exception as e:
-        logger.error(f"Parsing failed for {source_id}: {e}", exc_info=True)
-        _update_document_status_sync(source_id, ProcessingStatus.FAILED_PARSING, str(e))
-        raise
+        except Exception as e:
+            logger.error(f"💥 [PARSE-{short_id}] OPTIMIZED PARSING FAILED: {e}", exc_info=True)
+            _update_document_status_sync(source_id, ProcessingStatus.FAILED_PARSING, str(e))
+            raise
 
 # ——— Task 3: Embed (Fully Async DB) ——————————————————————————————————————————
 
@@ -1421,14 +1422,14 @@ def _parse_document_gevent(self, source_id: str, cdn_url: str, project_id: str) 
 )
 def embed_batch_task(self, source_id: str, project_id: str, texts: List[str], metadatas: List[Dict]):
     try:
-        return asyncio.run(_embed_batch_async(self, source_id, project_id, texts, metadatas))
+        return _embed_batch_gevent(self, source_id, project_id, texts, metadatas)
     except Exception as exc:
         logger.warning(f"Embedding batch for {source_id} failed, letting Celery handle retry: {exc}")
-        raise  # Let Celery handle the retry automatically
+        raise
 
 async def _embed_batch_async(self, source_id: str, project_id: str, texts: List[str], metadatas: List[Dict]):
     """
-    Embedding Task:
+    [DEPRECATED] Async Embedding Task:
     - Fully async with non-blocking DB calls via asyncpg.
     - Uses a shared connection pool and highly efficient `copy_records_to_table`.
     - Retries with exponential backoff and uses a circuit breaker for OpenAI calls.
@@ -1449,29 +1450,80 @@ async def _embed_batch_async(self, source_id: str, project_id: str, texts: List[
             token_count = len(tokenizer.encode(text))
             total_tokens += token_count
             records_to_insert.append((
-                uuid.uuid4(), uuid.UUID(source_id), uuid.UUID(project_id), text, 
+                str(uuid.uuid4()), str(uuid.UUID(source_id)), str(uuid.UUID(project_id)), text, 
                 json.dumps(meta), vec, token_count, datetime.now(timezone.utc)
             ))
 
         if not records_to_insert:
             return {'processed_count': 0, 'token_count': 0}
 
-        # 3. Fully Async Bulk Insert using copy_records_to_table for max performance
-        pool = await get_db_pool()
+
+        # 3. CHANGE: Use executemany instead of copy_records_to_table
+        pool = await get_async_db_pool()
         async with pool.acquire() as conn:
-            await conn.copy_records_to_table(
-                'document_vector_store',
-                records=records_to_insert,
-                columns=('id', 'source_id', 'project_id', 'content', 'metadata', 'embedding', 'num_tokens', 'created_at'),
-                timeout=120
-            )
-        
+            await conn.executemany(
+                '''INSERT INTO document_vector_store 
+                (id, source_id, project_id, content, metadata, embedding, num_tokens, created_at)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8)''',
+                records_to_insert
+            )    
         return {'processed_count': len(records_to_insert), 'token_count': total_tokens}
 
     except Exception as exc:
         logger.warning(f"Embedding batch for {source_id} failed (attempt {self.request.retries + 1}), retrying: {exc}")
         raise self.retry(exc=exc, countdown=DEFAULT_RETRY_DELAY * (RETRY_BACKOFF_MULTIPLIER ** self.request.retries))
 
+def _embed_batch_gevent(self, source_id: str, project_id: str, texts: List[str], metadatas: List[Dict]):
+    """
+    Gevent-based embedding implementation - more reliable with Celery
+    """
+    try:
+        # 1. Generate Embeddings using sync OpenAI client
+        logger.info(f"🤖 Generating embeddings...")
+        
+        # Use synchronous OpenAI client instead of async
+        embeddings = embedding_model.embed_documents(texts)  # ← SYNC method (no await)
+        
+        # 2. Prepare Data for DB
+        records_to_insert = []
+        total_tokens = 0
+        for text, meta, vec in zip(texts, metadatas, embeddings):
+            if len(vec) != EXPECTED_EMBEDDING_LEN:
+                logger.warning(f"Skipping malformed embedding for source {source_id}")
+                continue
+            
+            token_count = len(tokenizer.encode(text))
+            total_tokens += token_count
+            records_to_insert.append((
+                str(uuid.uuid4()), str(uuid.UUID(source_id)), str(uuid.UUID(project_id)), text, 
+                json.dumps(meta), vec, token_count, datetime.now(timezone.utc)
+            ))
+
+        if not records_to_insert:
+            return {'processed_count': 0, 'token_count': 0}
+
+        # 3. Use sync database pool (like Task 2)
+        pool = get_sync_db_pool()
+        conn = pool.getconn()
+        try:
+            with conn.cursor() as cur:
+                # Use executemany for bulk insert
+                cur.executemany(
+                    '''INSERT INTO document_vector_store 
+                    (id, source_id, project_id, content, metadata, embedding, num_tokens, created_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)''',
+                    records_to_insert
+                )
+                conn.commit()
+        finally:
+            pool.putconn(conn)
+        
+        return {'processed_count': len(records_to_insert), 'token_count': total_tokens}
+
+    except Exception as exc:
+        logger.warning(f"Embedding batch for {source_id} failed (attempt {self.request.retries + 1}), retrying: {exc}")
+        raise self.retry(exc=exc, countdown=DEFAULT_RETRY_DELAY * (RETRY_BACKOFF_MULTIPLIER ** self.request.retries))
+    
 # optional remove the exclude arg
 @CircuitBreaker(fail_max=5, reset_timeout=60) # EDIT: Removed the exclude parameter
 @embedding_retry
@@ -1480,25 +1532,37 @@ async def _embed_with_retry(texts: List[str]) -> List[List[float]]:
     return await embedding_model.aembed_documents(texts)
 
 
-# ——— Task 4: Finalize (v6 - Fully Async DB) ————————————————————————————————————————
+# ——— Task 4: Finalize (Fully Async DB) ————————————————————————————————————————
 
 @celery_app.task(bind=True, queue=FINAL_QUEUE, acks_late=True)
 def finalize_embeddings(self, batch_results: List[Dict[str, Any]], source_id: str) -> Dict[str, Any]:
-    return asyncio.run(_finalize_embeddings_async(self, batch_results, source_id))
+    return _finalize_embeddings_sync(self, batch_results, source_id)
 
-async def _finalize_embeddings_async(self, batch_results: List[Dict[str, Any]], source_id: str) -> Dict[str, Any]:
+def _finalize_embeddings_sync(self, batch_results: List[Dict[str, Any]], source_id: str) -> Dict[str, Any]:
     """
-    Finalization Task:
-    - Uses asyncpg for all database reads and writes.
-    - Preserves the detailed completion metrics and performance analysis from v5.
+    Sync implementation finalizes document processing by validating completion, calculating performance metrics,
+    and updating the document status:
+    - Compares expected vs actual chunk counts
+    - generates performance insights and optimization recommendations
+    - Sets the final processing status (COMPLETE, PARTIAL, or FAILED). 
+    Called after all embedding batches finish 🥳.
+
+    Args:
+        batch_results: List of results from completed embedding batch tasks
+        source_id: Document identifier to finalize
+        
+    Returns:
+        Dict containing source_id and final_status
     """
-    pool = await get_db_pool()
     final_status = ProcessingStatus.FAILED_FINALIZATION
+    pool = get_sync_db_pool()
+    conn = pool.getconn()
     
     try:
-        # ——— Phase 1: Fetch Current Document State Asynchronously ——————————————————
-        async with pool.acquire() as conn:
-            doc_data = await conn.fetchrow("SELECT * FROM document_sources WHERE id = $1", uuid.UUID(source_id))
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            # ——— Phase 1: Fetch Current Document State ————————————————————————————
+            cur.execute("SELECT * FROM document_sources WHERE id = %s", (source_id,))
+            doc_data = cur.fetchone()
         
         if not doc_data:
             raise ValueError(f"Document {source_id} not found during finalization.")
@@ -1506,13 +1570,14 @@ async def _finalize_embeddings_async(self, batch_results: List[Dict[str, Any]], 
         # ——— Phase 2: Validate Processing Completion ——————————————————————————————
         expected_chunks = doc_data.get('total_chunks', 0)
         
-        async with pool.acquire() as conn:
-            actual_vector_count = await conn.fetchval("SELECT COUNT(*) FROM document_vector_store WHERE source_id = $1", uuid.UUID(source_id))
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM document_vector_store WHERE source_id = %s", (source_id,))
+            actual_vector_count = cur.fetchone()[0]
         
         chunk_completion_rate = (actual_vector_count / expected_chunks * 100) if expected_chunks > 0 else 100 if actual_vector_count > 0 else 0
 
-        # ——— Phase 3: Determine Final Status
-        if abs(actual_vector_count - expected_chunks) <= 1: # Allow for minor discrepancy
+        # ——— Phase 3: Determine Final Status ————————————————————————————————————
+        if abs(actual_vector_count - expected_chunks) <= 1:  # Allow for minor discrepancy
             final_status = ProcessingStatus.COMPLETE
             status_message = "Processing completed successfully."
         elif actual_vector_count > 0:
@@ -1554,34 +1619,48 @@ async def _finalize_embeddings_async(self, batch_results: List[Dict[str, Any]], 
             recommendations.append(f"Investigate {failed_batches} failed batches for reliability issues")
 
         # ——— Phase 6: Final Database Update ————————————————————————————————————
+        # Handle processing_metadata - it comes as JSON string from psycopg2
+        existing_metadata = doc_data.get('processing_metadata', {})
+        if isinstance(existing_metadata, str):
+            try:
+                existing_metadata = json.loads(existing_metadata)
+            except (json.JSONDecodeError, TypeError):
+                existing_metadata = {}
+        elif existing_metadata is None:
+            existing_metadata = {}
+        
         final_metadata = {
-             **(doc_data.get('processing_metadata', {}) or {}),
+            **existing_metadata,
             'completion_timestamp': datetime.now(timezone.utc).isoformat(),
             'final_vector_count': actual_vector_count,
             'chunk_completion_rate': chunk_completion_rate,
-            # Add other aggregated metrics here
+            'performance_insights': performance_insights,
+            'recommendations': recommendations
         }
 
-        async with pool.acquire() as conn:
-            await conn.execute(
+        with conn.cursor() as cur:
+            cur.execute(
                 """
                 UPDATE document_sources
-                SET vector_embed_status = $1, final_vector_count = $2, completion_rate = $3,
-                    status_message = $4, completed_at = NOW(), processing_metadata = $5::jsonb
-                WHERE id = $6
+                SET vector_embed_status = %s, final_vector_count = %s, completion_rate = %s,
+                    status_message = %s, completed_at = NOW(), processing_metadata = %s::jsonb
+                WHERE id = %s
                 """,
-                final_status.value, actual_vector_count, chunk_completion_rate, status_message,
-                json.dumps(final_metadata), uuid.UUID(source_id)
+                (final_status.value, actual_vector_count, chunk_completion_rate, status_message,
+                json.dumps(final_metadata), source_id)
             )
+            conn.commit()
 
         logger.info(f"Document {source_id} finalization complete. Status: {final_status.value}")
         return {'source_id': source_id, 'final_status': final_status.value}
 
     except Exception as e:
         logger.error(f"Finalization failed for document {source_id}: {e}", exc_info=True)
-        await _update_document_status(source_id, ProcessingStatus.FAILED_FINALIZATION, f"Finalization failed: {str(e)}")
+        # Use sync version of status update
+        _update_document_status_sync(source_id, ProcessingStatus.FAILED_FINALIZATION, f"Finalization failed: {str(e)}")
         raise
-
+    finally:
+        pool.putconn(conn)
 
 
 # ——— Advanced Monitoring & Maintenance Tasks (Unchanged from v5) —————————————————
