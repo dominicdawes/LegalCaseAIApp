@@ -343,8 +343,8 @@ async def create_new_rag_project(
 
         # Chained job for RAG ingest && AI Note generation (PRODUCTION)
         job = chain(
-            process_document_task.s(request.files, request.metadata),
-            rag_note_task.s(
+            process_document_task.s(request.files, request.metadata),       # (.s) signature
+            rag_note_task.si(                                               # (.si) signature immutable
                 user_id=request.metadata["user_id"],
                 note_type=request.metadata["note_type"],
                 project_id=request.metadata["project_id"],
