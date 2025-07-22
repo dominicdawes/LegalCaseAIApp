@@ -920,7 +920,7 @@ async def _process_document_hybrid(file_urls: List[str], metadata: Dict[str, Any
     reused_docs = []
     same_project_duplicates = []
     
-    # [CHANGED] Switch to sync database operations for reliability
+    # Switch to sync database operations for reliability
     pool = get_sync_db_pool()
     conn = pool.getconn()
     
@@ -930,8 +930,10 @@ async def _process_document_hybrid(file_urls: List[str], metadata: Dict[str, Any
                 if isinstance(res, Exception) or not res:
                     logger.error(f"A document failed to download or prep: {res}")
                     continue
-                
-                # [CHANGED] First: Check if document already exists in THIS project (sync query)
+
+                # ——— Smart Reuse Checks (New Document or Duplicate) ———————————————————————————————————————————
+
+                # First: Check if document already exists in THIS project (sync query)
                 cur.execute(
                     'SELECT id FROM document_sources WHERE content_hash = %s AND project_id = %s',
                     (res['content_hash'], project_id)
@@ -943,7 +945,7 @@ async def _process_document_hybrid(file_urls: List[str], metadata: Dict[str, Any
                     logger.info(f"📋 Document already exists in this project: {res['content_hash'][:8]} -> {same_project_doc['id']}")
                     continue
                 
-                # [CHANGED] Second: Check if content exists in ANY project and is fully processed (sync query)
+                # Second: Check if content exists in ANY project and is fully processed (sync query)
                 cur.execute(
                     '''
                     SELECT id, project_id, total_chunks, total_batches
@@ -960,7 +962,7 @@ async def _process_document_hybrid(file_urls: List[str], metadata: Dict[str, Any
                     # Content exists and is fully processed - SMART REUSE!
                     logger.info(f"♻️  Found processed content {res['content_hash'][:8]} with {existing_processed_doc['total_chunks']} chunks")
                     
-                    # [CHANGED] Create new document entry for this project (sync insert)
+                    # Create new document entry for this project (sync insert)
                     new_doc_id = uuid.uuid4()
                     cur.execute(
                         '''
@@ -977,7 +979,7 @@ async def _process_document_hybrid(file_urls: List[str], metadata: Dict[str, Any
                             datetime.now(timezone.utc))
                     )
                     
-                    # [CHANGED] Copy embeddings to the new project (sync function)
+                    # Copy embeddings to the new project (sync function)
                     logger.info(f"♻️  Copying found embeddings...")
                     copy_result = copy_embeddings_for_project_sync(
                         str(existing_processed_doc['id']), 
@@ -994,9 +996,9 @@ async def _process_document_hybrid(file_urls: List[str], metadata: Dict[str, Any
                     })
                     
                     logger.info(f"🎯 Smart reuse complete: {copy_result['copied_count']} chunks, {copy_result['total_tokens']} tokens")
-                    
+                
+                # Finally: New content or unprocessed content - full processing needed 
                 else:
-                    # New content or unprocessed content - full processing needed
                     res['id'] = uuid.uuid4()
                     new_docs_to_insert.append(res)
                     logger.info(f"🆕 New content {res['content_hash'][:8]} needs full processing")
@@ -1129,6 +1131,8 @@ def copy_embeddings_for_project_sync(existing_source_id: str, new_source_id: str
             conn.commit()
             
             logger.info(f"✅ Copied {len(records_to_insert)} embeddings from {existing_source_id} to {new_source_id} for project {project_id}")
+
+            # JUMP TO TASK #4 (FINALIZE EMBEDDINGS or trigger NOTE GENERATION TASK)
             
             return {
                 'copied_count': len(records_to_insert),
