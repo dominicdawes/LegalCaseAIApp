@@ -341,10 +341,10 @@ async def create_new_rag_project(
         #     ]
         # )
 
-        # Chained job for RAG ingest && AI Note generation (PRODUCTION)
-        job = chain(
-            process_document_task.s(request.files, request.metadata),       # (.s) signature
-            rag_note_task.si(                                               # (.si) signature immutable
+        # Single task with callback - cleanest approach
+        job = process_document_task.apply_async(
+            args=[request.files, request.metadata],
+            link=rag_note_task.si(  # Callback fires after success
                 user_id=request.metadata["user_id"],
                 note_type=request.metadata["note_type"],
                 project_id=request.metadata["project_id"],
@@ -354,7 +354,7 @@ async def create_new_rag_project(
                 temperature=request.metadata["temperature"],
                 addtl_params=request.metadata["addtl_params"]
             )
-        ).apply_async()
+        )
         
         # The task will return the job ID for immediate status monitoring
         logger.info(f"🚀 Started chained RAG workflow (Ingest → New Note) with ID: {job.id}")
