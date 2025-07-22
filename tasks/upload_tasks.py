@@ -64,6 +64,7 @@ import psutil
 
 # ===== PROJECT MODULES =====
 from tasks.celery_app import celery_app
+from tasks.note_tasks import rag_note_task
 from utils.s3_utils import upload_to_s3, s3_client
 from utils.cloudfront_utils import get_cloudfront_url
 from utils.supabase_utils import supabase_client
@@ -823,10 +824,10 @@ def test_celery_log_task(self) -> str:
     return result
 
 @celery_app.task(bind=True, queue=INGEST_QUEUE, acks_late=True)
-def process_document_task(self, file_urls: List[str], metadata: Dict[str, Any]) -> Dict[str, Any]:
+def process_document_task(self, file_urls: List[str], metadata: Dict[str, Any], create_note: bool = False) -> Dict[str, Any]:
     task_id = self.request.id
     logger.info(f"🚀 Starting task {task_id} asyc document processing task URLs")
-    return asyncio.run(_process_document_hybrid(file_urls, metadata))
+    return asyncio.run(_process_document_hybrid(file_urls, metadata, create_note))
 
 async def copy_embeddings_for_project_async(existing_source_id: str, new_source_id: str, project_id: str, user_id: str) -> Dict[str, Any]:
     """
@@ -890,7 +891,7 @@ async def copy_embeddings_for_project_async(existing_source_id: str, new_source_
             'total_tokens': total_tokens
         }
 
-async def _process_document_hybrid(file_urls: List[str], metadata: Dict[str, Any]) -> Dict[str, Any]:
+async def _process_document_hybrid(file_urls: List[str], metadata: Dict[str, Any], create_note: bool = False) -> Dict[str, Any]:
     """
     [HYBRID] Smart Reuse Ingest Task:
     - Concurrent downloads directly into memory using httpx (ASYNC)
@@ -899,6 +900,10 @@ async def _process_document_hybrid(file_urls: List[str], metadata: Dict[str, Any
     - If content is new or unprocessed, do full processing pipeline (SYNC DB)
     - Bulk-inserts new documents and dispatches parsing tasks only when needed (SYNC DB)
     """
+    
+    # Add "create_note" to metadata & pass it along to Task #4
+    metadata['create_note'] = create_note
+    
     project_id = metadata['project_id']
     user_id = metadata['user_id']
     
@@ -1011,7 +1016,7 @@ async def _process_document_hybrid(file_urls: List[str], metadata: Dict[str, Any
             ]
             
             with conn.cursor() as cur:
-                # [CHANGED] Use sync executemany instead of async
+                # Use sync executemany instead of async
                 cur.executemany(
                     '''INSERT INTO document_sources 
                     (id, cdn_url, content_hash, project_id, content_tags, uploaded_by, 
@@ -1023,11 +1028,17 @@ async def _process_document_hybrid(file_urls: List[str], metadata: Dict[str, Any
                     
             inserted_ids = [str(doc['id']) for doc in new_docs_to_insert]
             
-            # [UNCHANGED] Schedule parsing tasks ONLY for new documents
+            # Schedule parsing tasks ONLY for new documents
             logger.info("🗂️ Scheduling parse tasks for NEW documents only...")
             for doc in new_docs_to_insert:
                 parse_document_task.apply_async(
-                    (str(doc['id']), doc['cdn_url'], doc['project_id']), queue=PARSE_QUEUE
+                    (
+                        str(doc['id']), 
+                        doc['cdn_url'], 
+                        doc['project_id'],
+                        metadata
+                    ), 
+                    queue=PARSE_QUEUE
                 )
         
     finally:
@@ -1183,7 +1194,7 @@ async def _download_and_prep_doc(client: httpx.AsyncClient, url: str, project_id
     autoretry_for=(Exception,),
     retry_kwargs={'max_retries': MAX_RETRIES, 'countdown': DEFAULT_RETRY_DELAY}
 )
-def parse_document_task(self, source_id: str, cdn_url: str, project_id: str) -> Dict[str, Any]:
+def parse_document_task(self, source_id: str, cdn_url: str, project_id: str, metadata: Dict[str, Any]) -> Dict[str, Any]:
     """
     Gevent-optimized Parsing Task:
     - Uses gevent for concurrent I/O operations
@@ -1194,12 +1205,12 @@ def parse_document_task(self, source_id: str, cdn_url: str, project_id: str) -> 
     - Fire off embed task celery group
     """
     try:
-        return _parse_document_gevent(self, source_id, cdn_url, project_id)
+        return _parse_document_gevent(self, source_id, cdn_url, project_id, metadata)
     except Exception as exc:
         logger.error(f"Parse task failed for {source_id}: {exc}")
         raise  # Let Celery handle the retry automatically with CELERY_RETRY_CONFIG
 
-def _parse_document_gevent(self, source_id: str, cdn_url: str, project_id: str) -> Dict[str, Any]:
+def _parse_document_gevent(self, source_id: str, cdn_url: str, project_id: str, metadata: Dict[str, Any]) -> Dict[str, Any]:
     """
     Gevent-based parsing implementation, with optimizations
     """
@@ -1378,9 +1389,9 @@ def _parse_document_gevent(self, source_id: str, cdn_url: str, project_id: str) 
             # Schedule embedding tasks
             if embedding_tasks:
                 logger.info(f"🚀 [PARSE-{short_id}] Scheduling {len(embedding_tasks)} embedding tasks...")
-                chord(group(embedding_tasks), queue=EMBED_QUEUE)(finalize_embeddings.s(source_id).set(queue=FINAL_QUEUE))
+                chord(group(embedding_tasks), queue=EMBED_QUEUE)(finalize_embeddings.s(source_id, metadata).set(queue=FINAL_QUEUE))
             else:
-                finalize_embeddings.apply_async(([], source_id), queue=FINAL_QUEUE)
+                finalize_embeddings.apply_async(([], source_id, metadata), queue=FINAL_QUEUE)
 
             # ⏳ Final timer/performance summary
             measured_time = sum([
@@ -1532,13 +1543,56 @@ async def _embed_with_retry(texts: List[str]) -> List[List[float]]:
     return await embedding_model.aembed_documents(texts)
 
 
-# ——— Task 4: Finalize (Fully Async DB) ————————————————————————————————————————
+# ——— Task 4a: Define note generation trigger ————————————————————————————————————————
+
+def trigger_next_workflow_step(source_id: str, final_status: ProcessingStatus, metadata: Dict[str, Any]):
+    """
+    Function that fires off a note generation task
+        - final_status: Final status of the document processing pipeline
+        - metadata: metadate direct from FastAPI call
+        - source_id: Document source UUID
+    """
+    if final_status != ProcessingStatus.COMPLETE:
+        logger.warning(f"Skipping note generation for {source_id} - status: {final_status}")
+        return
+    
+    # Add validation for required fields
+    required_fields = ["user_id", "project_id", "note_type", "note_title"]
+    missing_fields = [field for field in required_fields if not metadata.get(field)]
+    
+    if missing_fields:
+        error_msg = f"Missing required metadata fields: {missing_fields}"
+        logger.error(f"Cannot trigger note generation for {source_id}: {error_msg}")
+        _update_document_status_sync(source_id, ProcessingStatus.FAILED_ORCHESTRATION, error_msg)
+        return
+    
+    try:
+        rag_note_task.apply_async(
+            kwargs={
+                "user_id": metadata.get("user_id"),
+                "note_type": metadata.get("note_type"), 
+                "project_id": metadata.get("project_id"),
+                "note_title": metadata.get("note_title"),
+                "provider": metadata.get("provider"),
+                "model_name": metadata.get("model_name"),
+                "temperature": metadata.get("temperature"),
+                "addtl_params": metadata.get("addtl_params", {})
+            }
+        )
+        logger.info(f"🎯 Triggered rag_note_task for document {source_id}")
+    except Exception as e:
+        logger.error(f"Failed to trigger note generation for {source_id}: {e}")
+        # Update DB with orchestration failure - Supabase realtime will notify client
+        _update_document_status_sync(source_id, ProcessingStatus.FAILED_ORCHESTRATION, 
+                                        f"Note generation trigger failed: {str(e)}")
+
+# ——— Task 4b: Finalize (Fully Async DB) ————————————————————————————————————————
 
 @celery_app.task(bind=True, queue=FINAL_QUEUE, acks_late=True)
-def finalize_embeddings(self, batch_results: List[Dict[str, Any]], source_id: str) -> Dict[str, Any]:
-    return _finalize_embeddings_sync(self, batch_results, source_id)
+def finalize_embeddings(self, batch_results: List[Dict[str, Any]], source_id: str, metadata: Dict[str, Any]) -> Dict[str, Any]:
+    return _finalize_embeddings_sync(self, batch_results, source_id, metadata)
 
-def _finalize_embeddings_sync(self, batch_results: List[Dict[str, Any]], source_id: str) -> Dict[str, Any]:
+def _finalize_embeddings_sync(self, batch_results: List[Dict[str, Any]], source_id: str, metadata: Dict[str, Any]) -> Dict[str, Any]:
     """
     Sync implementation finalizes document processing by validating completion, calculating performance metrics,
     and updating the document status:
@@ -1652,6 +1706,12 @@ def _finalize_embeddings_sync(self, batch_results: List[Dict[str, Any]], source_
             conn.commit()
 
         logger.info(f"Document {source_id} finalization complete. Status: {final_status.value}")
+
+        # ——— Final Action: Create AI-Gen Note ————————————————————————————————————
+        # [DO NOT REMOVE] Metadata is for `note_tasks.py`, final_metadata is processing and performance insights
+        if metadata["create_note"] == True:
+                trigger_next_workflow_step(source_id, final_status, metadata)
+        
         return {'source_id': source_id, 'final_status': final_status.value}
 
     except Exception as e:
