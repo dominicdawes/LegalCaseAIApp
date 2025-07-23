@@ -2172,13 +2172,30 @@ def initialize_production_pipeline():
 # ——— Module Exports ————————————————————————————————————————————————————————————————
 
 __all__ = [
-    'process_document_task',
-    'parse_document_task', 
-    'embed_batch_task',
-    'finalize_embeddings',
-    'system_health_check',
-    'cleanup_orphaned_resources',
-    'optimize_embedding_performance',
-    'initialize_production_pipeline',
-    'validate_production_readiness'
+    # ——— Main Workflow Tasks ———————————————————————————————————————————————————————
+    'process_document_batch_workflow',           # NEW: Main entry point (replaces process_document_task)
+    'process_new_document_task',                 # NEW: Handle new documents in workflow
+    'process_reused_document_task',              # NEW: Handle reused documents in workflow
+    'finalize_batch_and_create_note',            # NEW: Batch coordination & note triggering
+    'handle_batch_failure',                      # NEW: Batch failure handling
+    
+    # ——— Legacy/Individual Document Tasks ——————————————————————————————————————————
+    'parse_document_task',                       # KEEP: Still used for individual parsing
+    'embed_batch_task',                          # KEEP: Core embedding functionality
+    # 'finalize_embeddings',                       # LEGACY: May be removed (replaced by batch finalization)
+    
+    # ——— Helper Functions ——————————————————————————————————————————————————————————
+    'copy_embeddings_for_project_sync',         # KEEP: Used by reused document processing
+    '_execute_batch_workflow',                   # NEW: Core workflow execution logic
+    '_analyze_document_for_workflow',            # NEW: Document classification
+    '_parse_document_gevent_for_workflow',       # NEW: Workflow-optimized parsing
+    '_handle_duplicate_only_batch',              # NEW: Handle all-duplicate scenarios
+    
+    # ——— System Management Tasks ———————————————————————————————————————————————————
+    'test_celery_log_task',                      # KEEP: Testing functionality
+    'system_health_check',                       # KEEP: If you have this
+    'cleanup_orphaned_resources',                # KEEP: If you have this
+    'optimize_embedding_performance',            # KEEP: If you have this
+    'initialize_production_pipeline',            # KEEP: If you have this
+    'validate_production_readiness'              # KEEP: If you have this
 ]
