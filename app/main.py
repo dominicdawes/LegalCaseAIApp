@@ -21,7 +21,7 @@ from utils.pdf_utils import extract_text_from_pdf
 from celery import chain, chord, group, states
 from celery.result import AsyncResult
 from tasks.podcast_generate_tasks import validate_and_generate_audio_task, generate_dialogue_only_task
-from tasks.upload_tasks import process_document_task
+from tasks.upload_tasks import process_document_batch_workflow
 from tasks.upload_tasks import test_celery_log_task
 # from tasks.upload_tasks import append_document_task  <-- need to revive this later
 from tasks.sample_tasks import addition_task
@@ -334,7 +334,7 @@ async def create_new_rag_project(
         # job = test_celery_log_task.apply_async()
         
         # Single job for Ingest → New Note (Task #4 Handles Note Generation)
-        job = process_document_task.apply_async(
+        job = process_document_batch_workflow.apply_async(
             args=[request.files, request.metadata],
             kwargs={"create_note": True}
         )
