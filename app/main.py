@@ -338,21 +338,6 @@ async def create_new_rag_project(
             args=[request.files, request.metadata],
             kwargs={"create_note": True}
         )
-
-        # # Single task with callback - cleanest approach
-        # job = process_document_task.apply_async(
-        #     args=[request.files, request.metadata ],
-        #     link=rag_note_task.si(  # Callback fires after success
-        #         user_id=request.metadata["user_id"],
-        #         note_type=request.metadata["note_type"],
-        #         project_id=request.metadata["project_id"],
-        #         note_title=request.metadata["note_title"],
-        #         provider=request.metadata["provider"],
-        #         model_name=request.metadata["model_name"],
-        #         temperature=request.metadata["temperature"],
-        #         addtl_params=request.metadata["addtl_params"]
-        #     )
-        # )
         
         # The task will return the job ID for immediate status monitoring
         logger.info(f"🚀 Started chained RAG workflow (Ingest → New Note) with ID: {job.id}")

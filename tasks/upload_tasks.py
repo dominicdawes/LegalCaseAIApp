@@ -907,10 +907,10 @@ async def _execute_batch_workflow(batch_id: str, file_urls: List[str], metadata:
 
     processing_tasks = []
     
-    # Calculate processable documents (EXCLUDE duplicates and failures)
+    # Calculate processable documents (EXCLUDE duplicates and failures) 
     processable_docs = len(new_documents) + len(reused_documents)
     
-    # Early exit if nothing to process
+    # ——— Early exit if nothing to process ———————————————————————————————————————
     if processable_docs == 0:
         logger.warning(f"⚠️ [BATCH-{batch_id[:8]}] No processable documents - all duplicates or failed")
         
@@ -1197,7 +1197,8 @@ def copy_embeddings_for_project_sync(existing_source_id: str, new_source_id: str
 
 async def _download_and_prep_doc(client: httpx.AsyncClient, url: str, project_id: str, user_id: str) -> Optional[Dict]:
     """
-    Helper to download to memory, hash, stream to S3 & Store in AWS CLoudfront, and prep data.
+    Helper for `_analyze_document_for_workflow` to download to memory (does not write to Disk),
+    hash, stream to S3 & Store in AWS CLoudfront, and prep data.
     """
     try:
         # Define headers for anti-bot detection
@@ -1228,6 +1229,7 @@ async def _download_and_prep_doc(client: httpx.AsyncClient, url: str, project_id
             upload_to_s3(s3_client, content_stream, s3_key)
             cdn_url = get_cloudfront_url(s3_key)
             
+            # Leverages my url (AWS Cloudfront) to perform in-memory streaming for the rest of the ingest pipeline
             return {
                 'cdn_url': cdn_url,
                 'project_id': project_id,
@@ -1494,13 +1496,13 @@ def _parse_document_gevent_for_workflow(self, source_id: str, cdn_url: str, proj
             _update_document_status_sync(source_id, ProcessingStatus.FAILED_PARSING, str(e))
             raise
 
-@celery_app.task(
-    bind=True, 
-    queue=PARSE_QUEUE, 
-    acks_late=True,
-    autoretry_for=(Exception,),
-    retry_kwargs={'max_retries': MAX_RETRIES, 'countdown': DEFAULT_RETRY_DELAY}
-)
+# @celery_app.task(
+#     bind=True, 
+#     queue=PARSE_QUEUE, 
+#     acks_late=True,
+#     autoretry_for=(Exception,),
+#     retry_kwargs={'max_retries': MAX_RETRIES, 'countdown': DEFAULT_RETRY_DELAY}
+# )
 
 # ——— Task 3: Embed (Fully Async DB) ——————————————————————————————————————————
 

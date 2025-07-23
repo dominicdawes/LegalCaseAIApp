@@ -48,65 +48,87 @@ celery_app = Celery(
     accept_content=["json", "pickle"],  # Accept JSON and pickle content
 )
 
+# 🎛️ Toggle Controls from Environment Variables
+SHOW_CELERY_LOGS = "false"   # os.getenv("SHOW_CELERY_LOGS", "true").lower() == "true"
+SHOW_MANUAL_LOGS = "true"  # os.getenv("SHOW_MANUAL_LOGS", "true").lower() == "true"
+
 @after_setup_logger.connect
 def setup_loggers(logger, **kwargs):
-    """
-    This function is triggered after Celery sets up its logger.
-    We can add our own handlers here.
-    """
-    # Create a formatter
-    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-    
-    # Create stdout handler
-    handler = logging.StreamHandler(sys.stdout)
-    handler.setFormatter(formatter)
-    
-    # Add handler to logger
-    logger.addHandler(handler)
-    logger.setLevel(logging.INFO)
-    
-    # Also configure the root logger
-    root_logger = logging.getLogger()
-    root_logger.addHandler(handler)
-    root_logger.setLevel(logging.INFO)
-
-@after_setup_task_logger.connect
-def setup_task_loggers(logger, **kwargs):
-    """
-    Configure task-specific loggers
-    """
+    """Configurable logger setup with toggles for different log types"""
     formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
     handler = logging.StreamHandler(sys.stdout)
     handler.setFormatter(formatter)
-    logger.addHandler(handler)
-    logger.setLevel(logging.INFO)
-
-# Optional: Load configuration from a separate config file or object
-celery_app.conf.update(
-    task_serializer="json",
-    accept_content=["json"],  # Specify content types to accept
-    result_serializer="json",
-    timezone="UTC",
-    enable_utc=True,
-    broker_connection_retry_on_startup=True,  # Added setting
-
-    # NEW: Async support configuration for Celery 5.4
-    task_protocol=2,  # Enable async task protocol
-    # worker_pool='gevent',  # Use gevent for async compatibility
-    # worker_concurrency=10,  # 2 to 200 Adjust based on your server capacity
-    worker_prefetch_multiplier=1,  # Good for async tasks
     
-    # Additional async-friendly settings
-    task_acks_late=True,  # Acknowledge tasks after completion
-    worker_disable_rate_limits=False,  # Keep rate limits for API calls
-    task_reject_on_worker_lost=True,  # Reject tasks if worker dies
+    # 🎯 Toggle 1: Celery Built-in Logs (task lifecycle, worker events)
+    if SHOW_CELERY_LOGS:
+        logger.addHandler(handler)
+        logger.setLevel(logging.INFO)
+        print("✅ Celery logs enabled")
+    else:
+        logger.setLevel(logging.WARNING)  # Only show warnings/errors
+        print("🔇 Celery logs disabled")
+    
+    # 🎯 Toggle 2: Manual Application Logs (your emoji logs)
+    if SHOW_MANUAL_LOGS:
+        # Configure all your task module loggers
+        task_modules = [
+            'tasks.upload_tasks',
+            'tasks.note_tasks', 
+            'tasks.chat_tasks',
+            'tasks.chat_streaming_tasks',
+            'tasks.sample_tasks'
+        ]
+        
+        for module_name in task_modules:
+            module_logger = logging.getLogger(module_name)
+            module_logger.addHandler(handler)
+            module_logger.setLevel(logging.INFO)
+            module_logger.propagate = True
+        
+        print("✅ Manual logs enabled")
+    else:
+        # Disable manual logs by setting high threshold
+        for module_name in ['tasks.upload_tasks', 'tasks.note_tasks', 'tasks.chat_tasks', 'tasks.chat_streaming_tasks', 'tasks.sample_tasks']:
+            module_logger = logging.getLogger(module_name)
+            module_logger.setLevel(logging.ERROR)  # Only errors
+        
+        print("🔇 Manual logs disabled")
 
-    # CRITICAL: Logging configuration for Render
-    worker_log_format='[%(asctime)s: %(levelname)s/%(processName)s] %(message)s',
-    worker_task_log_format='[%(asctime)s: %(levelname)s/%(processName)s][%(task_name)s(%(task_id)s)] %(message)s',
-    worker_hijack_root_logger=False,  # Don't hijack root logger
-)
+# @after_setup_task_logger.connect
+# def setup_task_loggers(logger, **kwargs):
+#     """
+#     Configure task-specific loggers
+#     """
+#     formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+#     handler = logging.StreamHandler(sys.stdout)
+#     handler.setFormatter(formatter)
+#     logger.addHandler(handler)
+#     logger.setLevel(logging.INFO)
 
+# 🎛️ Update Celery config to respect toggles
+celery_config_updates = {
+    "task_serializer": "json",
+    "accept_content": ["json"],
+    "result_serializer": "json",
+    "timezone": "UTC",
+    "enable_utc": True,
+    "broker_connection_retry_on_startup": True,
+    "task_protocol": 2,
+    "worker_prefetch_multiplier": 1,
+    "task_acks_late": True,
+    "worker_disable_rate_limits": False,
+    "task_reject_on_worker_lost": True,
+}
+
+# 🎯 Add Celery-specific log control
+if not SHOW_CELERY_LOGS:
+    celery_config_updates.update({
+        "worker_log_format": "",  # Minimize worker logs
+        "worker_task_log_format": "",  # Minimize task logs
+        "worker_hijack_root_logger": False,
+    })
+
+celery_app.conf.update(**celery_config_updates)
 # Import tasks to register them with Celery (THIS WORKS!!!)
 # import tasks.generate_tasks
 import tasks.chat_tasks
