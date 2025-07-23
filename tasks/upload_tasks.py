@@ -804,7 +804,7 @@ def get_clean_filename_from_url(url: str, extension: str) -> str:
     # Final fallback
     return f"document_{uuid.uuid4().hex[:8]}{extension}"
 
-# ——— Task 1: Ingest (Fully Async) ———————————————————————————————————————————
+# ——— Task 1: Ingest (Fully Async) ———————————————————————————————————————————  
 
 @celery_app.task(bind=True)
 def test_celery_log_task(self) -> str:
@@ -869,6 +869,7 @@ async def _execute_batch_workflow(batch_id: str, file_urls: List[str], metadata:
     # ——— Step 2: Classify Documents by Processing Type ———————————————————————————
     new_documents = []
     reused_documents = []
+    duplicate_documents = []  # Track same-project duplicates separately
     failed_downloads = []
     
     for result in analysis_results:
@@ -880,12 +881,16 @@ async def _execute_batch_workflow(batch_id: str, file_urls: List[str], metadata:
             new_documents.append(result)
         elif result['processing_type'] == 'REUSED':
             reused_documents.append(result)
+        elif result['processing_type'] == 'DUPLICATE':
+            duplicate_documents.append(result)
+            logger.info(f"📋 [BATCH-{batch_id[:8]}] Duplicate document skipped: {result.get('content_hash', 'unknown')[:8]}")
         else:
             failed_downloads.append(f"Unknown processing type: {result}")
     
     logger.info(f"📊 [BATCH-{batch_id[:8]}] Classification complete:")
     logger.info(f"   🆕 New documents: {len(new_documents)}")
     logger.info(f"   ♻️  Reused documents: {len(reused_documents)}")
+    logger.info(f"   📋 Duplicate documents: {len(duplicate_documents)}")
     logger.info(f"   ❌ Failed downloads: {len(failed_downloads)}")
 
     workflow_metadata = {
@@ -894,15 +899,36 @@ async def _execute_batch_workflow(batch_id: str, file_urls: List[str], metadata:
         'total_documents': len(file_urls),
         'new_count': len(new_documents),
         'reused_count': len(reused_documents),
+        'duplicate_count': len(duplicate_documents),
         'failed_count': len(failed_downloads)
     }
     
     # ——— Step 3: Determine Processing Path (ALL REUSED vs NEW/MIXED) ———————————————————————————————————————————
 
     processing_tasks = []
+    
+    # Calculate processable documents (EXCLUDE duplicates and failures)
+    processable_docs = len(new_documents) + len(reused_documents)
+    
+    # Early exit if nothing to process
+    if processable_docs == 0:
+        logger.warning(f"⚠️ [BATCH-{batch_id[:8]}] No processable documents - all duplicates or failed")
+        
+        # Still trigger note generation if only duplicates (documents ALREADY exist in CURRENT USER project)
+        if len(duplicate_documents) > 0 and metadata.get('create_note'):
+            logger.info(f"📝 [BATCH-{batch_id[:8]}] Triggering note for duplicate-only batch")
+            return await _handle_duplicate_only_batch(batch_id, workflow_metadata, duplicate_documents)
+        
+        # Otherwise handle as complete failure
+        handle_batch_failure.apply_async((batch_id, workflow_metadata, failed_downloads))
+        return {
+            'batch_id': batch_id,
+            'status': 'BATCH_FAILED',
+            'reason': 'No processable documents (all duplicates or failed)'
+        }
 
     # ——— Path A: All-Reused ⚡Fast Track ———————————————————————————————————————
-    if len(reused_documents) == len(file_urls) and len(reused_documents) > 0:     
+    if len(reused_documents) == processable_docs and len(reused_documents) > 0:     
         logger.info(f"⚡ [BATCH-{batch_id[:8]}] All-reused batch - fast track processing")
         
         # Still need full reused document pipeline for row copying
@@ -915,33 +941,23 @@ async def _execute_batch_workflow(batch_id: str, file_urls: List[str], metadata:
             )
             processing_tasks.append(task_sig)
             
-        if processing_tasks:
-            # Same coordination, just optimized for reused-only scenario
-            logger.info(f"🚀 [BATCH-{batch_id[:8]}] Launching coordinated REUSED workflow with {len(processing_tasks)} tasks")
-            workflow = chord(
-                group(processing_tasks),
-                finalize_batch_and_create_note.s(batch_id, workflow_metadata).set(queue=FINAL_QUEUE)
-            )
-            
-            # Execute the workflow
-            chord_result = workflow.apply_async()
-
-            return {
-                'batch_id': batch_id,
-                'workflow_id': chord_result.id,
-                'processing_tasks': len(processing_tasks),
-                'status': 'WORKFLOW_LAUNCHED'
-            }
-        else:
-            # Handle edge case: all documents failed download
-            logger.warning(f"⚠️ [BATCH-{batch_id[:8]}] No documents to process - triggering failure handling")
-            handle_batch_failure.apply_async((batch_id, workflow_metadata, failed_downloads))
+        # Same coordination, just optimized for reused-only scenario
+        logger.info(f"🚀 [BATCH-{batch_id[:8]}] Launching coordinated REUSED workflow with {len(processing_tasks)} tasks")
+        workflow = chord(
+            group(processing_tasks),
+            finalize_batch_and_create_note.s(batch_id, workflow_metadata).set(queue=FINAL_QUEUE)
+        )
         
-            return {
-                'batch_id': batch_id,
-                'status': 'BATCH_FAILED',
-                'reason': 'All documents failed download/analysis'
-            }
+        # Execute the workflow
+        chord_result = workflow.apply_async()
+
+        return {
+            'batch_id': batch_id,
+            'workflow_id': chord_result.id,
+            'processing_tasks': len(processing_tasks),
+            'workflow_path': 'ALL_REUSED_FAST_TRACK',
+            'status': 'WORKFLOW_LAUNCHED'
+        }
 
     
     # ——— Path B: Mixed/New Documents Standard Workflow ——————————————————————————
@@ -967,33 +983,67 @@ async def _execute_batch_workflow(batch_id: str, file_urls: List[str], metadata:
             )
             processing_tasks.append(task_sig)
 
-        if processing_tasks:
-            # Same coordination pattern
-            logger.info(f"🚀 [BATCH-{batch_id[:8]}] Launching coordinated MIXED/NEW workflow with {len(processing_tasks)} tasks")
-            workflow = chord(
-                group(processing_tasks),
-                finalize_batch_and_create_note.s(batch_id, workflow_metadata).set(queue=FINAL_QUEUE)
-            )
-            
-            # Execute the workflow
-            chord_result = workflow.apply_async()
-            
-            return {
-                'batch_id': batch_id,
-                'workflow_id': chord_result.id,
-                'processing_tasks': len(processing_tasks),
-                'status': 'WORKFLOW_LAUNCHED'
-            }
-        else:
-            # Handle edge case: all documents failed download
-            logger.warning(f"⚠️ [BATCH-{batch_id[:8]}] No documents to process - triggering failure handling")
-            handle_batch_failure.apply_async((batch_id, workflow_metadata, failed_downloads))
+        # Same coordination pattern
+        logger.info(f"🚀 [BATCH-{batch_id[:8]}] Launching coordinated MIXED/NEW workflow with {len(processing_tasks)} tasks")
+        workflow = chord(
+            group(processing_tasks),
+            finalize_batch_and_create_note.s(batch_id, workflow_metadata).set(queue=FINAL_QUEUE)
+        )
         
-            return {
-                'batch_id': batch_id,
-                'status': 'BATCH_FAILED',
-                'reason': 'All documents failed download/analysis'
+        # Execute the workflow
+        chord_result = workflow.apply_async()
+        
+        return {
+            'batch_id': batch_id,
+            'workflow_id': chord_result.id,
+            'processing_tasks': len(processing_tasks),
+            'workflow_path': 'MIXED_NEW_STANDARD',
+            'status': 'WORKFLOW_LAUNCHED'
+        }
+
+async def _handle_duplicate_only_batch(batch_id: str, workflow_metadata: Dict[str, Any], duplicate_docs: List[Dict]) -> Dict[str, Any]:
+    """
+    [DUPLICATE HANDLER] Handle batches containing only duplicate documents:
+    - Documents already EXIST in this project, so no processing needed (It;s a type of USER dumb error)
+    - Can still generate notes using existing document content
+    """
+    logger.info(f"📋 [BATCH-{batch_id[:8]}] Handling duplicate-only batch with {len(duplicate_docs)} documents")
+    
+    if workflow_metadata.get('create_note'):
+        # Enhance metadata for duplicate-only note generation
+        note_metadata = {
+            **workflow_metadata,
+            'batch_status': 'DUPLICATE_ONLY',
+            'duplicate_document_ids': [doc.get('existing_doc_id') for doc in duplicate_docs],
+            'processing_context': f'All {len(duplicate_docs)} documents already exist in project'
+        }
+        
+        logger.info(f"🎯 [BATCH-{batch_id[:8]}] Triggering note generation for duplicate-only batch")
+        rag_note_task.apply_async(kwargs={
+            "user_id": note_metadata["user_id"],
+            "note_type": note_metadata["note_type"], 
+            "project_id": note_metadata["project_id"],
+            "note_title": note_metadata["note_title"],
+            "provider": note_metadata.get("provider"),
+            "model_name": note_metadata.get("model_name"), 
+            "temperature": note_metadata.get("temperature"),
+            "addtl_params": {
+                **note_metadata.get("addtl_params", {}),
+                'batch_context': {
+                    'batch_id': batch_id,
+                    'batch_status': 'DUPLICATE_ONLY',
+                    'document_count': len(duplicate_docs),
+                    'duplicate_doc_ids': note_metadata['duplicate_document_ids']
+                }
             }
+        })
+    
+    return {
+        'batch_id': batch_id,
+        'status': 'DUPLICATE_ONLY_COMPLETE',
+        'duplicate_documents': len(duplicate_docs),
+        'note_generation_triggered': workflow_metadata.get('create_note', False)
+    }
 
 # ——— 🔍 Document Analysis & Classification ——————————————————————————————————————————
 
