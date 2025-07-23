@@ -135,6 +135,18 @@ class ProcessingStatus(Enum):
     FAILED_EMBEDDING = "FAILED_EMBEDDING"
     FAILED_FINALIZATION = "FAILED_FINALIZATION"
 
+class BatchProgressStatus(Enum):
+    """Batch-level progress tracking for UI observability"""
+    BATCH_INITIALIZING = "BATCH_INITIALIZING"
+    BATCH_ANALYZING = "BATCH_ANALYZING"        # Document classification phase
+    BATCH_DOWNLOADING = "BATCH_DOWNLOADING"    # Concurrent downloads
+    BATCH_PARSING = "BATCH_PARSING"           # Document parsing phase  [REUSE & COPYING are not logged]
+    BATCH_EMBEDDING = "BATCH_EMBEDDING"       # Embedding generation phase
+    BATCH_FINALIZING = "BATCH_FINALIZING"     # Coordination & cleanup
+    BATCH_COMPLETE = "BATCH_COMPLETE"         # All processing done
+    BATCH_PARTIAL = "BATCH_PARTIAL"           # Some docs failed
+    BATCH_FAILED = "BATCH_FAILED"             # Complete failure
+
 @dataclass
 class DocumentMetrics:
     """Enhanced telemetry for document processing"""
@@ -180,47 +192,6 @@ class DocumentMetrics:
             'embedding_calls': self.embedding_calls,
             'retry_count': self.retry_count
         }
-
-# class StreamingDocumentProcessor:
-#     """
-#     DEPRECATED: Wrapper class to encapsulate streaming document processing
-#     Maintains the TRUE IN-MEMORY STREAMING architecture
-#     """
-    
-#     def __init__(self, file_buffer: io.BytesIO, filename: str):
-#         self.file_buffer = file_buffer
-#         self.filename = filename
-#         self.loader = None
-        
-#     def get_loader(self) -> BaseDocumentLoader:
-#         """Get the appropriate loader for this document"""
-#         if self.loader is None:
-#             self.loader = get_loader_for(filename=self.filename, file_like_object=self.file_buffer)
-#         return self.loader
-    
-#     def stream_chunks(self, splitter: RecursiveCharacterTextSplitter) -> Iterator[Tuple[str, Dict]]:
-#         """
-#         Generator that yields (text, metadata) tuples for each chunk
-#         Maintains true streaming - never loads entire document into memory at once
-#         """
-#         loader = self.get_loader()
-        
-#         # Reset buffer position
-#         self.file_buffer.seek(0)
-        
-#         for page_num, page in enumerate(loader.stream_documents(self.file_buffer)):
-#             # Split page into chunks
-#             chunks = splitter.split_documents([page])
-            
-#             for chunk_idx, chunk in enumerate(chunks):
-#                 cleaned_content = _clean_text(chunk.page_content)
-#                 if cleaned_content:
-#                     metadata = {
-#                         **chunk.metadata,
-#                         'page_number': page_num,
-#                         'chunk_index': chunk_idx
-#                     }
-#                     yield cleaned_content, metadata
 
 # ——— DB Pool Instances (Initialized once per worker) ————————————————————————————
 
@@ -539,7 +510,7 @@ async def _update_document_status(doc_id: str, status: ProcessingStatus, error_m
         )
 
 def _update_document_status_sync(doc_id: str, status: ProcessingStatus, error_message: str = None):
-    """Synchronous version of document status update helper (for gevent)"""
+    """[PER DOCUMENT] Synchronous version of document status update helper (for gevent)"""
     logger.info(f"📋 Doc {doc_id[:8]}... → {status.value}")
     pool = get_sync_db_pool()
     conn = pool.getconn()
@@ -554,6 +525,31 @@ def _update_document_status_sync(doc_id: str, status: ProcessingStatus, error_me
                 (status.value, error_message, doc_id)
             )
             conn.commit()
+    finally:
+        pool.putconn(conn)
+
+def _update_batch_progress_sync(batch_id: str, project_id: str, status: BatchProgressStatus):
+    """
+    [PER BATCH] Update batch_progress for all documents in a batch
+    Fast bulk update - better than individual document updates
+    """
+    pool = get_sync_db_pool()
+    conn = pool.getconn()
+    try:
+        with conn.cursor() as cur:
+            # Use batch_id from processing_metadata to identify batch documents
+            cur.execute(
+                """
+                UPDATE document_sources 
+                SET batch_progress = %s, updated_at = NOW()
+                WHERE project_id = %s 
+                AND processing_metadata->>'batch_id' = %s
+                """,
+                (status.value, project_id, batch_id)
+            )
+            rows_updated = cur.rowcount
+            conn.commit()
+            logger.info(f"📊 [BATCH-{batch_id[:8]}] Progress → {status.value} ({rows_updated} docs)")
     finally:
         pool.putconn(conn)
 
@@ -941,7 +937,7 @@ async def _execute_batch_workflow(batch_id: str, file_urls: List[str], metadata:
             )
             processing_tasks.append(task_sig)
             
-        # Same coordination, just optimized for reused-only scenario
+        # Celery chord optimized for reused-only scenario
         logger.info(f"🚀 [BATCH-{batch_id[:8]}] Launching coordinated REUSED workflow with {len(processing_tasks)} tasks")
         workflow = chord(
             group(processing_tasks),
@@ -1244,7 +1240,7 @@ async def _download_and_prep_doc(client: httpx.AsyncClient, url: str, project_id
 
 # ——— Parsing & Embedding: For one document → Parse, batch, dispatch to OpenAI for emmbedding (In-Memory & Token-Aware) ————————————————————————————————
 
-def _parse_document_gevent_for_workflow(self, source_id: str, cdn_url: str, project_id: str, metadata: Dict[str, Any]) -> Dict[str, Any]:
+def _parse_document_gevent_for_workflow(self, source_id: str, cdn_url: str, project_id: str, workflow_metadata: Dict[str, Any]) -> Dict[str, Any]:
     """
     [WORKFLOW OPTIMIZED] Modified version of _parse_document_gevent for chord integration:
     - Removes the chord scheduling at the end (handled by workflow coordinator)
@@ -1424,6 +1420,7 @@ def _parse_document_gevent_for_workflow(self, source_id: str, cdn_url: str, proj
             
             # ——— Schedule Embedding Tasks and Wait for Completion ————————————————————
             if embedding_tasks:
+                _update_batch_progress_sync(workflow_metadata['batch_id'], project_id, BatchProgressStatus.BATCH_EMBEDDING)
                 logger.info(f"🚀 [PARSE-{short_id}] Waiting for {len(embedding_tasks)} embedding tasks...")
                 
                 try:
@@ -1607,6 +1604,8 @@ def process_new_document_task(self, doc_data: Dict[str, Any], project_id: str, w
             pool.putconn(conn)
         
         # ——— Launch Full Processing Pipeline ——————————————————————————————————————
+        _update_batch_progress_sync(workflow_metadata['batch_id'], project_id, BatchProgressStatus.BATCH_PARSING)
+
         # Use existing _parse_document_gevent_for_workflow function to (select optimal loader → clean/chunk → embed)
         parse_result = _parse_document_gevent_for_workflow(
             self, doc_id, doc_data['cdn_url'], project_id, workflow_metadata
@@ -1651,7 +1650,6 @@ def process_new_document_task(self, doc_data: Dict[str, Any], project_id: str, w
             'status': 'FAILED',
             'error': str(e)
         }
-
 
 @celery_app.task(bind=True, queue=INGEST_QUEUE, acks_late=True)  
 def process_reused_document_task(
@@ -1747,8 +1745,11 @@ def finalize_batch_and_create_note(
     - Triggers single RAG note generation with appropriate context
     - Handles all resilience cases (full success, partial, complete failure)
     
-    This is the ONLY place where rag_note_task gets triggered per batch!
+    ⚠️ This is the ONLY place where rag_note_task gets triggered per batch! (not including the duplicate shortcut)
     """
+
+    project_id = workflow_metadata['project_id']
+    _update_batch_progress_sync(workflow_metadata['batch_id'], project_id, BatchProgressStatus.BATCH_FINALIZING)
     logger.info(f"🎯 [BATCH-{batch_id[:8]}] Finalizing batch with {len(processing_results)} results")
     
     # ——— Analyze Batch Results ————————————————————————————————————————————————————
@@ -1769,21 +1770,30 @@ def finalize_batch_and_create_note(
     # ——— Determine Batch Status ———————————————————————————————————————————————————
     if success_count == total_docs:
         batch_status = 'COMPLETE'
+        final_progress = BatchProgressStatus.BATCH_COMPLETE
         note_context = 'All documents processed successfully'
     elif success_count > 0:
         batch_status = 'PARTIAL' 
+        final_progress = BatchProgressStatus.BATCH_PARTIAL
         note_context = f'{success_count}/{total_docs} documents processed successfully'
     else:
         batch_status = 'FAILED'
+        final_progress = BatchProgressStatus.BATCH_FAILED
         note_context = 'All documents failed to process'
     
+    # Final batch-level logging (view in terminal and in database)
+    _update_batch_progress_sync(workflow_metadata['batch_id'], project_id, final_progress)
+
     logger.info(f"📊 [BATCH-{batch_id[:8]}] Batch analysis:")
     logger.info(f"   ✅ Successful: {success_count}/{total_docs}")
     logger.info(f"   ❌ Failed: {failure_count}")
     logger.info(f"   📄 Total chunks: {total_chunks:,}")
     logger.info(f"   🔄 Status: {batch_status}")
     
+
+
     # ——— Trigger Note Generation (Based on Resilience Rules) ——————————————————————
+    
     if workflow_metadata.get('create_note') and batch_status in ['COMPLETE', 'PARTIAL']:
         # Enhance metadata with batch context for note generation
         note_metadata = {
