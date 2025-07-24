@@ -44,6 +44,7 @@ from pybreaker import CircuitBreaker
 # ===== DATABASE =====
 import asyncpg
 import psycopg2
+from psycopg2.extras import Json
 from psycopg2.pool import ThreadedConnectionPool
 from psycopg2.extras import execute_batch
 
@@ -1601,7 +1602,7 @@ def process_new_document_task(self, doc_data: Dict[str, Any], project_id: str, w
                     project_id, doc_data.get('content_tags', []), workflow_metadata['user_id'],
                     ProcessingStatus.PENDING.value, doc_data['filename'], 
                     doc_data['file_size_bytes'], os.path.splitext(doc_data['filename'])[1].lower(),
-                    datetime.now(timezone.utc), workflow_metadata)
+                    datetime.now(timezone.utc), Json(workflow_metadata))
                 )
                 conn.commit()
         finally:
@@ -1702,7 +1703,7 @@ def process_reused_document_task(
                      ProcessingStatus.COMPLETE.value, doc_data['filename'], 
                      doc_data['file_size_bytes'], os.path.splitext(doc_data['filename'])[1].lower(),
                      source_info['total_chunks'], source_info['total_batches'],
-                     datetime.now(timezone.utc), workflow_metadata)
+                     datetime.now(timezone.utc), Json(workflow_metadata))
                 )
         finally:
             pool.putconn(conn)
