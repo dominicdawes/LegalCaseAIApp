@@ -836,6 +836,7 @@ def process_document_batch_workflow(self, file_urls: List[str], metadata: Dict[s
     4. Coordinate completion via chord → single note generation
     """
     batch_id = str(uuid.uuid4())
+    # metadata['batch_id'] = batch_id
     metadata['create_note'] = create_note
     logger.info(f"🎯 [BATCH-{batch_id[:8]}] 🚀 Starting workflow for {len(file_urls)} documents")
     
@@ -889,6 +890,7 @@ async def _execute_batch_workflow(batch_id: str, file_urls: List[str], metadata:
     logger.info(f"   📋 Duplicate documents: {len(duplicate_documents)}")
     logger.info(f"   ❌ Failed downloads: {len(failed_downloads)}")
 
+    # flattened dictionary
     workflow_metadata = {
         **metadata,
         'batch_id': batch_id,
@@ -911,9 +913,9 @@ async def _execute_batch_workflow(batch_id: str, file_urls: List[str], metadata:
         logger.warning(f"⚠️ [BATCH-{batch_id[:8]}] No processable documents - all duplicates or failed")
         
         # Still trigger note generation if only duplicates (documents ALREADY exist in CURRENT USER project)
-        if len(duplicate_documents) > 0 and metadata.get('create_note'):
+        if len(duplicate_documents) > 0 and workflow_metadata.get('create_note'):
             logger.info(f"📝 [BATCH-{batch_id[:8]}] Triggering note for duplicate-only batch")
-            return await _handle_duplicate_only_batch(batch_id, workflow_metadata, duplicate_documents)
+            return await _handle_duplicate_only_batch(batch_id, project_id, workflow_metadata, duplicate_documents)
         
         # Otherwise handle as complete failure
         handle_batch_failure.apply_async((batch_id, workflow_metadata, failed_downloads))
@@ -997,12 +999,14 @@ async def _execute_batch_workflow(batch_id: str, file_urls: List[str], metadata:
             'status': 'WORKFLOW_LAUNCHED'
         }
 
-async def _handle_duplicate_only_batch(batch_id: str, workflow_metadata: Dict[str, Any], duplicate_docs: List[Dict]) -> Dict[str, Any]:
-    """
+async def _handle_duplicate_only_batch(batch_id: str, project_id: str, workflow_metadata: Dict[str, Any], duplicate_docs: List[Dict]) -> Dict[str, Any]:
+    """  
     [DUPLICATE HANDLER] Handle batches containing only duplicate documents:
     - Documents already EXIST in this project, so no processing needed (It;s a type of USER dumb error)
     - Can still generate notes using existing document content
     """
+    # Remeber to update do the UI recieves a SUPABASE REALTRINE update
+    _update_batch_progress_sync(batch_id, project_id, BatchProgressStatus.BATCH_COMPLETE)
     logger.info(f"📋 [BATCH-{batch_id[:8]}] Handling duplicate-only batch with {len(duplicate_docs)} documents")
     
     if workflow_metadata.get('create_note'):
@@ -1591,13 +1595,13 @@ def process_new_document_task(self, doc_data: Dict[str, Any], project_id: str, w
                 cur.execute(
                     '''INSERT INTO document_sources 
                     (id, cdn_url, content_hash, project_id, content_tags, uploaded_by, 
-                    vector_embed_status, filename, file_size_bytes, file_extension, created_at)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)''',
+                    vector_embed_status, filename, file_size_bytes, file_extension, created_at, processing_metadata)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)''',
                     (doc_id, doc_data['cdn_url'], doc_data['content_hash'], 
                     project_id, doc_data.get('content_tags', []), workflow_metadata['user_id'],
                     ProcessingStatus.PENDING.value, doc_data['filename'], 
                     doc_data['file_size_bytes'], os.path.splitext(doc_data['filename'])[1].lower(),
-                    datetime.now(timezone.utc))
+                    datetime.now(timezone.utc), workflow_metadata)
                 )
                 conn.commit()
         finally:
@@ -1691,14 +1695,14 @@ def process_reused_document_task(
                     '''INSERT INTO document_sources 
                     (id, cdn_url, content_hash, project_id, content_tags, uploaded_by, 
                      vector_embed_status, filename, file_size_bytes, file_extension, 
-                     total_chunks, total_batches, created_at)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)''',
+                     total_chunks, total_batches, created_at, processing_metadata)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, s%)''',
                     (new_doc_id, doc_data['cdn_url'], doc_data['content_hash'], 
                      project_id, doc_data.get('content_tags', []), workflow_metadata['user_id'],
                      ProcessingStatus.COMPLETE.value, doc_data['filename'], 
                      doc_data['file_size_bytes'], os.path.splitext(doc_data['filename'])[1].lower(),
                      source_info['total_chunks'], source_info['total_batches'],
-                     datetime.now(timezone.utc))
+                     datetime.now(timezone.utc), workflow_metadata)
                 )
         finally:
             pool.putconn(conn)
