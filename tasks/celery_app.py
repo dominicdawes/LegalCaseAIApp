@@ -49,7 +49,7 @@ celery_app = Celery(
 )
 
 # 🎛️ Toggle Controls from Environment Variables
-SHOW_CELERY_LOGS = "false"   # os.getenv("SHOW_CELERY_LOGS", "true").lower() == "true"
+SHOW_CELERY_LOGS = "true"   # os.getenv("SHOW_CELERY_LOGS", "true").lower() == "true"
 SHOW_MANUAL_LOGS = "true"  # os.getenv("SHOW_MANUAL_LOGS", "true").lower() == "true"
 
 @after_setup_logger.connect
