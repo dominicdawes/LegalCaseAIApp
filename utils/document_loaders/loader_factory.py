@@ -7,7 +7,7 @@ from typing import Type, Union, Optional, Dict, Any
 from .base import BaseDocumentLoader
 from .pdf_loader import PDFLoader, HighPerformancePDFLoader
 from .pdf_ocr_loader import PDFOCRLoader
-from .docx_loader import DocxLoader
+from .docx_loader import DocxLoader, LegacyDocLoader
 from .epub_loader import EpubLoader
 
 logger = logging.getLogger(__name__)
@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 _LOADER_MAP: dict[str, Type[BaseDocumentLoader]] = {
     ".pdf": PDFLoader,
     ".docx": DocxLoader,
-    # .doc is intentionally removed. See explanation below.
+    ".doc": LegacyDocLoader,
     ".epub": EpubLoader,
     # you could add ".txt": TxtLoader, etc.
     # you could add ".md": MarkdownLoader, etc.

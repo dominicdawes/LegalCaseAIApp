@@ -12,6 +12,7 @@ textract
 pytesseract
 tenacity==8.5.0 # tenacity
 python-docx
+docx2txt        # Legacy .doc files
 pypdf
 pymupdf    # import fitz
 PyPDF2
