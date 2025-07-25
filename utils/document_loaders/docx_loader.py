@@ -2,7 +2,9 @@
 
 # utils/document_loaders/docx_loader.py
 
+import textract
 import io
+import tempfile
 from typing import Iterator, Union, List
 from langchain.schema import Document
 from .base import BaseDocumentLoader
@@ -33,6 +35,28 @@ class DocxLoader(BaseDocumentLoader):
                 )
         except Exception as e:
             raise RuntimeError(f"Failed to process DOCX stream: {e}")
+
+class LegacyDocLoader(BaseDocumentLoader):
+    def stream_documents(self, source: io.BytesIO) -> Iterator[Document]:
+        # Minimal temp file usage - deleted immediately
+        with tempfile.NamedTemporaryFile(suffix='.doc', delete=False) as tmp:
+            source.seek(0)
+            tmp.write(source.read())
+            tmp.flush()
+            
+            try:
+                raw_bytes = textract.process(tmp.name)
+                text = raw_bytes.decode('utf-8', errors='ignore')
+            finally:
+                os.unlink(tmp.name)  # Clean up immediately
+            
+            # Stream the results
+            for i, para in enumerate(text.split('\n\n')):
+                if para.strip():
+                    yield Document(
+                        page_content=para.strip(), 
+                        metadata={"paragraph": i}
+                    )
 
 class DocxLoader_deprecated(BaseDocumentLoader):
     """
