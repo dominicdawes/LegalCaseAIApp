@@ -76,6 +76,7 @@ def setup_loggers(logger, **kwargs):
             'tasks.note_tasks', 
             'tasks.chat_tasks',
             'tasks.chat_streaming_tasks',
+            'tasks.profile_tasks',
             'tasks.sample_tasks'
         ]
         

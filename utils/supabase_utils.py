@@ -174,6 +174,7 @@ def insert_chat_message_supabase_record(
     dialogue_role,
     message_content,
     query_response_status,
+    format,
     created_at,
 ):
     """INSERT message into table public.messages"""
@@ -189,7 +190,8 @@ def insert_chat_message_supabase_record(
                     "chat_session_id": chat_session_id,
                     "role": dialogue_role,  # enum(user, assistant)
                     "content": message_content,
-                    "query_response_status": query_response_status,  # status for SUCCESS or FAILED llm query response
+                    "status": query_response_status,  # status for SUCCESS or FAILED llm query response
+                    "format": format,
                     "raw_response": raw,
                     "created_at": created_at,
                 }

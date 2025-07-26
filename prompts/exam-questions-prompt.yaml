@@ -53,4 +53,3 @@ escape_hatch:
 
 output_format:
   type: markdown
-  wrapper: ""

@@ -47,4 +47,3 @@ template: |
 
 output_format:
   type: markdown
-  wrapper: ""

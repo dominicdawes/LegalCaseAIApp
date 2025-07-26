@@ -20,6 +20,9 @@ from utils.pdf_utils import extract_text_from_pdf
 # Celery task imports
 from celery import chain, chord, group, states
 from celery.result import AsyncResult
+
+# Project modules
+from tasks.profile_tasks import upload_profile_picture_task
 from tasks.podcast_generate_tasks import validate_and_generate_audio_task, generate_dialogue_only_task
 from tasks.upload_tasks import process_document_batch_workflow
 from tasks.upload_tasks import test_celery_log_task
@@ -84,6 +87,10 @@ class PDFCaptureResponse(BaseModel):
     url: str
 
 # ======== PYDANTIC MODELS PROD ======== #
+# <---- Define Pydantic model for profile pic upload ----> #
+class ProfilePictureRequest(BaseModel):
+    user_id: str
+    image_url: str
 
 # <---- Define Pydantic model for the PDF extraction response ----> #
 class PDFExtractResponse(BaseModel):
@@ -278,6 +285,21 @@ async def celery_test_addition(request: AdditionRequest):
         
         # Return the task ID to the client
         return {"task_id": task.id}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ================================================ #
+#                USER UTILS ENDPOINTS
+# ================================================ #
+
+@app.post("/upload-profile-picture/", response_model=GenericTaskResponse)
+async def upload_profile_picture(request: ProfilePictureRequest):
+    """Accepts a user_id + CDN URL, uploads to S3/CloudFront, saves to Supabase."""
+    try:
+        job = upload_profile_picture_task.apply_async(
+            args=[request.user_id, request.image_url]
+        )
+        return {"task_id": job.id}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

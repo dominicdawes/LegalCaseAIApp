@@ -61,4 +61,3 @@ messages:
 
 output_format:
   type: markdown
-  wrapper: "```"
