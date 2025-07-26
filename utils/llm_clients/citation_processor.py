@@ -17,7 +17,7 @@ import asyncio
 import aiohttp
 import hashlib
 from typing import List, Dict, Optional, Any, Tuple
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from urllib.parse import urlparse, urljoin
 from datetime import datetime, timezone
 import logging
@@ -26,17 +26,26 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class Citation:
-    """Enhanced citation data structure"""
+    """Enhanced citation data structure supporting document chunks"""
     id: str
     text: str
-    url: str
+    url: str = ""  # Optional for document citations
     title: Optional[str] = None
     description: Optional[str] = None
     preview_image: Optional[str] = None
     source_type: str = "document"
     confidence: float = 1.0
     relevant_excerpt: Optional[str] = None
-    metadata: Dict[str, Any] = None
+    
+    # 🆕 Document-specific fields
+    page_number: Optional[int] = None
+    source_id: Optional[str] = None
+    document_title: Optional[str] = None
+    chunk_index: Optional[int] = None
+    similarity_score: Optional[float] = None
+    
+    # Metadata for future expansion
+    metadata: Dict[str, Any] = field(default_factory=dict)
     
     def __post_init__(self):
         if self.metadata is None:
@@ -56,7 +65,44 @@ class LinkPreview:
 
 class CitationProcessor:
     """
-    High-performance citation processor with real-time extraction and enrichment
+    High-performance citation processor with real-time extraction and enrichment.
+    
+    WORKFLOW:
+    1. RAG retrieval finds document chunks with metadata (page_number, source_id, etc.)
+    2. System prompt instructs LLM to cite using specific formats: [Case Name, p. X]
+    3. LLM generates response with natural citations: "...violated rights [Brown v. Board, p. 25]"
+    4. Regex patterns detect citations in streaming LLM output
+    5. Citations matched to original chunks by page_number/content
+    6. Rich Citation objects created with document metadata + clickable URLs
+    
+    EXAMPLE FLOW:
+    ```
+    Input Chunk: {
+        content: "The Supreme Court opinion in Brown states...",
+        page_number: 26,
+        source_id: "uuid-123",
+        metadata: {"title": "Brown v. Board Opinion"}
+    }
+    
+    LLM Output 🤖 : "...facilities are unequal [Brown v. Board, p. 26]"
+    
+    Detected Citation: {
+        id: "case:Brown v. Board:p26",
+        text: "Brown v. Board, p. 26", 
+        page_number: 26,
+        source_id: "uuid-123",
+        url: "/documents/uuid-123#page=26",
+        relevant_excerpt: "The Supreme Court opinion in Brown states..."
+    }
+    ```
+    
+    SUPPORTED PATTERNS:
+    - [Case Name, p. X] → Legal case citations
+    - [Document Title, p. X] → Document page references  
+    - [1], [2] → Simple chunk references
+    - Page X, p. X → Inline page mentions
+    
+    NOTE: No tool calling needed - pure regex extraction from LLM's natural language.
     """
     
     def __init__(self, redis_pool=None):
@@ -138,49 +184,284 @@ class CitationProcessor:
         
         return new_citations, seen_citations
 
-    def _process_citation_match(
+    # ADD this method to CitationProcessor class:
+    def extract_document_citations_from_chunks(
         self, 
-        match: tuple, 
-        relevant_chunks: List[Dict]
+        accumulated_text: str,
+        relevant_chunks: List[Dict],
+        seen_citations: set = None
+    ) -> Tuple[List[Citation], set]:
+        """
+        Extract document-based citations from streaming text
+        
+        Handles patterns like:
+        - [1] or (1) -> references chunk 1
+        - "Page 25" -> references specific page
+        - [Case Name, p. 45] -> legal case citation
+        """
+        if seen_citations is None:
+            seen_citations = set()
+        
+        new_citations = []
+        
+        # Pattern 1: Simple chunk references [1], [2], (1), etc.
+        chunk_pattern = r'\[(\d+)\]|\((\d+)\)'
+        chunk_matches = re.findall(chunk_pattern, accumulated_text)
+        
+        for match in chunk_matches:
+            chunk_num = match[0] or match[1]  # Handle both [1] and (1) patterns
+            citation_id = f"chunk:{chunk_num}"
+            
+            if citation_id not in seen_citations:
+                citation = self._create_document_citation(
+                    chunk_num, relevant_chunks, "chunk_reference"
+                )
+                if citation:
+                    new_citations.append(citation)
+                    seen_citations.add(citation_id)
+        
+        # Pattern 2: Page references "Page X", "p. X", "pg. X"
+        page_pattern = r'(?:Page|p\.|pg\.)\s*(\d+)'
+        page_matches = re.findall(page_pattern, accumulated_text, re.IGNORECASE)
+        
+        for page_num in page_matches:
+            citation_id = f"page:{page_num}"
+            
+            if citation_id not in seen_citations:
+                citation = self._find_citation_by_page(
+                    int(page_num), relevant_chunks
+                )
+                if citation:
+                    new_citations.append(citation)
+                    seen_citations.add(citation_id)
+        
+        # Pattern 3: Legal case citations "Case Name, p. X"
+        case_pattern = r'([A-Z][^,]+),\s*p\.\s*(\d+)'
+        case_matches = re.findall(case_pattern, accumulated_text)
+        
+        for case_name, page_num in case_matches:
+            citation_id = f"case:{case_name.strip()}:p{page_num}"
+            
+            if citation_id not in seen_citations:
+                citation = self._find_legal_case_citation(
+                    case_name.strip(), int(page_num), relevant_chunks
+                )
+                if citation:
+                    new_citations.append(citation)
+                    seen_citations.add(citation_id)
+        
+        return new_citations, seen_citations
+
+    def _create_document_citation(
+        self, chunk_num: str, relevant_chunks: List[Dict], citation_type: str
     ) -> Optional[Citation]:
-        """Process a regex match into a Citation object"""
-        
-        # Handle different match patterns
-        if len(match) == 2:
-            # [text](citation:N) pattern
-            text, citation_num = match
-            citation_id = f"citation:{citation_num}"
-        elif len(match) == 1:
-            # [N] or (N) pattern
-            citation_num = match[0]
-            citation_id = f"citation:{citation_num}"
-            text = f"Source {citation_num}"
-        else:
-            return None
-        
+        """Create citation from document chunk"""
         try:
-            chunk_idx = int(citation_num) - 1  # Convert to 0-based index
+            chunk_idx = int(chunk_num) - 1
             
             if 0 <= chunk_idx < len(relevant_chunks):
                 chunk = relevant_chunks[chunk_idx]
                 
+                # Extract document metadata
+                metadata = chunk.get('metadata', {})
+                
                 return Citation(
-                    id=citation_id,
-                    text=text,
-                    url=chunk.get('url', ''),
-                    title=chunk.get('title', ''),
-                    description=chunk.get('description', ''),
-                    source_type=self._classify_source_type(chunk),
-                    relevant_excerpt=self._extract_relevant_excerpt(chunk.get('content', '')),
+                    id=f"chunk:{chunk_num}",
+                    text=f"Document {chunk_num}",
+                    source_type="document",
+                    confidence=chunk.get('similarity', 0.8),
+                    relevant_excerpt=self._extract_relevant_excerpt(
+                        chunk.get('content', ''), max_length=150
+                    ),
+                    
+                    # Document-specific fields
+                    page_number=chunk.get('page_number'),
+                    source_id=chunk.get('source_id'),
+                    document_title=metadata.get('title') or metadata.get('filename'),
+                    chunk_index=chunk_idx,
+                    similarity_score=chunk.get('similarity'),
+                    
+                    # Build display URL for internal documents
+                    url=self._build_document_url(chunk),
+                    title=self._build_document_title(chunk),
+                    description=f"Page {chunk.get('page_number', 'N/A')} - {metadata.get('title', 'Document')}",
+                    
                     metadata={
-                        'chunk_index': chunk_idx,
-                        'similarity_score': chunk.get('similarity', 0.0),
+                        'citation_type': citation_type,
+                        'chunk_id': chunk.get('id'),
+                        'project_id': chunk.get('project_id'),
+                        'num_tokens': chunk.get('num_tokens'),
                         'extraction_time': datetime.utcnow().isoformat()
                     }
                 )
         except (ValueError, IndexError) as e:
-            logger.warning(f"⚠️ Invalid citation number: {citation_num} - {e}")
+            logger.warning(f"⚠️ Invalid chunk reference: {chunk_num} - {e}")
             return None
+
+    def _find_citation_by_page(
+        self, page_num: int, relevant_chunks: List[Dict]
+    ) -> Optional[Citation]:
+        """Find citation by page number across chunks"""
+        
+        # Look for chunk with matching page number
+        for chunk in relevant_chunks:
+            if chunk.get('page_number') == page_num:
+                metadata = chunk.get('metadata', {})
+                
+                return Citation(
+                    id=f"page:{page_num}",
+                    text=f"Page {page_num}",
+                    source_type="document",
+                    confidence=chunk.get('similarity', 0.8),
+                    relevant_excerpt=self._extract_relevant_excerpt(
+                        chunk.get('content', ''), max_length=200
+                    ),
+                    
+                    page_number=page_num,
+                    source_id=chunk.get('source_id'),
+                    document_title=metadata.get('title') or metadata.get('filename'),
+                    similarity_score=chunk.get('similarity'),
+                    
+                    url=self._build_document_url(chunk, page_num),
+                    title=f"Page {page_num} - {metadata.get('title', 'Document')}",
+                    description=f"Content from page {page_num}",
+                    
+                    metadata={
+                        'citation_type': 'page_reference',
+                        'chunk_id': chunk.get('id'),
+                        'project_id': chunk.get('project_id')
+                    }
+                )
+        
+        return None
+
+    def _find_legal_case_citation(
+        self, case_name: str, page_num: int, relevant_chunks: List[Dict]
+    ) -> Optional[Citation]:
+        """Find legal case citation by name and page"""
+        
+        # Look for chunk containing case name and page
+        for chunk in relevant_chunks:
+            content = chunk.get('content', '').lower()
+            metadata = chunk.get('metadata', {})
+            
+            if (case_name.lower() in content and 
+                chunk.get('page_number') == page_num):
+                
+                return Citation(
+                    id=f"case:{case_name}:p{page_num}",
+                    text=f"{case_name}, p. {page_num}",
+                    source_type="legal_case",
+                    confidence=chunk.get('similarity', 0.9),  # Higher for legal citations
+                    relevant_excerpt=self._extract_case_excerpt(content, case_name),
+                    
+                    page_number=page_num,
+                    source_id=chunk.get('source_id'),
+                    document_title=case_name,
+                    similarity_score=chunk.get('similarity'),
+                    
+                    url=self._build_document_url(chunk, page_num),
+                    title=f"{case_name} (Page {page_num})",
+                    description=f"Legal case citation from {case_name}",
+                    
+                    metadata={
+                        'citation_type': 'legal_case',
+                        'case_name': case_name,
+                        'chunk_id': chunk.get('id'),
+                        'project_id': chunk.get('project_id')
+                    }
+                )
+        
+        return None
+
+    def _build_document_url(self, chunk: Dict, page_num: int = None) -> str:
+        """Build internal document URL for navigation"""
+        source_id = chunk.get('source_id')
+        page = page_num or chunk.get('page_number')
+        
+        if source_id and page:
+            return f"/documents/{source_id}#page={page}"
+        elif source_id:
+            return f"/documents/{source_id}"
+        else:
+            return ""
+
+    def _build_document_title(self, chunk: Dict) -> str:
+        """Build human-readable title for document citation"""
+        metadata = chunk.get('metadata', {})
+        title = metadata.get('title') or metadata.get('filename', 'Document')
+        page = chunk.get('page_number')
+        
+        if page:
+            return f"{title} (Page {page})"
+        else:
+            return title
+
+    def _extract_case_excerpt(self, content: str, case_name: str) -> str:
+        """Extract relevant excerpt around case name"""
+        content_lower = content.lower()
+        case_lower = case_name.lower()
+        
+        # Find case name position
+        case_pos = content_lower.find(case_lower)
+        if case_pos == -1:
+            return content[:200] + "..."
+        
+        # Extract context around case name
+        start = max(0, case_pos - 100)
+        end = min(len(content), case_pos + len(case_name) + 100)
+        
+        excerpt = content[start:end].strip()
+        if start > 0:
+            excerpt = "..." + excerpt
+        if end < len(content):
+            excerpt = excerpt + "..."
+        
+        return excerpt
+
+        def _process_citation_match(
+            self, 
+            match: tuple, 
+            relevant_chunks: List[Dict]
+        ) -> Optional[Citation]:
+            """Process a regex match into a Citation object"""
+            
+            # Handle different match patterns
+            if len(match) == 2:
+                # [text](citation:N) pattern
+                text, citation_num = match
+                citation_id = f"citation:{citation_num}"
+            elif len(match) == 1:
+                # [N] or (N) pattern
+                citation_num = match[0]
+                citation_id = f"citation:{citation_num}"
+                text = f"Source {citation_num}"
+            else:
+                return None
+            
+            try:
+                chunk_idx = int(citation_num) - 1  # Convert to 0-based index
+                
+                if 0 <= chunk_idx < len(relevant_chunks):
+                    chunk = relevant_chunks[chunk_idx]
+                    
+                    return Citation(
+                        id=citation_id,
+                        text=text,
+                        url=chunk.get('url', ''),
+                        title=chunk.get('title', ''),
+                        description=chunk.get('description', ''),
+                        source_type=self._classify_source_type(chunk),
+                        relevant_excerpt=self._extract_relevant_excerpt(chunk.get('content', '')),
+                        metadata={
+                            'chunk_index': chunk_idx,
+                            'similarity_score': chunk.get('similarity', 0.0),
+                            'extraction_time': datetime.utcnow().isoformat()
+                        }
+                    )
+            except (ValueError, IndexError) as e:
+                logger.warning(f"⚠️ Invalid citation number: {citation_num} - {e}")
+                return None
 
     def _classify_source_type(self, chunk: Dict) -> str:
         """Classify the source type based on URL and metadata"""
@@ -501,6 +782,7 @@ class CitationProcessor:
             "high_confidence_count": len([c for c in citations if c.confidence >= 0.8]),
             "with_previews": len([c for c in citations if c.preview_image or c.title])
         }
+
 
 # Example usage
 async def example_usage():

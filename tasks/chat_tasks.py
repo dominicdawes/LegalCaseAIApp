@@ -69,7 +69,7 @@ from utils.supabase_utils import (
     log_llm_error,
 )
 from utils.llm_clients.llm_factory_enhanced import CitationAwareLLMFactory  # 🆕 Enhanced LLM factory
-from utils.llm_clients.citation_processor import CitationProcessor  # 🆕 Citation processing utility
+from utils.llm_clients.citation_processor import CitationProcessor  # detects citations in streaming chunks
 from utils.llm_clients.performance_monitor import PerformanceMonitor  # 🆕 Performance tracking
 
 # ——— Logging & Env Load ———————————————————————————————————————————————————————————
@@ -203,6 +203,16 @@ class Citation:
     source_type: str = "document"
     confidence: float = 1.0
     relevant_excerpt: Optional[str] = None
+
+    # 🆕 Document-specific fields
+    page_number: Optional[int] = None
+    source_id: Optional[str] = None
+    document_title: Optional[str] = None
+    chunk_index: Optional[int] = None
+    similarity_score: Optional[float] = None
+    
+    # Metadata for future expansion
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
 @dataclass
 class Highlight:
@@ -832,10 +842,30 @@ class StreamingChatManager:
     async def _enrich_citations_with_previews(
         self, citations: List[Citation]
     ) -> List[Citation]:
-        """🆕 Enrich citations with link previews"""
-        # Placeholder for link preview enrichment
-        # In production, integrate with microlink.io or similar service
-        return citations
+        """🆕 Enrich citations with link previews using CitationProcessor"""
+        if not citations:
+            return citations
+        
+        try:
+            # Initialize citation processor if not already done
+            if not hasattr(self, '_citation_processor_initialized'):
+                await self.citation_processor.initialize()
+                self._citation_processor_initialized = True
+            
+            # Enrich citations with previews
+            enriched_citations = await self.citation_processor.enrich_citations_with_previews(
+                citations, use_cache=True
+            )
+            
+            # Validate citations
+            validated_citations = self.citation_processor.validate_citations(enriched_citations)
+            
+            logger.info(f"🔗 Enriched {len(validated_citations)}/{len(citations)} citations")
+            return validated_citations
+            
+        except Exception as e:
+            logger.warning(f"⚠️ Citation enrichment failed: {e}")
+            return citations  # Return original citations if enrichment fails
 
     async def _finalize_streaming_message(
         self,
