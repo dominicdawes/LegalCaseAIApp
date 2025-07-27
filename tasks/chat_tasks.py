@@ -45,15 +45,11 @@ import asyncpg
 import redis.asyncio as aioredis
 import asyncpg
 import psycopg2
-from psycopg2.pool import ThreadedConnectionPool
-from psycopg2 import pool
 from contextlib import asynccontextmanager, contextmanager
 import threading
 
 # ===== ASYNC & CONCURRENCY & SOCKET =====
 import asyncio
-import gevent
-import gevent.socket
 import socket
 
 # ===== LLM & LANGCHAIN =====
@@ -191,10 +187,12 @@ def should_use_streaming(user_id: str, project_id: str = None) -> bool:
 
 # ——— Database and Metrics Variables ———————————————————————————————————————————————————————————
 
+# Persistent event loop per worker process
+worker_loop = None
+
 # Connection pools
 async_db_pool: Optional[asyncpg.Pool] = None                            # Asyncpg async database connection pool
 redis_pool: Optional[aioredis.ConnectionPool] = None                    # Redis connection pool
-sync_db_pool: Optional[ThreadedConnectionPool] = None                   # Psycopg2 sync database connection pool (for gevent)
 
 db_pool = async_db_pool                                                 # 🙊 monkey patch
 
@@ -266,6 +264,57 @@ class PerformanceMetrics:
     total_time: float = 0
     tokens_per_second: float = 0
     cache_hit_rate: float = 0
+
+# ——— Async Event Loop & Worker Management ———————————————————————————————————————
+
+def get_worker_loop():
+    """Get or create the persistent worker event loop"""
+    global worker_loop
+    if worker_loop is None or worker_loop.is_closed():
+        worker_loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(worker_loop)
+    return worker_loop
+
+def run_async_in_worker(coro):
+    """Execute async code in the persistent worker loop"""
+    loop = get_worker_loop()
+    return loop.run_until_complete(coro)
+
+async def init_worker_pools():
+    """Initialize all async resources once per worker"""
+    global db_pool, redis_pool
+    
+    if not db_pool:
+        db_pool = await asyncpg.create_pool(
+            dsn=DB_DSN,
+            min_size=2,
+            max_size=10,
+            command_timeout=30,
+            server_settings={'application_name': 'rag_worker'}
+        )
+        logger.info("✅ DB pool initialized")
+    
+    if not redis_pool:
+        redis_pool = aioredis.ConnectionPool.from_url(
+            REDIS_LABS_URL,
+            max_connections=20,
+            decode_responses=True
+        )
+        logger.info("✅ Redis pool initialized")
+
+async def cleanup_worker_pools():
+    """Cleanup all resources"""
+    global db_pool, redis_pool
+    
+    if db_pool:
+        await db_pool.close()
+        db_pool = None
+    
+    if redis_pool:
+        await redis_pool.disconnect() 
+        redis_pool = None
+    
+    logger.info("✅ Worker pools cleaned up")
 
 # ——— Database Connection Management ———————————————————————————————————————
 
@@ -390,97 +439,7 @@ def _cleanup_db_pool():
     """Cleanup function for weakref finalization"""
     # This runs during garbage collection, so avoid complex async operations
     logger.info("🧹 Database pool cleanup triggered")
-
-# ==== Synchronous DB pool =========
-
-def initialize_sync_database_pool() -> psycopg2.pool.ThreadedConnectionPool:
-    """
-    Initialize synchronous database connection pool using psycopg2
     
-    This is the sync equivalent of your async asyncpg pool
-    """
-    global sync_db_pool
-    
-    # Thread-safe initialization
-    with _sync_pool_lock:
-        if sync_db_pool and not sync_db_pool.closed:
-            # Pool already exists and is healthy
-            try:
-                # Quick health check
-                conn = sync_db_pool.getconn()
-                with conn.cursor() as cur:
-                    cur.execute('SELECT 1')
-                sync_db_pool.putconn(conn)
-                logger.info("✅ Existing sync database pool is healthy")
-                return sync_db_pool
-            except Exception as e:
-                logger.warning(f"⚠️ Existing sync pool unhealthy, recreating: {e}")
-                _close_sync_db_pool_safely()
-    
-    if not DB_DSN:
-        raise ValueError("❌ POSTGRES_DSN environment variable not set")
-    
-    logger.info("🏊 Creating psycopg2 threaded connection pool...")
-    
-    try:
-        # Parse DSN for psycopg2 format
-        parsed = urllib.parse.urlparse(DB_DSN)
-        
-        # Create threaded connection pool
-        sync_db_pool = psycopg2.pool.ThreadedConnectionPool(
-            minconn=DB_POOL_MIN_SIZE,
-            maxconn=DB_POOL_MAX_SIZE,
-            host=parsed.hostname,
-            port=parsed.port or 5432,
-            database=parsed.path[1:] if parsed.path else None,  # Remove leading slash
-            user=parsed.username,
-            password=parsed.password,
-            
-            # Connection settings equivalent to asyncpg version
-            application_name='celery_worker_sync',
-            connect_timeout=60,
-            
-            # Additional psycopg2 specific settings
-            cursor_factory=psycopg2.extras.RealDictCursor,  # Return dict-like rows
-        )
-        
-        # Test the pool
-        test_conn = sync_db_pool.getconn()
-        try:
-            with test_conn.cursor() as cur:
-                cur.execute('SELECT version()')
-                version = cur.fetchone()
-                logger.info(f"✅ Sync database pool initialized. Version: {version[0][:50]}...")
-        finally:
-            sync_db_pool.putconn(test_conn)
-        
-        return sync_db_pool
-        
-    except Exception as e:
-        logger.error(f"❌ Sync database pool initialization failed: {e}")
-        sync_db_pool = None
-        raise
-
-def _close_sync_db_pool_safely():
-    """Safely close sync database pool"""
-    global sync_db_pool
-    
-    if sync_db_pool and not sync_db_pool.closed:
-        try:
-            logger.info("🔄 Closing sync database pool...")
-            sync_db_pool.closeall()
-            logger.info("✅ Sync database pool closed successfully")
-        except Exception as e:
-            logger.error(f"❌ Sync database pool close error: {e}")
-        finally:
-            sync_db_pool = None
-
-# setup
-
-# close
-
-# clean 
-
 # ==== Redis Connection =============
 
 async def initialize_redis_pool() -> aioredis.ConnectionPool:
@@ -553,99 +512,78 @@ def _cleanup_redis_pool():
 @asynccontextmanager
 async def get_db_connection():
     """
-    🔧 IMPROVED: Context manager for database connections with better error handling
+    Simple DB connection context manager
+    NOTE: add error logging / timeout later
     """
     if not db_pool:
-        await initialize_async_database_pool()
+        await init_worker_pools()
     
-    connection = None
-    try:
-        # Acquire connection with timeout
-        connection = await asyncio.wait_for(
-            db_pool.acquire(), 
-            timeout=30
-        )
-        
-        # Verify connection is still good
-        await connection.fetchval('SELECT 1')
-        
-        yield connection
-        
-    except asyncio.TimeoutError:
-        logger.error("❌ Database connection acquisition timeout")
-        raise
-    except asyncpg.InterfaceError as e:
-        logger.error(f"❌ Database interface error: {e}")
-        # Try to reinitialize pool if connection is corrupted
-        if "another operation is in progress" in str(e).lower():
-            logger.warning("🔄 Detected corrupted connection, reinitializing pool...")
-            await _close_db_pool_safely()
-            await initialize_async_database_pool()
-        raise
-    except Exception as e:
-        logger.error(f"❌ Database connection error: {e}")
-        raise
-    finally:
-        if connection:
-            try:
-                # Always release connection back to pool
-                await db_pool.release(connection)
-            except Exception as e:
-                logger.warning(f"⚠️ Connection release error: {e}")
+    async with db_pool.acquire() as conn:
+        yield conn
 
-@asynccontextmanager
+@asynccontextmanager  
 async def get_redis_connection():
-    """Context manager for Redis connections"""
+    """
+    Simple Redis connection context manager
+    NOTE: add error logging / timeout late
+    """
     if not redis_pool:
-        await initialize_redis_pool()
-    
+        await init_worker_pools()
+        
     async with aioredis.Redis(connection_pool=redis_pool) as redis:
         yield redis
 
-@contextmanager
-def get_sync_db_connection():
-    """
-    Context manager for synchronous database connections
+# @asynccontextmanager
+# async def get_db_connection():
+#     """
+#     🔧 IMPROVED: Context manager for database connections with better error handling
+#     """
+#     if not db_pool:
+#         await initialize_async_database_pool()
     
-    This is the sync equivalent of your async get_db_connection()
-    """
-    if not sync_db_pool:
-        initialize_sync_database_pool()
+#     connection = None
+#     try:
+#         # Acquire connection with timeout
+#         connection = await asyncio.wait_for(
+#             db_pool.acquire(), 
+#             timeout=30
+#         )
+        
+#         # Verify connection is still good
+#         await connection.fetchval('SELECT 1')
+        
+#         yield connection
+        
+#     except asyncio.TimeoutError:
+#         logger.error("❌ Database connection acquisition timeout")
+#         raise
+#     except asyncpg.InterfaceError as e:
+#         logger.error(f"❌ Database interface error: {e}")
+#         # Try to reinitialize pool if connection is corrupted
+#         if "another operation is in progress" in str(e).lower():
+#             logger.warning("🔄 Detected corrupted connection, reinitializing pool...")
+#             await _close_db_pool_safely()
+#             await initialize_async_database_pool()
+#         raise
+#     except Exception as e:
+#         logger.error(f"❌ Database connection error: {e}")
+#         raise
+#     finally:
+#         if connection:
+#             try:
+#                 # Always release connection back to pool
+#                 await db_pool.release(connection)
+#             except Exception as e:
+#                 logger.warning(f"⚠️ Connection release error: {e}")
+
+# @asynccontextmanager
+# async def get_redis_connection():
+#     """Context manager for Redis connections"""
+#     if not redis_pool:
+#         await initialize_redis_pool()
     
-    connection = None
-    try:
-        # Get connection from pool
-        connection = sync_db_pool.getconn()
-        
-        if connection is None:
-            raise Exception("Failed to get connection from pool")
-        
-        # Verify connection is still good
-        with connection.cursor() as cur:
-            cur.execute('SELECT 1')
-        
-        yield connection
-        
-    except psycopg2.InterfaceError as e:
-        logger.error(f"❌ Sync database interface error: {e}")
-        # Handle connection corruption
-        if connection:
-            try:
-                sync_db_pool.putconn(connection, close=True)  # Force close bad connection
-                connection = None
-            except:
-                pass
-        raise
-    except Exception as e:
-        logger.error(f"❌ Sync database connection error: {e}")
-        raise
-    finally:
-        if connection:
-            try:
-                # Return connection to pool
-                sync_db_pool.putconn(connection)
-            except Exception as e:
-                logger.warning(f"⚠️ Sync connection release error: {e}")
+#     async with aioredis.Redis(connection_pool=redis_pool) as redis:
+#         yield redis
 
 # ——— Retry & Circuit Break Management ———————————————————————————————————————
 
@@ -658,7 +596,6 @@ class BaseTaskWithRetry(Task):
     retry_backoff = True
     retry_kwargs = {"max_retries": 5}
     retry_jitter = True
-
 
 # ——— Enhanced Caching Layer —————————————————————————————————————————————————————
 
@@ -1057,123 +994,6 @@ class StreamingChatManager:
             
         except Exception as e:
             logger.error(f"❌ {provider} streaming failed: {e}")
-            await self._update_message_status(assistant_message_id, "error", str(e))
-            raise
-
-    async def _stream_rag_response_no_adapter(
-        self,
-        assistant_message_id: str,
-        chat_session_id: str,
-        query: str,
-        relevant_chunks: List[Dict],
-        chat_history: List[Dict],
-        llm_client: Any
-    ) -> StreamingResponse:
-        """
-        Core streaming response generator with real-time processing
-        
-        Generator function that:
-        - 1. Determines if the stream is still going
-        - 2. Extracts citations from the chunk "content"
-        - 3. Extracts highlights (pertinent info like dates or facts)
-        - 4. Broadcasts the chink to the UI via websocket
-        """
-
-        # Initialize universal streaming manager
-        streaming_manager = UniversalStreamingManager()
-
-        # Build enhanced context with system instructions
-        context = await self._build_enhanced_context(
-            query, relevant_chunks, chat_history
-        )
-        
-        accumulated_content = ""
-        citations = []
-        highlights = []
-        last_broadcast = time.time()
-        last_db_update = time.time()
-        content_buffer = ""
-        
-        try:
-            logger.info("🌊 Starting LLM streaming...")
-            
-            # 🆕 Stream from citation-aware LLM
-            async for chunk_data in llm_client.stream_chat_with_citations(
-                query, relevant_chunks, chat_history
-            ):
-                
-                if chunk_data["type"] == "content_delta":
-                    chunk = chunk_data["content"]
-                    accumulated_content += chunk
-                    content_buffer += chunk
-                    
-                    # 1) --- Extract new citations and highlights in real-time
-                    if chunk_data.get("new_citations"):
-                        # Handle both web and document citations
-                        new_citations = [
-                            Citation(**cite) for cite in chunk_data["new_citations"]
-                        ]
-                        citations.extend(new_citations)
-                    else:
-                        # Extract document citations from accumulated text
-                        doc_citations, seen_citations = self.citation_processor.extract_document_citations_from_chunks(
-                            accumulated_content, relevant_chunks, getattr(self, '_seen_citations', set())
-                        )
-                        if doc_citations:
-                            citations.extend(doc_citations)
-                            self._seen_citations = seen_citations
-                            await self._broadcast_citations(chat_session_id, doc_citations)
-                    
-                    # 2) --- Extract highlights (metrics, key facts)
-                    new_highlights = self._extract_highlights_from_chunk(chunk)
-                    if new_highlights:
-                        highlights.extend(new_highlights)
-                        await self._broadcast_highlights(chat_session_id, new_highlights)
-                    
-                    # 3) --- Real-time WebSocket broadcasting (every 50ms)
-                    if time.time() - last_broadcast > STREAMING_CONFIG["chunk_broadcast_interval"]:
-                        await self._broadcast_content_chunk(
-                            chat_session_id, assistant_message_id, chunk
-                        )
-                        last_broadcast = time.time()
-                    
-                    # 4) --- Batched database updates (every 100ms)
-                    if time.time() - last_db_update > STREAMING_CONFIG["db_batch_update_interval"]:
-                        if content_buffer:
-                            await self._batch_update_content(assistant_message_id, content_buffer)
-                            content_buffer = ""
-                            last_db_update = time.time()
-                
-                elif chunk_data["type"] == "complete":
-                    logger.info("✅ LLM streaming completed")
-                    break
-                    
-                elif chunk_data["type"] == "error":
-                    raise Exception(f"LLM streaming error: {chunk_data['error']}")
-            
-            # Final buffer flush
-            if content_buffer:
-                await self._batch_update_content(assistant_message_id, content_buffer)
-            
-            # 🆕 Enrich citations with link previews
-            enriched_citations = await self._enrich_citations_with_previews(citations)
-            
-            logger.info(f"📊 Streaming complete: {len(accumulated_content)} chars, {len(enriched_citations)} citations, {len(highlights)} highlights")
-            
-            return StreamingResponse(
-                content=accumulated_content,
-                citations=enriched_citations,
-                highlights=highlights,
-                metadata={
-                    "model": llm_client.model_name,
-                    "chunks_used": len(relevant_chunks),
-                    "total_tokens": len(accumulated_content.split())
-                },
-                is_complete=True
-            )
-            
-        except Exception as e:
-            logger.error(f"❌ Streaming failed: {e}")
             await self._update_message_status(assistant_message_id, "error", str(e))
             raise
 
@@ -1590,7 +1410,7 @@ def persist_user_query(self, user_id, chat_session_id, query, project_id, model_
 
 # 🔥 CRITICAL FIX: Make the task itself async to avoid event loop conflicts
 @celery_app.task(bind=True, base=BaseTaskWithRetry)
-async def rag_chat_task(
+def rag_chat_task(
     self,
     message_id,  # ← From persist_user_query task (legacy interface maintained)
     user_id,
@@ -1604,9 +1424,9 @@ async def rag_chat_task(
     """
     🚀 Enhanced RAG chat task with high-performance streaming
     
-    🆕 FIXED: Now properly async to prevent event loop conflicts
+    🔄 [CRITICAL] This is SYNC function that uses run_async_in_worker()
+    to execute async code in the persistent worker event loop
     - No more asyncio.run() calls that create/destroy event loops
-    - Uses Celery's managed event loop for async operations
     - Prevents "another operation is in progress" asyncpg errors
     
     🆕 NEW FEATURES:
@@ -1640,109 +1460,24 @@ async def rag_chat_task(
         if use_streaming:
             logger.info(f"🚀 Using STREAMING mode for user {user_id}")
             
-            # 🔥 CRITICAL FIX: Direct await instead of asyncio.run()
-            # This uses Celery's managed event loop instead of creating a new one
-            result = await _execute_streaming_workflow(
-                message_id, user_id, chat_session_id, 
-                query, project_id, provider, model_name, temperature
-            )
-        else:
-            logger.info(f"🐌 Using LEGACY mode for user {user_id}")
-            
-            # 🔥 CRITICAL FIX: Direct await for legacy path too
-            result = await _execute_legacy_workflow(
-                message_id, user_id, chat_session_id,
-                query, project_id, provider, model_name, temperature
-            )
-        
-        # 🔄 TODO: Consider making this async too for full async consistency
-        # For now, this single synchronous call should be fine
-        supabase_client.table("messages").update({
-            "query_response_status": "complete"
-        }).eq("id", message_id).execute()
-        
-        mode = "streaming" if use_streaming else "legacy"
-        logger.info(f"✅ RAG task completed successfully ({mode} mode)")
-        return result
-
-    except Exception as e:
-        logger.error(f"❌ RAG task failed: {e}", exc_info=True)
-        log_llm_error(
-            client=supabase_client,
-            table_name="messages",
-            task_name="rag_chat_task",
-            error_message=str(e),
-            chat_session_id=chat_session_id,
-            user_id=user_id,
-        )
-        raise self.retry(exc=e)
-    
-    finally:
-        gc.collect()
-
-@celery_app.task(bind=True, base=BaseTaskWithRetry)
-def rag_chat_task_sync(
-    self,
-    message_id,  # ← From persist_user_query task (legacy interface maintained)
-    user_id,
-    chat_session_id,
-    query,
-    project_id,
-    provider: str,
-    model_name: str,
-    temperature: float = 0.7,
-):
-    """
-    🚀 Enhanced RAG chat task with high-performance streaming
-    
-    🆕 NEW FEATURES:
-    - Real-time streaming with WebSocket broadcasting
-    - Parallel processing (70% faster than original)
-    - Rich citations with confidence scoring
-    - Global query embedding cache
-    - Connection pooling and batched writes
-    - Comprehensive performance monitoring
-    
-    🔄 MAINTAINS LEGACY INTERFACE:
-    - Same function signature as original
-    - Same FastAPI chain integration
-    - Same error handling patterns
-    """
-    
-    try:
-	# Set explicit start time metadata
-        self.update_state(
-            state="STARTED", 
-            meta={"start_time": datetime.now(timezone.utc).isoformat()}
-        )
-
-        if not model_name:
-            model_name = "o4-mini"
-
-        # ———— 🔀 STREAMING VS LEGACY MODE DECISION ————————————————————————————
-        use_streaming = should_use_streaming(user_id, project_id)
-        use_streaming = True
-
-        if use_streaming:
-            logger.info(f"🚀 Using STREAMING mode for user {user_id}")
-            
-            # ✅ APPLY YOUR PATTERN: Single asyncio.run() call
-            result = asyncio.run(
-                _execute_streaming_workflow(
-                    message_id, user_id, chat_session_id, 
-                    query, project_id, provider, model_name, temperature
+            # 🔥 CRITICAL FIX: pass async def function into persistent loop (COTROUTINE → EVENT LOOP)
+            result = run_async_in_worker(
+                streaming_manager.process_streaming_query(
+                    message_id, user_id, chat_session_id, query, 
+                    project_id, provider, model_name, temperature
                 )
             )
         else:
             logger.info(f"🐌 Using LEGACY mode for user {user_id}")
-            result = asyncio.run(
-                _execute_legacy_workflow(
+            
+            # 🔥 CRITICAL FIX: pass async def function into persistent loop (COTROUTINE → EVENT LOOP)
+            result = run_async_in_worker(_execute_legacy_workflow(
                     message_id, user_id, chat_session_id,
                     query, project_id, provider, model_name, temperature
                 )
             )
         
-        # Update original message status (both modes STREAMING & LEGACY)
+        # Update message status (sync call)
         supabase_client.table("messages").update({
             "query_response_status": "complete"
         }).eq("id", message_id).execute()
@@ -2079,79 +1814,38 @@ def restart_chat_session(user_id: str, project_id: str) -> str:
     logger.info(f"✅ Chat session restarted: {old_session_id} → {new_session_id}")
     return new_session_id
 
-
 # ——— Worker Lifecycle Management ————————————————————————————————————————————————
 
 @worker_init.connect
 def worker_init_handler(sender, **kwargs):
-    """
-    🔧 IMPROVED: Worker initialization with proper async handling
+    """Initialize worker with persistent event loop"""
+    logger.info("🚀 Initializing worker...")
     
-    Key improvements:
-    - No event loop creation/destruction during worker lifecycle
-    - Proper error handling and recovery
-    - Resource initialization order
-    """
-    logger.info("🚀 Initializing enhanced streaming chat worker...")
+    # Initialize the persistent event loop
+    loop = get_worker_loop()
     
-    global streaming_manager
+    # Pre-initialize resources
+    loop.run_until_complete(init_worker_pools())
     
-    # Don't create/close event loops here - let Celery manage them
-    # Instead, initialize resources when they're first needed
-    logger.info("✅ Streaming chat worker ready for initialization")
+    logger.info("✅ Worker initialized with persistent event loop")
 
-
-@worker_shutdown.connect  
+@worker_shutdown.connect
 def worker_shutdown_handler(sender, **kwargs):
-    """
-    🔧 IMPROVED: Worker cleanup with proper async resource management
-    """
-    logger.info("🛑 Shutting down enhanced streaming chat worker...")
+    """Graceful worker shutdown"""
+    logger.info("🛑 Shutting down worker...")
     
-    # For graceful shutdown, we need to clean up async resources
-    # But avoid creating new event loops if possible
     try:
-        # Try to get current event loop
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            # No running loop, create one for cleanup
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            should_close_loop = True
-        else:
-            should_close_loop = False
+        # Cleanup in the persistent loop
+        loop = get_worker_loop()
+        if loop and not loop.is_closed():
+            loop.run_until_complete(cleanup_worker_pools())
+            loop.close()
         
-        # Schedule cleanup tasks
-        cleanup_tasks = []
-        
-        if db_pool:
-            cleanup_tasks.append(_close_db_pool_safely())
-        
-        if redis_pool:
-            cleanup_tasks.append(_close_redis_pool_safely())
-        
-        if cleanup_tasks:
-            # Run all cleanup tasks with timeout
-            loop.run_until_complete(
-                asyncio.wait_for(
-                    asyncio.gather(*cleanup_tasks, return_exceptions=True),
-                    timeout=60
-                )
-            )
-        
-        # Force garbage collection
-        gc.collect()
-        
-        logger.info("✅ Worker shutdown completed")
+        logger.info("✅ Worker shutdown complete")
         
     except Exception as e:
         logger.error(f"❌ Worker shutdown error: {e}")
-    finally:
-        # Only close loop if we created it
-        if should_close_loop and not loop.is_closed():
-            loop.close()
-
+        
 # ——— Health Check Functions ————————————————————————————————————————————————
 
 async def check_db_pool_health() -> bool:
