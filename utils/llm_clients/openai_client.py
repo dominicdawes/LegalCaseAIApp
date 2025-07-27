@@ -16,12 +16,16 @@ class OpenAIClient:
             "gpt-4.1-nano": {"supports_temperature": True,  "min": 0.0, "max": 2.0},
             # … add others if needed …
         }
+
         self.model_name = model_name
+        self._temperature = temperature
+
         llm_kwargs = {
             "api_key": OPENAI_API_KEY,
             "model": model_name,
             "streaming": streaming,
         }
+        
         # If temperature is supported, clamp it
         info = cfg.get(model_name, {"supports_temperature": True})
         if info.get("supports_temperature", False):
@@ -36,6 +40,27 @@ class OpenAIClient:
 
     def chat(self, prompt: str) -> str:
         """
-        Sends a single‐turn prompt; returns the entire response as a string.
+        Sends a single-turn prompt; returns the entire response as a string.
         """
         return self._client.predict(prompt)
+    
+    def stream_chat(self, prompt: str, system_prompt: str = None):
+        """Stream a chat response from OpenAI"""
+        # Create streaming version
+        streaming_client = ChatOpenAI(
+            api_key=OPENAI_API_KEY,
+            model=self.model_name,
+            streaming=True,
+            temperature=getattr(self, '_temperature', 0.7)
+        )
+        
+        # Format prompt with system if provided
+        if system_prompt:
+            full_prompt = f"{system_prompt}\n\n{prompt}"
+        else:
+            full_prompt = prompt
+        
+        # Stream response
+        for chunk in streaming_client.stream(full_prompt):
+            if chunk.content:
+                yield chunk.content

@@ -390,7 +390,20 @@ class EmbeddingCache:
 # ——— Streaming Chat Manager (Core New Component) ——————————————————————————————————
 
 class StreamingChatManager:
-    """🆕 High-performance streaming chat manager with rich content support"""
+    """
+    High-performance streaming chat manager with rich content support.
+    
+    CORE WORKFLOW:
+    1. process_streaming_query() - Main orchestrator (parallel processing)
+    2. _setup_llm_client() - Creates citation-aware LLM client  
+    3. _fetch_relevant_chunks_async() - RAG retrieval with project isolation
+    4. _stream_rag_response() - Real-time streaming + citation extraction
+    5. _finalize_streaming_message() - Persist citations/highlights to DB
+    
+    FEATURES: 70% faster via parallelization, Redis caching, WebSocket broadcasting,
+    document citations, performance monitoring. Maintains legacy compatibility.
+
+    """
     
     def __init__(self):
         self.embedding_cache = EmbeddingCache()
@@ -616,7 +629,15 @@ class StreamingChatManager:
         chat_history: List[Dict],
         llm_client: Any
     ) -> StreamingResponse:
-        """🆕 Core streaming response generator with real-time processing"""
+        """
+        Core streaming response generator with real-time processing
+        
+        Generator function that:
+        - 1. Determines if the stream is still going
+        - 2. Extracts citations from the chunk "content"
+        - 3. Extracts highlights (pertinent info like dates or facts)
+        - 4. Broadcasts the chink to the UI via websocket
+        """
         
         # Build enhanced context with system instructions
         context = await self._build_enhanced_context(
@@ -643,30 +664,37 @@ class StreamingChatManager:
                     accumulated_content += chunk
                     content_buffer += chunk
                     
-                    # 🆕 Extract new citations and highlights in real-time
+                    # 1) --- Extract new citations and highlights in real-time
                     if chunk_data.get("new_citations"):
+                        # Handle both web and document citations
                         new_citations = [
                             Citation(**cite) for cite in chunk_data["new_citations"]
                         ]
                         citations.extend(new_citations)
-                        
-                        # Broadcast citations immediately
-                        await self._broadcast_citations(chat_session_id, new_citations)
+                    else:
+                        # Extract document citations from accumulated text
+                        doc_citations, seen_citations = self.citation_processor.extract_document_citations_from_chunks(
+                            accumulated_content, relevant_chunks, getattr(self, '_seen_citations', set())
+                        )
+                        if doc_citations:
+                            citations.extend(doc_citations)
+                            self._seen_citations = seen_citations
+                            await self._broadcast_citations(chat_session_id, doc_citations)
                     
-                    # 🆕 Extract highlights (metrics, key facts)
+                    # 2) --- Extract highlights (metrics, key facts)
                     new_highlights = self._extract_highlights_from_chunk(chunk)
                     if new_highlights:
                         highlights.extend(new_highlights)
                         await self._broadcast_highlights(chat_session_id, new_highlights)
                     
-                    # 🆕 Real-time WebSocket broadcasting (every 50ms)
+                    # 3) --- Real-time WebSocket broadcasting (every 50ms)
                     if time.time() - last_broadcast > STREAMING_CONFIG["chunk_broadcast_interval"]:
                         await self._broadcast_content_chunk(
                             chat_session_id, assistant_message_id, chunk
                         )
                         last_broadcast = time.time()
                     
-                    # 🆕 Batched database updates (every 100ms)
+                    # 4) --- Batched database updates (every 100ms)
                     if time.time() - last_db_update > STREAMING_CONFIG["db_batch_update_interval"]:
                         if content_buffer:
                             await self._batch_update_content(assistant_message_id, content_buffer)
@@ -709,9 +737,20 @@ class StreamingChatManager:
     async def _build_enhanced_context(
         self, query: str, chunks: List[Dict], history: List[Dict]
     ) -> str:
-        """🆕 Build enhanced context with system instructions"""
+        """
+        Build enhanced context with RAG retrieval and system instructions
+        - Load system instructions from YAML 
+        - Format chat history
+        - 🧠 SMART chunk context trimming
+        - 
+        - 
+        - 
+        - 
+        - 
         
-        # Load system instructions from YAML (inherited from original)
+        """
+        
+        # Load system instructions from YAML
         try:
             yaml_dict = load_yaml_prompt("chat-persona-prompt.yaml")
             sys_msgs = build_chat_messages_from_yaml(yaml_dict)
@@ -725,22 +764,92 @@ class StreamingChatManager:
         # Format chat history
         formatted_history = self._format_chat_history(history) if history else ""
         
-        # Build numbered context for citations
+        # Build user context (before trimming)
+        user_context = (
+            f"{formatted_history}\n\n"
+            f"User Query: {query}"
+        )
+        
+        # 🆕 SMART CONTEXT TRIMMING
+        trimmed_user_context, final_chunks = self._trim_context_smart(
+            user_context=user_context,
+            chunks=chunks,
+            system_instructions=system_instructions,
+            model_name=getattr(self, '_current_model', 'gpt-4o-mini'),
+            max_tokens=120_000  # Leave buffer for response
+        )
+        
+        return f"{system_instructions}\n\n{trimmed_user_context}"
+
+    def _trim_context_smart(
+        self, 
+        user_context: str, 
+        chunks: List[Dict],
+        system_instructions: str,
+        model_name: str,
+        max_tokens: int
+    ) -> Tuple[str, List[Dict]]:
+        """🆕 Smart context trimming that preserves highest-quality chunks"""
+        
+        # Get tokenizer
+        model_to_encoding = {
+            "o4-mini": "o200k_base",
+            "gpt-4o": "cl100k_base", 
+            "gpt-4o-mini": "cl100k_base",
+            "claude-3-5-sonnet": "cl100k_base",
+        }
+        
+        encoding_name = model_to_encoding.get(model_name, "cl100k_base")
+        try:
+            tokenizer = tiktoken.get_encoding(encoding_name)
+        except Exception:
+            tokenizer = tiktoken.get_encoding("cl100k_base")
+        
+        # Calculate base token usage
+        system_tokens = len(tokenizer.encode(system_instructions))
+        user_tokens = len(tokenizer.encode(user_context))
+        base_tokens = system_tokens + user_tokens
+        
+        available_tokens = max_tokens - base_tokens - 1000  # Buffer for response
+        
+        logger.info(f"🔢 Token budget: {available_tokens} available for chunks")
+        
+        # Sort chunks by relevance (similarity score)
+        sorted_chunks = sorted(
+            chunks, 
+            key=lambda x: x.get('similarity', 0), 
+            reverse=True
+        )
+        
+        # Add chunks until we hit token limit
+        final_chunks = []
+        chunk_tokens = 0
+        
+        for chunk in sorted_chunks:
+            chunk_text = f"[CHUNK {len(final_chunks) + 1}]\nSource: {chunk.get('title', 'Unknown')}\nContent: {chunk.get('content', '')}\n"
+            chunk_token_count = len(tokenizer.encode(chunk_text))
+            
+            if chunk_tokens + chunk_token_count <= available_tokens:
+                final_chunks.append(chunk)
+                chunk_tokens += chunk_token_count
+            else:
+                logger.info(f"⚠️ Trimmed context: using {len(final_chunks)}/{len(chunks)} chunks")
+                break
+        
+        # Build final context with trimmed chunks
         numbered_chunks = []
-        for i, chunk in enumerate(chunks, 1):
-            chunk_text = f"[CHUNK {i}]\nSource: {chunk.get('title', 'Unknown')}\nContent: {chunk.get('content', '')}\n"
+        for i, chunk in enumerate(final_chunks, 1):
+            chunk_text = f"[CHUNK {i}]\nSource: {chunk.get('title', 'Unknown')}\nPage: {chunk.get('page_number', 'N/A')}\nContent: {chunk.get('content', '')}\n"
             numbered_chunks.append(chunk_text)
         
         chunk_context = "\n".join(numbered_chunks)
         
-        # Combine everything
-        user_context = (
-            f"{formatted_history}\n\n"
-            f"Relevant Context:\n{chunk_context}\n\n"
-            f"User Query: {query}"
-        )
+        final_context = f"{user_context}\n\nRelevant Context:\n{chunk_context}"
         
-        return f"{system_instructions}\n\n{user_context}"
+        final_tokens = len(tokenizer.encode(final_context)) + system_tokens
+        logger.info(f"📊 Final context: {final_tokens}/{max_tokens} tokens ({len(final_chunks)} chunks)")
+        
+        return final_context, final_chunks
 
     def _format_chat_history(self, history: List[Dict]) -> str:
         """Format chat history for context"""
@@ -1191,7 +1300,9 @@ async def process_legacy_rag(
         from utils.llm_factory import LLMFactory
         
         llm_client = LLMFactory.get_client(
-            provider=provider, model_name=model_name, temperature=temperature
+            provider=provider, 
+            model_name=model_name, 
+            temperature=temperature
         )
 
         # Step 4) Generate complete answer (blocking)
@@ -1497,46 +1608,46 @@ def worker_shutdown_handler(sender, **kwargs):
         loop.close()
 
 
-# ——— Legacy Compatibility Stubs ————————————————————————————————————————————————
+# ——— [TO BE DALETED] Legacy Compatibility Stubs ————————————————————————————————————————————————
 
-# 🔄 Maintain original callback handler for backward compatibility
-def publish_token(chat_session_id: str, token: str):
-    """🔄 Legacy token publishing - now redirects to WebSocket broadcasting"""
-    # This is now handled by the streaming manager's WebSocket broadcasting
-    pass
+# # 🔄 Maintain original callback handler for backward compatibility
+# def publish_token(chat_session_id: str, token: str):
+#     """🔄 Legacy token publishing - now redirects to WebSocket broadcasting"""
+#     # This is now handled by the streaming manager's WebSocket broadcasting
+#     pass
 
 
-class StreamToClientHandler(BaseCallbackHandler):
-    """🔄 Legacy callback handler - maintained for compatibility"""
+# class StreamToClientHandler(BaseCallbackHandler):
+#     """🔄 Legacy callback handler - maintained for compatibility"""
     
-    def __init__(self, session_id: str):
-        self.session_id = session_id
+#     def __init__(self, session_id: str):
+#         self.session_id = session_id
 
-    def on_llm_new_token(self, token: str, **kwargs) -> None:
-        # Legacy callback - now handled by streaming manager
-        pass
+#     def on_llm_new_token(self, token: str, **kwargs) -> None:
+#         # Legacy callback - now handled by streaming manager
+#         pass
 
 
-def get_chat_llm(model_name: str = "gpt-4o-mini", temperature: float = 0.7, callback_manager=None):
-    """🔄 Legacy LLM factory - deprecated in favor of enhanced factory"""
-    logger.warning("⚠️ get_chat_llm is deprecated - use CitationAwareLLMFactory instead")
+# def get_chat_llm(model_name: str = "gpt-4o-mini", temperature: float = 0.7, callback_manager=None):
+#     """🔄 Legacy LLM factory - deprecated in favor of enhanced factory"""
+#     logger.warning("⚠️ get_chat_llm is deprecated - use CitationAwareLLMFactory instead")
     
-    from langchain_openai import ChatOpenAI
+#     from langchain_openai import ChatOpenAI
     
-    cfg = _MODEL_TEMPERATURE_CONFIG.get(model_name, {"supports_temperature": True})
-    llm_kwargs = {
-        "api_key": OPENAI_API_KEY,
-        "model": model_name,
-        "streaming": False,
-    }
+#     cfg = _MODEL_TEMPERATURE_CONFIG.get(model_name, {"supports_temperature": True})
+#     llm_kwargs = {
+#         "api_key": OPENAI_API_KEY,
+#         "model": model_name,
+#         "streaming": False,
+#     }
     
-    if cfg.get("supports_temperature", False):
-        lo, hi = cfg.get("min", 0.0), cfg.get("max", 2.0)
-        safe_temp = max(lo, min(temperature, hi))
-        llm_kwargs["temperature"] = safe_temp
+#     if cfg.get("supports_temperature", False):
+#         lo, hi = cfg.get("min", 0.0), cfg.get("max", 2.0)
+#         safe_temp = max(lo, min(temperature, hi))
+#         llm_kwargs["temperature"] = safe_temp
 
-    if callback_manager:
-        llm_kwargs["streaming"] = True
-        llm_kwargs["callback_manager"] = callback_manager
+#     if callback_manager:
+#         llm_kwargs["streaming"] = True
+#         llm_kwargs["callback_manager"] = callback_manager
 
-    return ChatOpenAI(**llm_kwargs)
+#     return ChatOpenAI(**llm_kwargs)

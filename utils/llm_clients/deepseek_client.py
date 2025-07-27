@@ -2,6 +2,7 @@
 import os
 from openai import OpenAI
 from langchain_openai import ChatOpenAI
+from langchain.schema import SystemMessage, HumanMessage
 from dotenv import load_dotenv
 
 # Load environment variables
@@ -22,20 +23,40 @@ class DeepSeekClient:
         model_name: str = "deepseek-chat",
         temperature: float = 0.7,
         streaming: bool = False,
-        callback_manager=None,
     ):
-        
-        # make model_name available on the client
         self.model_name = model_name
+        self.temperature = temperature
         
-        llm_kwargs = {
-            "model_name": model_name,
-            "temperature": temperature,
-            "streaming": streaming,
-            "openai_api_key": DEEPSEEK_API_KEY,
-            "openai_api_base": DEEPSEEK_BASE_URL,
-        }
-        self._client = ChatOpenAI(**llm_kwargs)
+        # Create both regular and streaming clients
+        self._client = ChatOpenAI(
+            model=model_name,
+            temperature=temperature,
+            api_key=DEEPSEEK_API_KEY,
+            base_url=DEEPSEEK_BASE_URL,
+            streaming=False  # Non-streaming client
+        )
+        
+        self._streaming_client = ChatOpenAI(
+            model=model_name,
+            temperature=temperature,
+            api_key=DEEPSEEK_API_KEY,
+            base_url=DEEPSEEK_BASE_URL,
+            streaming=True  # Dedicated streaming client
+        )
 
-    def chat(self, prompt: str) -> str:
-        return self._client.predict(prompt)
+    def chat(self, prompt: str, system_prompt: str = None) -> str:
+        messages = self._build_messages(prompt, system_prompt)
+        return self._client.invoke(messages).content
+    
+    def stream_chat(self, prompt: str, system_prompt: str = None):
+        messages = self._build_messages(prompt, system_prompt)
+        for chunk in self._streaming_client.stream(messages):
+            if chunk.content:
+                yield chunk.content
+
+    def _build_messages(self, prompt: str, system_prompt: str = None):
+        messages = []
+        if system_prompt:
+            messages.append(SystemMessage(content=system_prompt))
+        messages.append(HumanMessage(content=prompt))
+        return messages
