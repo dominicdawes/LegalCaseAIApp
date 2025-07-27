@@ -2,6 +2,7 @@
 
 import os
 from langchain_openai import ChatOpenAI
+import asyncio
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -64,7 +65,7 @@ class OpenAIClient:
         async for chunk in streaming_client.astream(full_prompt):  # ← Change to astream
             if chunk.content:
                 yield chunk.content
-                
+
     def stream_chat_sync(self, prompt: str, system_prompt: str = None):
         """Stream a chat response from OpenAI"""
         # Create streaming version
