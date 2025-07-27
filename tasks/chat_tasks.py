@@ -925,8 +925,8 @@ class StreamingChatManager:
         try:
             logger.info(f"🌊 Starting {provider} streaming...")
             
-            # 🎯 FIXED: Stream directly from simple client
-            for raw_chunk in llm_client.stream_chat(context):
+            # 🔀 Need async for to iterate over the async generator from llm_client
+            async for raw_chunk in llm_client.stream_chat(context):
                 
                 # 🎯 NORMALIZE: Convert provider-specific format to text
                 chunk_text = self.normalizer.extract_text(raw_chunk, provider)
