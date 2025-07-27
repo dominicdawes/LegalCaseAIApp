@@ -289,6 +289,7 @@ async def init_worker_pools():
             min_size=2,
             max_size=10,
             command_timeout=30,
+            statement_cache_size=0, 
             server_settings={'application_name': 'rag_worker'}
         )
         logger.info("✅ DB pool initialized")
@@ -925,7 +926,7 @@ class StreamingChatManager:
             logger.info(f"🌊 Starting {provider} streaming...")
             
             # 🎯 FIXED: Stream directly from simple client
-            async for raw_chunk in llm_client.stream_chat(context):
+            for raw_chunk in llm_client.stream_chat(context):
                 
                 # 🎯 NORMALIZE: Convert provider-specific format to text
                 chunk_text = self.normalizer.extract_text(raw_chunk, provider)

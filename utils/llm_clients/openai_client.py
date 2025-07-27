@@ -43,8 +43,29 @@ class OpenAIClient:
         Sends a single-turn prompt; returns the entire response as a string.
         """
         return self._client.predict(prompt)
-    
-    def stream_chat(self, prompt: str, system_prompt: str = None):
+
+    async def stream_chat(self, prompt: str, system_prompt: str = None):  # ← Add async
+        """Stream a chat response from OpenAI"""
+        # Create streaming version
+        streaming_client = ChatOpenAI(
+            api_key=OPENAI_API_KEY,
+            model=self.model_name,
+            streaming=True,
+            temperature=getattr(self, '_temperature', 0.7)
+        )
+        
+        # Format prompt with system if provided
+        if system_prompt:
+            full_prompt = f"{system_prompt}\n\n{prompt}"
+        else:
+            full_prompt = prompt
+        
+        # Use async streaming
+        async for chunk in streaming_client.astream(full_prompt):  # ← Change to astream
+            if chunk.content:
+                yield chunk.content
+                
+    def stream_chat_sync(self, prompt: str, system_prompt: str = None):
         """Stream a chat response from OpenAI"""
         # Create streaming version
         streaming_client = ChatOpenAI(
