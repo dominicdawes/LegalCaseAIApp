@@ -8,8 +8,7 @@ from dotenv import load_dotenv
 
 import vertexai
 from vertexai.generative_models import (
-    GenerativeModel, GenerationConfig, Content, Part, 
-    ResponseBlockedError, HarmCategory, HarmBlockThreshold
+    GenerativeModel, GenerationConfig, HarmCategory, HarmBlockThreshold
 )
 from google.oauth2 import service_account
 from google.api_core import exceptions as google_exceptions
