@@ -44,7 +44,6 @@ from dotenv import load_dotenv
 import asyncpg
 import redis.asyncio as aioredis
 import asyncpg
-import psycopg2
 from contextlib import asynccontextmanager, contextmanager
 import threading
 
@@ -112,10 +111,10 @@ DEFAULT_HEADERS = {
 
 # 🆕 Cache configuration
 CACHE_CONFIG = {
-    "embedding_cache_ttl": 3600,       # 1 hour for query embeddings
-    "chat_history_cache_ttl": 1800,    # 30 minutes for chat history
-    "citation_preview_cache_ttl": 86400,  # 24 hours for link previews
-    "max_cache_size": 10000,           # Maximum cached embeddings
+    "embedding_cache_ttl": 3600,            # 1 hour for query embeddings
+    "chat_history_cache_ttl": 1800,         # 30 minutes for chat history
+    "citation_preview_cache_ttl": 86400,    # 24 hours for link previews
+    "max_cache_size": 10000,                # Maximum cached embeddings
 }
 
 # API Keys (inherited from original)
@@ -857,8 +856,8 @@ class StreamingChatManager:
         
         async with get_db_connection() as conn:
             rows = await conn.fetch(
-                "SELECT * FROM match_document_chunks_hnsw($1, $2, $3)",
-                project_id, embedding, k
+                "SELECT * FROM match_document_chunks_hnsw($1, $2::vector, $3)",
+                project_id, embedding, k  # ← Cast to vector type
             )
         
         chunks = [dict(row) for row in rows]
