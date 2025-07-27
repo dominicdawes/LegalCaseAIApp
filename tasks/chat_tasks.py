@@ -1192,7 +1192,8 @@ def rag_chat_task(
 
         # ———— 🔀 STREAMING VS LEGACY MODE DECISION ————————————————————————————
         use_streaming = should_use_streaming(user_id, project_id)
-        
+        use_streaming = True
+
         if use_streaming:
             logger.info(f"🚀 Using STREAMING mode for user {user_id}")
             
