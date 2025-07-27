@@ -854,10 +854,13 @@ class StreamingChatManager:
     ) -> List[Dict]:
         """🆕 Async chunk retrieval with project isolation"""
         
+        # Convert Python list to pgvector string format: [0.1,0.2,0.3]
+        vector_str = '[' + ','.join(map(str, embedding)) + ']'
+        
         async with get_db_connection() as conn:
             rows = await conn.fetch(
-                "SELECT * FROM match_document_chunks_hnsw($1, $2::vector, $3)",
-                project_id, embedding, k  # ← Cast to vector type
+                "SELECT * FROM match_document_chunks_hnsw($1, $2, $3)",
+                project_id, vector_str, k  # ← Pass as string
             )
         
         chunks = [dict(row) for row in rows]
