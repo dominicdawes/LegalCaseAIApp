@@ -1,3 +1,4 @@
+# tasks/upload_tasks.py
 """v6 By Gemini 2.5 Pro bc Claude hit rate/context limits"""
 
 # ===== STANDARD LIBRARY IMPORTS =====
@@ -841,8 +842,7 @@ def process_document_batch_workflow(self, file_urls: List[str], metadata: Dict[s
     metadata['create_note'] = create_note
     logger.info(f"🎯 [BATCH-{batch_id[:8]}] 🚀 Starting workflow for {len(file_urls)} documents")
     
-    # ——— Phase 1: Concurrent Download + Classification ————————————————————————————
-    # Download all documents and classify as new vs reused (async for performance)
+    # 🧼 CLEAN: One async event loop per task
     return asyncio.run(_execute_batch_workflow(batch_id, file_urls, metadata))
 
 async def _execute_batch_workflow(batch_id: str, file_urls: List[str], metadata: Dict[str, Any]) -> Dict[str, Any]:

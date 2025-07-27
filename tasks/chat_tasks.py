@@ -1,3 +1,4 @@
+# tasks/chat_tasks.py
 """
 High-performance streaming RAG chat system with rich content support.
 Replaces blocking sequential processing with parallel async operations + real-time streaming.
@@ -43,6 +44,12 @@ import asyncpg
 from psycopg2.pool import ThreadedConnectionPool
 from contextlib import asynccontextmanager
 
+# ===== ASYNC & CONCURRENCY & SOCKET =====
+import asyncio
+import gevent
+import gevent.socket
+import socket
+
 # ===== LLM & LANGCHAIN =====
 import tiktoken
 from langchain_openai import OpenAIEmbeddings
@@ -68,9 +75,11 @@ from utils.supabase_utils import (
     create_new_chat_session,
     log_llm_error,
 )
-from utils.llm_clients.llm_factory_enhanced import CitationAwareLLMFactory  # 🆕 Enhanced LLM factory
-from utils.llm_clients.citation_processor import CitationProcessor  # detects citations in streaming chunks
-from utils.llm_clients.performance_monitor import PerformanceMonitor  # 🆕 Performance tracking
+# from utils.llm_clients.llm_factory_enhanced import CitationAwareLLMFactory  # 🆕 Enhanced LLM factory
+from utils.llm_clients.llm_factory import LLMFactory                    # Simple LLM Client factory
+from utils.llm_clients.citation_processor import CitationProcessor      # detects citations in streaming chunks
+from utils.llm_clients.performance_monitor import PerformanceMonitor    # 🆕 Performance tracking
+from utils.llm_clients.stream_normalizer import StreamNormalizer        # Format streamed results from several providers
 
 # ——— Logging & Env Load ———————————————————————————————————————————————————————————
 logger = get_task_logger(__name__)
@@ -409,6 +418,7 @@ class StreamingChatManager:
         self.embedding_cache = EmbeddingCache()
         self.citation_processor = CitationProcessor()
         self.performance_monitor = PerformanceMonitor()
+        self.normalizer = StreamNormalizer()
         
     async def initialize(self):
         """Initialize all async resources"""
@@ -459,8 +469,8 @@ class StreamingChatManager:
                 self._setup_llm_client(provider, model_name, temperature)
             )
             
-            # Wait for all parallel tasks to complete
-            embedding, chat_history, llm_client = await asyncio.gather(
+            # 🤚 Wait for all parallel tasks to complete
+            embedding, chat_history, (llm_client, provider_name) = await asyncio.gather(
                 embedding_task, history_task, llm_task
             )
             
@@ -488,7 +498,8 @@ class StreamingChatManager:
                 query=query,
                 relevant_chunks=relevant_chunks,
                 chat_history=chat_history,
-                llm_client=llm_client
+                llm_client=llm_client,
+                provider=provider_name
             )
             llm_time = time.time() - llm_start
             
@@ -570,21 +581,11 @@ class StreamingChatManager:
         logger.info(f"📚 Fetched {len(history)} history messages")
         return history
 
-    async def _setup_llm_client(
-        self, provider: str, model_name: str, temperature: float
-    ):
-        """🆕 Setup citation-aware LLM client"""
-        
-        llm_client = CitationAwareLLMFactory.create_citation_aware_client(
-            provider=provider,
-            model_name=model_name,
-            temperature=temperature,
-            citation_style="academic",
-            streaming=True
-        )
-        
+    async def _setup_llm_client(self, provider: str, model_name: str, temperature: float):
+        """🎯 ONE LINE: Factory handles the routing complexity"""
+        client = LLMFactory.get_client_for(provider, model_name, temperature, streaming=True)
         logger.info(f"🤖 LLM client setup: {provider}/{model_name}")
-        return llm_client
+        return client, provider     # Return both for downstream use
 
     async def _fetch_relevant_chunks_async(
         self, embedding: List[float], project_id: str, k: int = 10
@@ -619,8 +620,121 @@ class StreamingChatManager:
             )
         
         logger.info(f"📝 Created assistant message placeholder: {assistant_id}")
-
+    
     async def _stream_rag_response(
+        self,
+        assistant_message_id: str,
+        chat_session_id: str,
+        query: str,
+        relevant_chunks: List[Dict],
+        chat_history: List[Dict],
+        llm_client: Any,
+        provider: str
+    ) -> StreamingResponse:
+        """
+        Core streaming response generator with real-time processing
+        
+        Generator function that:
+        - 1. Determines if the stream is still going
+        - 2. Extracts citations from the chunk "content"
+        - 3. Extracts highlights (pertinent info like dates or facts)
+        - 4. Broadcasts the chink to the UI via websocket
+        """
+
+        # # [DELETEME] Initialize universal streaming manager
+        # streaming_manager = UniversalStreamingManager()
+
+        # Build enhanced context with system instructions (from YAML)
+        context = await self._build_enhanced_context(
+            query, relevant_chunks, chat_history
+        )
+        
+        accumulated_content = ""
+        citations = []
+        highlights = []
+        last_broadcast = time.time()
+        last_db_update = time.time()
+        content_buffer = ""
+        
+        try:
+            logger.info(f"🌊 Starting {provider} streaming...")
+            
+            # 🎯 FIXED: Stream directly from simple client
+            async for raw_chunk in llm_client.stream_chat(context):
+                
+                # 🎯 NORMALIZE: Convert provider-specific format to text
+                chunk_text = self.normalizer.extract_text(raw_chunk, provider)
+                
+                # Skip empty chunks
+                if not chunk_text:
+                    continue
+                
+                # Check for completion
+                if self.normalizer.is_completion_chunk(raw_chunk, provider):
+                    logger.info("✅ Stream completion detected")
+                    break
+                
+                # Accumulate content
+                accumulated_content += chunk_text
+                content_buffer += chunk_text
+                
+                # 1) --- Extract citations using your existing processor
+                doc_citations, seen_citations = self.citation_processor.extract_document_citations_from_chunks(
+                    accumulated_content, relevant_chunks, getattr(self, '_seen_citations', set())
+                )
+                if doc_citations:
+                    citations.extend(doc_citations)
+                    self._seen_citations = seen_citations
+                    await self._broadcast_citations(chat_session_id, doc_citations)
+                
+                # 2) --- Extract highlights (your existing method)
+                new_highlights = self._extract_highlights_from_chunk(chunk_text)
+                if new_highlights:
+                    highlights.extend(new_highlights)
+                    await self._broadcast_highlights(chat_session_id, new_highlights)
+                
+                # 3) --- Real-time WebSocket broadcasting (every 50ms)
+                if time.time() - last_broadcast > STREAMING_CONFIG["chunk_broadcast_interval"]:
+                    await self._broadcast_content_chunk(
+                        chat_session_id, assistant_message_id, chunk_text
+                    )
+                    last_broadcast = time.time()
+                
+                # 4) --- Batched database updates (every 100ms)
+                if time.time() - last_db_update > STREAMING_CONFIG["db_batch_update_interval"]:
+                    if content_buffer:
+                        await self._batch_update_content(assistant_message_id, content_buffer)
+                        content_buffer = ""
+                        last_db_update = time.time()
+            
+            # Final buffer flush
+            if content_buffer:
+                await self._batch_update_content(assistant_message_id, content_buffer)
+            
+            # 🆕 Enrich citations with link previews (your existing method)
+            enriched_citations = await self._enrich_citations_with_previews(citations)
+            
+            logger.info(f"📊 Streaming complete: {len(accumulated_content)} chars, {len(enriched_citations)} citations, {len(highlights)} highlights")
+            
+            return StreamingResponse(
+                content=accumulated_content,
+                citations=enriched_citations,
+                highlights=highlights,
+                metadata={
+                    "provider": provider,  # 🆕 Track provider
+                    "model": getattr(llm_client, 'model_name', 'unknown'),
+                    "chunks_used": len(relevant_chunks),
+                    "total_tokens": len(accumulated_content.split())
+                },
+                is_complete=True
+            )
+            
+        except Exception as e:
+            logger.error(f"❌ {provider} streaming failed: {e}")
+            await self._update_message_status(assistant_message_id, "error", str(e))
+            raise
+
+    async def _stream_rag_response_no_adapter(
         self,
         assistant_message_id: str,
         chat_session_id: str,
@@ -638,7 +752,10 @@ class StreamingChatManager:
         - 3. Extracts highlights (pertinent info like dates or facts)
         - 4. Broadcasts the chink to the UI via websocket
         """
-        
+
+        # Initialize universal streaming manager
+        streaming_manager = UniversalStreamingManager()
+
         # Build enhanced context with system instructions
         context = await self._build_enhanced_context(
             query, relevant_chunks, chat_history
@@ -742,11 +859,6 @@ class StreamingChatManager:
         - Load system instructions from YAML 
         - Format chat history
         - 🧠 SMART chunk context trimming
-        - 
-        - 
-        - 
-        - 
-        - 
         
         """
         
@@ -1197,48 +1309,21 @@ def rag_chat_task(
         if use_streaming:
             logger.info(f"🚀 Using STREAMING mode for user {user_id}")
             
-            # Initialize event loop for streaming
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            
-            try:
-                result = loop.run_until_complete(
-                    streaming_manager.process_streaming_query(
-                        message_id=message_id,
-                        user_id=user_id,
-                        chat_session_id=chat_session_id,
-                        query=query,
-                        project_id=project_id,
-                        provider=provider,
-                        model_name=model_name,
-                        temperature=temperature
-                    )
+            # ✅ APPLY YOUR PATTERN: Single asyncio.run() call
+            result = asyncio.run(
+                _execute_streaming_workflow(
+                    message_id, user_id, chat_session_id, 
+                    query, project_id, provider, model_name, temperature
                 )
-
-            finally:
-                loop.close()
+            )
         else:
             logger.info(f"🐌 Using LEGACY mode for user {user_id}")
-            
-            # Use legacy blocking workflow
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            
-            try:
-                result = loop.run_until_complete(
-                    process_legacy_rag(
-                        message_id=message_id,
-                        user_id=user_id,
-                        chat_session_id=chat_session_id,
-                        query=query,
-                        project_id=project_id,
-                        provider=provider,
-                        model_name=model_name,
-                        temperature=temperature
-                    )
+            result = asyncio.run(
+                _execute_legacy_workflow(
+                    message_id, user_id, chat_session_id,
+                    query, project_id, provider, model_name, temperature
                 )
-            finally:
-                loop.close()
+            )
         
         # Update original message status (both modes STREAMING & LEGACY)
         supabase_client.table("messages").update({
@@ -1264,6 +1349,28 @@ def rag_chat_task(
     finally:
         gc.collect()
 
+# ✅ SEPARATE ASYNC FUNCTIONS (similatr to your upload_tasks.py)
+async def _execute_streaming_workflow(message_id, user_id, chat_session_id, query, project_id, provider, model_name, temperature):
+    """All streaming async operations happen here"""
+    # 🧼 CLEAN: One async event loop per task
+    return await streaming_manager.process_streaming_query(
+        message_id=message_id,
+        user_id=user_id,
+        chat_session_id=chat_session_id,
+        query=query,
+        project_id=project_id,
+        provider=provider,
+        model_name=model_name,
+        temperature=temperature
+    )
+
+async def _execute_legacy_workflow(message_id, user_id, chat_session_id, query, project_id, provider, model_name, temperature):
+    """All legacy async operations happen here"""
+    # 🧼 CLEAN: One async event loop per task
+    return await process_legacy_rag(
+        message_id, user_id, chat_session_id,
+        query, project_id, provider, model_name, temperature
+    )
 
 # ——— Legacy RAG Workflow (Original Non-Streaming Implementation) ————————————————————————————
 
