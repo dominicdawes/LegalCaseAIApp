@@ -1127,7 +1127,7 @@ def persist_user_query(self, user_id, chat_session_id, query, project_id, model_
             chat_session_id=chat_session_id,
             dialogue_role="user",
             message_content=query,
-            query_response_status=MessageStatus.pending,
+            query_response_status="pending",
             format="markdown",  # 🆕 Default to markdown
             created_at=datetime.now(timezone.utc).isoformat(),
         )
@@ -1242,7 +1242,7 @@ def rag_chat_task(
         
         # Update original message status (both modes STREAMING & LEGACY)
         supabase_client.table("messages").update({
-            "query_response_status": MessageStatus.complete
+            "query_response_status": "complete"
         }).eq("id", message_id).execute()
         
         mode = "streaming" if use_streaming else "legacy"
@@ -1323,7 +1323,7 @@ async def process_legacy_rag(
             chat_session_id=chat_session_id,
             dialogue_role="assistant",
             message_content=assistant_response,
-            query_response_status=MessageStatus.complete,
+            query_response_status="complete",
             format="markdown",
             created_at=datetime.now(timezone.utc).isoformat(),
         )
