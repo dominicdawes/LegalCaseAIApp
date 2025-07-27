@@ -1,4 +1,5 @@
 # tasks/chat_tasks.py
+
 """
 High-performance streaming RAG chat system with rich content support.
 Replaces blocking sequential processing with parallel async operations + real-time streaming.
