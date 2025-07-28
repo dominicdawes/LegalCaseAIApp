@@ -28,8 +28,7 @@ from fastapi import FastAPI, BackgroundTasks, HTTPException, WebSocket, WebSocke
 from fastapi.middleware.cors import CORSMiddleware
 
 # Websocket imports
-from ws_handlers import setup_websocket_routes, manager
-# from ws_handlers.endpoints import setup_websocket_routes
+from app.ws_handlers import setup_websocket_routes, manager     # from ws_handlers.endpoints import setup_websocket_routes
 # from ws_handlers.connection_manager import manager
 
 # Project modules
