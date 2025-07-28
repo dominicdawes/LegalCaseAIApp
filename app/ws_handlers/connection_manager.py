@@ -5,8 +5,12 @@ import json
 import logging
 from typing import Dict, Set
 from fastapi import WebSocket
+from celery.utils.log import get_task_logger
 
-logger = logging.getLogger(__name__)
+
+# ——— Logging & Env Load ———————————————————————————————————————————————————————————
+logger = get_task_logger(__name__)
+logger.propagate = False
 
 class ConnectionManager:
     """Manages WebSocket connections for real-time streaming"""

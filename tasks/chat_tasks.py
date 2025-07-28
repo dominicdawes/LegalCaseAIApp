@@ -937,6 +937,7 @@ class StreamingChatManager:
                     continue
                 
                 # Check for completion
+                logger.info(f"🔍 RAW CHUNK: {raw_chunk}")
                 if self.normalizer.is_completion_chunk(raw_chunk, provider):
                     logger.info("✅ Stream completion detected")
                     break
@@ -1148,6 +1149,7 @@ class StreamingChatManager:
         # import redis.asyncio as aioredis
         
         try:
+            logger.info(f"🔍 BROADCASTING: '{chunk}'")
             async with aioredis.Redis(connection_pool=redis_pool) as r:
                 await r.publish(f"chat:{session_id}", json.dumps({
                     "type": "content_delta",
@@ -1155,6 +1157,7 @@ class StreamingChatManager:
                     "chunk": chunk,
                     "timestamp": datetime.utcnow().isoformat()
                 }))
+            logger.info(f"🔍 BROADCASTING: '{chunk}'")
             logger.info(f"📡 PUBLISHED to chat:{session_id} | chunk: '{chunk[:50]}...' | msg_id: {message_id}")
 
         except Exception as e:

@@ -6,12 +6,16 @@ import logging
 from datetime import datetime
 from fastapi import WebSocket, WebSocketDisconnect
 from celery import chain
+from celery.utils.log import get_task_logger
+
 
 # Import your tasks and dependencies
 from tasks.chat_tasks import persist_user_query, rag_chat_task
 from .connection_manager import manager
 
-logger = logging.getLogger(__name__)
+# ——— Logging & Env Load ———————————————————————————————————————————————————————————
+logger = get_task_logger(__name__)
+logger.propagate = False
 
 async def listen_redis_and_forward(pubsub, session_id: str):
     """Listen to Redis pub/sub and forward to WebSocket"""

@@ -6,6 +6,8 @@ import logging
 from datetime import datetime
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from celery import chain
+from celery.utils.log import get_task_logger
+
 
 from .connection_manager import manager
 from .handlers import (
@@ -14,7 +16,9 @@ from .handlers import (
     handle_chat_message
 )
 
-logger = logging.getLogger(__name__)
+# ——— Logging & Env Load ———————————————————————————————————————————————————————————
+logger = get_task_logger(__name__)
+logger.propagate = False
 
 def setup_websocket_routes(app: FastAPI, redis_pub):
     """Setup all WebSocket routes on the FastAPI app
