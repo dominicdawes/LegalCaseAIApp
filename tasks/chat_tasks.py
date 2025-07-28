@@ -1145,7 +1145,7 @@ class StreamingChatManager:
         self, session_id: str, message_id: str, chunk: str
     ):
         """🆕 Broadcast content chunk via WebSocket"""
-        import redis.asyncio as aioredis
+        # import redis.asyncio as aioredis
         
         try:
             async with aioredis.Redis(connection_pool=redis_pool) as r:
@@ -1155,6 +1155,8 @@ class StreamingChatManager:
                     "chunk": chunk,
                     "timestamp": datetime.utcnow().isoformat()
                 }))
+            logger.info(f"📡 PUBLISHED to chat:{session_id} | chunk: '{chunk[:50]}...' | msg_id: {message_id}")
+
         except Exception as e:
             logger.warning(f"⚠️ Broadcast failed: {e}")
 
