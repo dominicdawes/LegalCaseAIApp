@@ -1,4 +1,4 @@
-# app/websockets/connection_manager.py
+# app/ws_handlers/connection_manager.py
 
 import asyncio
 import json

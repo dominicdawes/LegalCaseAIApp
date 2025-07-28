@@ -1,4 +1,4 @@
-# app/websockets/endpoints.py
+# app/ws_handlers/endpoints.py
 
 import asyncio
 import json
@@ -17,7 +17,9 @@ from .handlers import (
 logger = logging.getLogger(__name__)
 
 def setup_websocket_routes(app: FastAPI, redis_pub):
-    """Setup all WebSocket routes on the FastAPI app"""
+    """Setup all WebSocket routes on the FastAPI app
+    session_id: chat session id for that particular convo (stored in Supabase table `chat_sessions`)
+    """
     
     @app.websocket("/ws/chat/{session_id}")
     async def websocket_chat_enhanced(websocket: WebSocket, session_id: str, user_id: str = None):
