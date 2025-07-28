@@ -28,7 +28,7 @@ from fastapi import FastAPI, BackgroundTasks, HTTPException, WebSocket, WebSocke
 from fastapi.middleware.cors import CORSMiddleware
 
 # Websocket imports
-from ws_handlers import setup_websocket_routes, manager
+from ws_handlers.connection_managers import setup_websocket_routes, manager
 
 # Project modules
 from tasks.profile_tasks import upload_profile_picture_task
