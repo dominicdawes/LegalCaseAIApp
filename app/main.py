@@ -74,6 +74,27 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ================================================ #
+#                  WEBSOCKETS
+# ================================================ #
+
+# After creating app and redis_pub, add this line:
+setup_websocket_routes(app, redis_pub)
+
+# @app.websocket("/ws/chat/{session_id}")
+# async def websocket_chat(session_id: str, websocket: WebSocket):
+#     await websocket.accept()
+#     pubsub = redis_pub.pubsub()
+#     await pubsub.subscribe(f"chat_result:{session_id}")
+
+#     try:
+#         async for message in pubsub.listen():
+#             if message['type'] == 'message':
+#                 await websocket.send_text(message['data'])
+#     except WebSocketDisconnect:
+#         await pubsub.unsubscribe(f"chat_result:{session_id}")
+
+
 # ——— PYDANTIC MODELS TEST ————————————————————————————————————————————————————
 
 class Numbers(BaseModel):
@@ -247,23 +268,6 @@ class NewGeneratedNoteRequest(BaseModel):
     '''
     # files: List[str]  # List of URLs or file paths of the PDFs
     metadata: Dict[str, Any]  # A dictionary for any metadata information
-
-# ================================================ #
-#                  WEBSOCKETS
-# ================================================ #
-
-# @app.websocket("/ws/chat/{session_id}")
-# async def websocket_chat(session_id: str, websocket: WebSocket):
-#     await websocket.accept()
-#     pubsub = redis_pub.pubsub()
-#     await pubsub.subscribe(f"chat_result:{session_id}")
-
-#     try:
-#         async for message in pubsub.listen():
-#             if message['type'] == 'message':
-#                 await websocket.send_text(message['data'])
-#     except WebSocketDisconnect:
-#         await pubsub.unsubscribe(f"chat_result:{session_id}")
 
 
 # ================================================ #
