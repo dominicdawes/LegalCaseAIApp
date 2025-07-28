@@ -982,6 +982,7 @@ class StreamingChatManager:
             # 🆕 Enrich citations with link previews (your existing method)
             enriched_citations = await self._enrich_citations_with_previews(citations)
             
+            logger.info(f"🏁 Final accum. content {accumulated_content}...")
             logger.info(f"📊 Streaming complete: {len(accumulated_content)} chars, {len(enriched_citations)} citations, {len(highlights)} highlights")
             
             return StreamingResponse(
@@ -1149,7 +1150,6 @@ class StreamingChatManager:
         # import redis.asyncio as aioredis
         
         try:
-            logger.info(f"🔍 BROADCASTING: '{chunk}'")
             async with aioredis.Redis(connection_pool=redis_pool) as r:
                 await r.publish(f"chat:{session_id}", json.dumps({
                     "type": "content_delta",
