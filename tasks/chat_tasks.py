@@ -888,6 +888,121 @@ class StreamingChatManager:
         
         logger.info(f"📝 Created assistant message placeholder: {assistant_id}")
     
+    # async def _stream_rag_response(
+    #     self,
+    #     assistant_message_id: str,
+    #     chat_session_id: str,
+    #     query: str,
+    #     relevant_chunks: List[Dict],
+    #     chat_history: List[Dict],
+    #     llm_client: Any,
+    #     provider: str
+    # ) -> StreamingResponse:
+    #     """
+    #     Core streaming response generator with real-time processing
+        
+    #     Generator function that:
+    #     - 1. Determines if the stream is still going
+    #     - 2. Extracts citations from the chunk "content"
+    #     - 3. Extracts highlights (pertinent info like dates or facts)
+    #     - 4. Broadcasts the chink to the UI via websocket
+    #     """
+
+    #     # # [DELETEME] Initialize universal streaming manager
+    #     # streaming_manager = UniversalStreamingManager()
+
+    #     # Build enhanced context with system instructions (from YAML)
+    #     context = await self._build_enhanced_context(
+    #         query, relevant_chunks, chat_history
+    #     )
+        
+    #     accumulated_content = ""
+    #     citations = []
+    #     highlights = []
+    #     last_broadcast = time.time()
+    #     last_db_update = time.time()
+    #     content_buffer = ""
+        
+    #     try:
+    #         logger.info(f"🌊 Starting {provider} streaming...")
+            
+    #         # 🔀 Need async for to iterate over the async generator from llm_client
+    #         async for raw_chunk in llm_client.stream_chat(context):
+                
+    #             # 🎯 NORMALIZE: Convert provider-specific format to text
+    #             chunk_text = self.normalizer.extract_text(raw_chunk, provider)
+                
+    #             # Skip empty chunks
+    #             if not chunk_text:
+    #                 continue
+                
+    #             # Check for completion
+    #             logger.info(f"🔍 RAW CHUNK: {raw_chunk}")
+    #             if self.normalizer.is_completion_chunk(raw_chunk, provider):
+    #                 logger.info("✅ Stream completion detected")
+    #                 break
+                
+    #             # Accumulate content
+    #             accumulated_content += chunk_text
+    #             content_buffer += chunk_text
+                
+    #             # 1) --- Extract citations using your existing processor
+    #             doc_citations, seen_citations = self.citation_processor.extract_document_citations_from_chunks(
+    #                 accumulated_content, relevant_chunks, getattr(self, '_seen_citations', set())
+    #             )
+    #             if doc_citations:
+    #                 citations.extend(doc_citations)
+    #                 self._seen_citations = seen_citations
+    #                 await self._broadcast_citations(chat_session_id, doc_citations)
+                
+    #             # 2) --- Extract highlights (your existing method)
+    #             new_highlights = self._extract_highlights_from_chunk(chunk_text)
+    #             if new_highlights:
+    #                 highlights.extend(new_highlights)
+    #                 await self._broadcast_highlights(chat_session_id, new_highlights)
+                
+    #             # 3) --- Real-time WebSocket broadcasting (every 50ms)
+    #             if time.time() - last_broadcast > STREAMING_CONFIG["chunk_broadcast_interval"]:
+    #                 await self._broadcast_content_chunk(
+    #                     chat_session_id, assistant_message_id, chunk_text
+    #                 )
+    #                 last_broadcast = time.time()
+                
+    #             # 4) --- Batched database updates (every 100ms)
+    #             if time.time() - last_db_update > STREAMING_CONFIG["db_batch_update_interval"]:
+    #                 if content_buffer:
+    #                     await self._batch_update_content(assistant_message_id, content_buffer)
+    #                     content_buffer = ""
+    #                     last_db_update = time.time()
+            
+    #         # Final buffer flush
+    #         if content_buffer:
+    #             await self._batch_update_content(assistant_message_id, content_buffer)
+            
+    #         # 🆕 Enrich citations with link previews (your existing method)
+    #         enriched_citations = await self._enrich_citations_with_previews(citations)
+            
+    #         logger.info(f"🏁 Final accum. content {accumulated_content}...")
+    #         logger.info(f"📊 Streaming complete: {len(accumulated_content)} chars, {len(enriched_citations)} citations, {len(highlights)} highlights")
+            
+    #         return StreamingResponse(
+    #             content=accumulated_content,
+    #             citations=enriched_citations,
+    #             highlights=highlights,
+    #             metadata={
+    #                 "provider": provider,  # 🆕 Track provider
+    #                 "model": getattr(llm_client, 'model_name', 'unknown'),
+    #                 "chunks_used": len(relevant_chunks),
+    #                 "total_tokens": len(accumulated_content.split())
+    #             },
+    #             is_complete=True
+    #         )
+            
+    #     except Exception as e:
+    #         logger.error(f"❌ {provider} streaming failed: {e}")
+    #         await self._update_message_status(assistant_message_id, "error", str(e))
+    #         raise
+    
     async def _stream_rag_response(
         self,
         assistant_message_id: str,
@@ -899,17 +1014,13 @@ class StreamingChatManager:
         provider: str
     ) -> StreamingResponse:
         """
-        Core streaming response generator with real-time processing
+        Core streaming response generator with professional-grade smart buffering
         
-        Generator function that:
-        - 1. Determines if the stream is still going
-        - 2. Extracts citations from the chunk "content"
-        - 3. Extracts highlights (pertinent info like dates or facts)
-        - 4. Broadcasts the chink to the UI via websocket
+        Uses intelligent chunking strategy similar to Claude/ChatGPT:
+        - Buffers tokens until word/sentence boundaries
+        - Sends chunks every 20-30ms for optimal UX
+        - Prioritizes perceived speed over raw latency
         """
-
-        # # [DELETEME] Initialize universal streaming manager
-        # streaming_manager = UniversalStreamingManager()
 
         # Build enhanced context with system instructions (from YAML)
         context = await self._build_enhanced_context(
@@ -919,14 +1030,44 @@ class StreamingChatManager:
         accumulated_content = ""
         citations = []
         highlights = []
-        last_broadcast = time.time()
         last_db_update = time.time()
         content_buffer = ""
         
-        try:
-            logger.info(f"🌊 Starting {provider} streaming...")
+        # 🚀 SMART BUFFERING STATE (Professional streaming)
+        streaming_buffer = ""
+        last_broadcast = time.time()
+        chunk_count = 0
+        
+        # Smart buffering configuration (based on industry standards)
+        BUFFER_CONFIG = {
+            'max_chunk_size': 5,        # Max tokens before forcing send
+            'ideal_interval_ms': 25,    # 25ms = professional sweet spot
+            'min_interval_ms': 10,      # Never send faster than 10ms
+            'word_boundaries': {' ', '.', ',', '!', '?', '\n', ':', ';'},
+            'immediate_triggers': {'\n\n', '. ', '! ', '? '},  # Send immediately
+        }
+        
+        async def smart_broadcast_chunk():
+            """Smart broadcasting with professional timing"""
+            nonlocal streaming_buffer, last_broadcast, chunk_count
             
-            # 🔀 Need async for to iterate over the async generator from llm_client
+            if not streaming_buffer:
+                return
+            
+            chunk_count += 1
+            logger.info(f"🎯 SMART BROADCAST #{chunk_count}: '{streaming_buffer}' ({len(streaming_buffer)} chars)")
+            
+            await self._broadcast_content_chunk(
+                chat_session_id, assistant_message_id, streaming_buffer
+            )
+            
+            streaming_buffer = ""
+            last_broadcast = time.time()
+        
+        try:
+            logger.info(f"🌊 Starting {provider} streaming with smart buffering...")
+            
+            # 🔀 Process each token from LLM with intelligent buffering
             async for raw_chunk in llm_client.stream_chat(context):
                 
                 # 🎯 NORMALIZE: Convert provider-specific format to text
@@ -937,14 +1078,47 @@ class StreamingChatManager:
                     continue
                 
                 # Check for completion
-                logger.info(f"🔍 RAW CHUNK: {raw_chunk}")
+                logger.info(f"🔍 RAW CHUNK: '{chunk_text}'")
                 if self.normalizer.is_completion_chunk(raw_chunk, provider):
                     logger.info("✅ Stream completion detected")
                     break
                 
-                # Accumulate content
+                # Accumulate content for final response
                 accumulated_content += chunk_text
                 content_buffer += chunk_text
+                
+                # 🧠 SMART BUFFERING LOGIC (Claude/ChatGPT style)
+                streaming_buffer += chunk_text
+                time_since_last = (time.time() - last_broadcast) * 1000  # Convert to ms
+                
+                should_send = False
+                send_reason = ""
+                
+                # Rule 1: Immediate triggers (sentence endings, paragraph breaks)
+                if any(trigger in streaming_buffer for trigger in BUFFER_CONFIG['immediate_triggers']):
+                    should_send = True
+                    send_reason = "immediate_trigger"
+                
+                # Rule 2: Word boundary + minimum time elapsed
+                elif (chunk_text in BUFFER_CONFIG['word_boundaries'] and 
+                    time_since_last >= BUFFER_CONFIG['min_interval_ms']):
+                    should_send = True
+                    send_reason = "word_boundary"
+                
+                # Rule 3: Buffer size limit reached
+                elif len(streaming_buffer) >= BUFFER_CONFIG['max_chunk_size']:
+                    should_send = True
+                    send_reason = "buffer_full"
+                
+                # Rule 4: Ideal interval elapsed (regardless of content)
+                elif time_since_last >= BUFFER_CONFIG['ideal_interval_ms']:
+                    should_send = True
+                    send_reason = "time_interval"
+                
+                # Send buffered content if conditions are met
+                if should_send:
+                    logger.info(f"📡 Broadcasting reason: {send_reason} (after {time_since_last:.1f}ms)")
+                    await smart_broadcast_chunk()
                 
                 # 1) --- Extract citations using your existing processor
                 doc_citations, seen_citations = self.citation_processor.extract_document_citations_from_chunks(
@@ -961,39 +1135,40 @@ class StreamingChatManager:
                     highlights.extend(new_highlights)
                     await self._broadcast_highlights(chat_session_id, new_highlights)
                 
-                # 3) --- Real-time WebSocket broadcasting (every 50ms)
-                if time.time() - last_broadcast > STREAMING_CONFIG["chunk_broadcast_interval"]:
-                    await self._broadcast_content_chunk(
-                        chat_session_id, assistant_message_id, chunk_text
-                    )
-                    last_broadcast = time.time()
-                
-                # 4) --- Batched database updates (every 100ms)
+                # 3) --- Batched database updates (every 100ms)
                 if time.time() - last_db_update > STREAMING_CONFIG["db_batch_update_interval"]:
                     if content_buffer:
                         await self._batch_update_content(assistant_message_id, content_buffer)
                         content_buffer = ""
                         last_db_update = time.time()
             
-            # Final buffer flush
+            # 🏁 FINAL BUFFER FLUSH - Send any remaining content
+            if streaming_buffer:
+                logger.info("📤 Final buffer flush")
+                await smart_broadcast_chunk()
+            
+            # Final database buffer flush
             if content_buffer:
                 await self._batch_update_content(assistant_message_id, content_buffer)
             
             # 🆕 Enrich citations with link previews (your existing method)
             enriched_citations = await self._enrich_citations_with_previews(citations)
             
-            logger.info(f"🏁 Final accum. content {accumulated_content}...")
-            logger.info(f"📊 Streaming complete: {len(accumulated_content)} chars, {len(enriched_citations)} citations, {len(highlights)} highlights")
+            logger.info(f"🏁 Final content: {len(accumulated_content)} chars")
+            logger.info(f"📊 Smart streaming: {chunk_count} broadcasts, avg {(len(accumulated_content)/chunk_count):.1f} chars/chunk")
+            logger.info(f"📊 Complete: {len(enriched_citations)} citations, {len(highlights)} highlights")
             
             return StreamingResponse(
                 content=accumulated_content,
                 citations=enriched_citations,
                 highlights=highlights,
                 metadata={
-                    "provider": provider,  # 🆕 Track provider
+                    "provider": provider,
                     "model": getattr(llm_client, 'model_name', 'unknown'),
                     "chunks_used": len(relevant_chunks),
-                    "total_tokens": len(accumulated_content.split())
+                    "total_tokens": len(accumulated_content.split()),
+                    "broadcast_count": chunk_count,
+                    "avg_chars_per_chunk": len(accumulated_content) / max(chunk_count, 1)
                 },
                 is_complete=True
             )
