@@ -1194,12 +1194,12 @@ class StreamingChatManager:
         try:
             yaml_dict = load_yaml_prompt("chat-persona-prompt.yaml")
             sys_msgs = build_chat_messages_from_yaml(yaml_dict)
-            system_instructions = "\n\n".join(
+            SYSTEM_INSTRUCTIONS = "\n\n".join(
                 msg["content"] for msg in sys_msgs if msg["role"] == "system"
             )
         except Exception as e:
             logger.warning(f"⚠️ YAML loading failed: {e}")
-            system_instructions = ""
+            SYSTEM_INSTRUCTIONS = ""
         
         # Format chat history
         formatted_history = self._format_chat_history(history) if history else ""
@@ -1214,12 +1214,12 @@ class StreamingChatManager:
         trimmed_user_context, final_chunks = self._trim_context_smart(
             user_context=user_context,
             chunks=chunks,
-            system_instructions=system_instructions,
+            system_instructions=SYSTEM_INSTRUCTIONS,
             model_name=getattr(self, '_current_model', 'gpt-4o-mini'),
             max_tokens=120_000  # Leave buffer for response
         )
         
-        return f"{system_instructions}\n\n{trimmed_user_context}"
+        return f"{SYSTEM_INSTRUCTIONS}\n\n{trimmed_user_context}"
 
     def _trim_context_smart(
         self, 
