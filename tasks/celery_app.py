@@ -6,7 +6,10 @@ and the cloud hosted (Render) version.
 # celery_app.py
 import logging
 import sys
+import asyncio
+import threading
 from celery import Celery
+from celery.signals import worker_init, worker_shutdown
 from celery.signals import after_setup_logger, after_setup_task_logger
 from celery.app.log import TaskFormatter
 from datetime import datetime, timezone
@@ -52,6 +55,59 @@ celery_app = Celery(
 SHOW_CELERY_LOGS = "true"   # os.getenv("SHOW_CELERY_LOGS", "true").lower() == "true"
 SHOW_MANUAL_LOGS = "true"  # os.getenv("SHOW_MANUAL_LOGS", "true").lower() == "true"
 
+# ——— Event Loop ———————————————————————————————————————————————————————————
+
+def _run_event_loop(loop):
+    """Run the event loop in a dedicated thread"""
+    asyncio.set_event_loop(loop)
+    loop.run_forever()
+
+@worker_init.connect
+def worker_init_handler(sender=None, **kwargs):
+    """Initialize persistent event loop when worker starts"""
+    global _worker_loop, _worker_thread
+    
+    # Create new event loop for this worker
+    _worker_loop = asyncio.new_event_loop()
+    
+    # Run it in a dedicated thread
+    _worker_thread = threading.Thread(
+        target=_run_event_loop, 
+        args=(_worker_loop,),
+        daemon=True
+    )
+    _worker_thread.start()
+    
+    print(f"🔄 Worker {sender} initialized with persistent event loop")
+
+@worker_shutdown.connect
+def worker_shutdown_handler(sender=None, **kwargs):
+    """Clean up event loop when worker shuts down"""
+    global _worker_loop, _worker_thread
+    
+    if _worker_loop and not _worker_loop.is_closed():
+        _worker_loop.call_soon_threadsafe(_worker_loop.stop)
+        _worker_loop = None
+    
+    if _worker_thread and _worker_thread.is_alive():
+        _worker_thread.join(timeout=5)
+        _worker_thread = None
+    
+    print(f"🛑 Worker {sender} event loop cleaned up")
+
+def run_async_in_worker(coro):
+    """Run coroutine in the persistent worker event loop"""
+    global _worker_loop
+    
+    if _worker_loop is None or _worker_loop.is_closed():
+        raise RuntimeError("Worker event loop not initialized")
+    
+    # Submit coroutine to the persistent loop and wait for result
+    future = asyncio.run_coroutine_threadsafe(coro, _worker_loop)
+    return future.result()
+
+# ——— Logging & Env Load ———————————————————————————————————————————————————————————
+
 @after_setup_logger.connect
 def setup_loggers(logger, **kwargs):
     """Configurable logger setup with toggles for different log types"""
@@ -95,17 +151,6 @@ def setup_loggers(logger, **kwargs):
         
         print("🔇 Manual logs disabled")
 
-# @after_setup_task_logger.connect
-# def setup_task_loggers(logger, **kwargs):
-#     """
-#     Configure task-specific loggers
-#     """
-#     formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-#     handler = logging.StreamHandler(sys.stdout)
-#     handler.setFormatter(formatter)
-#     logger.addHandler(handler)
-#     logger.setLevel(logging.INFO)
-
 # 🎛️ Update Celery config to respect toggles
 celery_config_updates = {
     "task_serializer": "json",
@@ -138,7 +183,6 @@ import tasks.upload_tasks
 import tasks.note_tasks
 import tasks.sample_tasks
 
-
 # # Optional: ASK GPT ABOUT IT'S PURPOSE: Automatically discover tasks in specified modules
 # # This allows Celery to find tasks in modules like `generate_tasks.py` and `other_tasks.py`
 celery_app.autodiscover_tasks(["tasks"])
@@ -148,3 +192,7 @@ print("🚀 Celery app initialized successfully!")
 print("📋 Registered tasks:")
 print(list(celery_app.tasks.keys()))
 print("✅ Ready to process tasks")
+
+
+# ——— Module Exports ————————————————————————————————————————————————————————————————
+__all__ = ['celery_app', 'run_async_in_worker']

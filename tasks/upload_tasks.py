@@ -65,7 +65,7 @@ from langchain_openai import OpenAIEmbeddings
 import psutil
 
 # ===== PROJECT MODULES =====
-from tasks.celery_app import celery_app
+from tasks.celery_app import celery_app, run_async_in_worker
 from tasks.note_tasks import rag_note_task
 from utils.s3_utils import upload_to_s3, s3_client
 from utils.cloudfront_utils import get_cloudfront_url
@@ -842,8 +842,14 @@ def process_document_batch_workflow(self, file_urls: List[str], metadata: Dict[s
     metadata['create_note'] = create_note
     logger.info(f"🎯 [BATCH-{batch_id[:8]}] 🚀 Starting workflow for {len(file_urls)} documents")
     
+
+    # return asyncio.run(_execute_batch_workflow(batch_id, file_urls, metadata))
+
     # 🧼 CLEAN: One async event loop per task
-    return asyncio.run(_execute_batch_workflow(batch_id, file_urls, metadata))
+    return run_async_in_worker(
+        _execute_batch_workflow(batch_id, file_urls, metadata)
+    )
+    
 
 async def _execute_batch_workflow(batch_id: str, file_urls: List[str], metadata: Dict[str, Any]) -> Dict[str, Any]:
     """

@@ -69,7 +69,7 @@ from celery.exceptions import Retry as CeleryRetry
 import psutil
 
 # ===== PROJECT MODULES =====
-from tasks.celery_app import celery_app
+from tasks.celery_app import celery_app, run_async_in_worker
 from utils.prompt_utils import load_yaml_prompt, build_chat_messages_from_yaml
 from utils.supabase_utils import (
     supabase_client,
@@ -84,6 +84,7 @@ from utils.llm_clients.performance_monitor import PerformanceMonitor    # 🆕 P
 from utils.llm_clients.stream_normalizer import StreamNormalizer        # Format streamed results from several providers
 
 # ——— Logging & Env Load ———————————————————————————————————————————————————————————
+
 logger = get_task_logger(__name__)
 logger.propagate = False
 load_dotenv()
@@ -275,10 +276,10 @@ def get_worker_loop():
         asyncio.set_event_loop(worker_loop)
     return worker_loop
 
-def run_async_in_worker(coro):
-    """Execute async code in the persistent worker loop"""
-    loop = get_worker_loop()
-    return loop.run_until_complete(coro)
+# def run_async_in_worker(coro):
+#     """Execute async code in the persistent worker loop"""
+#     loop = get_worker_loop()
+#     return loop.run_until_complete(coro)
 
 async def init_worker_pools():
     """Initialize all async resources once per worker"""
