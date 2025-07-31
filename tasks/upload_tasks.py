@@ -50,7 +50,7 @@ from psycopg2.pool import ThreadedConnectionPool
 from psycopg2.extras import execute_batch
 
 # ===== CELERY & TASK QUEUE =====
-from celery import chord, group
+from celery import chord, group, chain
 from celery.signals import worker_init, worker_shutdown
 from celery.result import AsyncResult
 from celery.utils.log import get_task_logger
@@ -858,6 +858,13 @@ async def _execute_batch_workflow(batch_id: str, file_urls: List[str], metadata:
     - Downloads and classifies documents concurrently (smart reuse feature)
     - Builds appropriate Celery workflow based on document types
     - Returns workflow execution results
+
+    Batch Level:
+    ├── Document A Chain: parse_only → wait_for_embeddings → COMPLETE
+    ├── Document B Chain: parse_only → wait_for_embeddings → COMPLETE  
+    ├── Document C Chain: parse_only → wait_for_embeddings → FAILED
+    └── finalize_batch_and_create_note (gets clean final results)
+
     """
     project_id = metadata['project_id']
     user_id = metadata['user_id']
@@ -2226,6 +2233,7 @@ def handle_batch_failure(self, batch_id: str, workflow_metadata: Dict[str, Any],
         'errors': errors,
         'note_generation_triggered': False
     }
+
 
 # ——— Advanced Monitoring & Maintenance Tasks (Unchanged from v5) —————————————————
 # NOTE: The highly-praised health check, cleanup, and optimization tasks are
