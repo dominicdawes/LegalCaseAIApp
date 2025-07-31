@@ -1662,10 +1662,16 @@ def finalize_batch_and_create_note(
     workflow_metadata: Dict[str, Any]
 ) -> Dict[str, Any]:
     """
-    [BATCH COORDINATOR] Receives completed workflow results:
-    - Each result is from a completed document workflow (chord result)
-    - Extracts final document status from chord results
-    - Handles the fact that chord results return the finalize_document_processing result
+    Final batch coordinator - analyzes results and triggers note generation.
+    
+    Process:
+    1. Extract final document statuses from workflow results
+    2. Calculate batch success metrics (COMPLETE/PARTIAL/FAILED)
+    3. Trigger RAG note generation for successful batches
+    
+    Handles: AsyncResult extraction, status aggregation, note coordination
+    Input: List of completed document workflow results 
+    Output: Batch summary with note generation status
     """
     project_id = workflow_metadata['project_id']
     logger.info(f"🎯 [BATCH-{batch_id[:8]}] Finalizing batch with {len(workflow_results)} completed workflows")
@@ -1963,10 +1969,6 @@ async def _process_document_async_workflow(
         
         # ——— 3. Process Embeddings (Async with concurrency control) ————————————————
         logger.info(f"📋 [DOC-{short_id}] → EMBEDDING")
-        metadata = {
-            workflow_metadata**,
-            **chunks_metadata
-        }
         embedding_result = await _process_embeddings_async(doc_id, project_id, chunks, chunks_metadata)
         
         if not embedding_result.get('success'):
