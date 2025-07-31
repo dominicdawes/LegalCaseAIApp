@@ -180,6 +180,7 @@ celery_app.conf.update(**celery_config_updates)
 import tasks.chat_tasks
 import tasks.chat_streaming_tasks
 import tasks.upload_tasks_chains_0730
+import tasks.upload_tasks
 import tasks.note_tasks
 import tasks.sample_tasks
 
