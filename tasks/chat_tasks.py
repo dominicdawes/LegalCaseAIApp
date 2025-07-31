@@ -1655,7 +1655,8 @@ def rag_chat_task(
             logger.info(f"🐌 Using LEGACY mode for user {user_id}")
             
             # 🔥 CRITICAL FIX: pass async def function into persistent loop (COTROUTINE → EVENT LOOP)
-            result = run_async_in_worker(_execute_legacy_workflow(
+            result = run_async_in_worker(
+                _execute_legacy_workflow(
                     message_id, user_id, chat_session_id,
                     query, project_id, provider, model_name, temperature
                 )
@@ -1685,23 +1686,23 @@ def rag_chat_task(
     finally:
         gc.collect()
 
-# ✅ SEPARATE ASYNC FUNCTIONS (similatr to your upload_tasks.py)
-async def _execute_streaming_workflow(message_id, user_id, chat_session_id, query, project_id, provider, model_name, temperature):
-    """All streaming async operations happen here"""
-    # 🧼 CLEAN: One async event loop per task
-    return await streaming_manager.process_streaming_query(
-        message_id=message_id,
-        user_id=user_id,
-        chat_session_id=chat_session_id,
-        query=query,
-        project_id=project_id,
-        provider=provider,
-        model_name=model_name,
-        temperature=temperature
-    )
+# ✅ SEPARATE ASYNC FUNCTIONS (similar to your upload_tasks.py)
+# async def _execute_streaming_workflow(message_id, user_id, chat_session_id, query, project_id, provider, model_name, temperature):
+#     """All streaming async operations happen here"""
+#     # 🧼 CLEAN: One async event loop per task
+#     return await streaming_manager.process_streaming_query(
+#         message_id=message_id,
+#         user_id=user_id,
+#         chat_session_id=chat_session_id,
+#         query=query,
+#         project_id=project_id,
+#         provider=provider,
+#         model_name=model_name,
+#         temperature=temperature
+#     )
 
 async def _execute_legacy_workflow(message_id, user_id, chat_session_id, query, project_id, provider, model_name, temperature):
-    """All legacy async operations happen here"""
+    """All Legacy async operations happen here"""
     # 🧼 CLEAN: One async event loop per task
     return await process_legacy_rag(
         message_id, user_id, chat_session_id,
@@ -1743,10 +1744,11 @@ async def process_legacy_rag(
         # Step 3) Generate LLM client (original factory)
         from utils.llm_factory import LLMFactory
         
-        llm_client = LLMFactory.get_client(
+        llm_client = LLMFactory.get_client_for(
             provider=provider, 
             model_name=model_name, 
-            temperature=temperature
+            temperature=temperature,
+            streaming=True
         )
 
         # Step 4) Generate complete answer (blocking)
@@ -1843,7 +1845,7 @@ async def generate_rag_answer_legacy(
 
 # ——— Legacy Support Functions (Enhanced) ————————————————————————————————————————
 
-def fetch_relevant_chunks(query_embedding, project_id, match_count=10):
+def fetch_relevant_chunks_legacy(query_embedding, project_id, match_count=10):
     """
     🔄 Legacy function maintained for backward compatibility
     Now wraps the async version for synchronous calls
@@ -1862,8 +1864,7 @@ def fetch_relevant_chunks(query_embedding, project_id, match_count=10):
     finally:
         loop.close()
 
-
-def fetch_chat_history(chat_session_id):
+def fetch_chat_history_legacy(chat_session_id):
     """🔄 Legacy function - enhanced with status filtering"""
     response = (
         supabase_client.table("messages")
@@ -1875,13 +1876,11 @@ def fetch_chat_history(chat_session_id):
     )
     return response.data
 
-
 def format_chat_history(chat_history):
     """🔄 Legacy function maintained"""
     return "".join(
         f"{m['role'].capitalize()}: {m['content']}\n" for m in chat_history
     ).strip()
-
 
 def trim_context_length(full_context, query, relevant_chunks, model_name, max_tokens):
     """🔄 Legacy function maintained with enhanced tokenizer support"""
@@ -1913,7 +1912,6 @@ def trim_context_length(full_context, query, relevant_chunks, model_name, max_to
     
     return history
 
-
 # ——— Session Management (Enhanced from Original) ————————————————————————————————
 
 @celery_app.task(bind=True, base=BaseTaskWithRetry)
@@ -1942,7 +1940,6 @@ def new_chat_session(self, user_id, project_id):
     except Exception as e:
         logger.error(f"❌ Chat session creation failed: {e}", exc_info=True)
         raise self.retry(exc=e)
-
 
 def restart_chat_session(user_id: str, project_id: str) -> str:
     """🔄 Enhanced chat session restart (maintains legacy interface)"""
@@ -2029,7 +2026,7 @@ def worker_shutdown_handler(sender, **kwargs):
         
     except Exception as e:
         logger.error(f"❌ Worker shutdown error: {e}")
-        
+
 # ——— Health Check Functions ————————————————————————————————————————————————
 
 async def check_db_pool_health() -> bool:
@@ -2046,7 +2043,6 @@ async def check_db_pool_health() -> bool:
         logger.warning(f"⚠️ Database pool health check failed: {e}")
         return False
 
-
 async def check_redis_pool_health() -> bool:
     """Check if Redis pool is healthy"""
     if not redis_pool:
@@ -2061,7 +2057,7 @@ async def check_redis_pool_health() -> bool:
         logger.warning(f"⚠️ Redis pool health check failed: {e}")
         return False
     
-# ——— [TO BE DALETED] Legacy Compatibility Stubs ————————————————————————————————————————————————
+# ——— [TO BE DELETED] Legacy Compatibility Stubs ————————————————————————————————————————————————
 
 # # 🔄 Maintain original callback handler for backward compatibility
 # def publish_token(chat_session_id: str, token: str):

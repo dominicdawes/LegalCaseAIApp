@@ -346,8 +346,11 @@ def rag_note_task(
             raise ValueError(f"Unsupported note_type: {note_type}")
 
         # Step 5) Generate llm client from factory
-        llm_client = LLMFactory.get_client(
-            provider=provider, model_name=model_name, temperature=temperature
+        llm_client = LLMFactory.get_client_for(
+            provider=provider, 
+            model_name=model_name, 
+            temperature=temperature,
+            streaming=True
         )
 
         # Step 6) Generate answer for client
