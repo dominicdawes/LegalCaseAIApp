@@ -52,7 +52,7 @@ from psycopg2.extras import execute_batch
 # ===== CELERY & TASK QUEUE =====
 from celery import chord, group, chain
 from celery.signals import worker_init, worker_shutdown
-from celery.result import AsyncResult
+from celery.result import AsyncResult, EagerResult
 from celery.utils.log import get_task_logger
 from celery.exceptions import MaxRetriesExceededError
 from celery.exceptions import Retry as CeleryRetry
@@ -803,567 +803,7 @@ def get_clean_filename_from_url(url: str, extension: str) -> str:
     # Final fallback
     return f"document_{uuid.uuid4().hex[:8]}{extension}"
 
-# ——— Task 1: Kickoff & Coordinate Ingest (Fully Async) ———————————————————————————————————————————  
-
-@celery_app.task(bind=True)
-def test_celery_log_task(self) -> str:
-    """Test task with multiple logging methods to ensure visibility"""
-    task_id = self.request.id
-
-    
-    # Method 2: Celery task logger
-    logger.info(f"📊 [TASK_LOGGER] Task {task_id} - testing Info level task logger working")
-    logger.warning(f"⚠️  [TASK_LOGGER] Task {task_id} - Warning level message")
-    logger.error(f"❌ [TASK_LOGGER] Task {task_id} - Error level message (not a real error)")
-    
-    # Return a success message
-    result = f"Task {task_id} completed successfully with all logging methods tested"
-    print(f"✅ [PRINT] {result}")
-    
-    return result
-
-
-@celery_app.task(bind=True, queue=INGEST_QUEUE, acks_late=True)
-def process_document_batch_workflow(self, file_urls: List[str], metadata: Dict[str, Any], create_note: bool = False) -> Dict[str, Any]:
-    """
-    [ORCHESTRATOR] Master workflow coordinator for batch document processing:
-    - Handles mixed new/reused document scenarios intelligently
-    - Uses Celery's group + chord pattern for distributed coordination
-    - Ensures exactly ONE note generation per batch regardless of document mix
-    - Scales horizontally without database coordination bottlenecks
-    
-    Workflow Steps:
-    1. Analyze batch: separate new vs reused documents
-    2. Process new documents via async pipeline (group of tasks)
-    3. Process reused documents via lightweight sync tasks  
-    4. Coordinate completion via chord → single note generation
-    """
-    batch_id = str(uuid.uuid4())
-    # metadata['batch_id'] = batch_id
-    metadata['create_note'] = create_note
-    logger.info(f"🎯 [BATCH-{batch_id[:8]}] 🚀 Starting workflow for {len(file_urls)} documents")
-    
-
-    # return asyncio.run(_execute_batch_workflow(batch_id, file_urls, metadata))
-
-    # 🧼 CLEAN: One persistent async event loop per task
-    return run_async_in_worker(
-        _execute_batch_workflow(batch_id, file_urls, metadata)
-    )
-    
-
-async def _execute_batch_workflow(batch_id: str, file_urls: List[str], metadata: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    [ASYNC COORDINATOR] Executes the full batch workflow:
-    - Downloads and classifies documents concurrently (smart reuse feature)
-    - Builds appropriate Celery workflow based on document types
-    - Returns workflow execution results
-
-    Batch Level:
-    ├── Document A Chain: parse_only → wait_for_embeddings → COMPLETE
-    ├── Document B Chain: parse_only → wait_for_embeddings → COMPLETE  
-    ├── Document C Chain: parse_only → wait_for_embeddings → FAILED
-    └── finalize_batch_and_create_note (gets clean final results)
-
-    """
-    project_id = metadata['project_id']
-    user_id = metadata['user_id']
-    
-    # ——— Step 1: Concurrent Document Analysis ————————————————————————————————————
-    logger.info(f"🔍 [BATCH-{batch_id[:8]}] Analyzing document types...")
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        analysis_tasks = [
-            _analyze_document_for_workflow(client, url, project_id, user_id) 
-            for url in file_urls
-        ]
-        analysis_results = await asyncio.gather(*analysis_tasks, return_exceptions=True)
-    
-    # ——— Step 2: Classify Documents by Processing Type ———————————————————————————
-    new_documents = []
-    reused_documents = []
-    duplicate_documents = []  # Track same-project duplicates separately
-    failed_downloads = []
-    
-    for result in analysis_results:
-        if isinstance(result, Exception):
-            failed_downloads.append(str(result))
-            continue
-        
-        if result['processing_type'] == 'NEW':
-            new_documents.append(result)
-        elif result['processing_type'] == 'REUSED':
-            reused_documents.append(result)
-        elif result['processing_type'] == 'DUPLICATE':
-            duplicate_documents.append(result)
-            logger.info(f"📋 [BATCH-{batch_id[:8]}] Duplicate document skipped: {result.get('content_hash', 'unknown')[:8]}")
-        else:
-            failed_downloads.append(f"Unknown processing type: {result}")
-    
-    logger.info(f"📊 [BATCH-{batch_id[:8]}] Classification complete:")
-    logger.info(f"   🆕 New documents: {len(new_documents)}")
-    logger.info(f"   ♻️  Reused documents: {len(reused_documents)}")
-    logger.info(f"   📋 Duplicate documents: {len(duplicate_documents)}")
-    logger.info(f"   ❌ Failed downloads: {len(failed_downloads)}")
-
-    # flattened dictionary
-    workflow_metadata = {
-        **metadata,
-        'batch_id': batch_id,
-        'total_documents': len(file_urls),
-        'new_count': len(new_documents),
-        'reused_count': len(reused_documents),
-        'duplicate_count': len(duplicate_documents),
-        'failed_count': len(failed_downloads)
-    }
-    
-    # ——— Step 3: Determine Processing Path (ALL REUSED vs NEW/MIXED) ———————————————————————————————————————————
-
-    processing_tasks = []
-    
-    # Calculate processable documents (EXCLUDE duplicates and failures) 
-    processable_docs = len(new_documents) + len(reused_documents)
-    
-    # ——— 1️⃣ Path A: Early exit if nothing to process ———————————————————————————————————————
-    if processable_docs == 0:
-        logger.warning(f"⚠️ [BATCH-{batch_id[:8]}] No processable documents - all duplicates or failed")
-        
-        # Still trigger note generation if only duplicates (documents ALREADY exist in CURRENT USER project)
-        if len(duplicate_documents) > 0 and workflow_metadata.get('create_note'):
-            logger.info(f"📝 [BATCH-{batch_id[:8]}] Triggering note for duplicate-only batch")
-            return await _handle_duplicate_only_batch(batch_id, project_id, workflow_metadata, duplicate_documents)
-        
-        # Otherwise handle as complete failure
-        handle_batch_failure.apply_async((batch_id, workflow_metadata, failed_downloads))
-        return {
-            'batch_id': batch_id,
-            'status': 'BATCH_FAILED',
-            'reason': 'No processable documents (all duplicates or failed)'
-        }
-
-    # ——— 2️⃣ Path B: All-Reused ⚡Fast Track ———————————————————————————————————————
-    if len(reused_documents) == processable_docs and len(reused_documents) > 0:     
-        logger.info(f"⚡ [BATCH-{batch_id[:8]}] All-reused batch - fast track processing")
-        
-        # Still need full reused document pipeline for row copying
-        for doc_info in reused_documents:
-            task_sig = process_reused_document_task.s(
-                doc_info['existing_doc_id'],
-                doc_info['doc_data'], 
-                doc_info['project_id'],
-                workflow_metadata
-            )
-            processing_tasks.append(task_sig)
-            
-        # Celery chord optimized for reused-only scenario
-        logger.info(f"🚀 [BATCH-{batch_id[:8]}] Launching coordinated REUSED workflow with {len(processing_tasks)} tasks")
-        workflow = chord(
-            group(processing_tasks),
-            finalize_batch_and_create_note.s(batch_id, workflow_metadata).set(queue=FINAL_QUEUE)
-        )
-        
-        # Execute the workflow
-        chord_result = workflow.apply_async()
-
-        return {
-            'batch_id': batch_id,
-            'workflow_id': chord_result.id,
-            'processing_tasks': len(processing_tasks),
-            'workflow_path': 'ALL_REUSED_FAST_TRACK',
-            'status': 'WORKFLOW_LAUNCHED'
-        }
-
-    
-    # ——— 3️⃣ Path C: Mixed/New Documents Standard Workflow ——————————————————————————
-    else:      
-        logger.info(f"🔄 [BATCH-{batch_id[:8]}] Mixed batch - standard workflow processing")
-        
-        document_chains = []
-        
-        # For NEW documents: Create complete chain
-        for doc_info in new_documents:
-            # Chain: parse_only → wait_for_embeddings → return_final_status
-            complete_document_chain = chain(
-                process_new_document_parse_only.s(  # NEW: Only does parsing
-                    doc_info['doc_data'], 
-                    doc_info['project_id'], 
-                    workflow_metadata
-                ),
-                wait_for_document_embeddings.s()    # NEW: Waits for embeddings
-            )
-            document_chains.append(complete_document_chain)
-        
-        # For REUSED documents: Simple single task (already complete)
-        for doc_info in reused_documents:
-            reused_task = process_reused_document_task.s(
-                doc_info['existing_doc_id'],
-                doc_info['doc_data'],
-                doc_info['project_id'],
-                workflow_metadata
-            )
-            document_chains.append(reused_task)
-
-        # ——— Batch Coordination: Wait for ALL document chains ———————————————————————
-        logger.info(f"🚀 [BATCH-{batch_id[:8]}] Launching {len(document_chains)} complete document chains")
-        
-        batch_workflow = chord(
-            group(document_chains),  # All document chains run in parallel
-            finalize_batch_and_create_note.s(batch_id, workflow_metadata)  # Triggered when ALL chains complete
-        )
-        
-        chord_result = batch_workflow.apply_async()
-        
-        return {
-            'batch_id': batch_id,
-            'workflow_id': chord_result.id,
-            'document_chains': len(document_chains),
-            'workflow_path': 'COMPLETE_DOCUMENT_CHAINS',
-            'status': 'WORKFLOW_LAUNCHED'
-        }
-
-# ——— Specialized Processing Tasks ————————————————————————————————————————————————
-
-@celery_app.task(bind=True, queue=INGEST_QUEUE, acks_late=True)
-def process_new_document_parse_only(
-    self, 
-    doc_data: Dict[str, Any], 
-    project_id: str, 
-    workflow_metadata: Dict[str, Any]
-) -> Dict[str, Any]:
-    """
-    [PARSE ONLY] Process document through parsing phase only:
-    - Insert document record
-    - Parse and create embedding tasks (but don't wait)
-    - Return parsing results for next task in chain
-    """
-    doc_id = str(uuid.uuid4())
-    doc_data['id'] = doc_id
-    
-    try:
-        # ——— Insert Document Record ———————————————————————————————————————————————
-        pool = get_sync_db_pool()
-        conn = pool.getconn()
-        try:
-            with conn.cursor() as cur:
-                cur.execute(
-                    '''INSERT INTO document_sources 
-                    (id, cdn_url, content_hash, project_id, content_tags, uploaded_by, 
-                    vector_embed_status, filename, file_size_bytes, file_extension, created_at, processing_metadata)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)''',
-                    (doc_id, doc_data['cdn_url'], doc_data['content_hash'], 
-                    project_id, doc_data.get('content_tags', []), workflow_metadata['user_id'],
-                    ProcessingStatus.PENDING.value, doc_data['filename'], 
-                    doc_data['file_size_bytes'], os.path.splitext(doc_data['filename'])[1].lower(),
-                    datetime.now(timezone.utc), Json(workflow_metadata))
-                )
-                conn.commit()
-        finally:
-            pool.putconn(conn)
-        
-        # ——— Parse Document (Same as before, but return chord ID) ————————————————
-        parse_result = _parse_document_for_workflow(
-            self, doc_id, doc_data['cdn_url'], project_id, workflow_metadata
-        )
-        
-        if parse_result.get('status') == 'PARSING_COMPLETE':
-            # Return info needed for next task to wait for embeddings
-            return {
-                'doc_id': doc_id,
-                'processing_type': 'NEW',
-                'status': 'PARSING_COMPLETE',
-                'chunks_created': parse_result.get('total_chunks', 0),
-                'embedding_chord_id': parse_result.get('chord_id'),  # Pass chord ID to next task
-                'performance_metrics': parse_result.get('performance_metrics', {})
-            }
-        else:
-            # Parsing failed
-            return {
-                'doc_id': doc_id,
-                'processing_type': 'NEW',
-                'status': 'FAILED',
-                'error': parse_result.get('error', 'Parsing failed'),
-                'chunks_created': 0
-            }
-            
-    except Exception as e:
-        logger.error(f"❌ [DOC-{doc_id[:8]}] Document parsing failed: {e}")
-        return {
-            'doc_id': doc_id,
-            'processing_type': 'NEW',
-            'status': 'FAILED',
-            'error': str(e)
-        }
-    
-async def _handle_duplicate_only_batch(batch_id: str, project_id: str, workflow_metadata: Dict[str, Any], duplicate_docs: List[Dict]) -> Dict[str, Any]:
-    """  
-    [DUPLICATE HANDLER] Handle batches containing only duplicate documents:
-    - Documents already EXIST in this project, so no processing needed (It;s a type of USER dumb error)
-    - Can still generate notes using existing document content
-    """
-    # Remeber to update do the UI recieves a SUPABASE REALTRINE update
-    _update_batch_progress_sync(batch_id, project_id, BatchProgressStatus.BATCH_COMPLETE)
-    logger.info(f"📋 [BATCH-{batch_id[:8]}] Handling duplicate-only batch with {len(duplicate_docs)} documents")
-    
-    if workflow_metadata.get('create_note'):
-        # Enhance metadata for duplicate-only note generation
-        note_metadata = {
-            **workflow_metadata,
-            'batch_status': 'DUPLICATE_ONLY',
-            'duplicate_document_ids': [doc.get('existing_doc_id') for doc in duplicate_docs],
-            'processing_context': f'All {len(duplicate_docs)} documents already exist in project'
-        }
-        
-        logger.info(f"🎯 [BATCH-{batch_id[:8]}] Triggering note generation for duplicate-only batch")
-        rag_note_task.apply_async(kwargs={
-            "user_id": note_metadata["user_id"],
-            "note_type": note_metadata["note_type"], 
-            "project_id": note_metadata["project_id"],
-            "note_title": note_metadata["note_title"],
-            "provider": note_metadata.get("provider"),
-            "model_name": note_metadata.get("model_name"), 
-            "temperature": note_metadata.get("temperature"),
-            "addtl_params": {
-                **note_metadata.get("addtl_params", {}),
-                'batch_context': {
-                    'batch_id': batch_id,
-                    'batch_status': 'DUPLICATE_ONLY',
-                    'document_count': len(duplicate_docs),
-                    'duplicate_doc_ids': note_metadata['duplicate_document_ids']
-                }
-            }
-        })
-    
-    return {
-        'batch_id': batch_id,
-        'status': 'DUPLICATE_ONLY_COMPLETE',
-        'duplicate_documents': len(duplicate_docs),
-        'note_generation_triggered': workflow_metadata.get('create_note', False)
-    }
-
-@celery_app.task(bind=True, queue=INGEST_QUEUE, acks_late=True)
-def process_new_document_task(self, doc_data: Dict[str, Any], project_id: str, workflow_metadata: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    [NEW DOC PIPELINE] Process completely new document (SINGULAR) through full pipeline:
-    - Insert document record `public.document_sources`
-    - Pass document to `_parse_document_for_workflow` to → Fetch Loader → Parse → Embed → Store vectors
-    - Returns processing results for workflow coordination
-
-    process_new_document_task
-    ↓
-    _parse_document_for_workflow (creates embedding chord)
-    ↓
-    [embed_batch_task, embed_batch_task, ...] (parallel)
-    ↓
-    finalize_document_processing (triggered by chord)
-    ↓
-    finalize_batch_and_create_note (batch-level coordination)
-    """
-    doc_id = str(uuid.uuid4())
-    doc_data['id'] = doc_id
-    
-    try:
-        # ——— Insert Document Record ———————————————————————————————————————————————
-
-        pool = get_sync_db_pool()
-        conn = pool.getconn()
-        try:
-            with conn.cursor() as cur:
-                cur.execute(
-                    '''INSERT INTO document_sources 
-                    (id, cdn_url, content_hash, project_id, content_tags, uploaded_by, 
-                    vector_embed_status, filename, file_size_bytes, file_extension, created_at, processing_metadata)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)''',
-                    (doc_id, doc_data['cdn_url'], doc_data['content_hash'], 
-                    project_id, doc_data.get('content_tags', []), workflow_metadata['user_id'],
-                    ProcessingStatus.PENDING.value, doc_data['filename'], 
-                    doc_data['file_size_bytes'], os.path.splitext(doc_data['filename'])[1].lower(),
-                    datetime.now(timezone.utc), Json(workflow_metadata))
-                )
-                conn.commit()
-        finally:
-            pool.putconn(conn)
-        
-        # ——— Launch Parsing (which → schedules embeddings) ——————————————————————————
-        _update_batch_progress_sync(workflow_metadata['batch_id'], project_id, BatchProgressStatus.BATCH_PARSING)
-
-        # Parse Document (this will return PARSING_COMPLETE and schedule embeddings)
-        # document_cdn → select optimal loader → clean/chunk → embed)
-        parse_result = _parse_document_for_workflow(
-            self, doc_id, doc_data['cdn_url'], project_id, workflow_metadata
-        )
-        
-        # ——— Check Parse Result and Return ————————————————————————————————————————
-        if parse_result.get('status') == 'PARSING_COMPLETE':
-            # Parsing succeeded, embeddings are scheduled
-            return {
-                'doc_id': doc_id,
-                'processing_type': 'NEW',
-                'status': 'PARSING_COMPLETE',  # This indicates embeddings are in progress
-                'chunks_created': parse_result.get('total_chunks', 0),
-                'embedding_tasks_scheduled': parse_result.get('embedding_tasks_scheduled', 0),
-                'performance_metrics': parse_result.get('performance_metrics', {})
-            }
-        else:
-            # Parsing failed
-            logger.error(f"❌ [DOC-{doc_id[:8]}] Document parsing failed")
-            return {
-                'doc_id': doc_id,
-                'processing_type': 'NEW',
-                'status': 'FAILED',
-                'error': parse_result.get('error', 'Unknown parsing failure'),
-                'chunks_created': 0
-            }
-        
-    except Exception as e:
-        logger.error(f"❌ [DOC-{doc_id[:8]}] New document processing failed: {e}")
-        _update_document_status_sync(doc_id, ProcessingStatus.FAILED_PARSING, str(e))
-        return {
-            'doc_id': doc_id,
-            'processing_type': 'NEW', 
-            'status': 'FAILED',
-            'error': str(e)
-        }
-
-@celery_app.task(bind=True, queue=INGEST_QUEUE, acks_late=True)  
-def process_reused_document_task(
-    self, 
-    existing_doc_id: str, 
-    doc_data: Dict[str, Any], 
-    project_id: str, 
-    workflow_metadata: Dict[str, Any]
-) -> Dict[str, Any]:
-    """
-    [REUSED DOC PIPELINE] Smart reuse: copy existing embeddings to new project:
-    - Create new document entry → Copy embeddings → Mark complete
-        * New document entry is created from a reused document ♻️
-        * Embeddings are copied from existing processed document ♻️ as a shortcut
-    - Much faster than full processing pipeline
-    - Returns processing results for workflow coordination
-    """
-    new_doc_id = str(uuid.uuid4())
-    
-    try:
-        # ——— Create New Document Entry + Copy Embeddings ——————————————————————————
-        pool = get_sync_db_pool()
-        conn = pool.getconn()
-        
-        try:
-            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-                # FIND source document info for copying
-                cur.execute(
-                    'SELECT total_chunks, total_batches FROM document_sources WHERE id = %s',
-                    (existing_doc_id,)
-                )
-                source_info = cur.fetchone()
-                
-                if not source_info:
-                    raise Exception(f"Source document {existing_doc_id} not found")
-                
-                # INSERT new document record with completed status
-                cur.execute(
-                    '''INSERT INTO document_sources 
-                    (id, cdn_url, content_hash, project_id, content_tags, uploaded_by, 
-                    vector_embed_status, filename, file_size_bytes, file_extension, 
-                    total_chunks, total_batches, created_at, processing_metadata)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, s%)''',
-                    (new_doc_id, doc_data['cdn_url'], doc_data['content_hash'], 
-                    project_id, doc_data.get('content_tags', []), workflow_metadata['user_id'],
-                    ProcessingStatus.COMPLETE.value, doc_data['filename'], 
-                    doc_data['file_size_bytes'], os.path.splitext(doc_data['filename'])[1].lower(),
-                    source_info['total_chunks'], source_info['total_batches'],
-                    datetime.now(timezone.utc), Json(workflow_metadata))
-                )
-        finally:
-            pool.putconn(conn)
-        
-        # ——— Copy Embeddings (reuse existing sync function) ————————————————————————
-        copy_result = copy_embeddings_for_project_sync(
-            existing_doc_id, 
-            new_doc_id, 
-            project_id, 
-            workflow_metadata['user_id']
-        )
-        
-        logger.info(f"♻️ [DOC-{new_doc_id[:8]}] Smart reuse complete: {copy_result['copied_count']} chunks")
-        return {
-            'doc_id': new_doc_id,
-            'processing_type': 'REUSED',
-            'status': 'COMPLETE',
-            'chunks_reused': copy_result['copied_count'],
-            'tokens_reused': copy_result['total_tokens']
-        }
-        
-    except Exception as e:
-        logger.error(f"❌ [DOC-{new_doc_id[:8]}] Reused document processing failed: {e}")
-        return {
-            'doc_id': new_doc_id,
-            'processing_type': 'REUSED',
-            'status': 'FAILED', 
-            'error': str(e)
-        }
-
-@celery_app.task(bind=True, queue=INGEST_QUEUE, acks_late=True)
-def wait_for_document_embeddings(
-    self, 
-    parse_result: Dict[str, Any]
-) -> Dict[str, Any]:
-    """
-    [EMBEDDING WAITER] Waits for embeddings using Celery's AsyncResult:
-    - Takes parse result with chord ID
-    - Uses AsyncResult.get() to wait (this is OK because it's the MAIN task purpose)
-    - Returns final document status
-    
-    KEY: This task's ONLY job is waiting, so .get() is appropriate here!
-    """
-    doc_id = parse_result['doc_id']
-    short_id = doc_id[:8]
-    
-    # Check if parsing succeeded
-    if parse_result.get('status') != 'PARSING_COMPLETE':
-        logger.error(f"❌ [DOC-{short_id}] Cannot wait for embeddings - parsing failed")
-        return parse_result  # Return the failed parse result
-    
-    embedding_chord_id = parse_result.get('embedding_chord_id')
-    if not embedding_chord_id:
-        # No embeddings (empty document case)
-        logger.info(f"✅ [DOC-{short_id}] No embeddings needed - document complete")
-        return {
-            **parse_result,
-            'status': 'COMPLETE',
-            'final_chunks': parse_result.get('chunks_created', 0)
-        }
-    
-    # ——— Wait for Embedding Chord Completion (This IS the task's purpose!) ———————
-    logger.info(f"⏳ [DOC-{short_id}] Waiting for embedding chord completion...")
-    
-    try:
-        chord_result = AsyncResult(embedding_chord_id)
-        
-        # This .get() call is OK because:
-        # 1. This task's ONLY purpose is waiting
-        # 2. It's not a nested task call - it's waiting for a separate workflow
-        # 3. The chord runs independently of this task
-        final_embedding_result = chord_result.get(timeout=300)  # 5 minute timeout
-        
-        logger.info(f"✅ [DOC-{short_id}] Embeddings completed successfully")
-        
-        # Return the final result from finalize_document_processing
-        return final_embedding_result
-        
-    except Exception as e:
-        logger.error(f"❌ [DOC-{short_id}] Embedding wait failed: {e}")
-        
-        # Update document status to failed
-        _update_document_status_sync(doc_id, ProcessingStatus.FAILED_EMBEDDING, str(e))
-        
-        return {
-            'doc_id': doc_id,
-            'processing_type': 'NEW',
-            'status': 'FAILED',
-            'error': f'Embedding completion failed: {str(e)}',
-            'chunks_created': parse_result.get('chunks_created', 0)
-        }
-
-# ——— Task 2: 🔍 Document Analysis & Classification ——————————————————————————————————————————
+# ——— Utils: 🔍 Document Analysis & Classification ——————————————————————————————————————————
 
 async def _analyze_document_for_workflow(
     client: httpx.AsyncClient, 
@@ -1560,9 +1000,818 @@ async def _download_and_prep_doc(client: httpx.AsyncClient, url: str, project_id
         logger.error(f"Failed to download and prep {url}: {e}")
         return None
 
+
+# ——— Task 1: Kickoff & Coordinate Ingest (Fully Async) ———————————————————————————————————————————  
+
+@celery_app.task(bind=True)
+def test_celery_log_task(self) -> str:
+    """Test task with multiple logging methods to ensure visibility"""
+    task_id = self.request.id
+
+    
+    # Method 2: Celery task logger
+    logger.info(f"📊 [TASK_LOGGER] Task {task_id} - testing Info level task logger working")
+    logger.warning(f"⚠️  [TASK_LOGGER] Task {task_id} - Warning level message")
+    logger.error(f"❌ [TASK_LOGGER] Task {task_id} - Error level message (not a real error)")
+    
+    # Return a success message
+    result = f"Task {task_id} completed successfully with all logging methods tested"
+    print(f"✅ [PRINT] {result}")
+    
+    return result
+
+
+@celery_app.task(bind=True, queue=INGEST_QUEUE, acks_late=True)
+def process_document_batch_workflow(self, file_urls: List[str], metadata: Dict[str, Any], create_note: bool = False) -> Dict[str, Any]:
+    """
+    [ORCHESTRATOR] Master workflow coordinator for batch document processing:
+    - Handles mixed new/reused document scenarios intelligently
+    - Uses Celery's group + chord pattern for distributed coordination
+    - Ensures exactly ONE note generation per batch regardless of document mix
+    - Scales horizontally without database coordination bottlenecks
+    
+    Workflow Steps:
+    1. Analyze batch: separate new vs reused documents
+    2. Process new documents via async pipeline (group of tasks)
+    3. Process reused documents via lightweight sync tasks  
+    4. Coordinate completion via chord → single note generation
+    """
+    batch_id = str(uuid.uuid4())
+    # metadata['batch_id'] = batch_id
+    metadata['create_note'] = create_note
+    logger.info(f"🎯 [BATCH-{batch_id[:8]}] 🚀 Starting workflow for {len(file_urls)} documents")
+    
+
+    # return asyncio.run(_execute_batch_workflow(batch_id, file_urls, metadata))
+
+    # 🧼 CLEAN: One persistent async event loop per task
+    return run_async_in_worker(
+        _execute_batch_workflow(batch_id, file_urls, metadata)
+    )
+    
+async def _execute_batch_workflow(batch_id: str, file_urls: List[str], metadata: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    [ASYNC COORDINATOR] Executes the full batch workflow:
+    - Downloads and classifies documents concurrently (smart reuse feature)
+    - Builds appropriate Celery workflow based on document types
+    - Returns workflow execution results
+
+    Batch Level:
+    ├── Document A Chain: parse_only → wait_for_embeddings → COMPLETE
+    ├── Document B Chain: parse_only → wait_for_embeddings → COMPLETE  
+    ├── Document C Chain: parse_only → wait_for_embeddings → FAILED
+    └── finalize_batch_and_create_note (gets clean final results)
+
+    """
+    project_id = metadata['project_id']
+    user_id = metadata['user_id']
+    
+    # ——— Step 1: Concurrent Document Analysis ————————————————————————————————————
+    logger.info(f"🔍 [BATCH-{batch_id[:8]}] Analyzing document types...")
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        analysis_tasks = [
+            _analyze_document_for_workflow(client, url, project_id, user_id) 
+            for url in file_urls
+        ]
+        analysis_results = await asyncio.gather(*analysis_tasks, return_exceptions=True)
+    
+    # ——— Step 2: Classify Documents by Processing Type ———————————————————————————
+    new_documents = []
+    reused_documents = []
+    duplicate_documents = []  # Track same-project duplicates separately
+    failed_downloads = []
+    
+    for result in analysis_results:
+        if isinstance(result, Exception):
+            failed_downloads.append(str(result))
+            continue
+        
+        if result['processing_type'] == 'NEW':
+            new_documents.append(result)
+        elif result['processing_type'] == 'REUSED':
+            reused_documents.append(result)
+        elif result['processing_type'] == 'DUPLICATE':
+            duplicate_documents.append(result)
+            logger.info(f"📋 [BATCH-{batch_id[:8]}] Duplicate document skipped: {result.get('content_hash', 'unknown')[:8]}")
+        else:
+            failed_downloads.append(f"Unknown processing type: {result}")
+    
+    logger.info(f"📊 [BATCH-{batch_id[:8]}] Classification complete:")
+    logger.info(f"   🆕 New documents: {len(new_documents)}")
+    logger.info(f"   ♻️  Reused documents: {len(reused_documents)}")
+    logger.info(f"   📋 Duplicate documents: {len(duplicate_documents)}")
+    logger.info(f"   ❌ Failed downloads: {len(failed_downloads)}")
+
+    # flattened dictionary
+    workflow_metadata = {
+        **metadata,
+        'batch_id': batch_id,
+        'total_documents': len(file_urls),
+        'new_count': len(new_documents),
+        'reused_count': len(reused_documents),
+        'duplicate_count': len(duplicate_documents),
+        'failed_count': len(failed_downloads)
+    }
+    
+    # ——— Step 3: Determine Processing Path (ALL REUSED vs NEW/MIXED) ———————————————————————————————————————————
+
+    processing_tasks = []
+    
+    # Calculate processable documents (EXCLUDE duplicates and failures) 
+    processable_docs = len(new_documents) + len(reused_documents)
+    
+    # ——— 1️⃣ Path A: Early exit if nothing to process ———————————————————————————————————————
+    if processable_docs == 0:
+        logger.warning(f"⚠️ [BATCH-{batch_id[:8]}] No processable documents - all duplicates or failed")
+        
+        # Still trigger note generation if only duplicates (documents ALREADY exist in CURRENT USER project)
+        if len(duplicate_documents) > 0 and workflow_metadata.get('create_note'):
+            logger.info(f"📝 [BATCH-{batch_id[:8]}] Triggering note for duplicate-only batch")
+            return await _handle_duplicate_only_batch(batch_id, project_id, workflow_metadata, duplicate_documents)
+        
+        # Otherwise handle as complete failure
+        handle_batch_failure.apply_async((batch_id, workflow_metadata, failed_downloads))
+        return {
+            'batch_id': batch_id,
+            'status': 'BATCH_FAILED',
+            'reason': 'No processable documents (all duplicates or failed)'
+        }
+
+    # ——— 2️⃣ Path B: All-Reused ⚡Fast Track ———————————————————————————————————————
+    if len(reused_documents) == processable_docs and len(reused_documents) > 0:     
+        logger.info(f"⚡ [BATCH-{batch_id[:8]}] All-reused batch - fast track processing")
+        
+        # Still need full reused document pipeline for row copying
+        for doc_info in reused_documents:
+            task_sig = process_reused_document_task.s(
+                doc_info['existing_doc_id'],
+                doc_info['doc_data'], 
+                doc_info['project_id'],
+                workflow_metadata
+            )
+            processing_tasks.append(task_sig)
+            
+        # Celery chord optimized for reused-only scenario
+        logger.info(f"🚀 [BATCH-{batch_id[:8]}] Launching coordinated REUSED workflow with {len(processing_tasks)} tasks")
+        workflow = chord(
+            group(processing_tasks),
+            finalize_batch_and_create_note.s(batch_id, workflow_metadata).set(queue=FINAL_QUEUE)
+        )
+        
+        # Execute the workflow
+        chord_result = workflow.apply_async()
+
+        return {
+            'batch_id': batch_id,
+            'workflow_id': chord_result.id,
+            'processing_tasks': len(processing_tasks),
+            'workflow_path': 'ALL_REUSED_FAST_TRACK',
+            'status': 'WORKFLOW_LAUNCHED'
+        }
+
+    
+    # ——— 3️⃣ Path C: Mixed/New Documents Standard Workflow ——————————————————————————
+    else:      
+        logger.info(f"🔄 [BATCH-{batch_id[:8]}] Mixed batch - standard workflow processing")
+        
+        document_workflow_promises = []
+        
+        # For NEW documents: Create workflow promise
+        for doc_info in new_documents:
+            workflow_promise = create_document_embedding_workflow.s(
+                doc_info['doc_data'], 
+                doc_info['project_id'], 
+                workflow_metadata
+            )
+            document_workflow_promises.append(workflow_promise)
+        
+        # For REUSED documents: Simple task promise
+        for doc_info in reused_documents:
+            reused_promise = process_reused_document_task.s(
+                doc_info['existing_doc_id'],
+                doc_info['doc_data'],
+                doc_info['project_id'],
+                workflow_metadata
+            )
+            document_workflow_promises.append(reused_promise)
+
+        # ——— Batch Coordination with Promises ————————————————————————————————————————
+        logger.info(f"🚀 [BATCH-{batch_id[:8]}] Launching {len(document_workflow_promises)} document workflow promises")
+        
+        # The key: we're coordinating workflow PROMISES, not intermediate results
+        batch_workflow = chord(
+            group(document_workflow_promises),
+            finalize_batch_and_create_note.s(batch_id, workflow_metadata)
+        )
+        
+        chord_result = batch_workflow.apply_async()
+        
+        return {
+            'batch_id': batch_id,
+            'workflow_id': chord_result.id,
+            'document_workflows': len(document_workflow_promises),
+            'workflow_path': 'CALLBACK_PATTERN',
+            'status': 'WORKFLOW_LAUNCHED'
+        }
+
+# ——— Processing Tasks ————————————————————————————————————————————————
+
+@celery_app.task(bind=True, queue=INGEST_QUEUE, acks_late=True)
+def create_document_embedding_workflow(
+    self, 
+    doc_data: Dict[str, Any], 
+    project_id: str, 
+    workflow_metadata: Dict[str, Any]
+) -> AsyncResult:
+    """
+    [WORKFLOW CREATOR] Creates and returns a document processing workflow:
+    - Parse document and create embedding tasks
+    - Create embedding chord with finalization callback
+    - Return the chord promise (not the result!)
+    
+    KEY: This returns a Celery AsyncResult that the batch can wait for
+    """
+    doc_id = str(uuid.uuid4())
+    doc_data['id'] = doc_id
+    
+    try:
+        # ——— Insert Document Record ———————————————————————————————————————————————
+        pool = get_sync_db_pool()
+        conn = pool.getconn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    '''INSERT INTO document_sources 
+                    (id, cdn_url, content_hash, project_id, content_tags, uploaded_by, 
+                    vector_embed_status, filename, file_size_bytes, file_extension, created_at, processing_metadata)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)''',
+                    (doc_id, doc_data['cdn_url'], doc_data['content_hash'], 
+                    project_id, doc_data.get('content_tags', []), workflow_metadata['user_id'],
+                    ProcessingStatus.PENDING.value, doc_data['filename'], 
+                    doc_data['file_size_bytes'], os.path.splitext(doc_data['filename'])[1].lower(),
+                    datetime.now(timezone.utc), Json(workflow_metadata))
+                )
+                conn.commit()
+        finally:
+            pool.putconn(conn)
+        
+        # ——— Parse Document ———————————————————————————————————————————————————————
+        parse_result = _parse_document_for_workflow(
+            self, doc_id, doc_data['cdn_url'], project_id, workflow_metadata
+        )
+        
+        if parse_result.get('status') == 'PARSING_COMPLETE':
+            # Create embedding workflow with callback
+            embedding_tasks = parse_result.get('embedding_tasks', [])
+            
+            if embedding_tasks:
+                # Create the embedding chord with finalization callback
+                embedding_workflow = chord(
+                    group(embedding_tasks),
+                    finalize_document_processing.s(doc_id)
+                )
+                
+                # Execute and return the promise (not .get()!)
+                workflow_promise = embedding_workflow.apply_async()
+                
+                logger.info(f"🚀 [DOC-{doc_id[:8]}] Created embedding workflow with {len(embedding_tasks)} tasks")
+                
+                # Return the AsyncResult promise - Celery will wait for this automatically
+                return workflow_promise
+            else:
+                # No embeddings needed - return immediate success
+                _update_document_status_sync(doc_id, ProcessingStatus.COMPLETE)
+                
+                # Create a dummy completed result
+                from celery.result import EagerResult
+                return EagerResult(
+                    id=str(uuid.uuid4()),
+                    ret_value={
+                        'doc_id': doc_id,
+                        'processing_type': 'NEW',
+                        'status': 'COMPLETE',
+                        'chunks_created': 0
+                    },
+                    state='SUCCESS'
+                )
+        else:
+            # Parsing failed
+            _update_document_status_sync(doc_id, ProcessingStatus.FAILED_PARSING, 
+                                       parse_result.get('error', 'Parsing failed'))
+            
+            # Return failed result
+            return EagerResult(
+                id=str(uuid.uuid4()),
+                ret_value={
+                    'doc_id': doc_id,
+                    'processing_type': 'NEW',
+                    'status': 'FAILED',
+                    'error': parse_result.get('error', 'Parsing failed'),
+                    'chunks_created': 0
+                },
+                state='SUCCESS'  # Task succeeded, but document failed
+            )
+            
+    except Exception as e:
+        logger.error(f"❌ [DOC-{doc_id[:8]}] Workflow creation failed: {e}")
+        _update_document_status_sync(doc_id, ProcessingStatus.FAILED_PARSING, str(e))
+        
+        # Return error result
+        from celery.result import EagerResult
+        return EagerResult(
+            id=str(uuid.uuid4()),
+            ret_value={
+                'doc_id': doc_id,
+                'processing_type': 'NEW',
+                'status': 'FAILED',
+                'error': str(e)
+            },
+            state='SUCCESS'
+        )
+    
+@celery_app.task(bind=True, queue=INGEST_QUEUE, acks_late=True)
+def wait_for_document_embeddings(
+    self, 
+    parse_result: Dict[str, Any]
+) -> Dict[str, Any]:
+    """
+    [EMBEDDING WAITER] Waits for embeddings using Celery's AsyncResult:
+    - Takes parse result with chord ID
+    - Uses AsyncResult.get() to wait (this is OK because it's the MAIN task purpose)
+    - Returns final document status
+    
+    KEY: This task's ONLY job is waiting, so .get() is appropriate here!
+    """
+    doc_id = parse_result['doc_id']
+    short_id = doc_id[:8]
+    
+    # Check if parsing succeeded
+    if parse_result.get('status') != 'PARSING_COMPLETE':
+        logger.error(f"❌ [DOC-{short_id}] Cannot wait for embeddings - parsing failed")
+        return parse_result  # Return the failed parse result
+    
+    embedding_chord_id = parse_result.get('embedding_chord_id')
+    if not embedding_chord_id:
+        # No embeddings (empty document case)
+        logger.info(f"✅ [DOC-{short_id}] No embeddings needed - document complete")
+        return {
+            **parse_result,
+            'status': 'COMPLETE',
+            'final_chunks': parse_result.get('chunks_created', 0)
+        }
+    
+    # ——— Wait for Embedding Chord Completion (This IS the task's purpose!) ———————
+    logger.info(f"⏳ [DOC-{short_id}] Waiting for embedding chord completion...")
+    
+    try:
+        chord_result = AsyncResult(embedding_chord_id)
+        
+        # This .get() call is OK because:
+        # 1. This task's ONLY purpose is waiting
+        # 2. It's not a nested task call - it's waiting for a separate workflow
+        # 3. The chord runs independently of this task
+        final_embedding_result = chord_result.get(timeout=300)  # 5 minute timeout
+        
+        logger.info(f"✅ [DOC-{short_id}] Embeddings completed successfully")
+        
+        # Return the final result from finalize_document_processing
+        return final_embedding_result
+        
+    except Exception as e:
+        logger.error(f"❌ [DOC-{short_id}] Embedding wait failed: {e}")
+        
+        # Update document status to failed
+        _update_document_status_sync(doc_id, ProcessingStatus.FAILED_EMBEDDING, str(e))
+        
+        return {
+            'doc_id': doc_id,
+            'processing_type': 'NEW',
+            'status': 'FAILED',
+            'error': f'Embedding completion failed: {str(e)}',
+            'chunks_created': parse_result.get('chunks_created', 0)
+        }
+
+@celery_app.task(bind=True, queue=INGEST_QUEUE, acks_late=True)
+def process_new_document_task(self, doc_data: Dict[str, Any], project_id: str, workflow_metadata: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    [SOON TO BE REPLACED] by process_new_document_parse_only --> wait_for_document_embeddings
+    Process completely new document (SINGULAR) through full pipeline:
+    - Insert document record `public.document_sources`
+    - Pass document to `_parse_document_for_workflow` to → Fetch Loader → Parse → Embed → Store vectors
+    - Returns processing results for workflow coordination
+
+    process_new_document_task
+    ↓
+    _parse_document_for_workflow (creates embedding chord)
+    ↓
+    [embed_batch_task, embed_batch_task, ...] (parallel)
+    ↓
+    finalize_document_processing (triggered by chord)
+    ↓
+    finalize_batch_and_create_note (batch-level coordination)
+    """
+    doc_id = str(uuid.uuid4())
+    doc_data['id'] = doc_id
+    
+    try:
+        # ——— Insert Document Record ———————————————————————————————————————————————
+
+        pool = get_sync_db_pool()
+        conn = pool.getconn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    '''INSERT INTO document_sources 
+                    (id, cdn_url, content_hash, project_id, content_tags, uploaded_by, 
+                    vector_embed_status, filename, file_size_bytes, file_extension, created_at, processing_metadata)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)''',
+                    (doc_id, doc_data['cdn_url'], doc_data['content_hash'], 
+                    project_id, doc_data.get('content_tags', []), workflow_metadata['user_id'],
+                    ProcessingStatus.PENDING.value, doc_data['filename'], 
+                    doc_data['file_size_bytes'], os.path.splitext(doc_data['filename'])[1].lower(),
+                    datetime.now(timezone.utc), Json(workflow_metadata))
+                )
+                conn.commit()
+        finally:
+            pool.putconn(conn)
+        
+        # ——— Launch Parsing (which → schedules embeddings) ——————————————————————————
+        _update_batch_progress_sync(workflow_metadata['batch_id'], project_id, BatchProgressStatus.BATCH_PARSING)
+
+        # Parse Document (this will return PARSING_COMPLETE and schedule embeddings)
+        # document_cdn → select optimal loader → clean/chunk → embed)
+        parse_result = _parse_document_for_workflow(
+            self, doc_id, doc_data['cdn_url'], project_id, workflow_metadata
+        )
+        
+        # ——— Check Parse Result and Return ————————————————————————————————————————
+        if parse_result.get('status') == 'PARSING_COMPLETE':
+            # Parsing succeeded, embeddings are scheduled
+            return {
+                'doc_id': doc_id,
+                'processing_type': 'NEW',
+                'status': 'PARSING_COMPLETE',  # This indicates embeddings are in progress
+                'chunks_created': parse_result.get('total_chunks', 0),
+                'embedding_tasks_scheduled': parse_result.get('embedding_tasks_scheduled', 0),
+                'performance_metrics': parse_result.get('performance_metrics', {})
+            }
+        else:
+            # Parsing failed
+            logger.error(f"❌ [DOC-{doc_id[:8]}] Document parsing failed")
+            return {
+                'doc_id': doc_id,
+                'processing_type': 'NEW',
+                'status': 'FAILED',
+                'error': parse_result.get('error', 'Unknown parsing failure'),
+                'chunks_created': 0
+            }
+        
+    except Exception as e:
+        logger.error(f"❌ [DOC-{doc_id[:8]}] New document processing failed: {e}")
+        _update_document_status_sync(doc_id, ProcessingStatus.FAILED_PARSING, str(e))
+        return {
+            'doc_id': doc_id,
+            'processing_type': 'NEW', 
+            'status': 'FAILED',
+            'error': str(e)
+        }
+
+# ——— Edge Case Processing Tasks ———————————————————————————————————————
+
+async def _handle_duplicate_only_batch(batch_id: str, project_id: str, workflow_metadata: Dict[str, Any], duplicate_docs: List[Dict]) -> Dict[str, Any]:
+    """  
+    [DUPLICATE HANDLER] Handle batches containing only duplicate documents:
+    - Documents already EXIST in this project, so no processing needed (It;s a type of USER dumb error)
+    - Can still generate notes using existing document content
+    """
+    # Remeber to update do the UI recieves a SUPABASE REALTRINE update
+    _update_batch_progress_sync(batch_id, project_id, BatchProgressStatus.BATCH_COMPLETE)
+    logger.info(f"📋 [BATCH-{batch_id[:8]}] Handling duplicate-only batch with {len(duplicate_docs)} documents")
+    
+    if workflow_metadata.get('create_note'):
+        # Enhance metadata for duplicate-only note generation
+        note_metadata = {
+            **workflow_metadata,
+            'batch_status': 'DUPLICATE_ONLY',
+            'duplicate_document_ids': [doc.get('existing_doc_id') for doc in duplicate_docs],
+            'processing_context': f'All {len(duplicate_docs)} documents already exist in project'
+        }
+        
+        logger.info(f"🎯 [BATCH-{batch_id[:8]}] Triggering note generation for duplicate-only batch")
+        rag_note_task.apply_async(kwargs={
+            "user_id": note_metadata["user_id"],
+            "note_type": note_metadata["note_type"], 
+            "project_id": note_metadata["project_id"],
+            "note_title": note_metadata["note_title"],
+            "provider": note_metadata.get("provider"),
+            "model_name": note_metadata.get("model_name"), 
+            "temperature": note_metadata.get("temperature"),
+            "addtl_params": {
+                **note_metadata.get("addtl_params", {}),
+                'batch_context': {
+                    'batch_id': batch_id,
+                    'batch_status': 'DUPLICATE_ONLY',
+                    'document_count': len(duplicate_docs),
+                    'duplicate_doc_ids': note_metadata['duplicate_document_ids']
+                }
+            }
+        })
+    
+    return {
+        'batch_id': batch_id,
+        'status': 'DUPLICATE_ONLY_COMPLETE',
+        'duplicate_documents': len(duplicate_docs),
+        'note_generation_triggered': workflow_metadata.get('create_note', False)
+    }
+
+@celery_app.task(bind=True, queue=INGEST_QUEUE, acks_late=True)  
+def process_reused_document_task(
+    self, 
+    existing_doc_id: str, 
+    doc_data: Dict[str, Any], 
+    project_id: str, 
+    workflow_metadata: Dict[str, Any]
+) -> Dict[str, Any]:
+    """
+    [REUSED DOC PIPELINE] Smart reuse: copy existing embeddings to new project:
+    - Create new document entry → Copy embeddings → Mark complete
+        * New document entry is created from a reused document ♻️
+        * Embeddings are copied from existing processed document ♻️ as a shortcut
+    - Much faster than full processing pipeline
+    - Returns processing results for workflow coordination
+    """
+    new_doc_id = str(uuid.uuid4())
+    
+    try:
+        # ——— Create New Document Entry + Copy Embeddings ——————————————————————————
+        pool = get_sync_db_pool()
+        conn = pool.getconn()
+        
+        try:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                # FIND source document info for copying
+                cur.execute(
+                    'SELECT total_chunks, total_batches FROM document_sources WHERE id = %s',
+                    (existing_doc_id,)
+                )
+                source_info = cur.fetchone()
+                
+                if not source_info:
+                    raise Exception(f"Source document {existing_doc_id} not found")
+                
+                # INSERT new document record with completed status
+                cur.execute(
+                    '''INSERT INTO document_sources 
+                    (id, cdn_url, content_hash, project_id, content_tags, uploaded_by, 
+                    vector_embed_status, filename, file_size_bytes, file_extension, 
+                    total_chunks, total_batches, created_at, processing_metadata)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, s%)''',
+                    (new_doc_id, doc_data['cdn_url'], doc_data['content_hash'], 
+                    project_id, doc_data.get('content_tags', []), workflow_metadata['user_id'],
+                    ProcessingStatus.COMPLETE.value, doc_data['filename'], 
+                    doc_data['file_size_bytes'], os.path.splitext(doc_data['filename'])[1].lower(),
+                    source_info['total_chunks'], source_info['total_batches'],
+                    datetime.now(timezone.utc), Json(workflow_metadata))
+                )
+        finally:
+            pool.putconn(conn)
+        
+        # ——— Copy Embeddings (reuse existing sync function) ————————————————————————
+        copy_result = copy_embeddings_for_project_sync(
+            existing_doc_id, 
+            new_doc_id, 
+            project_id, 
+            workflow_metadata['user_id']
+        )
+        
+        logger.info(f"♻️ [DOC-{new_doc_id[:8]}] Smart reuse complete: {copy_result['copied_count']} chunks")
+        return {
+            'doc_id': new_doc_id,
+            'processing_type': 'REUSED',
+            'status': 'COMPLETE',
+            'chunks_reused': copy_result['copied_count'],
+            'tokens_reused': copy_result['total_tokens']
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ [DOC-{new_doc_id[:8]}] Reused document processing failed: {e}")
+        return {
+            'doc_id': new_doc_id,
+            'processing_type': 'REUSED',
+            'status': 'FAILED', 
+            'error': str(e)
+        }
+
 # ——— Parsing & Embedding: For one document → Parse, batch, dispatch to OpenAI for emmbedding (In-Memory & Token-Aware) ————————————————————————————————
 
 def _parse_document_for_workflow(self, source_id: str, cdn_url: str, project_id: str, workflow_metadata: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    [PARSER OPTIMIZED] Receives new document (SINGULAR):
+    - Determines which optimized loaded to use
+    - Parses document and creates embedding tasks
+    - Sets up chord to coordinate embeddings → document finalization
+    - Returns immediately after scheduling (no blocking)
+    """
+    _update_document_status_sync(source_id, ProcessingStatus.PARSING)
+    
+    short_id = source_id[:8]
+    file_buffer = io.BytesIO()
+    doc_metrics = DocumentMetrics(doc_id=source_id)
+    perf_summary = {}
+
+    # Total `_parse_document_gevent` task Timer Wrapper
+    with Timer() as total_timer:
+        try:
+            # Phase 1: Gevent-optimized streaming download
+            with Timer() as download_timer:
+                # Helper to create HTTP request sessions with retry strategy
+                session = create_http_session()
+                
+                # Stream the file with gevent-friendly requests
+                logger.info(f"🚀 Starting document streaming for {source_id}, with url: {cdn_url}")
+                response = session.get(cdn_url, headers=DEFAULT_HEADERS, stream=True, timeout=120)
+                response.raise_for_status()
+
+                # Log response headers for debugging
+                content_length = response.headers.get('content-length')
+                content_type = response.headers.get('content-type', 'unknown')
+                
+                # Stream into memory buffer
+                downloaded_bytes = 0
+                chunk_count = 0
+                for chunk in response.iter_content(chunk_size=8192):
+                    if chunk:
+                        file_buffer.write(chunk)
+                        downloaded_bytes += len(chunk)
+                        chunk_count += 1
+                        
+                        # Log progress every 5MB or 500 chunks
+                        if chunk_count % 500 == 0 or downloaded_bytes % (1024 * 1024 * 5) == 0:
+                            logger.info(f"📥 [PARSE-{short_id}] Downloaded {downloaded_bytes:,} bytes ({chunk_count} chunks)")
+                        
+                        gevent.sleep(0)
+
+                file_buffer.seek(0)
+                doc_metrics.download_time_ms = download_timer.elapsed_ms
+                doc_metrics.file_size_bytes = file_buffer.getbuffer().nbytes
+                perf_summary['download_ms'] = download_timer.elapsed_ms
+
+            # Phase 2: Document Analysis & Optimal Loader Selection (CPU-bound, but fast)
+            with Timer() as analysis_timer:
+                # Quick analysis to choose best processing strategy
+                doc_analysis = analyze_document_before_processing(cdn_url, file_buffer)
+                
+                logger.info(f"📊 [PARSE-{short_id}] Analysis: {doc_analysis['file_size_mb']:.1f}MB, "
+                            f"complexity: {doc_analysis.get('complexity_score', 'N/A')}, "
+                            f"estimated time: {doc_analysis['processing_time_estimate']:.1f}s")
+                
+                # Choose optimal loader based on analysis
+                if doc_analysis.get('complexity_score', 0) >= 7:
+                    loader = get_high_performance_loader(cdn_url, file_buffer)
+                    processor_mode = "fast"
+                    logger.info(f"⚡ [PARSE-{short_id}] Using HIGH PERFORMANCE mode")
+                else:
+                    loader = get_loader_for(cdn_url, file_buffer, performance_mode="auto")
+                    processor_mode = "balanced"
+                    logger.info(f"⚖️ [PARSE-{short_id}] Using BALANCED mode")
+                
+                # Add to performance bench summary dict
+                perf_summary['analysis_ms'] = analysis_timer.elapsed_ms
+
+            # Phase 3: Optimized Text Processing, Cleaning, & Chunking
+            with Timer() as process_timer:
+                # Create optimized processor (class uses "pseudo-Semantic Chunking" using RecursiveCharacterTextSplitter)
+                processor = create_optimized_processor(
+                    chunk_size=CHUNK_SIZE,
+                    chunk_overlap=CHUNK_OVERLAP,
+                    performance_mode=processor_mode
+                )
+                
+                # Stream processing with real-time metrics
+                all_texts, all_metadatas = [], []
+                
+                logger.info(f"🔄 [PARSE-{short_id}] Starting streaming processing...")
+                
+                # Process document stream into chunks (and associated metadata)
+                document_stream = loader.stream_documents(file_buffer)
+                text_stream = processor.process_documents_streaming(document_stream, source_id)
+                for chunk_text, chunk_metadata in text_stream:
+                    all_texts.append(chunk_text)
+                    all_metadatas.append(chunk_metadata)
+                    
+                    # Log progress every 200 chunks
+                    if len(all_texts) % 200 == 0:
+                        logger.info(f"✂️ [PARSE-{short_id}] Created {len(all_texts)} chunks")
+                    
+                    gevent.sleep(0)
+                
+                # [DEBUG] Print statement at the end of document chunking (i.e. the full 13.9MB)
+                logger.info(f"⏱️ PARSING COMPLETE...")
+                
+                # Get processing performance summary
+                processing_summary = processor.get_performance_summary()
+                perf_summary.update({
+                    'text_processing_ms': process_timer.elapsed_ms,
+                    'total_chunks': len(all_texts),
+                    'total_pages': processing_summary['total_pages'],
+                    'chars_per_second': processing_summary['chars_per_second'],
+                    'chunks_per_second': processing_summary['chunks_per_second']
+                })
+                
+                logger.info(f"✅ [PARSE-{short_id}] Processing complete: {len(all_texts)} chunks from {processing_summary['total_pages']} pages")
+
+            # Phase 4: Optimized Token Counting & Embedding Batching
+            with Timer() as token_timer:
+                # Batch token counting for efficiency
+                token_counter = BatchTokenCounter(tokenizer)
+                token_counts = token_counter.count_tokens_batch(all_texts)
+                
+                perf_summary['token_counting_ms'] = token_timer.elapsed_ms
+                total_tokens = sum(token_counts)
+                logger.info(f"🔢 [PARSE-{short_id}] Token counting: {total_tokens:,} tokens in {perf_summary['token_counting_ms']:.1f}ms")
+
+            with Timer() as batch_timer:
+                embedding_tasks = []
+                current_batch_texts, current_batch_metas = [], []
+                current_batch_tokens = 0
+
+                # EMBEDDING TASK FOR LOOP
+                for i, (text, token_count) in enumerate(zip(all_texts, token_counts)):
+                    if current_batch_tokens + token_count > OPENAI_MAX_TOKENS_PER_BATCH and current_batch_texts:
+                        task_sig = embed_batch_task.s(source_id, project_id, current_batch_texts, current_batch_metas)
+                        embedding_tasks.append(task_sig)
+                        
+                        if len(embedding_tasks) % 5 == 0:  # Log every 5 batches
+                            logger.info(f"📦 [PARSE-{short_id}] Created {len(embedding_tasks)} batches")
+                        
+                        current_batch_texts, current_batch_metas, current_batch_tokens = [], [], 0
+
+                    current_batch_texts.append(text)
+                    current_batch_metas.append(all_metadatas[i])
+                    current_batch_tokens += token_count
+
+                if current_batch_texts:
+                    task_sig = embed_batch_task.s(source_id, project_id, current_batch_texts, current_batch_metas)
+                    embedding_tasks.append(task_sig)
+
+                perf_summary['batching_ms'] = batch_timer.elapsed_ms
+                perf_summary['total_batches'] = len(embedding_tasks)
+
+            # ——— Phase 5: Modified Database Update (no chord scheduling) ——————————————
+            pool = get_sync_db_pool()
+            conn = pool.getconn()
+            try:
+                with conn.cursor() as cur:
+                    # Enhanced metrics for database
+                    enhanced_metrics = {
+                        **doc_metrics.to_dict(),
+                        **perf_summary,
+                        'processing_mode': processor_mode,
+                        'loader_type': type(loader).__name__,
+                        'workflow_integration': True  # Flag for workflow processing
+                    }
+                    
+                    cur.execute(
+                        """
+                        UPDATE document_sources
+                        SET vector_embed_status = %s, total_chunks = %s, total_batches = %s, 
+                            processing_metadata = processing_metadata || %s::jsonb
+                        WHERE id = %s""",
+                        (ProcessingStatus.EMBEDDING.value, len(all_texts), 
+                            len(embedding_tasks), json.dumps(enhanced_metrics), source_id)
+                    )
+                    conn.commit()
+            finally:
+                pool.putconn(conn)
+            
+            # ——— REFACTOR: Schedule Embedding Tasks and Wait for Completion ————————————————————
+
+            # Instead of waiting for embeddings, return embedding task signatures (not executed chord)
+            if embedding_tasks:
+                logger.info(f"🚀 [PARSE-{source_id[:8]}] Created {len(embedding_tasks)} embedding task signatures")
+                
+                return {
+                    'source_id': source_id,
+                    'status': 'PARSING_COMPLETE',
+                    'total_chunks': len(all_texts),
+                    'embedding_tasks': embedding_tasks,  # Return task signatures
+                    'performance_metrics': perf_summary
+                }
+            else:
+                return {
+                    'source_id': source_id,
+                    'status': 'PARSING_COMPLETE',
+                    'total_chunks': 0,
+                    'embedding_tasks': [],
+                    'performance_metrics': perf_summary
+                }
+
+        except Exception as e:
+            logger.error(f"💥 [PARSE-{short_id}] WORKFLOW PARSING FAILED: {e}", exc_info=True)
+            _update_document_status_sync(source_id, ProcessingStatus.FAILED_PARSING, str(e))
+            raise
+
+def _parse_document_for_workflow_legacy(self, source_id: str, cdn_url: str, project_id: str, workflow_metadata: Dict[str, Any]) -> Dict[str, Any]:
     """
     [PARSER OPTIMIZED] Receives new document (SINGULAR):
     - Determines which optimized loaded to use
@@ -1856,6 +2105,7 @@ def _parse_document_for_workflow(self, source_id: str, cdn_url: str, project_id:
 
 # ——— Document Finalization Task (called by embedding chord) ——————————————————————
 
+
 @celery_app.task(bind=True, queue=INGEST_QUEUE, acks_late=True)
 def finalize_document_processing(self, embedding_results: List[Dict], source_id: str) -> Dict[str, Any]:
     """
@@ -1994,29 +2244,45 @@ def _embed_batch_gevent(self, source_id: str, project_id: str, texts: List[str],
 @celery_app.task(bind=True, queue=FINAL_QUEUE, acks_late=True)
 def finalize_batch_and_create_note(
     self, 
-    processing_results: List[Dict[str, Any]], 
+    workflow_results: List[AsyncResult], 
     batch_id: str, 
     workflow_metadata: Dict[str, Any]
 ) -> Dict[str, Any]:
     """
-    [BATCH COORDINATOR] Receives FINAL document results:
-    - No more PARSING_COMPLETE status confusion
-    - No more race conditions
-    - Clean COMPLETE/PARTIAL/FAILED results only
+    [BATCH COORDINATOR] Receives completed workflow results:
+    - Each result is from a completed document workflow
+    - No race conditions - all workflows are fully complete
+    - Extract final results and process normally
     """
     project_id = workflow_metadata['project_id']
-    logger.info(f"🎯 [BATCH-{batch_id[:8]}] Finalizing batch with {len(processing_results)} completed documents")
+    logger.info(f"🎯 [BATCH-{batch_id[:8]}] Finalizing batch with {len(workflow_results)} completed workflows")
     
-    # ——— Clean Result Analysis (No More Edge Cases!) ——————————————————————————————
+    # ——— Extract Results from AsyncResult Objects —————————————————————————————————
+    processing_results = []
+    
+    for workflow_result in workflow_results:
+        try:
+            if isinstance(workflow_result, AsyncResult):
+                # Extract the actual result value
+                result_value = workflow_result.result
+                processing_results.append(result_value)
+            else:
+                # Direct result (for reused documents)
+                processing_results.append(workflow_result)
+        except Exception as e:
+            logger.error(f"❌ [BATCH-{batch_id[:8]}] Failed to extract workflow result: {e}")
+            processing_results.append({
+                'status': 'FAILED',
+                'error': f'Failed to extract result: {str(e)}'
+            })
+    
+    # ——— Standard Batch Analysis ——————————————————————————————————————————————————
     successful_docs = [r for r in processing_results if r and r.get('status') in ['COMPLETE', 'PARTIAL']]
     failed_docs = [r for r in processing_results if r and r.get('status') == 'FAILED']
     
     total_docs = len(processing_results)
     success_count = len(successful_docs)
     failure_count = len(failed_docs)
-    
-    # All results should now be accounted for
-    assert success_count + failure_count == total_docs, f"Result count mismatch: {success_count} + {failure_count} != {total_docs}"
     
     total_chunks = sum(r.get('chunks_created', 0) for r in successful_docs)
     
