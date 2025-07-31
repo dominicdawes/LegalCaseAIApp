@@ -1277,7 +1277,8 @@ def create_document_embedding_workflow(
                 logger.info(f"🚀 [DOC-{doc_id[:8]}] Created embedding workflow with {len(embedding_tasks)} tasks")
                 
                 # Return the AsyncResult promise - Celery will wait for this automatically
-                return workflow_promise
+                final_result = workflow_promise.get(timeout=300)
+                return final_result
             else:
                 # No embeddings needed - return immediate success
                 _update_document_status_sync(doc_id, ProcessingStatus.COMPLETE)
