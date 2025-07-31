@@ -804,7 +804,7 @@ def get_clean_filename_from_url(url: str, extension: str) -> str:
     # Final fallback
     return f"document_{uuid.uuid4().hex[:8]}{extension}"
 
-# ——— Utils: 🔍 Document Analysis & Classification ——————————————————————————————————————————
+# ——— Utils: Document Analysis/Classification and Embedding Utils ——————————————————————————————————————————
 
 async def _analyze_document_for_workflow(
     client: httpx.AsyncClient, 
@@ -1200,7 +1200,6 @@ async def _parse_document_async(source_id: str, cdn_url: str, project_id: str) -
                 'error': str(e)
             }
 
-
 async def _embed_batch_async(doc_id: str, project_id: str, batch_info: List[str]) -> Dict[str, Any]:
     """
     Process a SIMGLE embedding batch - combines your legacy robustness with async benefits
@@ -1399,7 +1398,7 @@ def process_document_batch_workflow(
     [ORCHESTRATOR] 🚶‍➡️ Main entry point for batch document processing, this is the task that gets called by your API/frontend
 
     1. Use persistent event loop for coordination/analysis
-        - Handles mixed new/reused document scenarios
+    - Handles mixed new/reused document scenarios
 
     2. Spawn separate workers for heavy processing
 
@@ -1453,11 +1452,11 @@ async def _execute_batch_workflow(batch_id: str, file_urls: List[str], metadata:
     - Builds appropriate Celery workflow based on document types
     - Returns workflow execution results
 
-    Batch Level (chord)
-    ├── Document A : (async) parse_only → (async) embed only → COMPLETE
-    ├── Document B : (async) parse_only → (async) embed only → COMPLETE
-    ├── Document C : (async) parse_only → (async) embed only → FAILED
-    └── finalize_batch_and_create_note (gets clean final results PARTIAL SUCCESS)
+    Batch Level Workflow:
+    ├── Document A : (async) Download/stream → (async) classify → REUSED
+    ├── Document B : (async) Download/stream → (async) classify → NEW
+    ├── Document C : (async) Download/stream → (async) classify → NEW
+    └── Build Celery workflow signatures → New: 2, Reused: 1  # Return coordination plan
 
     """
     project_id = metadata['project_id']
@@ -1784,7 +1783,7 @@ def finalize_batch_and_create_note(
     logger.info(f"   📄 Total chunks: {total_chunks:,}")
     logger.info(f"   🔄 Status: {batch_status}")
     
-    # ——— Trigger Note Generation (Based on Resilience Rules) ——————————————————————
+    # ——— 📝 Trigger Note Generation (Based on Resilience Rules) ——————————————————————
     if workflow_metadata.get('create_note') and batch_status in ['COMPLETE', 'PARTIAL']:
         # Enhance metadata with batch context for note generation
         note_metadata = {
@@ -1912,9 +1911,7 @@ async def _process_document_async_workflow(
     workflow_metadata: Dict[str, Any]
 ) -> Dict[str, Any]:
     """
-    [ASYNC PROCESSOR] Processing for a NEW document
-    Pure async function that handles the complete workflow: 
-    
+    Processing for a NEW document (async function) that handles the complete workflow: 
     1. INSERT document into Supaabse
     2. PARSE document into semantic chunks
     3. EMBED chunks using 'smart batching' using OpenAI embeddings
@@ -1928,7 +1925,7 @@ async def _process_document_async_workflow(
     short_id = doc_id[:8]
     
     try:
-        # ——— 1. Insert Document Record (Sync DB) ———————————————————————————————————
+        # ——— 1. INSERT Document Record (Sync DB) ———————————————————————————————————
         pool = get_sync_db_pool()
         conn = pool.getconn()
         try:
@@ -1948,7 +1945,7 @@ async def _process_document_async_workflow(
         finally:
             pool.putconn(conn)
         
-        # ——— 2. Parse Document (Can be sync or async ??) ———————————————————————————————
+        # ——— 2. PARSE Document ———————————————————————————————
         logger.info(f"📋 [DOC-{short_id}] → PARSING")
 
         # Parsing contains these subtasks: select optimal loader → in-memory streaming → clean/chunk text
@@ -1967,7 +1964,7 @@ async def _process_document_async_workflow(
         chunks_metadata = parse_result.get('metadatas', [])  # ← Extract metadatas
         logger.info(f"✅ [DOC-{short_id}] Parsed {len(chunks)} chunks")
         
-        # ——— 3. Process Embeddings (Async with concurrency control) ————————————————
+        # ——— 3. EMBEDDING Process, async with concurrency control ————————————————
         logger.info(f"📋 [DOC-{short_id}] → EMBEDDING")
         embedding_result = await _process_embeddings_async(doc_id, project_id, chunks, chunks_metadata)
         
@@ -2086,60 +2083,56 @@ def finalize_document_processing(self, embedding_results: List[Dict], source_id:
 #         logger.warning(f"Embedding batch for {source_id} failed, letting Celery handle retry: {exc}")
 #         raise
 
-def _embed_batch_gevent(self, source_id: str, project_id: str, texts: List[str], metadatas: List[Dict]):
-    """
-    Gevent-based embedding implementation - more reliable with Celery (does this have retry/circuit breaker logic?)
-    """
-    try:
-        # 1. Generate Embeddings using sync OpenAI client
-        logger.info(f"🤖 Generating embeddings...")
+# def _embed_batch_gevent(self, source_id: str, project_id: str, texts: List[str], metadatas: List[Dict]):
+#     """
+#     Gevent-based embedding implementation - more reliable with Celery (does this have retry/circuit breaker logic?)
+#     """
+#     try:
+#         # 1. Generate Embeddings using sync OpenAI client
+#         logger.info(f"🤖 Generating embeddings...")
         
-        # Use synchronous OpenAI client instead of async
-        embeddings = embedding_model.embed_documents(texts)  # ← SYNC method (no await)
+#         # Use synchronous OpenAI client instead of async
+#         embeddings = embedding_model.embed_documents(texts)  # ← SYNC method (no await)
         
-        # 2. Prepare Data for DB
-        records_to_insert = []
-        total_tokens = 0
-        for text, meta, vec in zip(texts, metadatas, embeddings):
-            if len(vec) != EXPECTED_EMBEDDING_LEN:
-                logger.warning(f"Skipping malformed embedding for source {source_id}")
-                continue
+#         # 2. Prepare Data for DB
+#         records_to_insert = []
+#         total_tokens = 0
+#         for text, meta, vec in zip(texts, metadatas, embeddings):
+#             if len(vec) != EXPECTED_EMBEDDING_LEN:
+#                 logger.warning(f"Skipping malformed embedding for source {source_id}")
+#                 continue
             
-            token_count = len(tokenizer.encode(text))
-            total_tokens += token_count
-            records_to_insert.append((
-                str(uuid.uuid4()), str(uuid.UUID(source_id)), str(uuid.UUID(project_id)), text, 
-                json.dumps(meta), vec, token_count, datetime.now(timezone.utc)
-            ))
+#             token_count = len(tokenizer.encode(text))
+#             total_tokens += token_count
+#             records_to_insert.append((
+#                 str(uuid.uuid4()), str(uuid.UUID(source_id)), str(uuid.UUID(project_id)), text, 
+#                 json.dumps(meta), vec, token_count, datetime.now(timezone.utc)
+#             ))
 
-        if not records_to_insert:
-            return {'processed_count': 0, 'token_count': 0}
+#         if not records_to_insert:
+#             return {'processed_count': 0, 'token_count': 0}
 
-        # 3. Use sync database pool (like Task 2)
-        pool = get_sync_db_pool()
-        conn = pool.getconn()
-        try:
-            with conn.cursor() as cur:
-                # Use executemany for bulk insert
-                cur.executemany(
-                    '''INSERT INTO document_vector_store 
-                    (id, source_id, project_id, content, metadata, embedding, num_tokens, created_at)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)''',
-                    records_to_insert
-                )
-                conn.commit()
-        finally:
-            pool.putconn(conn)
+#         # 3. Use sync database pool (like Task 2)
+#         pool = get_sync_db_pool()
+#         conn = pool.getconn()
+#         try:
+#             with conn.cursor() as cur:
+#                 # Use executemany for bulk insert
+#                 cur.executemany(
+#                     '''INSERT INTO document_vector_store 
+#                     (id, source_id, project_id, content, metadata, embedding, num_tokens, created_at)
+#                     VALUES (%s, %s, %s, %s, %s, %s, %s, %s)''',
+#                     records_to_insert
+#                 )
+#                 conn.commit()
+#         finally:
+#             pool.putconn(conn)
         
-        return {'processed_count': len(records_to_insert), 'token_count': total_tokens}
+#         return {'processed_count': len(records_to_insert), 'token_count': total_tokens}
 
-    except Exception as exc:
-        logger.warning(f"Embedding batch for {source_id} failed (attempt {self.request.retries + 1}), retrying: {exc}")
-        raise self.retry(exc=exc, countdown=DEFAULT_RETRY_DELAY * (RETRY_BACKOFF_MULTIPLIER ** self.request.retries))
-
-
-
-
+#     except Exception as exc:
+#         logger.warning(f"Embedding batch for {source_id} failed (attempt {self.request.retries + 1}), retrying: {exc}")
+#         raise self.retry(exc=exc, countdown=DEFAULT_RETRY_DELAY * (RETRY_BACKOFF_MULTIPLIER ** self.request.retries))
 
 # ——— Edge Case Processing Tasks ———————————————————————————————————————
 
@@ -2269,145 +2262,143 @@ def process_reused_document_task(
 
 # ——— Finalization: Batch Coordination & Note Generation ————————————————————————————————————————
 
-@celery_app.task(bind=True, queue=FINAL_QUEUE, acks_late=True)
-def finalize_batch_and_create_note_legacy(
-    self, 
-    processing_results: List[Dict[str, Any]], 
-    batch_id: str, 
-    workflow_metadata: Dict[str, Any]
-) -> Dict[str, Any]:
-    """
-    [BATCH COORDINATOR] Final coordination point for entire batch:
-    - Analyzes all document processing results
-    - Determines batch success/partial/failure status  
-    - Triggers single RAG note generation with appropriate context
-    - Handles all resilience cases (full success, partial, complete failure)
+# @celery_app.task(bind=True, queue=FINAL_QUEUE, acks_late=True)
+# def finalize_batch_and_create_note_legacy(
+#     self, 
+#     processing_results: List[Dict[str, Any]], 
+#     batch_id: str, 
+#     workflow_metadata: Dict[str, Any]
+# ) -> Dict[str, Any]:
+#     """
+#     [BATCH COORDINATOR] Final coordination point for entire batch:
+#     - Analyzes all document processing results
+#     - Determines batch success/partial/failure status  
+#     - Triggers single RAG note generation with appropriate context
+#     - Handles all resilience cases (full success, partial, complete failure)
     
-    ⚠️ This is the ONLY place where rag_note_task gets triggered per batch! (not including the duplicate shortcut)
-    """
+#     ⚠️ This is the ONLY place where rag_note_task gets triggered per batch! (not including the duplicate shortcut)
+#     """
 
-    project_id = workflow_metadata['project_id']
-    _update_batch_progress_sync(workflow_metadata['batch_id'], project_id, BatchProgressStatus.BATCH_FINALIZING)
-    logger.info(f"🎯 [BATCH-{batch_id[:8]}] Finalizing batch with {len(processing_results)} results")
+#     project_id = workflow_metadata['project_id']
+#     _update_batch_progress_sync(workflow_metadata['batch_id'], project_id, BatchProgressStatus.BATCH_FINALIZING)
+#     logger.info(f"🎯 [BATCH-{batch_id[:8]}] Finalizing batch with {len(processing_results)} results")
     
-    # ——— Analyze Batch Results ————————————————————————————————————————————————————
-    successful_docs = [r for r in processing_results if r and r.get('status') == 'COMPLETE']
-    failed_docs = [r for r in processing_results if r and r.get('status') == 'FAILED']
+#     # ——— Analyze Batch Results ————————————————————————————————————————————————————
+#     successful_docs = [r for r in processing_results if r and r.get('status') == 'COMPLETE']
+#     failed_docs = [r for r in processing_results if r and r.get('status') == 'FAILED']
     
-    total_docs = workflow_metadata['total_documents']
-    success_count = len(successful_docs)
-    failure_count = len(failed_docs)
+#     total_docs = workflow_metadata['total_documents']
+#     success_count = len(successful_docs)
+#     failure_count = len(failed_docs)
     
-    # Calculate batch statistics
-    total_chunks = sum(
-        r.get('chunks_created', 0) + r.get('chunks_reused', 0) 
-        for r in successful_docs
-    )
-    total_tokens_reused = sum(r.get('tokens_reused', 0) for r in successful_docs)
+#     # Calculate batch statistics
+#     total_chunks = sum(
+#         r.get('chunks_created', 0) + r.get('chunks_reused', 0) 
+#         for r in successful_docs
+#     )
+#     total_tokens_reused = sum(r.get('tokens_reused', 0) for r in successful_docs)
     
-    # ——— Determine Batch Status ———————————————————————————————————————————————————
-    if success_count == total_docs:
-        batch_status = 'COMPLETE'
-        final_progress = BatchProgressStatus.BATCH_COMPLETE
-        note_context = 'All documents processed successfully'
-    elif success_count > 0:
-        batch_status = 'PARTIAL' 
-        final_progress = BatchProgressStatus.BATCH_PARTIAL
-        note_context = f'{success_count}/{total_docs} documents processed successfully'
-    else:
-        batch_status = 'FAILED'
-        final_progress = BatchProgressStatus.BATCH_FAILED
-        note_context = 'All documents failed to process'
+#     # ——— Determine Batch Status ———————————————————————————————————————————————————
+#     if success_count == total_docs:
+#         batch_status = 'COMPLETE'
+#         final_progress = BatchProgressStatus.BATCH_COMPLETE
+#         note_context = 'All documents processed successfully'
+#     elif success_count > 0:
+#         batch_status = 'PARTIAL' 
+#         final_progress = BatchProgressStatus.BATCH_PARTIAL
+#         note_context = f'{success_count}/{total_docs} documents processed successfully'
+#     else:
+#         batch_status = 'FAILED'
+#         final_progress = BatchProgressStatus.BATCH_FAILED
+#         note_context = 'All documents failed to process'
     
-    # Final batch-level logging (view in terminal and in database)
-    _update_batch_progress_sync(workflow_metadata['batch_id'], project_id, final_progress)
+#     # Final batch-level logging (view in terminal and in database)
+#     _update_batch_progress_sync(workflow_metadata['batch_id'], project_id, final_progress)
 
-    logger.info(f"📊 [BATCH-{batch_id[:8]}] Batch analysis:")
-    logger.info(f"   ✅ Successful: {success_count}/{total_docs}")
-    logger.info(f"   ❌ Failed: {failure_count}")
-    logger.info(f"   📄 Total chunks: {total_chunks:,}")
-    logger.info(f"   🔄 Status: {batch_status}")
+#     logger.info(f"📊 [BATCH-{batch_id[:8]}] Batch analysis:")
+#     logger.info(f"   ✅ Successful: {success_count}/{total_docs}")
+#     logger.info(f"   ❌ Failed: {failure_count}")
+#     logger.info(f"   📄 Total chunks: {total_chunks:,}")
+#     logger.info(f"   🔄 Status: {batch_status}")
     
 
-    # ——— Trigger Note Generation (Based on Resilience Rules) ——————————————————————
+#     # ——— Trigger Note Generation (Based on Resilience Rules) ——————————————————————
     
-    if workflow_metadata.get('create_note') and batch_status in ['COMPLETE', 'PARTIAL']:
-        # Enhance metadata with batch context for note generation
-        note_metadata = {
-            **workflow_metadata,
-            'batch_status': batch_status,
-            'successful_documents': success_count,
-            'total_documents': total_docs, 
-            'processing_context': note_context,
-            'total_chunks_available': total_chunks,
-            'batch_id': batch_id
-        }
+#     if workflow_metadata.get('create_note') and batch_status in ['COMPLETE', 'PARTIAL']:
+#         # Enhance metadata with batch context for note generation
+#         note_metadata = {
+#             **workflow_metadata,
+#             'batch_status': batch_status,
+#             'successful_documents': success_count,
+#             'total_documents': total_docs, 
+#             'processing_context': note_context,
+#             'total_chunks_available': total_chunks,
+#             'batch_id': batch_id
+#         }
         
-        logger.info(f"🎯 [BATCH-{batch_id[:8]}] Triggering RAG note generation...")
-        try:
-            rag_note_task.apply_async(kwargs={
-                "user_id": note_metadata["user_id"],
-                "note_type": note_metadata["note_type"], 
-                "project_id": note_metadata["project_id"],
-                "note_title": note_metadata["note_title"],
-                "provider": note_metadata.get("provider"),
-                "model_name": note_metadata.get("model_name"), 
-                "temperature": note_metadata.get("temperature"),
-                "addtl_params": {
-                    **note_metadata.get("addtl_params", {}),
-                    'batch_context': {
-                        'batch_id': batch_id,
-                        'batch_status': batch_status,
-                        'document_count': success_count,
-                        'total_chunks': total_chunks
-                    }
-                }
-            })
-            logger.info(f"✅ [BATCH-{batch_id[:8]}] RAG note generation triggered")
+#         logger.info(f"🎯 [BATCH-{batch_id[:8]}] Triggering RAG note generation...")
+#         try:
+#             rag_note_task.apply_async(kwargs={
+#                 "user_id": note_metadata["user_id"],
+#                 "note_type": note_metadata["note_type"], 
+#                 "project_id": note_metadata["project_id"],
+#                 "note_title": note_metadata["note_title"],
+#                 "provider": note_metadata.get("provider"),
+#                 "model_name": note_metadata.get("model_name"), 
+#                 "temperature": note_metadata.get("temperature"),
+#                 "addtl_params": {
+#                     **note_metadata.get("addtl_params", {}),
+#                     'batch_context': {
+#                         'batch_id': batch_id,
+#                         'batch_status': batch_status,
+#                         'document_count': success_count,
+#                         'total_chunks': total_chunks
+#                     }
+#                 }
+#             })
+#             logger.info(f"✅ [BATCH-{batch_id[:8]}] RAG note generation triggered")
             
-        except Exception as e:
-            logger.error(f"❌ [BATCH-{batch_id[:8]}] Failed to trigger note generation: {e}")
-            batch_status = 'NOTE_GENERATION_FAILED'
+#         except Exception as e:
+#             logger.error(f"❌ [BATCH-{batch_id[:8]}] Failed to trigger note generation: {e}")
+#             batch_status = 'NOTE_GENERATION_FAILED'
             
-    elif batch_status == 'FAILED':
-        logger.info(f"⚠️ [BATCH-{batch_id[:8]}] Skipping note generation - all documents failed")
+#     elif batch_status == 'FAILED':
+#         logger.info(f"⚠️ [BATCH-{batch_id[:8]}] Skipping note generation - all documents failed")
         
-    else:
-        logger.info(f"ℹ️ [BATCH-{batch_id[:8]}] Note generation not requested")
+#     else:
+#         logger.info(f"ℹ️ [BATCH-{batch_id[:8]}] Note generation not requested")
     
-    return {
-        'batch_id': batch_id,
-        'batch_status': batch_status,
-        'successful_documents': success_count,
-        'failed_documents': failure_count,
-        'total_chunks_processed': total_chunks,
-        'tokens_saved': total_tokens_reused,
-        'note_generation_triggered': workflow_metadata.get('create_note') and batch_status in ['COMPLETE', 'PARTIAL']
-    }
+#     return {
+#         'batch_id': batch_id,
+#         'batch_status': batch_status,
+#         'successful_documents': success_count,
+#         'failed_documents': failure_count,
+#         'total_chunks_processed': total_chunks,
+#         'tokens_saved': total_tokens_reused,
+#         'note_generation_triggered': workflow_metadata.get('create_note') and batch_status in ['COMPLETE', 'PARTIAL']
+#     }
 
-@celery_app.task(bind=True, queue=FINAL_QUEUE, acks_late=True)
-def handle_batch_failure(self, batch_id: str, workflow_metadata: Dict[str, Any], errors: List[str]) -> Dict[str, Any]:
-    """
-    [FAILURE HANDLER] Handle complete batch failure scenarios:
-    - Log comprehensive failure information
-    - Could store failure record for debugging/monitoring
-    - No note generation for complete failures
-    """
-    logger.error(f"💥 [BATCH-{batch_id[:8]}] Complete batch failure:")
-    for i, error in enumerate(errors, 1):
-        logger.error(f"   {i}. {error}")
+# @celery_app.task(bind=True, queue=FINAL_QUEUE, acks_late=True)
+# def handle_batch_failure(self, batch_id: str, workflow_metadata: Dict[str, Any], errors: List[str]) -> Dict[str, Any]:
+#     """
+#     [FAILURE HANDLER] Handle complete batch failure scenarios:
+#     - Log comprehensive failure information
+#     - Could store failure record for debugging/monitoring
+#     - No note generation for complete failures
+#     """
+#     logger.error(f"💥 [BATCH-{batch_id[:8]}] Complete batch failure:")
+#     for i, error in enumerate(errors, 1):
+#         logger.error(f"   {i}. {error}")
     
-    # Optional: Store failure record in database for monitoring
-    # This could be useful for debugging and user feedback
+#     # Optional: Store failure record in database for monitoring
+#     # This could be useful for debugging and user feedback
     
-    return {
-        'batch_id': batch_id,
-        'batch_status': 'COMPLETE_FAILURE',
-        'errors': errors,
-        'note_generation_triggered': False
-    }
-
-
+#     return {
+#         'batch_id': batch_id,
+#         'batch_status': 'COMPLETE_FAILURE',
+#         'errors': errors,
+#         'note_generation_triggered': False
+#     }
 
 
 # ——— Advanced Monitoring & Maintenance Tasks (Unchanged from v5) —————————————————
