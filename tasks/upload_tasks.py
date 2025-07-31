@@ -845,7 +845,7 @@ def process_document_batch_workflow(self, file_urls: List[str], metadata: Dict[s
 
     # return asyncio.run(_execute_batch_workflow(batch_id, file_urls, metadata))
 
-    # 🧼 CLEAN: One async event loop per task
+    # 🧼 CLEAN: One persistent async event loop per task
     return run_async_in_worker(
         _execute_batch_workflow(batch_id, file_urls, metadata)
     )
@@ -1057,16 +1057,27 @@ async def _handle_duplicate_only_batch(batch_id: str, project_id: str, workflow_
 @celery_app.task(bind=True, queue=INGEST_QUEUE, acks_late=True)
 def process_new_document_task(self, doc_data: Dict[str, Any], project_id: str, workflow_metadata: Dict[str, Any]) -> Dict[str, Any]:
     """
-    [NEW DOC PIPELINE] Process completely new document through full pipeline:
+    [NEW DOC PIPELINE] Process completely new document (SINGULAR) through full pipeline:
     - Insert document record `public.document_sources`
-    - Pass document to `_parse_document_gevent_for_workflow` to → Fetch Loader → Parse → Embed → Store vectors
+    - Pass document to `_parse_document_for_workflow` to → Fetch Loader → Parse → Embed → Store vectors
     - Returns processing results for workflow coordination
+
+    process_new_document_task
+    ↓
+    _parse_document_for_workflow (creates embedding chord)
+    ↓
+    [embed_batch_task, embed_batch_task, ...] (parallel)
+    ↓
+    finalize_document_processing (triggered by chord)
+    ↓
+    finalize_batch_and_create_note (batch-level coordination)
     """
     doc_id = str(uuid.uuid4())
     doc_data['id'] = doc_id
     
     try:
         # ——— Insert Document Record ———————————————————————————————————————————————
+
         pool = get_sync_db_pool()
         conn = pool.getconn()
         try:
@@ -1086,42 +1097,35 @@ def process_new_document_task(self, doc_data: Dict[str, Any], project_id: str, w
         finally:
             pool.putconn(conn)
         
-        # ——— Launch Full Processing Pipeline ——————————————————————————————————————
+        # ——— Launch Parsing (which → schedules embeddings) ——————————————————————————
         _update_batch_progress_sync(workflow_metadata['batch_id'], project_id, BatchProgressStatus.BATCH_PARSING)
 
-        # Use existing _parse_document_gevent_for_workflow function to (select optimal loader → clean/chunk → embed)
-        parse_result = _parse_document_gevent_for_workflow(
+        # Parse Document (this will return PARSING_COMPLETE and schedule embeddings)
+        # document_cdn → select optimal loader → clean/chunk → embed)
+        parse_result = _parse_document_for_workflow(
             self, doc_id, doc_data['cdn_url'], project_id, workflow_metadata
         )
         
-        # ——— Check Parse Result Status and Return Appropriately ——————————————————
-        if parse_result.get('status') == 'COMPLETE':
-            logger.info(f"✅ [DOC-{doc_id[:8]}] New document processing complete")
+        # ——— Check Parse Result and Return ————————————————————————————————————————
+        if parse_result.get('status') == 'PARSING_COMPLETE':
+            # Parsing succeeded, embeddings are scheduled
             return {
                 'doc_id': doc_id,
                 'processing_type': 'NEW',
-                'status': 'COMPLETE',
+                'status': 'PARSING_COMPLETE',  # This indicates embeddings are in progress
                 'chunks_created': parse_result.get('total_chunks', 0),
+                'embedding_tasks_scheduled': parse_result.get('embedding_tasks_scheduled', 0),
                 'performance_metrics': parse_result.get('performance_metrics', {})
             }
-        elif parse_result.get('status') == 'PARTIAL':
-            logger.warning(f"⚠️ [DOC-{doc_id[:8]}] New document processing partially successful")
-            return {
-                'doc_id': doc_id,
-                'processing_type': 'NEW',
-                'status': 'PARTIAL',
-                'chunks_created': parse_result.get('total_chunks', 0),
-                'successful_batches': parse_result.get('successful_batches', 0),
-                'failed_batches': parse_result.get('failed_batches', 0)
-            }
-        else:  # FAILED
-            logger.error(f"❌ [DOC-{doc_id[:8]}] New document processing failed")
+        else:
+            # Parsing failed
+            logger.error(f"❌ [DOC-{doc_id[:8]}] Document parsing failed")
             return {
                 'doc_id': doc_id,
                 'processing_type': 'NEW',
                 'status': 'FAILED',
                 'error': parse_result.get('error', 'Unknown parsing failure'),
-                'chunks_created': parse_result.get('total_chunks', 0)
+                'chunks_created': 0
             }
         
     except Exception as e:
@@ -1411,12 +1415,13 @@ async def _download_and_prep_doc(client: httpx.AsyncClient, url: str, project_id
 
 # ——— Parsing & Embedding: For one document → Parse, batch, dispatch to OpenAI for emmbedding (In-Memory & Token-Aware) ————————————————————————————————
 
-def _parse_document_gevent_for_workflow(self, source_id: str, cdn_url: str, project_id: str, workflow_metadata: Dict[str, Any]) -> Dict[str, Any]:
+def _parse_document_for_workflow(self, source_id: str, cdn_url: str, project_id: str, workflow_metadata: Dict[str, Any]) -> Dict[str, Any]:
     """
-    [WORKFLOW OPTIMIZED] Modified version of _parse_document_gevent for chord integration:
-    - Removes the chord scheduling at the end (handled by workflow coordinator)
-    - Returns parsing results directly for batch coordination
-    - Keeps all the performance optimizations and gevent benefits
+    [PARSER OPTIMIZED] Receives new document (SINGULAR):
+    - Determines which optimized loaded to use
+    - Parses document and creates embedding tasks
+    - Sets up chord to coordinate embeddings → document finalization
+    - Returns immediately after scheduling (no blocking)
     """
     _update_document_status_sync(source_id, ProcessingStatus.PARSING)
     
@@ -1541,6 +1546,7 @@ def _parse_document_gevent_for_workflow(self, source_id: str, cdn_url: str, proj
                 current_batch_texts, current_batch_metas = [], []
                 current_batch_tokens = 0
 
+                # EMBEDDING TASK FOR LOOP
                 for i, (text, token_count) in enumerate(zip(all_texts, token_counts)):
                     if current_batch_tokens + token_count > OPENAI_MAX_TOKENS_PER_BATCH and current_batch_texts:
                         task_sig = embed_batch_task.s(source_id, project_id, current_batch_texts, current_batch_metas)
@@ -1589,81 +1595,185 @@ def _parse_document_gevent_for_workflow(self, source_id: str, cdn_url: str, proj
             finally:
                 pool.putconn(conn)
             
-            # ——— Schedule Embedding Tasks and Wait for Completion ————————————————————
+            # ——— REFACTOR: Schedule Embedding Tasks and Wait for Completion ————————————————————
+
+            # Instead of waiting for embeddings, return parsing success and let chord handle coordination
             if embedding_tasks:
-                _update_batch_progress_sync(workflow_metadata['batch_id'], project_id, BatchProgressStatus.BATCH_EMBEDDING)
-                logger.info(f"🚀 [PARSE-{short_id}] Waiting for {len(embedding_tasks)} embedding tasks...")
+                # Schedule embedding tasks with document finalization
+                embedding_chord = chord(
+                    group(embedding_tasks),
+                    finalize_document_processing.s(source_id)
+                )
                 
-                try:
-                    # Execute embeddings and wait for ALL to complete
-                    embedding_group = group(embedding_tasks)
-                    embedding_results = embedding_group.apply_async().get()  # Wait for completion
-                    
-                    # Analyze embedding results
-                    successful_embeddings = [r for r in embedding_results if r and r.get('processed_count', 0) > 0]
-                    failed_embeddings = len(embedding_tasks) - len(successful_embeddings)
-                    
-                    if len(successful_embeddings) == 0:
-                        # All embeddings failed
-                        logger.error(f"💥 [PARSE-{short_id}] All embedding batches failed")
-                        _update_document_status_sync(source_id, ProcessingStatus.FAILED_EMBEDDING)
-                        return {
-                            'source_id': source_id,
-                            'status': 'FAILED',
-                            'error': 'All embedding batches failed',
-                            'total_chunks': len(all_texts),
-                            'failed_batches': len(embedding_tasks)
-                        }
-                    elif failed_embeddings > 0:
-                        # Partial success
-                        logger.warning(f"⚠️ [PARSE-{short_id}] Partial embedding success: {len(successful_embeddings)}/{len(embedding_tasks)} batches")
-                        _update_document_status_sync(source_id, ProcessingStatus.PARTIAL)
-                        return {
-                            'source_id': source_id,
-                            'status': 'PARTIAL',
-                            'successful_batches': len(successful_embeddings),
-                            'failed_batches': failed_embeddings,
-                            'total_chunks': len(all_texts)
-                        }
-                    else:
-                        # Complete success
-                        logger.info(f"✅ [PARSE-{short_id}] All embeddings successful: {len(successful_embeddings)} batches")
-                        _update_document_status_sync(source_id, ProcessingStatus.COMPLETE)
-                        return {
-                            'source_id': source_id,
-                            'status': 'COMPLETE',
-                            'total_chunks': len(all_texts),
-                            'successful_batches': len(successful_embeddings),
-                            'performance_metrics': perf_summary
-                        }
-                        
-                except Exception as embedding_error:
-                    # Embedding group execution failed
-                    logger.error(f"💥 [PARSE-{short_id}] Embedding group execution failed: {embedding_error}")
-                    _update_document_status_sync(source_id, ProcessingStatus.FAILED_EMBEDDING, str(embedding_error))
-                    return {
-                        'source_id': source_id,
-                        'status': 'FAILED',
-                        'error': f'Embedding group execution failed: {str(embedding_error)}',
-                        'total_chunks': len(all_texts)
-                    }
+                # Execute the chord (non-blocking)
+                chord_result = embedding_chord.apply_async()
+                
+                # Update status to embedding phase
+                _update_document_status_sync(source_id, ProcessingStatus.EMBEDDING)
+                
+                logger.info(f"🚀 [PARSE-{source_id[:8]}] Scheduled {len(embedding_tasks)} embedding tasks with finalization chord")
+                
+                return {
+                    'source_id': source_id,
+                    'status': 'PARSING_COMPLETE',
+                    'total_chunks': len(all_texts),
+                    'embedding_tasks_scheduled': len(embedding_tasks),
+                    'chord_id': chord_result.id,
+                    'performance_metrics': perf_summary
+                }
             else:
-                # No embedding tasks created (edge case)
-                logger.warning(f"⚠️ [PARSE-{short_id}] No embedding tasks created - empty document?")
+                # No embedding tasks (empty document)
+                logger.warning(f"⚠️ [PARSE-{source_id[:8]}] No embedding tasks created - empty document?")
                 _update_document_status_sync(source_id, ProcessingStatus.COMPLETE)
                 return {
                     'source_id': source_id,
                     'status': 'COMPLETE',
                     'total_chunks': 0,
-                    'successful_batches': 0,
+                    'embedding_tasks_scheduled': 0,
                     'performance_metrics': perf_summary
                 }
+
+            # if embedding_tasks:
+            #     _update_batch_progress_sync(workflow_metadata['batch_id'], project_id, BatchProgressStatus.BATCH_EMBEDDING)
+            #     logger.info(f"🚀 [PARSE-{short_id}] Waiting for {len(embedding_tasks)} embedding tasks...")
+                
+            #     try:
+            #         # Execute embeddings and wait for ALL to complete
+            #         embedding_group = group(embedding_tasks)
+            #         embedding_results = embedding_group.apply_async().get()  # Wait for completion
+                    
+            #         # Analyze embedding results
+            #         successful_embeddings = [r for r in embedding_results if r and r.get('processed_count', 0) > 0]
+            #         failed_embeddings = len(embedding_tasks) - len(successful_embeddings)
+                    
+            #         if len(successful_embeddings) == 0:
+            #             # All embeddings failed
+            #             logger.error(f"💥 [PARSE-{short_id}] All embedding batches failed")
+            #             _update_document_status_sync(source_id, ProcessingStatus.FAILED_EMBEDDING)
+            #             return {
+            #                 'source_id': source_id,
+            #                 'status': 'FAILED',
+            #                 'error': 'All embedding batches failed',
+            #                 'total_chunks': len(all_texts),
+            #                 'failed_batches': len(embedding_tasks)
+            #             }
+            #         elif failed_embeddings > 0:
+            #             # Partial success
+            #             logger.warning(f"⚠️ [PARSE-{short_id}] Partial embedding success: {len(successful_embeddings)}/{len(embedding_tasks)} batches")
+            #             _update_document_status_sync(source_id, ProcessingStatus.PARTIAL)
+            #             return {
+            #                 'source_id': source_id,
+            #                 'status': 'PARTIAL',
+            #                 'successful_batches': len(successful_embeddings),
+            #                 'failed_batches': failed_embeddings,
+            #                 'total_chunks': len(all_texts)
+            #             }
+            #         else:
+            #             # Complete success
+            #             logger.info(f"✅ [PARSE-{short_id}] All embeddings successful: {len(successful_embeddings)} batches")
+            #             _update_document_status_sync(source_id, ProcessingStatus.COMPLETE)
+            #             return {
+            #                 'source_id': source_id,
+            #                 'status': 'COMPLETE',
+            #                 'total_chunks': len(all_texts),
+            #                 'successful_batches': len(successful_embeddings),
+            #                 'performance_metrics': perf_summary
+            #             }
+                        
+            #     except Exception as embedding_error:
+            #         # Embedding group execution failed
+            #         logger.error(f"💥 [PARSE-{short_id}] Embedding group execution failed: {embedding_error}")
+            #         _update_document_status_sync(source_id, ProcessingStatus.FAILED_EMBEDDING, str(embedding_error))
+            #         return {
+            #             'source_id': source_id,
+            #             'status': 'FAILED',
+            #             'error': f'Embedding group execution failed: {str(embedding_error)}',
+            #             'total_chunks': len(all_texts)
+            #         }
+            # else:
+            #     # No embedding tasks created (edge case)
+            #     logger.warning(f"⚠️ [PARSE-{short_id}] No embedding tasks created - empty document?")
+            #     _update_document_status_sync(source_id, ProcessingStatus.COMPLETE)
+            #     return {
+            #         'source_id': source_id,
+            #         'status': 'COMPLETE',
+            #         'total_chunks': 0,
+            #         'successful_batches': 0,
+            #         'performance_metrics': perf_summary
+            #     }
 
         except Exception as e:
             logger.error(f"💥 [PARSE-{short_id}] WORKFLOW PARSING FAILED: {e}", exc_info=True)
             _update_document_status_sync(source_id, ProcessingStatus.FAILED_PARSING, str(e))
             raise
 
+# ——— Document Finalization Task (called by embedding chord) ——————————————————————
+
+@celery_app.task(bind=True, queue=INGEST_QUEUE, acks_late=True)
+def finalize_document_processing(self, embedding_results: List[Dict], source_id: str) -> Dict[str, Any]:
+    """
+    [DOCUMENT FINALIZER] Called after all embeddings for a document complete:
+    - Analyzes embedding results
+    - Updates document status appropriately
+    - Returns final document status for batch coordination
+    
+    This is called by the chord after all embed_batch_task complete for this document.
+    """
+    short_id = source_id[:8]
+    logger.info(f"🎯 [DOC-{short_id}] Finalizing document with {len(embedding_results)} embedding results")
+    
+    # Analyze embedding results
+    successful_embeddings = [r for r in embedding_results if r and r.get('processed_count', 0) > 0]
+    failed_embeddings = len(embedding_results) - len(successful_embeddings)
+    
+    # Calculate totals
+    total_chunks_embedded = sum(r.get('processed_count', 0) for r in successful_embeddings)
+    total_tokens = sum(r.get('token_count', 0) for r in successful_embeddings)
+    
+    # Determine final status
+    if len(successful_embeddings) == 0:
+        # All embeddings failed
+        logger.error(f"💥 [DOC-{short_id}] All embedding batches failed")
+        _update_document_status_sync(source_id, ProcessingStatus.FAILED_EMBEDDING)
+        
+        return {
+            'doc_id': source_id,
+            'processing_type': 'NEW',
+            'status': 'FAILED',
+            'error': 'All embedding batches failed',
+            'chunks_created': 0,
+            'failed_batches': len(embedding_results)
+        }
+        
+    elif failed_embeddings > 0:
+        # Partial success
+        logger.warning(f"⚠️ [DOC-{short_id}] Partial embedding success: {len(successful_embeddings)}/{len(embedding_results)} batches")
+        _update_document_status_sync(source_id, ProcessingStatus.PARTIAL)
+        
+        return {
+            'doc_id': source_id,
+            'processing_type': 'NEW',
+            'status': 'PARTIAL',
+            'chunks_created': total_chunks_embedded,
+            'successful_batches': len(successful_embeddings),
+            'failed_batches': failed_embeddings,
+            'total_tokens': total_tokens
+        }
+        
+    else:
+        # Complete success
+        logger.info(f"✅ [DOC-{short_id}] All embeddings successful: {total_chunks_embedded} chunks embedded")
+        _update_document_status_sync(source_id, ProcessingStatus.COMPLETE)
+        
+        return {
+            'doc_id': source_id,
+            'processing_type': 'NEW',
+            'status': 'COMPLETE',
+            'chunks_created': total_chunks_embedded,
+            'successful_batches': len(successful_embeddings),
+            'total_tokens': total_tokens
+        }
+    
 # ——— Task 3: Embed (Fully Async DB) ——————————————————————————————————————————
 
 @celery_app.task(
@@ -1736,6 +1846,143 @@ def _embed_batch_gevent(self, source_id: str, project_id: str, texts: List[str],
 
 @celery_app.task(bind=True, queue=FINAL_QUEUE, acks_late=True)
 def finalize_batch_and_create_note(
+    self, 
+    processing_results: List[Dict[str, Any]], 
+    batch_id: str, 
+    workflow_metadata: Dict[str, Any]
+) -> Dict[str, Any]:
+    """
+    [BATCH COORDINATOR] Final coordination point for entire batch:
+    - Analyzes all document processing results
+    - Determines batch success/partial/failure status  
+    - Triggers single RAG note generation with appropriate context
+    - Handles all resilience cases (full success, partial, complete failure)
+    - Now handles both immediate results (REUSED docs) and async results (NEW docs)
+    - Waits for any async document processing to complete before finalizing
+    
+    ⚠️ This is the ONLY place where rag_note_task gets triggered per batch! (not including the duplicate shortcut)
+    """
+
+    project_id = workflow_metadata['project_id']
+    _update_batch_progress_sync(workflow_metadata['batch_id'], project_id, BatchProgressStatus.BATCH_FINALIZING)
+    logger.info(f"🎯 [BATCH-{batch_id[:8]}] Finalizing batch with {len(processing_results)} results")
+    
+    # ——— Wait for any async document processing to complete ———————————————————————
+    final_results = []
+    
+    for result in processing_results:
+        if result.get('status') == 'PARSING_COMPLETE':
+            # This document is still processing embeddings asynchronously
+            # We need to wait for its finalization (or implement a different strategy)
+            logger.info(f"⏳ [BATCH-{batch_id[:8]}] Document {result['doc_id'][:8]} still processing embeddings")
+            
+            # For now, mark as in-progress (you might want a different strategy here)
+            final_results.append({
+                **result,
+                'status': 'IN_PROGRESS',
+                'note': 'Embeddings still processing'
+            })
+        else:
+            # Document is fully processed (COMPLETE, PARTIAL, FAILED, or REUSED)
+            final_results.append(result)
+
+    # ——— Analyze Batch Results ————————————————————————————————————————————————————
+    successful_docs = [r for r in processing_results if r and r.get('status') == 'COMPLETE']
+    failed_docs = [r for r in processing_results if r and r.get('status') == 'FAILED']
+    
+    total_docs = workflow_metadata['total_documents']
+    success_count = len(successful_docs)
+    failure_count = len(failed_docs)
+    
+    # Calculate batch statistics
+    total_chunks = sum(
+        r.get('chunks_created', 0) + r.get('chunks_reused', 0) 
+        for r in successful_docs
+    )
+    total_tokens_reused = sum(r.get('tokens_reused', 0) for r in successful_docs)
+    
+    # ——— Determine Batch Status ———————————————————————————————————————————————————
+    if success_count == total_docs:
+        batch_status = 'COMPLETE'
+        final_progress = BatchProgressStatus.BATCH_COMPLETE
+        note_context = 'All documents processed successfully'
+    elif success_count > 0:
+        batch_status = 'PARTIAL' 
+        final_progress = BatchProgressStatus.BATCH_PARTIAL
+        note_context = f'{success_count}/{total_docs} documents processed successfully'
+    else:
+        batch_status = 'FAILED'
+        final_progress = BatchProgressStatus.BATCH_FAILED
+        note_context = 'All documents failed to process'
+    
+    # Final batch-level logging (view in terminal and in database)
+    _update_batch_progress_sync(workflow_metadata['batch_id'], project_id, final_progress)
+
+    logger.info(f"📊 [BATCH-{batch_id[:8]}] Batch analysis:")
+    logger.info(f"   ✅ Successful: {success_count}/{total_docs}")
+    logger.info(f"   ❌ Failed: {failure_count}")
+    logger.info(f"   📄 Total chunks: {total_chunks:,}")
+    logger.info(f"   🔄 Status: {batch_status}")
+    
+
+    # ——— Trigger Note Generation (Based on Resilience Rules) ——————————————————————
+    
+    if workflow_metadata.get('create_note') and batch_status in ['COMPLETE', 'PARTIAL']:
+        # Enhance metadata with batch context for note generation
+        note_metadata = {
+            **workflow_metadata,
+            'batch_status': batch_status,
+            'successful_documents': success_count,
+            'total_documents': total_docs, 
+            'processing_context': note_context,
+            'total_chunks_available': total_chunks,
+            'batch_id': batch_id
+        }
+        
+        logger.info(f"🎯 [BATCH-{batch_id[:8]}] Triggering RAG note generation...")
+        try:
+            rag_note_task.apply_async(kwargs={
+                "user_id": note_metadata["user_id"],
+                "note_type": note_metadata["note_type"], 
+                "project_id": note_metadata["project_id"],
+                "note_title": note_metadata["note_title"],
+                "provider": note_metadata.get("provider"),
+                "model_name": note_metadata.get("model_name"), 
+                "temperature": note_metadata.get("temperature"),
+                "addtl_params": {
+                    **note_metadata.get("addtl_params", {}),
+                    'batch_context': {
+                        'batch_id': batch_id,
+                        'batch_status': batch_status,
+                        'document_count': success_count,
+                        'total_chunks': total_chunks
+                    }
+                }
+            })
+            logger.info(f"✅ [BATCH-{batch_id[:8]}] RAG note generation triggered")
+            
+        except Exception as e:
+            logger.error(f"❌ [BATCH-{batch_id[:8]}] Failed to trigger note generation: {e}")
+            batch_status = 'NOTE_GENERATION_FAILED'
+            
+    elif batch_status == 'FAILED':
+        logger.info(f"⚠️ [BATCH-{batch_id[:8]}] Skipping note generation - all documents failed")
+        
+    else:
+        logger.info(f"ℹ️ [BATCH-{batch_id[:8]}] Note generation not requested")
+    
+    return {
+        'batch_id': batch_id,
+        'batch_status': batch_status,
+        'successful_documents': success_count,
+        'failed_documents': failure_count,
+        'total_chunks_processed': total_chunks,
+        'tokens_saved': total_tokens_reused,
+        'note_generation_triggered': workflow_metadata.get('create_note') and batch_status in ['COMPLETE', 'PARTIAL']
+    }
+
+@celery_app.task(bind=True, queue=FINAL_QUEUE, acks_late=True)
+def finalize_batch_and_create_note_legacy(
     self, 
     processing_results: List[Dict[str, Any]], 
     batch_id: str, 
@@ -2202,7 +2449,7 @@ __all__ = [
     'copy_embeddings_for_project_sync',         # KEEP: Used by reused document processing
     '_execute_batch_workflow',                   # NEW: Core workflow execution logic
     '_analyze_document_for_workflow',            # NEW: Document classification
-    '_parse_document_gevent_for_workflow',       # NEW: Workflow-optimized parsing
+    '_parse_document_for_workflow',       # NEW: Workflow-optimized parsing
     '_handle_duplicate_only_batch',              # NEW: Handle all-duplicate scenarios
     
     # ——— System Management Tasks ———————————————————————————————————————————————————
