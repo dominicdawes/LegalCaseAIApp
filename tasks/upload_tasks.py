@@ -52,6 +52,7 @@ from psycopg2.extras import execute_batch
 # ===== CELERY & TASK QUEUE =====
 from celery import chord, group
 from celery.signals import worker_init, worker_shutdown
+from celery.result import AsyncResult
 from celery.utils.log import get_task_logger
 from celery.exceptions import MaxRetriesExceededError
 from celery.exceptions import Retry as CeleryRetry
@@ -915,7 +916,7 @@ async def _execute_batch_workflow(batch_id: str, file_urls: List[str], metadata:
     # Calculate processable documents (EXCLUDE duplicates and failures) 
     processable_docs = len(new_documents) + len(reused_documents)
     
-    # ——— 1️⃣ Early exit if nothing to process ———————————————————————————————————————
+    # ——— 1️⃣ Path A: Early exit if nothing to process ———————————————————————————————————————
     if processable_docs == 0:
         logger.warning(f"⚠️ [BATCH-{batch_id[:8]}] No processable documents - all duplicates or failed")
         
@@ -932,7 +933,7 @@ async def _execute_batch_workflow(batch_id: str, file_urls: List[str], metadata:
             'reason': 'No processable documents (all duplicates or failed)'
         }
 
-    # ——— 2️⃣ Path A: All-Reused ⚡Fast Track ———————————————————————————————————————
+    # ——— 2️⃣ Path B: All-Reused ⚡Fast Track ———————————————————————————————————————
     if len(reused_documents) == processable_docs and len(reused_documents) > 0:     
         logger.info(f"⚡ [BATCH-{batch_id[:8]}] All-reused batch - fast track processing")
         
@@ -965,49 +966,126 @@ async def _execute_batch_workflow(batch_id: str, file_urls: List[str], metadata:
         }
 
     
-    # ——— 3️⃣ Path B: Mixed/New Documents Standard Workflow ——————————————————————————
+    # ——— 3️⃣ Path C: Mixed/New Documents Standard Workflow ——————————————————————————
     else:      
         logger.info(f"🔄 [BATCH-{batch_id[:8]}] Mixed batch - standard workflow processing")
         
-        # Add new document processing tasks (full async pipeline)
-        for doc_info in new_documents:
-            task_sig = process_new_document_task.s(
-                doc_info['doc_data'], 
-                doc_info['project_id'], 
-                workflow_metadata
-            )
-            processing_tasks.append(task_sig)
+        document_chains = []
         
-        # Add reused document processing tasks (lightweight sync operations)
+        # For NEW documents: Create complete chain
+        for doc_info in new_documents:
+            # Chain: parse_only → wait_for_embeddings → return_final_status
+            complete_document_chain = chain(
+                process_new_document_parse_only.s(  # NEW: Only does parsing
+                    doc_info['doc_data'], 
+                    doc_info['project_id'], 
+                    workflow_metadata
+                ),
+                wait_for_document_embeddings.s()    # NEW: Waits for embeddings
+            )
+            document_chains.append(complete_document_chain)
+        
+        # For REUSED documents: Simple single task (already complete)
         for doc_info in reused_documents:
-            task_sig = process_reused_document_task.s(
+            reused_task = process_reused_document_task.s(
                 doc_info['existing_doc_id'],
                 doc_info['doc_data'],
                 doc_info['project_id'],
                 workflow_metadata
             )
-            processing_tasks.append(task_sig)
+            document_chains.append(reused_task)
 
-        # Same coordination pattern
-        logger.info(f"🚀 [BATCH-{batch_id[:8]}] Launching coordinated MIXED/NEW workflow with {len(processing_tasks)} tasks")
-        workflow = chord(
-            group(processing_tasks),
-            finalize_batch_and_create_note.s(batch_id, workflow_metadata).set(queue=FINAL_QUEUE)
+        # ——— Batch Coordination: Wait for ALL document chains ———————————————————————
+        logger.info(f"🚀 [BATCH-{batch_id[:8]}] Launching {len(document_chains)} complete document chains")
+        
+        batch_workflow = chord(
+            group(document_chains),  # All document chains run in parallel
+            finalize_batch_and_create_note.s(batch_id, workflow_metadata)  # Triggered when ALL chains complete
         )
         
-        # Execute the workflow
-        chord_result = workflow.apply_async()
+        chord_result = batch_workflow.apply_async()
         
         return {
             'batch_id': batch_id,
             'workflow_id': chord_result.id,
-            'processing_tasks': len(processing_tasks),
-            'workflow_path': 'MIXED_NEW_STANDARD',
+            'document_chains': len(document_chains),
+            'workflow_path': 'COMPLETE_DOCUMENT_CHAINS',
             'status': 'WORKFLOW_LAUNCHED'
         }
 
 # ——— Specialized Processing Tasks ————————————————————————————————————————————————
 
+@celery_app.task(bind=True, queue=INGEST_QUEUE, acks_late=True)
+def process_new_document_parse_only(
+    self, 
+    doc_data: Dict[str, Any], 
+    project_id: str, 
+    workflow_metadata: Dict[str, Any]
+) -> Dict[str, Any]:
+    """
+    [PARSE ONLY] Process document through parsing phase only:
+    - Insert document record
+    - Parse and create embedding tasks (but don't wait)
+    - Return parsing results for next task in chain
+    """
+    doc_id = str(uuid.uuid4())
+    doc_data['id'] = doc_id
+    
+    try:
+        # ——— Insert Document Record ———————————————————————————————————————————————
+        pool = get_sync_db_pool()
+        conn = pool.getconn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    '''INSERT INTO document_sources 
+                    (id, cdn_url, content_hash, project_id, content_tags, uploaded_by, 
+                    vector_embed_status, filename, file_size_bytes, file_extension, created_at, processing_metadata)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)''',
+                    (doc_id, doc_data['cdn_url'], doc_data['content_hash'], 
+                    project_id, doc_data.get('content_tags', []), workflow_metadata['user_id'],
+                    ProcessingStatus.PENDING.value, doc_data['filename'], 
+                    doc_data['file_size_bytes'], os.path.splitext(doc_data['filename'])[1].lower(),
+                    datetime.now(timezone.utc), Json(workflow_metadata))
+                )
+                conn.commit()
+        finally:
+            pool.putconn(conn)
+        
+        # ——— Parse Document (Same as before, but return chord ID) ————————————————
+        parse_result = _parse_document_for_workflow(
+            self, doc_id, doc_data['cdn_url'], project_id, workflow_metadata
+        )
+        
+        if parse_result.get('status') == 'PARSING_COMPLETE':
+            # Return info needed for next task to wait for embeddings
+            return {
+                'doc_id': doc_id,
+                'processing_type': 'NEW',
+                'status': 'PARSING_COMPLETE',
+                'chunks_created': parse_result.get('total_chunks', 0),
+                'embedding_chord_id': parse_result.get('chord_id'),  # Pass chord ID to next task
+                'performance_metrics': parse_result.get('performance_metrics', {})
+            }
+        else:
+            # Parsing failed
+            return {
+                'doc_id': doc_id,
+                'processing_type': 'NEW',
+                'status': 'FAILED',
+                'error': parse_result.get('error', 'Parsing failed'),
+                'chunks_created': 0
+            }
+            
+    except Exception as e:
+        logger.error(f"❌ [DOC-{doc_id[:8]}] Document parsing failed: {e}")
+        return {
+            'doc_id': doc_id,
+            'processing_type': 'NEW',
+            'status': 'FAILED',
+            'error': str(e)
+        }
+    
 async def _handle_duplicate_only_batch(batch_id: str, project_id: str, workflow_metadata: Dict[str, Any], duplicate_docs: List[Dict]) -> Dict[str, Any]:
     """  
     [DUPLICATE HANDLER] Handle batches containing only duplicate documents:
@@ -1214,6 +1292,68 @@ def process_reused_document_task(
             'processing_type': 'REUSED',
             'status': 'FAILED', 
             'error': str(e)
+        }
+
+@celery_app.task(bind=True, queue=INGEST_QUEUE, acks_late=True)
+def wait_for_document_embeddings(
+    self, 
+    parse_result: Dict[str, Any]
+) -> Dict[str, Any]:
+    """
+    [EMBEDDING WAITER] Waits for embeddings using Celery's AsyncResult:
+    - Takes parse result with chord ID
+    - Uses AsyncResult.get() to wait (this is OK because it's the MAIN task purpose)
+    - Returns final document status
+    
+    KEY: This task's ONLY job is waiting, so .get() is appropriate here!
+    """
+    doc_id = parse_result['doc_id']
+    short_id = doc_id[:8]
+    
+    # Check if parsing succeeded
+    if parse_result.get('status') != 'PARSING_COMPLETE':
+        logger.error(f"❌ [DOC-{short_id}] Cannot wait for embeddings - parsing failed")
+        return parse_result  # Return the failed parse result
+    
+    embedding_chord_id = parse_result.get('embedding_chord_id')
+    if not embedding_chord_id:
+        # No embeddings (empty document case)
+        logger.info(f"✅ [DOC-{short_id}] No embeddings needed - document complete")
+        return {
+            **parse_result,
+            'status': 'COMPLETE',
+            'final_chunks': parse_result.get('chunks_created', 0)
+        }
+    
+    # ——— Wait for Embedding Chord Completion (This IS the task's purpose!) ———————
+    logger.info(f"⏳ [DOC-{short_id}] Waiting for embedding chord completion...")
+    
+    try:
+        chord_result = AsyncResult(embedding_chord_id)
+        
+        # This .get() call is OK because:
+        # 1. This task's ONLY purpose is waiting
+        # 2. It's not a nested task call - it's waiting for a separate workflow
+        # 3. The chord runs independently of this task
+        final_embedding_result = chord_result.get(timeout=300)  # 5 minute timeout
+        
+        logger.info(f"✅ [DOC-{short_id}] Embeddings completed successfully")
+        
+        # Return the final result from finalize_document_processing
+        return final_embedding_result
+        
+    except Exception as e:
+        logger.error(f"❌ [DOC-{short_id}] Embedding wait failed: {e}")
+        
+        # Update document status to failed
+        _update_document_status_sync(doc_id, ProcessingStatus.FAILED_EMBEDDING, str(e))
+        
+        return {
+            'doc_id': doc_id,
+            'processing_type': 'NEW',
+            'status': 'FAILED',
+            'error': f'Embedding completion failed: {str(e)}',
+            'chunks_created': parse_result.get('chunks_created', 0)
         }
 
 # ——— Task 2: 🔍 Document Analysis & Classification ——————————————————————————————————————————
@@ -1852,73 +1992,41 @@ def finalize_batch_and_create_note(
     workflow_metadata: Dict[str, Any]
 ) -> Dict[str, Any]:
     """
-    [BATCH COORDINATOR] Final coordination point for entire batch:
-    - Analyzes all document processing results
-    - Determines batch success/partial/failure status  
-    - Triggers single RAG note generation with appropriate context
-    - Handles all resilience cases (full success, partial, complete failure)
-    - Now handles both immediate results (REUSED docs) and async results (NEW docs)
-    - Waits for any async document processing to complete before finalizing
-    
-    ⚠️ This is the ONLY place where rag_note_task gets triggered per batch! (not including the duplicate shortcut)
+    [BATCH COORDINATOR] Receives FINAL document results:
+    - No more PARSING_COMPLETE status confusion
+    - No more race conditions
+    - Clean COMPLETE/PARTIAL/FAILED results only
     """
-
     project_id = workflow_metadata['project_id']
-    _update_batch_progress_sync(workflow_metadata['batch_id'], project_id, BatchProgressStatus.BATCH_FINALIZING)
-    logger.info(f"🎯 [BATCH-{batch_id[:8]}] Finalizing batch with {len(processing_results)} results")
+    logger.info(f"🎯 [BATCH-{batch_id[:8]}] Finalizing batch with {len(processing_results)} completed documents")
     
-    # ——— Wait for any async document processing to complete ———————————————————————
-    final_results = []
-    
-    for result in processing_results:
-        if result.get('status') == 'PARSING_COMPLETE':
-            # This document is still processing embeddings asynchronously
-            # We need to wait for its finalization (or implement a different strategy)
-            logger.info(f"⏳ [BATCH-{batch_id[:8]}] Document {result['doc_id'][:8]} still processing embeddings")
-            
-            # For now, mark as in-progress (you might want a different strategy here)
-            final_results.append({
-                **result,
-                'status': 'IN_PROGRESS',
-                'note': 'Embeddings still processing'
-            })
-        else:
-            # Document is fully processed (COMPLETE, PARTIAL, FAILED, or REUSED)
-            final_results.append(result)
-
-    # ——— Analyze Batch Results ————————————————————————————————————————————————————
-    successful_docs = [r for r in processing_results if r and r.get('status') == 'COMPLETE']
+    # ——— Clean Result Analysis (No More Edge Cases!) ——————————————————————————————
+    successful_docs = [r for r in processing_results if r and r.get('status') in ['COMPLETE', 'PARTIAL']]
     failed_docs = [r for r in processing_results if r and r.get('status') == 'FAILED']
     
-    total_docs = workflow_metadata['total_documents']
+    total_docs = len(processing_results)
     success_count = len(successful_docs)
     failure_count = len(failed_docs)
     
-    # Calculate batch statistics
-    total_chunks = sum(
-        r.get('chunks_created', 0) + r.get('chunks_reused', 0) 
-        for r in successful_docs
-    )
-    total_tokens_reused = sum(r.get('tokens_reused', 0) for r in successful_docs)
+    # All results should now be accounted for
+    assert success_count + failure_count == total_docs, f"Result count mismatch: {success_count} + {failure_count} != {total_docs}"
     
-    # ——— Determine Batch Status ———————————————————————————————————————————————————
+    total_chunks = sum(r.get('chunks_created', 0) for r in successful_docs)
+    
+    # ——— Determine Final Batch Status ————————————————————————————————————————————
     if success_count == total_docs:
         batch_status = 'COMPLETE'
         final_progress = BatchProgressStatus.BATCH_COMPLETE
-        note_context = 'All documents processed successfully'
     elif success_count > 0:
-        batch_status = 'PARTIAL' 
+        batch_status = 'PARTIAL'
         final_progress = BatchProgressStatus.BATCH_PARTIAL
-        note_context = f'{success_count}/{total_docs} documents processed successfully'
     else:
         batch_status = 'FAILED'
         final_progress = BatchProgressStatus.BATCH_FAILED
-        note_context = 'All documents failed to process'
     
-    # Final batch-level logging (view in terminal and in database)
-    _update_batch_progress_sync(workflow_metadata['batch_id'], project_id, final_progress)
-
-    logger.info(f"📊 [BATCH-{batch_id[:8]}] Batch analysis:")
+    _update_batch_progress_sync(batch_id, project_id, final_progress)
+    
+    logger.info(f"📊 [BATCH-{batch_id[:8]}] Final analysis:")
     logger.info(f"   ✅ Successful: {success_count}/{total_docs}")
     logger.info(f"   ❌ Failed: {failure_count}")
     logger.info(f"   📄 Total chunks: {total_chunks:,}")
