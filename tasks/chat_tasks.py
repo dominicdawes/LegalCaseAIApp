@@ -69,18 +69,16 @@ from celery.exceptions import Retry as CeleryRetry
 import psutil
 
 # ===== PROJECT MODULES =====
-from tasks.celery_app import celery_app, run_async_in_worker
-from utils.prompt_utils import load_yaml_prompt, build_chat_messages_from_yaml
-from utils.supabase_utils import (
-    supabase_client,
-    insert_chat_message_supabase_record,
-    create_new_chat_session,
-    log_llm_error,
-)
 from utils.llm_clients.llm_factory import LLMFactory                    # Simple LLM Client factory
 from utils.llm_clients.citation_processor import CitationProcessor      # detects citations in streaming chunks
 from utils.llm_clients.performance_monitor import PerformanceMonitor    # 🆕 Performance tracking
 from utils.llm_clients.stream_normalizer import StreamNormalizer        # Format streamed results from several providers
+from tasks.celery_app import (
+    run_async_in_worker,
+    get_global_async_db_pool,
+    get_global_redis_pool,
+    init_async_pools
+)
 
 # ——— Logging & Env Load ———————————————————————————————————————————————————————————
 
@@ -321,78 +319,78 @@ async def cleanup_worker_pools():
 
 # ==== Asynchronous DB pool =======
 
-async def initialize_async_database_pool() -> asyncpg.Pool:
-    """
-    🔧 IMPROVED: Initialize async database connection pool with proper lifecycle management
+# async def initialize_async_database_pool() -> asyncpg.Pool:
+#     """
+#     🔧 IMPROVED: Initialize async database connection pool with proper lifecycle management
     
-    Key improvements:
-    - Proper connection lifecycle management
-    - Race condition prevention
-    - Better error handling and recovery
-    - Pool health monitoring
-    """
-    global db_pool
+#     Key improvements:
+#     - Proper connection lifecycle management
+#     - Race condition prevention
+#     - Better error handling and recovery
+#     - Pool health monitoring
+#     """
+#     global db_pool
     
-    # Prevent multiple simultaneous initializations
-    async with _async_pool_init_lock:
-        # Check if pool already exists and is healthy
-        if db_pool and not db_pool.is_closing():
-            try:
-                # Quick health check
-                async with db_pool.acquire(timeout=5) as conn:
-                    await conn.fetchval('SELECT 1')
-                logger.info("✅ Existing database pool is healthy")
-                return db_pool
-            except Exception as e:
-                logger.warning(f"⚠️ Existing pool unhealthy, recreating: {e}")
-                await _close_db_pool_safely()
+#     # Prevent multiple simultaneous initializations
+#     async with _async_pool_init_lock:
+#         # Check if pool already exists and is healthy
+#         if db_pool and not db_pool.is_closing():
+#             try:
+#                 # Quick health check
+#                 async with db_pool.acquire(timeout=5) as conn:
+#                     await conn.fetchval('SELECT 1')
+#                 logger.info("✅ Existing database pool is healthy")
+#                 return db_pool
+#             except Exception as e:
+#                 logger.warning(f"⚠️ Existing pool unhealthy, recreating: {e}")
+#                 await _close_db_pool_safely()
     
-    if not DB_DSN:
-        raise ValueError("❌ POSTGRES_DSN environment variable not set")
+#     if not DB_DSN:
+#         raise ValueError("❌ POSTGRES_DSN environment variable not set")
     
-    logger.info("🏊 Creating optimized asyncpg connection pool...")
+#     logger.info("🏊 Creating optimized asyncpg connection pool...")
     
-    try:
-        # Create new pool with improved settings
-        db_pool = await asyncpg.create_pool(
-            dsn=DB_DSN,
-            min_size=DB_POOL_MIN_SIZE,
-            max_size=DB_POOL_MAX_SIZE,
+#     try:
+#         # Create new pool with improved settings
+#         db_pool = await asyncpg.create_pool(
+#             dsn=DB_DSN,
+#             min_size=DB_POOL_MIN_SIZE,
+#             max_size=DB_POOL_MAX_SIZE,
             
-            # Connection timeouts
-            command_timeout=30,          # Individual command timeout
-            timeout=60,                  # Connection acquisition timeout
+#             # Connection timeouts
+#             command_timeout=30,          # Individual command timeout
+#             timeout=60,                  # Connection acquisition timeout
             
-            # Performance settings
-            server_settings={
-                'application_name': 'streaming_chat_worker',
-                'tcp_keepalives_idle': '300',     # Keep connections alive
-                'tcp_keepalives_interval': '30',
-                'tcp_keepalives_count': '3'
-            },
+#             # Performance settings
+#             server_settings={
+#                 'application_name': 'streaming_chat_worker',
+#                 'tcp_keepalives_idle': '300',     # Keep connections alive
+#                 'tcp_keepalives_interval': '30',
+#                 'tcp_keepalives_count': '3'
+#             },
             
-            # Compatibility settings
-            statement_cache_size=0,      # pgBouncer compatibility
+#             # Compatibility settings
+#             statement_cache_size=0,      # pgBouncer compatibility
             
-            # Connection lifecycle management
-            setup=_setup_connection,     # Run on each new connection
-            init=_init_connection,       # Run once per connection
-        )
+#             # Connection lifecycle management
+#             setup=_setup_connection,     # Run on each new connection
+#             init=_init_connection,       # Run once per connection
+#         )
         
-        # Verify pool health with a test query
-        async with db_pool.acquire() as conn:
-            result = await conn.fetchval('SELECT version()')
-            logger.info(f"✅ Database pool initialized successfully. Version: {result[:50]}...")
+#         # Verify pool health with a test query
+#         async with db_pool.acquire() as conn:
+#             result = await conn.fetchval('SELECT version()')
+#             logger.info(f"✅ Database pool initialized successfully. Version: {result[:50]}...")
             
-        # Register cleanup on process exit
-        weakref.finalize(db_pool, _cleanup_db_pool)
+#         # Register cleanup on process exit
+#         weakref.finalize(db_pool, _cleanup_db_pool)
         
-        return db_pool
+#         return db_pool
         
-    except Exception as e:
-        logger.error(f"❌ Database pool initialization failed: {e}")
-        db_pool = None
-        raise
+#     except Exception as e:
+#         logger.error(f"❌ Database pool initialization failed: {e}")
+#         db_pool = None
+#         raise
 
 async def _setup_connection(conn: asyncpg.Connection):
     """Run setup commands on each new connection"""
@@ -512,14 +510,13 @@ def _cleanup_redis_pool():
 
 @asynccontextmanager
 async def get_db_connection():
-    """
-    Simple DB connection context manager
-    NOTE: add error logging / timeout later
-    """
-    if not db_pool:
-        await init_worker_pools()
+    """Use global pool"""
+    pool = get_global_async_db_pool()
+    if not pool:
+        await init_async_pools()
+        pool = get_global_async_db_pool()
     
-    async with db_pool.acquire() as conn:
+    async with pool.acquire() as conn:
         yield conn
 
 @asynccontextmanager  

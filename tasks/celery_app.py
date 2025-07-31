@@ -1,9 +1,10 @@
+# celery_app.py
+
 """
 This creates and configures the celery_app instance. There are 2 versions, the localhost version
 and the cloud hosted (Render) version.
 """
 
-# celery_app.py
 import logging
 import sys
 import asyncio
@@ -15,10 +16,30 @@ from celery.app.log import TaskFormatter
 from datetime import datetime, timezone
 import os
 from dotenv import load_dotenv
+import asyncpg
+import aioredis
+import psycopg2.pool
+
+# ——— Global Variables (CRITICAL: Declare all globals at top) ————————————————————————
 
 # Load environment variables
 load_dotenv()
+logger = logging.getLogger(__name__) 
+logger.setLevel(logging.DEBUG)
 
+# Event loop globals
+_worker_loop = None
+_worker_thread = None
+
+# Database pools
+db_pool = None
+redis_pool = None
+sync_db_pool = None
+
+
+# ——— Environment Configuration ————————————————————————————————————————————————————
+
+# Redis (cache) and Message Queues
 CLOUD_AMQP_ENDPOINT = os.getenv("CLOUDAMQP_PUBLIC_ENDPOINT", "amqp://guest@localhost//")
 REDIS_LABS_ENDPOINT = (
     "redis://default:"
@@ -27,19 +48,24 @@ REDIS_LABS_ENDPOINT = (
     + (os.getenv("REDIS_PUBLIC_ENDPOINT") or "localhost:6379")
 )
 
-# <--- localhost version --->
+# Database constants
+DB_DSN = os.getenv("POSTGRES_DSN_POOL") # e.g., Supabase -> Connection -> Get Pool URL
+DB_POOL_MIN_SIZE = 2    # if I had more compute MIN: 5, MAX: 20
+DB_POOL_MAX_SIZE = 5
 
-# Initialize the Celery app
-# celery_app = Celery(
-#     'celery_app',
-#     broker='amqps://btwzozrv:pcIervFsmCoKgcB2KtOSdNNHMJD7qWRJ@octopus.rmq3.cloudamqp.com/btwzozrv',
-#     backend='redis://localhost:6380/0',  # Memurai instance as backend on port 6380
-#     task_serializer='json',
-#     result_serializer='json',
-#     accept_content=['json'],  # Accept only JSON content
-# )
+# Initialize Redis sync client for pub/sub
+REDIS_LABS_URL = (
+    "redis://default:"
+    + os.getenv("REDIS_PASSWORD")
+    + "@"
+    + os.getenv("REDIS_PUBLIC_ENDPOINT")
+)
 
-# <--- cloud hosted version --->
+# 🎛️ Toggle Controls from Environment Variables
+SHOW_CELERY_LOGS = "true"   # os.getenv("SHOW_CELERY_LOGS", "true").lower() == "true"
+SHOW_MANUAL_LOGS = "true"  # os.getenv("SHOW_MANUAL_LOGS", "true").lower() == "true"
+
+# ——— Celery App Initialization ————————————————————————————————————————————————————
 
 # Initialize the Celery app
 celery_app = Celery(
@@ -51,11 +77,17 @@ celery_app = Celery(
     accept_content=["json", "pickle"],  # Accept JSON and pickle content
 )
 
-# 🎛️ Toggle Controls from Environment Variables
-SHOW_CELERY_LOGS = "true"   # os.getenv("SHOW_CELERY_LOGS", "true").lower() == "true"
-SHOW_MANUAL_LOGS = "true"  # os.getenv("SHOW_MANUAL_LOGS", "true").lower() == "true"
+# Initialize the (localhost) Celery app
+# celery_app = Celery(
+#     'celery_app',
+#     broker='amqps://btwzozrv:pcIervFsmCoKgcB2KtOSdNNHMJD7qWRJ@octopus.rmq3.cloudamqp.com/btwzozrv',
+#     backend='redis://localhost:6380/0',  # Memurai instance as backend on port 6380
+#     task_serializer='json',
+#     result_serializer='json',
+#     accept_content=['json'],  # Accept only JSON content
+# )
 
-# ——— Event Loop ———————————————————————————————————————————————————————————
+# ——— Event Loop Management ———————————————————————————————————————————————————————
 
 def _run_event_loop(loop):
     """Run the event loop in a dedicated thread"""
@@ -83,11 +115,22 @@ def worker_init_handler(sender=None, **kwargs):
 @worker_shutdown.connect
 def worker_shutdown_handler(sender=None, **kwargs):
     """Clean up event loop when worker shuts down"""
-    global _worker_loop, _worker_thread
+    global _worker_loop, _worker_thread, db_pool, redis_pool, sync_db_pool
     
+    # Clean up async pools
     if _worker_loop and not _worker_loop.is_closed():
+        if db_pool:
+            asyncio.run_coroutine_threadsafe(db_pool.close(), _worker_loop)
+        if redis_pool:
+            asyncio.run_coroutine_threadsafe(redis_pool.disconnect(), _worker_loop)
+        
         _worker_loop.call_soon_threadsafe(_worker_loop.stop)
         _worker_loop = None
+    
+    # Clean up sync pool
+    if sync_db_pool:
+        sync_db_pool.closeall()
+        sync_db_pool = None
     
     if _worker_thread and _worker_thread.is_alive():
         _worker_thread.join(timeout=5)
@@ -106,7 +149,67 @@ def run_async_in_worker(coro):
     future = asyncio.run_coroutine_threadsafe(coro, _worker_loop)
     return future.result()
 
-# ——— Logging & Env Load ———————————————————————————————————————————————————————————
+# ——— Global Pool Management ————————————————————————————————————————————————————
+
+async def init_async_pools():
+    """Initialize async pools once per worker"""
+    global db_pool, redis_pool
+    
+    if not db_pool:
+        db_pool = await asyncpg.create_pool(
+            dsn=DB_DSN,
+            min_size=DB_POOL_MIN_SIZE,
+            max_size=DB_POOL_MAX_SIZE,
+            command_timeout=30,
+            statement_cache_size=0,
+            server_settings={'application_name': 'celery_worker'}
+        )
+        logger.info("✅ [celery_app] Global async DB pool initialized")
+    
+    if not redis_pool:
+        redis_pool = aioredis.ConnectionPool.from_url(
+            REDIS_LABS_URL,
+            max_connections=20,
+            decode_responses=True
+        )
+        logger.info("✅ [celery_app] Global Redis pool initialized")
+
+def init_sync_pool():
+    """Initialize sync database pool for upload tasks"""
+    global sync_db_pool
+    
+    if not sync_db_pool:
+        # Extract connection params from DSN for psycopg2
+        import urllib.parse
+        parsed = urllib.parse.urlparse(DB_DSN)
+        
+        sync_db_pool = psycopg2.pool.ThreadedConnectionPool(
+            minconn=2,
+            maxconn=10,
+            host=parsed.hostname,
+            port=parsed.port,
+            database=parsed.path[1:],  # Remove leading '/'
+            user=parsed.username,
+            password=parsed.password,
+            application_name='celery_sync_worker'
+        )
+        logger.info("✅ [celery_app] Global sync DB pool initialized")
+
+def get_global_async_db_pool():
+    """Get the global async database pool"""
+    return db_pool
+
+def get_global_redis_pool():
+    """Get the global Redis pool"""
+    return redis_pool
+
+def get_global_sync_db_pool():
+    """Get the global sync database pool"""
+    if not sync_db_pool:
+        init_sync_pool()
+    return sync_db_pool
+
+# ——— Logging Configuration ———————————————————————————————————————————————————————
 
 @after_setup_logger.connect
 def setup_loggers(logger, **kwargs):
@@ -151,6 +254,8 @@ def setup_loggers(logger, **kwargs):
         
         print("🔇 Manual logs disabled")
 
+# ——— Celery Configuration ————————————————————————————————————————————————————————
+
 # 🎛️ Update Celery config to respect toggles
 celery_config_updates = {
     "task_serializer": "json",
@@ -175,18 +280,20 @@ if not SHOW_CELERY_LOGS:
     })
 
 celery_app.conf.update(**celery_config_updates)
-# Import tasks to register them with Celery (THIS WORKS!!!)
-# import tasks.generate_tasks
+
+# ——— Task Registration (Import after app is configured) ——————————————————————————
+
+# Import tasks to register them with Celery
 import tasks.chat_tasks
 import tasks.chat_streaming_tasks
-# import tasks.upload_tasks_chains_0730
 import tasks.upload_tasks
 import tasks.note_tasks
 import tasks.sample_tasks
 
-# # Optional: ASK GPT ABOUT IT'S PURPOSE: Automatically discover tasks in specified modules
-# # This allows Celery to find tasks in modules like `generate_tasks.py` and `other_tasks.py`
+# Automatically discover tasks in specified modules
 celery_app.autodiscover_tasks(["tasks"])
+
+# ——— Startup Messages ————————————————————————————————————————————————————————————
 
 # Sanity check print statement - these should show up in Render logs
 print("🚀 Celery app initialized successfully!")
@@ -196,4 +303,10 @@ print("✅ Ready to process tasks")
 
 
 # ——— Module Exports ————————————————————————————————————————————————————————————————
-__all__ = ['celery_app', 'run_async_in_worker']
+__all__ = [
+    'celery_app', 
+    'run_async_in_worker',
+    'get_global_async_db_pool',
+    'get_global_redis_pool',
+    'init_async_pools'
+]

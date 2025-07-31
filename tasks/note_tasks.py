@@ -58,7 +58,7 @@ from langchain_community.document_loaders import PyPDFLoader
 from langchain.text_splitter import CharacterTextSplitter
 
 # ===== PROJECT MODULES =====
-from tasks.celery_app import celery_app, run_async_in_worker
+from tasks.celery_app import celery_app
 from utils.prompt_utils import load_yaml_prompt, build_prompt_template_from_yaml
 from utils.supabase_utils import (
     insert_note_supabase_record,
@@ -69,7 +69,12 @@ from utils.llm_clients.llm_factory import LLMFactory                    # Simple
 from utils.llm_clients.citation_processor import CitationProcessor      # detects citations in streaming chunks
 from utils.llm_clients.performance_monitor import PerformanceMonitor    # 🆕 Performance tracking
 from utils.llm_clients.stream_normalizer import StreamNormalizer        # Format streamed results from several providers
-
+from tasks.celery_app import (
+    run_async_in_worker,
+    get_global_async_db_pool,
+    get_global_redis_pool,
+    init_async_pools
+)
 
 # ——— Logging & Env Load ———————————————————————————————————————————————————————————
 logger = get_task_logger(__name__)

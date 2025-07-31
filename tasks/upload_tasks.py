@@ -67,7 +67,7 @@ from langchain_openai import OpenAIEmbeddings
 import psutil
 
 # ===== PROJECT MODULES =====
-from tasks.celery_app import celery_app, run_async_in_worker
+from tasks.celery_app import celery_app
 from tasks.note_tasks import rag_note_task
 from utils.s3_utils import upload_to_s3, s3_client
 from utils.cloudfront_utils import get_cloudfront_url
@@ -78,6 +78,12 @@ from utils.document_loaders.performance import create_optimized_processor, Batch
 from utils.metrics import MetricsCollector, Timer
 from utils.connection_pool import ConnectionPoolManager
 from utils.memory_manager import MemoryManager # Kept for health checks
+from tasks.celery_app import (
+    run_async_in_worker,
+    get_global_async_db_pool,
+    get_global_redis_pool,
+    init_async_pools
+)
 
 # ——— Logging & Env Load ———————————————————————————————————————————————————————————
 logger = get_task_logger(__name__)
@@ -1458,7 +1464,7 @@ async def _execute_batch_workflow(batch_id: str, file_urls: List[str], metadata:
     ├── Document A : (async) Download/stream → (async) classify → REUSED
     ├── Document B : (async) Download/stream → (async) classify → NEW
     ├── Document C : (async) Download/stream → (async) classify → NEW
-    └── Build Celery workflow signatures → New: 2, Reused: 1  # Return coordination plan
+    └── Build Celery workflow signa tures → New: 2, Reused: 1  # Return coordination plan
 
     """
     project_id = metadata['project_id']
@@ -1468,6 +1474,7 @@ async def _execute_batch_workflow(batch_id: str, file_urls: List[str], metadata:
 
     logger.info(f"🔍 [BATCH-{batch_id[:8]}] Analyzing document types...")
     _update_batch_progress_sync(batch_id, project_id, BatchProgressStatus.BATCH_ANALYZING)
+
     async with httpx.AsyncClient(timeout=60.0) as client:
         analysis_tasks = [
             _analyze_document_for_workflow(client, url, project_id, user_id) 
@@ -1499,7 +1506,7 @@ async def _execute_batch_workflow(batch_id: str, file_urls: List[str], metadata:
     
     logger.info(f"📊 [BATCH-{batch_id[:8]}] Classification complete:")
     logger.info(f"   🆕 New documents: {len(new_documents)}")
-    logger.info(f"   ♻️  Reused documents: {len(reused_documents)}")
+    logger.info(f"   ♻️ Reused documents: {len(reused_documents)}")
     logger.info(f"   📋 Duplicate documents: {len(duplicate_documents)}")
     logger.info(f"   ❌ Failed downloads: {len(failed_downloads)}")
     _update_batch_progress_sync(batch_id, project_id, BatchProgressStatus.BATCH_PROCESSING)
@@ -1629,7 +1636,7 @@ async def _execute_batch_workflow(batch_id: str, file_urls: List[str], metadata:
             group(document_tasks),
             finalize_batch_and_create_note.s(batch_id, workflow_metadata)
         )
-        _update_batch_progress_sync(batch_id, project_id, BatchProgressStatus.BATCH_EMBEDDING) # ← Technically embedding start  with apply_async() in the parent function but this is a good place
+        _update_batch_progress_sync(batch_id, project_id, BatchProgressStatus.BATCH_EMBEDDING) # ← Technically embedding start with apply_async() in the parent function but this is a good place
         
         return {
             'batch_id': batch_id,
@@ -1932,7 +1939,7 @@ async def _process_document_async_workflow(
         finally:
             pool.putconn(conn)
         
-        # ——— 2. PARSE Document ———————————————————————————————
+        # ——— 2. PARSE Document ———————————————————————————————————————————————————
         logger.info(f"📋 [DOC-{short_id}] → PARSING")
 
         # Parsing contains these subtasks: select optimal loader → in-memory streaming → clean/chunk text
@@ -1988,70 +1995,70 @@ async def _process_document_async_workflow(
 
 # ——— Document Finalization Task (called by embedding chord) ——————————————————————
 
-@celery_app.task(bind=True, queue=INGEST_QUEUE, acks_late=True)
-def finalize_document_processing(self, embedding_results: List[Dict], source_id: str) -> Dict[str, Any]:
-    """
-    [DOCUMENT FINALIZER] Called after all embeddings for a document complete:
-    - Analyzes embedding results
-    - Updates document status appropriately
-    - Returns final document status for batch coordination
+# @celery_app.task(bind=True, queue=INGEST_QUEUE, acks_late=True)
+# def finalize_document_processing(self, embedding_results: List[Dict], source_id: str) -> Dict[str, Any]:
+#     """
+#     [DOCUMENT FINALIZER] Called after all embeddings for a document complete:
+#     - Analyzes embedding results
+#     - Updates document status appropriately
+#     - Returns final document status for batch coordination
     
-    This is called by the chord after all embed_batch_task complete for this document.
-    """
-    short_id = source_id[:8]
-    logger.info(f"🎯 [DOC-{short_id}] Finalizing document with {len(embedding_results)} embedding results")
+#     This is called by the chord after all embed_batch_task complete for this document.
+#     """
+#     short_id = source_id[:8]
+#     logger.info(f"🎯 [DOC-{short_id}] Finalizing document with {len(embedding_results)} embedding results")
     
-    # Analyze embedding results
-    successful_embeddings = [r for r in embedding_results if r and r.get('processed_count', 0) > 0]
-    failed_embeddings = len(embedding_results) - len(successful_embeddings)
+#     # Analyze embedding results
+#     successful_embeddings = [r for r in embedding_results if r and r.get('processed_count', 0) > 0]
+#     failed_embeddings = len(embedding_results) - len(successful_embeddings)
     
-    # Calculate totals
-    total_chunks_embedded = sum(r.get('processed_count', 0) for r in successful_embeddings)
-    total_tokens = sum(r.get('token_count', 0) for r in successful_embeddings)
+#     # Calculate totals
+#     total_chunks_embedded = sum(r.get('processed_count', 0) for r in successful_embeddings)
+#     total_tokens = sum(r.get('token_count', 0) for r in successful_embeddings)
     
-    # Determine final status
-    if len(successful_embeddings) == 0:
-        # All embeddings failed
-        logger.error(f"💥 [DOC-{short_id}] All embedding batches failed")
-        _update_document_status_sync(source_id, ProcessingStatus.FAILED_EMBEDDING)
+#     # Determine final status
+#     if len(successful_embeddings) == 0:
+#         # All embeddings failed
+#         logger.error(f"💥 [DOC-{short_id}] All embedding batches failed")
+#         _update_document_status_sync(source_id, ProcessingStatus.FAILED_EMBEDDING)
         
-        return {
-            'doc_id': source_id,
-            'processing_type': 'NEW',
-            'status': 'FAILED',
-            'error': 'All embedding batches failed',
-            'chunks_created': 0,
-            'failed_batches': len(embedding_results)
-        }
+#         return {
+#             'doc_id': source_id,
+#             'processing_type': 'NEW',
+#             'status': 'FAILED',
+#             'error': 'All embedding batches failed',
+#             'chunks_created': 0,
+#             'failed_batches': len(embedding_results)
+#         }
         
-    elif failed_embeddings > 0:
-        # Partial success
-        logger.warning(f"⚠️ [DOC-{short_id}] Partial embedding success: {len(successful_embeddings)}/{len(embedding_results)} batches")
-        _update_document_status_sync(source_id, ProcessingStatus.PARTIAL)
+#     elif failed_embeddings > 0:
+#         # Partial success
+#         logger.warning(f"⚠️ [DOC-{short_id}] Partial embedding success: {len(successful_embeddings)}/{len(embedding_results)} batches")
+#         _update_document_status_sync(source_id, ProcessingStatus.PARTIAL)
         
-        return {
-            'doc_id': source_id,
-            'processing_type': 'NEW',
-            'status': 'PARTIAL',
-            'chunks_created': total_chunks_embedded,
-            'successful_batches': len(successful_embeddings),
-            'failed_batches': failed_embeddings,
-            'total_tokens': total_tokens
-        }
+#         return {
+#             'doc_id': source_id,
+#             'processing_type': 'NEW',
+#             'status': 'PARTIAL',
+#             'chunks_created': total_chunks_embedded,
+#             'successful_batches': len(successful_embeddings),
+#             'failed_batches': failed_embeddings,
+#             'total_tokens': total_tokens
+#         }
         
-    else:
-        # Complete success
-        logger.info(f"✅ [DOC-{short_id}] All embeddings successful: {total_chunks_embedded} chunks embedded")
-        _update_document_status_sync(source_id, ProcessingStatus.COMPLETE)
+#     else:
+#         # Complete success
+#         logger.info(f"✅ [DOC-{short_id}] All embeddings successful: {total_chunks_embedded} chunks embedded")
+#         _update_document_status_sync(source_id, ProcessingStatus.COMPLETE)
         
-        return {
-            'doc_id': source_id,
-            'processing_type': 'NEW',
-            'status': 'COMPLETE',
-            'chunks_created': total_chunks_embedded,
-            'successful_batches': len(successful_embeddings),
-            'total_tokens': total_tokens
-        }
+#         return {
+#             'doc_id': source_id,
+#             'processing_type': 'NEW',
+#             'status': 'COMPLETE',
+#             'chunks_created': total_chunks_embedded,
+#             'successful_batches': len(successful_embeddings),
+#             'total_tokens': total_tokens
+#         }
 
 # ——— Task 3: Embed (Fully Async DB) ——————————————————————————————————————————
 
