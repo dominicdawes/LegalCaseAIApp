@@ -2241,6 +2241,7 @@ def _embed_batch_gevent(self, source_id: str, project_id: str, texts: List[str],
 
 # ——— Finalization: Batch Coordination & Note Generation ————————————————————————————————————————
 
+
 @celery_app.task(bind=True, queue=FINAL_QUEUE, acks_late=True)
 def finalize_batch_and_create_note(
     self, 
@@ -2250,52 +2251,112 @@ def finalize_batch_and_create_note(
 ) -> Dict[str, Any]:
     """
     [BATCH COORDINATOR] Receives completed workflow results:
-    - Each result is from a completed document workflow
-    - No race conditions - all workflows are fully complete
-    - Extract final results and process normally
+    - Each result is from a completed document workflow (chord result)
+    - Extracts final document status from chord results
+    - Handles the fact that chord results return the finalize_document_processing result
     """
     project_id = workflow_metadata['project_id']
     logger.info(f"🎯 [BATCH-{batch_id[:8]}] Finalizing batch with {len(workflow_results)} completed workflows")
+    logger.info(f"🪲 [BATCH-{batch_id[:8]}] DEBUG : {workflow_results}")
     
     # ——— Extract Results from AsyncResult Objects —————————————————————————————————
     processing_results = []
     
-    for workflow_result in workflow_results:
+    for i, workflow_result in enumerate(workflow_results):
         try:
             if isinstance(workflow_result, AsyncResult):
-                # Extract the actual result value
+                # Extract the actual result value from the AsyncResult
                 result_value = workflow_result.result
-                processing_results.append(result_value)
+                
+                # Debug: Log what we're getting
+                logger.info(f"🔍 [BATCH-{batch_id[:8]}] Workflow {i+1} result type: {type(result_value)}")
+                logger.info(f"🔍 [BATCH-{batch_id[:8]}] Workflow {i+1} result value: {result_value}")
+                
+                # The result_value should be the return from finalize_document_processing
+                # which should be a dict, not a list
+                if isinstance(result_value, dict):
+                    processing_results.append(result_value)
+                elif isinstance(result_value, list):
+                    # If it's a list, it might be from a chord that returned multiple results
+                    # In our case, it should be a single result from finalize_document_processing
+                    if len(result_value) == 1 and isinstance(result_value[0], dict):
+                        processing_results.append(result_value[0])
+                    else:
+                        logger.error(f"❌ [BATCH-{batch_id[:8]}] Unexpected list result: {result_value}")
+                        processing_results.append({
+                            'status': 'FAILED',
+                            'error': f'Unexpected result format: {type(result_value)}'
+                        })
+                else:
+                    logger.error(f"❌ [BATCH-{batch_id[:8]}] Unexpected result type: {type(result_value)}")
+                    processing_results.append({
+                        'status': 'FAILED',
+                        'error': f'Unexpected result type: {type(result_value)}'
+                    })
             else:
-                # Direct result (for reused documents)
+                # Direct result (for reused documents or immediate results)
+                logger.info(f"🔍 [BATCH-{batch_id[:8]}] Direct result {i+1}: {workflow_result}")
                 processing_results.append(workflow_result)
+                
         except Exception as e:
-            logger.error(f"❌ [BATCH-{batch_id[:8]}] Failed to extract workflow result: {e}")
+            logger.error(f"❌ [BATCH-{batch_id[:8]}] Failed to extract workflow result {i+1}: {e}")
             processing_results.append({
                 'status': 'FAILED',
                 'error': f'Failed to extract result: {str(e)}'
             })
     
+    # ——— Debug: Log processed results ————————————————————————————————————————————
+    logger.info(f"🔍 [BATCH-{batch_id[:8]}] Processed results:")
+    for i, result in enumerate(processing_results):
+        logger.info(f"   Result {i+1}: {result}")
+    
     # ——— Standard Batch Analysis ——————————————————————————————————————————————————
-    successful_docs = [r for r in processing_results if r and r.get('status') in ['COMPLETE', 'PARTIAL']]
-    failed_docs = [r for r in processing_results if r and r.get('status') == 'FAILED']
+    successful_docs = []
+    failed_docs = []
+    
+    for result in processing_results:
+        if result and isinstance(result, dict):
+            status = result.get('status')
+            if status in ['COMPLETE', 'PARTIAL']:
+                successful_docs.append(result)
+            elif status == 'FAILED':
+                failed_docs.append(result)
+            else:
+                logger.warning(f"⚠️ [BATCH-{batch_id[:8]}] Unknown status: {status}")
+                failed_docs.append(result)
+        else:
+            logger.error(f"❌ [BATCH-{batch_id[:8]}] Invalid result format: {result}")
+            failed_docs.append({
+                'status': 'FAILED',
+                'error': 'Invalid result format'
+            })
     
     total_docs = len(processing_results)
     success_count = len(successful_docs)
     failure_count = len(failed_docs)
     
-    total_chunks = sum(r.get('chunks_created', 0) for r in successful_docs)
+    # Calculate total chunks safely
+    total_chunks = 0
+    total_tokens_reused = 0
+    
+    for doc in successful_docs:
+        if isinstance(doc, dict):
+            total_chunks += doc.get('chunks_created', 0)
+            total_tokens_reused += doc.get('tokens_reused', 0)
     
     # ——— Determine Final Batch Status ————————————————————————————————————————————
     if success_count == total_docs:
         batch_status = 'COMPLETE'
         final_progress = BatchProgressStatus.BATCH_COMPLETE
+        note_context = 'All documents processed successfully'
     elif success_count > 0:
         batch_status = 'PARTIAL'
         final_progress = BatchProgressStatus.BATCH_PARTIAL
+        note_context = f'{success_count}/{total_docs} documents processed successfully'
     else:
         batch_status = 'FAILED'
         final_progress = BatchProgressStatus.BATCH_FAILED
+        note_context = 'All documents failed to process'
     
     _update_batch_progress_sync(batch_id, project_id, final_progress)
     
@@ -2305,9 +2366,7 @@ def finalize_batch_and_create_note(
     logger.info(f"   📄 Total chunks: {total_chunks:,}")
     logger.info(f"   🔄 Status: {batch_status}")
     
-
     # ——— Trigger Note Generation (Based on Resilience Rules) ——————————————————————
-    
     if workflow_metadata.get('create_note') and batch_status in ['COMPLETE', 'PARTIAL']:
         # Enhance metadata with batch context for note generation
         note_metadata = {
