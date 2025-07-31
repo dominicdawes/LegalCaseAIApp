@@ -144,6 +144,7 @@ class BatchProgressStatus(Enum):
     BATCH_INITIALIZING = "BATCH_INITIALIZING"
     BATCH_ANALYZING = "BATCH_ANALYZING"        # Document classification phase
     BATCH_DOWNLOADING = "BATCH_DOWNLOADING"    # Concurrent downloads
+    BATCH_PROCESSING = "BATCH_PROCESSING"
     BATCH_PARSING = "BATCH_PARSING"           # Document parsing phase  [REUSE & COPYING are not logged]
     BATCH_EMBEDDING = "BATCH_EMBEDDING"       # Embedding generation phase
     BATCH_FINALIZING = "BATCH_FINALIZING"     # Coordination & cleanup
@@ -437,7 +438,7 @@ def reset_db_pool_task(self):
         logger.error(f"❌ Failed to reset database pool: {e}")
         return {"status": "error", "message": str(e)}
 
-# ——— 6. Retry Strategies ————————————————————————————————
+# ——— 6. Retry Strategies ————————————————————————————————————————————————
 
 # HTTP Retry Strategy (for requests library)
 HTTP_RETRY_STRATEGY = UrllibRetry(
@@ -1425,9 +1426,10 @@ def process_document_batch_workflow(
             _execute_batch_workflow(batch_id, file_urls, metadata)
         )
         
-        # ✅ FIXED: Handle workflow signature execution
+        # ✅ FIXED: Handle workflow signature execution (embedding finalization)
         if workflow_result['status'] == 'WORKFLOW_READY':
             workflow_signature = workflow_result['workflow_signature']
+            _update_batch_progress_sync(batch_id, metadata['project_id'], BatchProgressStatus.BATCH_EMBEDDING)
             chord_result = workflow_signature.apply_async()  # ← Execute here, not in async function
             
             return {
@@ -1465,6 +1467,7 @@ async def _execute_batch_workflow(batch_id: str, file_urls: List[str], metadata:
     # ——— Step 1: Concurrent Document Analysis ————————————————————————————————————
 
     logger.info(f"🔍 [BATCH-{batch_id[:8]}] Analyzing document types...")
+    _update_batch_progress_sync(batch_id, project_id, BatchProgressStatus.BATCH_ANALYZING)
     async with httpx.AsyncClient(timeout=60.0) as client:
         analysis_tasks = [
             _analyze_document_for_workflow(client, url, project_id, user_id) 
@@ -1499,6 +1502,7 @@ async def _execute_batch_workflow(batch_id: str, file_urls: List[str], metadata:
     logger.info(f"   ♻️  Reused documents: {len(reused_documents)}")
     logger.info(f"   📋 Duplicate documents: {len(duplicate_documents)}")
     logger.info(f"   ❌ Failed downloads: {len(failed_downloads)}")
+    _update_batch_progress_sync(batch_id, project_id, BatchProgressStatus.BATCH_PROCESSING)
 
     # flattened dictionary
     workflow_metadata = {
@@ -1541,6 +1545,7 @@ async def _execute_batch_workflow(batch_id: str, file_urls: List[str], metadata:
         # Sub-case B: All failed downloads (network/access issues)
         elif len(failed_downloads) > 0:
             logger.error(f"❌ [BATCH-{batch_id[:8]}] All documents failed to download")
+            _update_batch_progress_sync(batch_id, project_id, BatchProgressStatus.BATCH_FAILED)
             
             # FIXED: Don't use apply_async - handle failure synchronously
             await _handle_batch_failure_async(batch_id, metadata, failed_downloads)
@@ -1575,13 +1580,8 @@ async def _execute_batch_workflow(batch_id: str, file_urls: List[str], metadata:
                 {**metadata, 'batch_id': batch_id}
             )
             document_tasks.append(task_sig)  # ← Same variable
-            
-        # workflow = chord(
-        #     group(document_tasks),  # ← Use populated list
-        #     finalize_batch_and_create_note.s(batch_id, workflow_metadata)
-        # )
         
-        # Execute the workflow
+        # Gather the workflow chord
         workflow_signature = chord(
             group(document_tasks),
             finalize_batch_and_create_note.s(batch_id, workflow_metadata)
@@ -1625,25 +1625,11 @@ async def _execute_batch_workflow(batch_id: str, file_urls: List[str], metadata:
         # ——— Simple Chord Coordination (for reused_documents && new_documents) ——————————————————————————————————————————————
         logger.info(f"🚀 [BATCH-{batch_id[:8]}] Launching {len(document_tasks)} complete document tasks")
         
-        # Much simpler - just wait for complete document results
-        # batch_workflow = chord(
-        #     group(document_tasks),
-        #     finalize_batch_and_create_note.s(batch_id, workflow_metadata)
-        # )
-        
-        # chord_result = batch_workflow.apply_async()
-        
-        # return {
-        #     'batch_id': batch_id,
-        #     'workflow_id': chord_result.id,
-        #     'document_tasks': len(document_tasks),
-        #     'workflow_path': 'ASYNC_DELEGATION_PATTERN',
-        #     'status': 'WORKFLOW_LAUNCHED'
-        # }
         workflow_signature = chord(
             group(document_tasks),
             finalize_batch_and_create_note.s(batch_id, workflow_metadata)
         )
+        _update_batch_progress_sync(batch_id, project_id, BatchProgressStatus.BATCH_EMBEDDING) # ← Technically embedding start  with apply_async() in the parent function but this is a good place
         
         return {
             'batch_id': batch_id,
@@ -1766,16 +1752,17 @@ def finalize_batch_and_create_note(
         batch_status = 'COMPLETE'
         final_progress = BatchProgressStatus.BATCH_COMPLETE
         note_context = 'All documents processed successfully'
+        _update_batch_progress_sync(batch_id, project_id, final_progress)
     elif success_count > 0:
         batch_status = 'PARTIAL'
         final_progress = BatchProgressStatus.BATCH_PARTIAL
         note_context = f'{success_count}/{total_docs} documents processed successfully'
+        _update_batch_progress_sync(batch_id, project_id, final_progress)
     else:
         batch_status = 'FAILED'
         final_progress = BatchProgressStatus.BATCH_FAILED
         note_context = 'All documents failed to process'
-    
-    _update_batch_progress_sync(batch_id, project_id, final_progress)
+        _update_batch_progress_sync(batch_id, project_id, final_progress)
     
     logger.info(f"📊 [BATCH-{batch_id[:8]}] Final analysis:")
     logger.info(f"   ✅ Successful: {success_count}/{total_docs}")
