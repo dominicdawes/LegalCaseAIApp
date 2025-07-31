@@ -1200,87 +1200,6 @@ async def _parse_document_async(source_id: str, cdn_url: str, project_id: str) -
                 'error': str(e)
             }
 
-async def _process_embeddings_async(doc_id: str, project_id: str, chunks: List[str], metadatas: List[Dict] = None) -> Dict[str, Any]:
-    """
-    Process embeddings with async concurrency control - replaces gevent coordination
-    
-    Features:
-    - Batches chunks intelligently (token-aware)
-    - Processes batches concurrently with rate limiting
-    - Uses your existing robust error handling
-    - Integrates with your sync database pool
-    """
-    short_id = doc_id[:8]
-
-    try:
-        # Create batches (Token-Aware batching)
-        embedding_batches = _create_smart_embedding_batches(chunks, metadatas or [{}] * len(chunks))
-        
-        logger.info(f"🤖 [DOC-{short_id}] Created {len(embedding_batches)} embedding batches")
-        
-        # ——— 2. Process Batches with Concurrency Control ————————————————————————
-        # Rate limiting to respect OpenAI limits
-        semaphore = asyncio.Semaphore(5)  # Max 5 concurrent requests
-        
-        async def process_single_batch(batch_info):
-            async with semaphore:
-                return await _embed_batch_async(doc_id, project_id, batch_info)
-        
-        # Process all batches concurrently
-        batch_results = await asyncio.gather(
-            *[process_single_batch(batch) for batch in embedding_batches],
-            return_exceptions=True
-        )
-        
-        # ——— 3. Analyze Results (Same logic as legacy) ———————————————————————————
-        successful_batches = []
-        failed_batches = []
-        total_chunks_embedded = 0
-        total_tokens = 0
-        
-        for result in batch_results:
-            if isinstance(result, Exception):
-                logger.error(f"❌ [DOC-{short_id}] Batch failed with exception: {result}")
-                failed_batches.append(str(result))
-            elif result and result.get('success'):
-                successful_batches.append(result)
-                total_chunks_embedded += result.get('chunks_embedded', 0)
-                total_tokens += result.get('token_count', 0)
-            else:
-                error_msg = result.get('error', 'Unknown error') if result else 'No result'
-                logger.error(f"❌ [DOC-{short_id}] Batch failed: {error_msg}")
-                failed_batches.append(error_msg)
-        
-        # ——— 4. Determine Final Status ———————————————————————————————————————————
-        if len(successful_batches) == 0:
-            _update_document_status_sync(doc_id, ProcessingStatus.FAILED_EMBEDDING)
-            return {
-                'success': False,
-                'error': f'All {len(embedding_batches)} embedding batches failed'
-            }
-        elif len(failed_batches) > 0:
-            _update_document_status_sync(doc_id, ProcessingStatus.PARTIAL)
-            logger.warning(f"⚠️ [DOC-{short_id}] Partial success: {len(successful_batches)}/{len(embedding_batches)} batches")
-        else:
-            _update_document_status_sync(doc_id, ProcessingStatus.COMPLETE)
-            logger.info(f"✅ [DOC-{short_id}] All embeddings successful")
-        
-        return {
-            'success': True,
-            'chunks_embedded': total_chunks_embedded,
-            'total_tokens': total_tokens,
-            'successful_batches': len(successful_batches),
-            'failed_batches': len(failed_batches),
-            'processing_time_ms': 0  # Could add timing if needed
-        }
-        
-    except Exception as e:
-        logger.error(f"❌ [DOC-{short_id}] Embedding processing failed: {e}")
-        _update_document_status_sync(doc_id, ProcessingStatus.FAILED_EMBEDDING, str(e))
-        return {
-            'success': False,
-            'error': str(e)
-        }
 
 async def _embed_batch_async(doc_id: str, project_id: str, batch_info: List[str]) -> Dict[str, Any]:
     """
@@ -1385,6 +1304,88 @@ async def _handle_batch_failure_async(
     # Update batch progress
     _update_batch_progress_sync(batch_id, project_id, BatchProgressStatus.BATCH_FAILED)
 
+async def _process_embeddings_async(doc_id: str, project_id: str, chunks: List[str], metadatas: List[Dict] = None) -> Dict[str, Any]:
+    """
+    Process document chunks into OpenAI embeddings with smart batching.
+    
+    Features:
+    - Token-aware batching (respects OpenAI limits)
+    - Concurrent processing with rate limiting (max 5 requests) 
+    - Robust error handling with partial success support
+    - Direct database insertion using sync connection pool
+    """
+    short_id = doc_id[:8]
+
+    try:
+        # Create batches (Token-Aware batching)
+        embedding_batches = _create_smart_embedding_batches(chunks, metadatas or [{}] * len(chunks))
+        
+        logger.info(f"🤖 [DOC-{short_id}] Created {len(embedding_batches)} embedding batches")
+        
+        # ——— 2. Process Batches with Concurrency Control ————————————————————————
+        # Rate limiting to respect OpenAI limits
+        semaphore = asyncio.Semaphore(5)  # Max 5 concurrent requests
+        
+        async def process_single_batch(batch_info):
+            async with semaphore:
+                return await _embed_batch_async(doc_id, project_id, batch_info)
+        
+        # Process all batches concurrently
+        batch_results = await asyncio.gather(
+            *[process_single_batch(batch) for batch in embedding_batches],
+            return_exceptions=True
+        )
+        
+        # ——— 3. Analyze Results (Same logic as legacy) ———————————————————————————
+        successful_batches = []
+        failed_batches = []
+        total_chunks_embedded = 0
+        total_tokens = 0
+        
+        for result in batch_results:
+            if isinstance(result, Exception):
+                logger.error(f"❌ [DOC-{short_id}] Batch failed with exception: {result}")
+                failed_batches.append(str(result))
+            elif result and result.get('success'):
+                successful_batches.append(result)
+                total_chunks_embedded += result.get('chunks_embedded', 0)
+                total_tokens += result.get('token_count', 0)
+            else:
+                error_msg = result.get('error', 'Unknown error') if result else 'No result'
+                logger.error(f"❌ [DOC-{short_id}] Batch failed: {error_msg}")
+                failed_batches.append(error_msg)
+        
+        # ——— 4. Determine Final Status ———————————————————————————————————————————
+        if len(successful_batches) == 0:
+            _update_document_status_sync(doc_id, ProcessingStatus.FAILED_EMBEDDING)
+            return {
+                'success': False,
+                'error': f'All {len(embedding_batches)} embedding batches failed'
+            }
+        elif len(failed_batches) > 0:
+            _update_document_status_sync(doc_id, ProcessingStatus.PARTIAL)
+            logger.warning(f"⚠️ [DOC-{short_id}] Partial success: {len(successful_batches)}/{len(embedding_batches)} batches")
+        else:
+            _update_document_status_sync(doc_id, ProcessingStatus.COMPLETE)
+            logger.info(f"✅ [DOC-{short_id}] All embeddings successful")
+        
+        return {
+            'success': True,
+            'chunks_embedded': total_chunks_embedded,
+            'total_tokens': total_tokens,
+            'successful_batches': len(successful_batches),
+            'failed_batches': len(failed_batches),
+            'processing_time_ms': 0  # Could add timing if needed
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ [DOC-{short_id}] Embedding processing failed: {e}")
+        _update_document_status_sync(doc_id, ProcessingStatus.FAILED_EMBEDDING, str(e))
+        return {
+            'success': False,
+            'error': str(e)
+        }
+
 # ——— [GLOBAL BATCH LEVEL] Kickoff & Coordinate Ingest (Fully Async) ———————————————————————————————————————————  
 
 @celery_app.task(bind=True, queue=INGEST_QUEUE, acks_late=True)
@@ -1395,20 +1396,55 @@ def process_document_batch_workflow(
     create_note: bool = False
 ) -> Dict[str, Any]:
     """
-    [ORCHESTRATOR] 🚶‍➡️ Main entry point for batch document processing:
-    - This is the task that gets called by your API/frontend
-    - Handles mixed new/reused document scenarios
-    - Uses async delegation pattern for coordination
+    [ORCHESTRATOR] 🚶‍➡️ Main entry point for batch document processing, this is the task that gets called by your API/frontend
+
+    1. Use persistent event loop for coordination/analysis
+        - Handles mixed new/reused document scenarios
+
+    2. Spawn separate workers for heavy processing
+
+    VISUAL FLOW:
+    Celery Task (process_document_batch_workflow)
+    ├── run_async_in_worker(_execute_batch_workflow)  # Same process, persistent loop
+    │   ├── Async HTTP calls for document analysis    # Concurrent via gather()
+    │   ├── Document classification                   # Fast in-memory work
+    │   └── Build Celery workflow signatures          # Return coordination plan
+    │
+    └── workflow_signature.apply_async()              # NEW processes/workers
+        ├── Worker 1: process_complete_document_workflow
+        ├── Worker 2: process_complete_document_workflow  
+        └── Worker 3: finalize_batch_and_create_note
     """
     batch_id = str(uuid.uuid4())
     metadata['create_note'] = create_note
     
     logger.info(f"🎯 [BATCH-{batch_id[:8]}] 🚀 Starting workflow for {len(file_urls)} documents")
-    
-    # ——— CRITICAL: Delegate to async function (same pattern as your RAG chat) ————
-    return run_async_in_worker(
-        _execute_batch_workflow(batch_id, file_urls, metadata)
-    )
+
+    try:
+        # Execute async workflow coordination CRITICAL: Delegate to async function (same pattern as your RAG chat)
+        workflow_result = run_async_in_worker(
+            _execute_batch_workflow(batch_id, file_urls, metadata)
+        )
+        
+        # ✅ FIXED: Handle workflow signature execution
+        if workflow_result['status'] == 'WORKFLOW_READY':
+            workflow_signature = workflow_result['workflow_signature']
+            chord_result = workflow_signature.apply_async()  # ← Execute here, not in async function
+            
+            return {
+                'batch_id': batch_id,
+                'workflow_id': chord_result.id,
+                'document_count': workflow_result['document_count'],
+                'workflow_path': workflow_result['workflow_path'],
+                'status': 'WORKFLOW_LAUNCHED'
+            }
+        else:
+            # Edge case handled (duplicates, failures, etc.)
+            return workflow_result
+            
+    except Exception as e:
+        logger.error(f"❌ [BATCH-{batch_id[:8]}] Workflow creation failed: {e}")
+        raise
 
 async def _execute_batch_workflow(batch_id: str, file_urls: List[str], metadata: Dict[str, Any]) -> Dict[str, Any]:
     """
@@ -1417,11 +1453,11 @@ async def _execute_batch_workflow(batch_id: str, file_urls: List[str], metadata:
     - Builds appropriate Celery workflow based on document types
     - Returns workflow execution results
 
-    Batch Level:
-    ├── Document A Chain: parse_only → wait_for_embeddings → COMPLETE
-    ├── Document B Chain: parse_only → wait_for_embeddings → COMPLETE  
-    ├── Document C Chain: parse_only → wait_for_embeddings → FAILED
-    └── finalize_batch_and_create_note (gets clean final results)
+    Batch Level (chord)
+    ├── Document A : (async) parse_only → (async) embed only → COMPLETE
+    ├── Document B : (async) parse_only → (async) embed only → COMPLETE
+    ├── Document C : (async) parse_only → (async) embed only → FAILED
+    └── finalize_batch_and_create_note (gets clean final results PARTIAL SUCCESS)
 
     """
     project_id = metadata['project_id']
@@ -1477,8 +1513,6 @@ async def _execute_batch_workflow(batch_id: str, file_urls: List[str], metadata:
     }
     
     # ——— Step 3: Determine Processing Path (ALL REUSED vs NEW/MIXED) ———————————————————————————————————————————
-
-    processing_tasks = []
     
     # Calculate processable documents (EXCLUDE duplicates and failures) 
     processable_docs = len(new_documents) + len(reused_documents)
@@ -1533,7 +1567,7 @@ async def _execute_batch_workflow(batch_id: str, file_urls: List[str], metadata:
     if len(reused_documents) == processable_docs and len(reused_documents) > 0:     
         logger.info(f"⚡ [BATCH-{batch_id[:8]}] All-reused batch - fast track processing")
         
-        # For REUSED documents: Keep existing logic
+        document_tasks = []  # ← Use consistent variable name
         for doc_info in reused_documents:
             task_sig = process_reused_document_task.s(
                 doc_info['existing_doc_id'],
@@ -1541,24 +1575,25 @@ async def _execute_batch_workflow(batch_id: str, file_urls: List[str], metadata:
                 doc_info['project_id'],
                 {**metadata, 'batch_id': batch_id}
             )
-            document_tasks.append(task_sig)
+            document_tasks.append(task_sig)  # ← Same variable
             
-        # Celery chord optimized for reused-only scenario
-        logger.info(f"🚀 [BATCH-{batch_id[:8]}] Launching coordinated REUSED workflow with {len(processing_tasks)} tasks")
-        workflow = chord(
-            group(processing_tasks),
-            finalize_batch_and_create_note.s(batch_id, workflow_metadata).set(queue=FINAL_QUEUE)
-        )
+        # workflow = chord(
+        #     group(document_tasks),  # ← Use populated list
+        #     finalize_batch_and_create_note.s(batch_id, workflow_metadata)
+        # )
         
         # Execute the workflow
-        chord_result = workflow.apply_async()
-
+        workflow_signature = chord(
+            group(document_tasks),
+            finalize_batch_and_create_note.s(batch_id, workflow_metadata)
+        )
+        
         return {
             'batch_id': batch_id,
-            'workflow_id': chord_result.id,
-            'processing_tasks': len(processing_tasks),
+            'workflow_signature': workflow_signature,  # ← Return signature (for execution in `process_document_batch_workflow`)
+            'document_count': len(document_tasks),
             'workflow_path': 'ALL_REUSED_FAST_TRACK',
-            'status': 'WORKFLOW_LAUNCHED'
+            'status': 'WORKFLOW_READY'  # ← Not launched yet
         }
 
     
@@ -1576,7 +1611,7 @@ async def _execute_batch_workflow(batch_id: str, file_urls: List[str], metadata:
                 doc_info['project_id'], 
                 {**metadata, 'batch_id': batch_id}
             )
-            document_tasks.append(task_sig)
+            document_tasks.append(task_sig)     # ← Add NEW docs to chord signature
 
         # For reused documents (keep existing logic)
         for doc_info in reused_documents:
@@ -1586,25 +1621,37 @@ async def _execute_batch_workflow(batch_id: str, file_urls: List[str], metadata:
                 doc_info['project_id'],
                 workflow_metadata
             )
-            document_tasks.append(task_sig)
+            document_tasks.append(task_sig)     # ← Add REUSED docs to chord signature
 
-        # ——— Simple Chord Coordination ——————————————————————————————————————————————
+        # ——— Simple Chord Coordination (for reused_documents && new_documents) ——————————————————————————————————————————————
         logger.info(f"🚀 [BATCH-{batch_id[:8]}] Launching {len(document_tasks)} complete document tasks")
         
         # Much simpler - just wait for complete document results
-        batch_workflow = chord(
+        # batch_workflow = chord(
+        #     group(document_tasks),
+        #     finalize_batch_and_create_note.s(batch_id, workflow_metadata)
+        # )
+        
+        # chord_result = batch_workflow.apply_async()
+        
+        # return {
+        #     'batch_id': batch_id,
+        #     'workflow_id': chord_result.id,
+        #     'document_tasks': len(document_tasks),
+        #     'workflow_path': 'ASYNC_DELEGATION_PATTERN',
+        #     'status': 'WORKFLOW_LAUNCHED'
+        # }
+        workflow_signature = chord(
             group(document_tasks),
             finalize_batch_and_create_note.s(batch_id, workflow_metadata)
         )
         
-        chord_result = batch_workflow.apply_async()
-        
         return {
             'batch_id': batch_id,
-            'workflow_id': chord_result.id,
-            'document_tasks': len(document_tasks),
+            'workflow_signature': workflow_signature,  # ← Return signature
+            'document_count': len(document_tasks),
             'workflow_path': 'ASYNC_DELEGATION_PATTERN',
-            'status': 'WORKFLOW_LAUNCHED'
+            'status': 'WORKFLOW_READY'  # ← Not launched yet
         }
 
 @celery_app.task(bind=True, queue=FINAL_QUEUE, acks_late=True)
@@ -1911,11 +1958,16 @@ async def _process_document_async_workflow(
             }
         
         chunks = parse_result['chunks']
+        chunks_metadata = parse_result.get('metadatas', [])  # ← Extract metadatas
         logger.info(f"✅ [DOC-{short_id}] Parsed {len(chunks)} chunks")
         
         # ——— 3. Process Embeddings (Async with concurrency control) ————————————————
         logger.info(f"📋 [DOC-{short_id}] → EMBEDDING")
-        embedding_result = await _process_embeddings_async(doc_id, project_id, chunks, workflow_metadata)
+        metadata = {
+            workflow_metadata**,
+            **chunks_metadata
+        }
+        embedding_result = await _process_embeddings_async(doc_id, project_id, chunks, chunks_metadata)
         
         if not embedding_result.get('success'):
             return {

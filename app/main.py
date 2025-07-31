@@ -34,8 +34,8 @@ from app.ws_handlers import setup_websocket_routes, manager     # from ws_handle
 # Project modules
 from tasks.profile_tasks import upload_profile_picture_task
 from tasks.podcast_generate_tasks import validate_and_generate_audio_task, generate_dialogue_only_task
-from tasks.upload_tasks import process_document_batch_workflow
-from tasks.upload_tasks import test_celery_log_task
+from tasks.upload_tasks_chains_0730 import process_document_batch_workflow
+from tasks.upload_tasks_chains_0730 import test_celery_log_task
 # from tasks.upload_tasks import append_document_task  <-- need to revive this later
 from tasks.sample_tasks import addition_task
 from tasks.chat_streaming_tasks import rag_chat_streaming_task
