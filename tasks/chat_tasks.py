@@ -77,7 +77,6 @@ from utils.supabase_utils import (
     create_new_chat_session,
     log_llm_error,
 )
-# from utils.llm_clients.llm_factory_enhanced import CitationAwareLLMFactory  # 🆕 Enhanced LLM factory
 from utils.llm_clients.llm_factory import LLMFactory                    # Simple LLM Client factory
 from utils.llm_clients.citation_processor import CitationProcessor      # detects citations in streaming chunks
 from utils.llm_clients.performance_monitor import PerformanceMonitor    # 🆕 Performance tracking

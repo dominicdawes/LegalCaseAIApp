@@ -58,15 +58,17 @@ from langchain_community.document_loaders import PyPDFLoader
 from langchain.text_splitter import CharacterTextSplitter
 
 # ===== PROJECT MODULES =====
-from tasks.celery_app import (
-    celery_app,
-)  # Import the Celery app instance (see celery_app.py for LocalHost config)
+from tasks.celery_app import celery_app, run_async_in_worker
 from utils.prompt_utils import load_yaml_prompt, build_prompt_template_from_yaml
 from utils.supabase_utils import (
     insert_note_supabase_record,
     supabase_client,
     log_llm_error,
 )
+from utils.llm_clients.llm_factory import LLMFactory                    # Simple LLM Client factory
+from utils.llm_clients.citation_processor import CitationProcessor      # detects citations in streaming chunks
+from utils.llm_clients.performance_monitor import PerformanceMonitor    # 🆕 Performance tracking
+from utils.llm_clients.stream_normalizer import StreamNormalizer        # Format streamed results from several providers
 
 
 # ——— Logging & Env Load ———————————————————————————————————————————————————————————
@@ -344,8 +346,6 @@ def rag_note_task(
             raise ValueError(f"Unsupported note_type: {note_type}")
 
         # Step 5) Generate llm client from factory
-        from utils.llm_factory import LLMFactory  # Lazy-import heavy modules
-
         llm_client = LLMFactory.get_client(
             provider=provider, model_name=model_name, temperature=temperature
         )
