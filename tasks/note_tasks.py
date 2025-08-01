@@ -57,6 +57,7 @@ from utils.supabase_utils import (
 )
 from utils.llm_clients.llm_factory import LLMFactory
 from utils.llm_clients.performance_monitor import PerformanceMonitor
+from utils.note_processing.flashcard_processor import FlashcardProcessor
 
 # ——— Logging & Env Load ———————————————————————————————————————————————————————————
 logger = get_task_logger(__name__)
