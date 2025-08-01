@@ -1,3 +1,5 @@
+# tasks/note_tasks.py
+
 """
 This file runs Celery tasks for handling RAG AI note creation tasks (outlines, summaries, compare-contrast)
 Note genereation (with RAG) is done without token streaming. Returns full answer in one go.
@@ -70,19 +72,21 @@ from utils.llm_clients.llm_factory import LLMFactory                    # Simple
 from utils.llm_clients.citation_processor import CitationProcessor      # detects citations in streaming chunks
 from utils.llm_clients.performance_monitor import PerformanceMonitor    # 🆕 Performance tracking
 from utils.llm_clients.stream_normalizer import StreamNormalizer        # Format streamed results from several providers
-from tasks.celery_app import (
-    run_async_in_worker,
-    get_global_async_db_pool,
-    get_global_redis_pool,
-    init_async_pools,
-    get_db_connection,      # ← Context manager
-    get_redis_connection    # ← Context manager
-)
-# Import health checks from the shared module:
-from tasks.pool_utils import (
-    check_async_db_pool_health,
-    check_redis_pool_health
-)
+from tasks.celery_app import run_async_in_worker
+from tasks.database import get_db_connection, get_redis_connection, get_global_async_db_pool, get_global_redis_pool, init_async_pools, check_db_pool_health
+# from tasks.celery_app import (
+#     run_async_in_worker,
+#     get_global_async_db_pool,
+#     get_global_redis_pool,
+#     init_async_pools,
+#     get_db_connection,      # ← Context manager
+#     get_redis_connection    # ← Context manager
+# )
+# # Import health checks from the shared module:
+# from tasks.pool_utils import (
+#     check_async_db_pool_health,
+#     check_redis_pool_health
+# )
 
 # ——— Logging & Env Load ———————————————————————————————————————————————————————————
 logger = get_task_logger(__name__)

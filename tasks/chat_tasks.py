@@ -79,19 +79,22 @@ from utils.supabase_utils import (
     supabase_client,
     log_llm_error,
 )
-from tasks.celery_app import (
-    run_async_in_worker,
-    get_global_async_db_pool,
-    get_global_redis_pool,
-    init_async_pools,
-    get_db_connection,      # ← Context manager
-    get_redis_connection    # ← Context manager
-)
-# Import health checks from the shared module:
-from tasks.pool_utils import (
-    check_async_db_pool_health,
-    check_redis_pool_health
-)
+
+from tasks.celery_app import run_async_in_worker
+from tasks.database import get_db_connection, get_redis_connection, get_global_async_db_pool, get_global_redis_pool, init_async_pools, check_db_pool_health
+# from tasks.celery_app import (
+#     run_async_in_worker,
+#     get_global_async_db_pool,
+#     get_global_redis_pool,
+#     init_async_pools,
+#     get_db_connection,      # ← Context manager
+#     get_redis_connection    # ← Context manager
+# )
+# # Import health checks from the shared module:
+# from tasks.pool_utils import (
+#     check_async_db_pool_health,
+#     check_redis_pool_health
+# )
 
 # ——— Logging & Env Load ———————————————————————————————————————————————————————————
 

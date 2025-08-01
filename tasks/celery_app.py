@@ -1,4 +1,4 @@
-# celery_app.py
+# tasks/celery_app.py
 
 """
 This creates and configures the celery_app instance. There are 2 versions, the localhost version
@@ -32,16 +32,6 @@ logger.setLevel(logging.DEBUG)
 _worker_loop = None
 _worker_thread = None
 
-# Database pools
-db_pool = None
-redis_pool = None
-sync_db_pool = None
-
-# Race condition prevention locks
-_sync_pool_lock = threading.Lock()
-_async_pool_init_lock = None  # Will be created as asyncio.Lock() in async context
-_redis_init_lock = None       # Will be created as asyncio.Lock() in async context
-
 # ——— Environment Configuration ————————————————————————————————————————————————————
 
 # Redis (cache) and Message Queues
@@ -51,19 +41,6 @@ REDIS_LABS_ENDPOINT = (
     + (os.getenv("REDIS_PASSWORD") or "")
     + "@"
     + (os.getenv("REDIS_PUBLIC_ENDPOINT") or "localhost:6379")
-)
-
-# Database constants
-DB_DSN = os.getenv("POSTGRES_DSN_POOL") # e.g., Supabase -> Connection -> Get Pool URL
-DB_POOL_MIN_SIZE = 2    # if I had more compute MIN: 5, MAX: 20
-DB_POOL_MAX_SIZE = 5
-
-# Initialize Redis sync client for pub/sub
-REDIS_LABS_URL = (
-    "redis://default:"
-    + os.getenv("REDIS_PASSWORD")
-    + "@"
-    + os.getenv("REDIS_PUBLIC_ENDPOINT")
 )
 
 # 🎛️ Toggle Controls from Environment Variables
@@ -120,22 +97,19 @@ def worker_init_handler(sender=None, **kwargs):
 @worker_shutdown.connect
 def worker_shutdown_handler(sender=None, **kwargs):
     """Clean up event loop when worker shuts down"""
-    global _worker_loop, _worker_thread, db_pool, redis_pool, sync_db_pool
+    global _worker_loop, _worker_thread
     
-    # Clean up async pools
+    # Import database cleanup functions
+    from .database import cleanup_async_pools, cleanup_sync_pool
+    
+    # Clean up pools using database module functions
     if _worker_loop and not _worker_loop.is_closed():
-        if db_pool:
-            asyncio.run_coroutine_threadsafe(db_pool.close(), _worker_loop)
-        if redis_pool:
-            asyncio.run_coroutine_threadsafe(redis_pool.disconnect(), _worker_loop)
-        
+        asyncio.run_coroutine_threadsafe(cleanup_async_pools(), _worker_loop)
         _worker_loop.call_soon_threadsafe(_worker_loop.stop)
         _worker_loop = None
     
     # Clean up sync pool
-    if sync_db_pool:
-        sync_db_pool.closeall()
-        sync_db_pool = None
+    cleanup_sync_pool()
     
     if _worker_thread and _worker_thread.is_alive():
         _worker_thread.join(timeout=5)
@@ -153,83 +127,6 @@ def run_async_in_worker(coro):
     # Submit coroutine to the persistent loop and wait for result
     future = asyncio.run_coroutine_threadsafe(coro, _worker_loop)
     return future.result()
-
-# ——— Global Pool Management ————————————————————————————————————————————————————
-
-async def init_async_pools():
-    """Initialize async pools once per worker with race condition protection"""
-    global db_pool, redis_pool, _async_pool_init_lock, _redis_init_lock
-    
-    # Initialize locks if they don't exist (lazy initialization)
-    if _async_pool_init_lock is None:
-        _async_pool_init_lock = asyncio.Lock()
-    if _redis_init_lock is None:
-        _redis_init_lock = asyncio.Lock()
-    
-    # Database pool initialization with lock
-    if not db_pool:
-        async with _async_pool_init_lock:
-            # Double-check pattern: another coroutine might have initialized it
-            if not db_pool:
-                db_pool = await asyncpg.create_pool(
-                    dsn=DB_DSN,
-                    min_size=DB_POOL_MIN_SIZE,
-                    max_size=DB_POOL_MAX_SIZE,
-                    command_timeout=30,
-                    statement_cache_size=0,
-                    server_settings={'application_name': 'celery_worker'}
-                )
-                logger.info("✅ [celery_app] Global async DB pool initialized")
-    
-    # Redis pool initialization with lock
-    if not redis_pool:
-        async with _redis_init_lock:
-            # Double-check pattern
-            if not redis_pool:
-                redis_pool = aioredis.ConnectionPool.from_url(
-                    REDIS_LABS_URL,
-                    max_connections=20,
-                    decode_responses=True
-                )
-                logger.info("✅ [celery_app] Global Redis pool initialized")
-
-def init_sync_pool():
-    """Initialize sync database pool for upload tasks with race condition protection"""
-    global sync_db_pool
-    
-    # Use threading lock for sync pool
-    with _sync_pool_lock:
-        # Double-check pattern: another thread might have initialized it
-        if not sync_db_pool:
-            # Extract connection params from DSN for psycopg2
-            import urllib.parse
-            parsed = urllib.parse.urlparse(DB_DSN)
-            
-            sync_db_pool = psycopg2.pool.ThreadedConnectionPool(
-                minconn=2,
-                maxconn=10,
-                host=parsed.hostname,
-                port=parsed.port,
-                database=parsed.path[1:],  # Remove leading '/'
-                user=parsed.username,
-                password=parsed.password,
-                application_name='celery_sync_worker'
-            )
-            logger.info("✅ [celery_app] Global sync DB pool initialized")
-
-def get_global_async_db_pool():
-    """Get the global async database pool"""
-    return db_pool
-
-def get_global_redis_pool():
-    """Get the global Redis pool"""
-    return redis_pool
-
-def get_global_sync_db_pool():
-    """Get the global sync database pool"""
-    if not sync_db_pool:
-        init_sync_pool()
-    return sync_db_pool
 
 # ——— Logging Configuration ———————————————————————————————————————————————————————
 
@@ -304,13 +201,20 @@ if not SHOW_CELERY_LOGS:
 celery_app.conf.update(**celery_config_updates)
 
 # ——— Task Registration (Import after app is configured) ——————————————————————————
+def register_tasks():
+    """Register tasks after app is fully configured"""
+    import tasks.chat_tasks
+    import tasks.chat_streaming_tasks
+    import tasks.upload_tasks
+    import tasks.note_tasks
+    import tasks.sample_tasks
 
-# Import tasks to register them with Celery
-import tasks.chat_tasks
-import tasks.chat_streaming_tasks
-import tasks.upload_tasks
-import tasks.note_tasks
-import tasks.sample_tasks
+# # Import tasks to register them with Celery
+# import tasks.chat_tasks
+# import tasks.chat_streaming_tasks
+# import tasks.upload_tasks
+# import tasks.note_tasks
+# import tasks.sample_tasks
 
 # Automatically discover tasks in specified modules
 celery_app.autodiscover_tasks(["tasks"])
@@ -323,57 +227,12 @@ print("📋 Registered tasks:")
 print(list(celery_app.tasks.keys()))
 print("✅ Ready to process tasks")
 
-# ——— Pool Health Checks ——————————————————————————————————————————————————————
-
-# Import shared utilities
-from .pool_utils import (
-    check_async_db_pool_health,
-    check_redis_pool_health, 
-    check_sync_db_pool_health,
-    get_db_connection_from_pool,
-    get_redis_connection_from_pool
-)
-
-async def check_db_pool_health() -> bool:
-    """Check if global database pool is healthy"""
-    return await check_async_db_pool_health(db_pool)
-
-async def check_global_redis_pool_health() -> bool:
-    """Check if global Redis pool is healthy"""
-    return await check_redis_pool_health(redis_pool)
-
-def check_global_sync_pool_health() -> bool:
-    """Check if global sync database pool is healthy"""
-    return check_sync_db_pool_health(sync_db_pool)
-
-# ——— Context Manager Wrappers ————————————————————————————————————————————————————
-
-@asynccontextmanager
-async def get_db_connection():
-    """Get database connection from global pool"""
-    if not db_pool:
-        await init_async_pools()
-    async with get_db_connection_from_pool(db_pool) as conn:
-        yield conn
-
-@asynccontextmanager
-async def get_redis_connection():
-    """Get Redis connection from global pool"""
-    if not redis_pool:
-        await init_async_pools()
-    async with get_redis_connection_from_pool(redis_pool) as redis:
-        yield redis
 # ——— Module Exports ————————————————————————————————————————————————————————————————
 
 __all__ = [
     'celery_app', 
     'run_async_in_worker',
-    'get_global_async_db_pool',
-    'get_global_redis_pool',
-    'get_global_sync_db_pool',
-    'init_async_pools',
-    'init_sync_pool',
-    'check_db_pool_health',      # ← Add to exports
-    'check_redis_pool_health',   # ← Add to exports
-    'check_sync_pool_health'     # ← Add to exports
 ]
+
+# Call this function at the very end
+register_tasks()
