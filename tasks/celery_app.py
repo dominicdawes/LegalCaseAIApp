@@ -36,6 +36,10 @@ db_pool = None
 redis_pool = None
 sync_db_pool = None
 
+# Race condition prevention locks
+_sync_pool_lock = threading.Lock()
+_async_pool_init_lock = None  # Will be created as asyncio.Lock() in async context
+_redis_init_lock = None       # Will be created as asyncio.Lock() in async context
 
 # ——— Environment Configuration ————————————————————————————————————————————————————
 
@@ -152,48 +156,65 @@ def run_async_in_worker(coro):
 # ——— Global Pool Management ————————————————————————————————————————————————————
 
 async def init_async_pools():
-    """Initialize async pools once per worker"""
-    global db_pool, redis_pool
+    """Initialize async pools once per worker with race condition protection"""
+    global db_pool, redis_pool, _async_pool_init_lock, _redis_init_lock
     
+    # Initialize locks if they don't exist (lazy initialization)
+    if _async_pool_init_lock is None:
+        _async_pool_init_lock = asyncio.Lock()
+    if _redis_init_lock is None:
+        _redis_init_lock = asyncio.Lock()
+    
+    # Database pool initialization with lock
     if not db_pool:
-        db_pool = await asyncpg.create_pool(
-            dsn=DB_DSN,
-            min_size=DB_POOL_MIN_SIZE,
-            max_size=DB_POOL_MAX_SIZE,
-            command_timeout=30,
-            statement_cache_size=0,
-            server_settings={'application_name': 'celery_worker'}
-        )
-        logger.info("✅ [celery_app] Global async DB pool initialized")
+        async with _async_pool_init_lock:
+            # Double-check pattern: another coroutine might have initialized it
+            if not db_pool:
+                db_pool = await asyncpg.create_pool(
+                    dsn=DB_DSN,
+                    min_size=DB_POOL_MIN_SIZE,
+                    max_size=DB_POOL_MAX_SIZE,
+                    command_timeout=30,
+                    statement_cache_size=0,
+                    server_settings={'application_name': 'celery_worker'}
+                )
+                logger.info("✅ [celery_app] Global async DB pool initialized")
     
+    # Redis pool initialization with lock
     if not redis_pool:
-        redis_pool = aioredis.ConnectionPool.from_url(
-            REDIS_LABS_URL,
-            max_connections=20,
-            decode_responses=True
-        )
-        logger.info("✅ [celery_app] Global Redis pool initialized")
+        async with _redis_init_lock:
+            # Double-check pattern
+            if not redis_pool:
+                redis_pool = aioredis.ConnectionPool.from_url(
+                    REDIS_LABS_URL,
+                    max_connections=20,
+                    decode_responses=True
+                )
+                logger.info("✅ [celery_app] Global Redis pool initialized")
 
 def init_sync_pool():
-    """Initialize sync database pool for upload tasks"""
+    """Initialize sync database pool for upload tasks with race condition protection"""
     global sync_db_pool
     
-    if not sync_db_pool:
-        # Extract connection params from DSN for psycopg2
-        import urllib.parse
-        parsed = urllib.parse.urlparse(DB_DSN)
-        
-        sync_db_pool = psycopg2.pool.ThreadedConnectionPool(
-            minconn=2,
-            maxconn=10,
-            host=parsed.hostname,
-            port=parsed.port,
-            database=parsed.path[1:],  # Remove leading '/'
-            user=parsed.username,
-            password=parsed.password,
-            application_name='celery_sync_worker'
-        )
-        logger.info("✅ [celery_app] Global sync DB pool initialized")
+    # Use threading lock for sync pool
+    with _sync_pool_lock:
+        # Double-check pattern: another thread might have initialized it
+        if not sync_db_pool:
+            # Extract connection params from DSN for psycopg2
+            import urllib.parse
+            parsed = urllib.parse.urlparse(DB_DSN)
+            
+            sync_db_pool = psycopg2.pool.ThreadedConnectionPool(
+                minconn=2,
+                maxconn=10,
+                host=parsed.hostname,
+                port=parsed.port,
+                database=parsed.path[1:],  # Remove leading '/'
+                user=parsed.username,
+                password=parsed.password,
+                application_name='celery_sync_worker'
+            )
+            logger.info("✅ [celery_app] Global sync DB pool initialized")
 
 def get_global_async_db_pool():
     """Get the global async database pool"""
