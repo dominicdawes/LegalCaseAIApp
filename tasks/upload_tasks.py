@@ -123,13 +123,6 @@ MAX_CONCURRENT_DOWNLOADS = 3 # A modest limit instead of 10
 CHUNK_SIZE = 1000
 CHUNK_OVERLAP = 200
 
-# Database (asyncpg)
-DB_DSN = os.getenv("POSTGRES_DSN_POOL") # e.g., Supabase -> Connection -> Get Direct URL
-# DB_POOL_MIN_SIZE = 5  # <-- if i had more compute
-# DB_POOL_MAX_SIZE = 20
-DB_POOL_MIN_SIZE = 2
-DB_POOL_MAX_SIZE = 5
-
 DEFAULT_HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
     'Accept': 'application/pdf,text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
@@ -268,7 +261,6 @@ def _calculate_stream_hash(stream: io.BytesIO) -> str:
         sha256_hash.update(chunk)
     stream.seek(0) # Reset stream position after reading
     return sha256_hash.hexdigest()
-
 
 def _update_document_status_sync(doc_id: str, status: ProcessingStatus, error_message: str = None):
     """[PER DOCUMENT] Synchronous version of document status update helper (for gevent)"""
