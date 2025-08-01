@@ -599,16 +599,24 @@ class EmbeddingCache:
     """🆕 Global query embedding cache with Redis backend"""
     
     def __init__(self):
-        self.redis_pool = redis_pool
         self.ttl = CACHE_CONFIG["embedding_cache_ttl"]
-    
+
+    async def _get_redis_pool(self):
+        """Get Redis pool from global pool manager"""
+        pool = get_global_redis_pool()
+        if not pool:
+            await init_async_pools()
+            pool = get_global_redis_pool()
+        return pool
+
     async def get_embedding(self, query: str) -> Optional[List[float]]:
         """Get cached embedding for query"""
         cache_key = f"embedding:{hashlib.md5(query.encode()).hexdigest()}"
         
         try:
             import redis.asyncio as aioredis
-            async with aioredis.Redis(connection_pool=self.redis_pool) as r:
+            pool = await self._get_redis_pool()
+            async with aioredis.Redis(connection_pool=pool) as r:
                 cached_data = await r.get(cache_key)
                 if cached_data:
                     logger.info(f"🎯 Cache HIT for query embedding")
