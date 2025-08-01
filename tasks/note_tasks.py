@@ -430,19 +430,19 @@ class AsyncNoteManager:
     async def _handle_note_error(
         self, project_id: str, user_id: str, note_type: str, error_message: str
     ):
-        """🆕 Enhanced error handling with async logging"""
         try:
-            # Log error asynchronously
             loop = asyncio.get_event_loop()
             await loop.run_in_executor(
                 None,
-                log_llm_error,
-                supabase_client,
-                "notes",
-                "async_note_generation", 
-                error_message,
-                project_id,
-                user_id
+                lambda: log_llm_error(
+                    supabase_client,
+                    table_name="notes",
+                    task_name="async_note_generation",
+                    error_message=error_message,
+                    project_id=project_id,
+                    user_id=user_id,
+                    note_type=note_type,
+                ),
             )
         except Exception as e:
             logger.warning(f"⚠️ Error logging failed: {e}")

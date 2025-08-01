@@ -271,7 +271,7 @@ def update_document_sources_realtime_status_log(
 
 
 def log_llm_error(
-    client, table_name, task_name, error_message, project_id=None, chat_session_id=None, user_id=None
+    client, table_name, task_name, error_message, project_id=None, chat_session_id=None, user_id=None, note_type=None
 ):
     """Insert a log row for LLM related errors for `public.messages` and `public.notes`"""
     if table_name == "messages":
@@ -284,6 +284,7 @@ def log_llm_error(
         }
     elif table_name == "notes":
         payload = {
+            "note_type": note_type,
             "task_name": task_name,
             "error_message": error_message,
             "project_id": project_id,
