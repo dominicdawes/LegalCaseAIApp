@@ -13,6 +13,7 @@ from celery import Celery
 from celery.signals import worker_init, worker_shutdown
 from celery.signals import after_setup_logger, after_setup_task_logger
 from celery.app.log import TaskFormatter
+from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timezone
 import os
 from dotenv import load_dotenv
@@ -324,59 +325,55 @@ print("✅ Ready to process tasks")
 
 # ——— Pool Health Checks ——————————————————————————————————————————————————————
 
+# Import shared utilities
+from .pool_utils import (
+    check_async_db_pool_health,
+    check_redis_pool_health, 
+    check_sync_db_pool_health,
+    get_db_connection_from_pool,
+    get_redis_connection_from_pool
+)
+
 async def check_db_pool_health() -> bool:
     """Check if global database pool is healthy"""
-    if not db_pool or db_pool.is_closing():
-        return False
-    
-    try:
-        async with asyncio.timeout(5):
-            async with db_pool.acquire() as conn:
-                await conn.fetchval('SELECT 1')
-        return True
-    except Exception as e:
-        logger.warning(f"⚠️ Database pool health check failed: {e}")
-        return False
+    return await check_async_db_pool_health(db_pool)
 
-async def check_redis_pool_health() -> bool:
+async def check_global_redis_pool_health() -> bool:
     """Check if global Redis pool is healthy"""
-    if not redis_pool:
-        return False
-    try:
-        async with asyncio.timeout(5):
-            import redis.asyncio as aioredis
-            async with aioredis.Redis(connection_pool=redis_pool) as r:
-                await r.ping()
-        return True
-    except Exception as e:
-        logger.warning(f"⚠️ Redis pool health check failed: {e}")
-        return False
+    return await check_redis_pool_health(redis_pool)
 
-def check_sync_pool_health() -> bool:
+def check_global_sync_pool_health() -> bool:
     """Check if global sync database pool is healthy"""
-    if not sync_db_pool:
-        return False
-    try:
-        conn = sync_db_pool.getconn()
-        try:
-            with conn.cursor() as cur:
-                cur.execute('SELECT 1')
-                cur.fetchone()
-            return True
-        finally:
-            sync_db_pool.putconn(conn)
-    except Exception as e:
-        logger.warning(f"⚠️ Sync pool health check failed: {e}")
-        return False
+    return check_sync_db_pool_health(sync_db_pool)
 
+# ——— Context Manager Wrappers ————————————————————————————————————————————————————
+
+@asynccontextmanager
+async def get_db_connection():
+    """Get database connection from global pool"""
+    if not db_pool:
+        await init_async_pools()
+    async with get_db_connection_from_pool(db_pool) as conn:
+        yield conn
+
+@asynccontextmanager
+async def get_redis_connection():
+    """Get Redis connection from global pool"""
+    if not redis_pool:
+        await init_async_pools()
+    async with get_redis_connection_from_pool(redis_pool) as redis:
+        yield redis
 # ——— Module Exports ————————————————————————————————————————————————————————————————
+
 __all__ = [
     'celery_app', 
     'run_async_in_worker',
     'get_global_async_db_pool',
     'get_global_redis_pool',
+    'get_global_sync_db_pool',
     'init_async_pools',
+    'init_sync_pool',
     'check_db_pool_health',      # ← Add to exports
     'check_redis_pool_health',   # ← Add to exports
-    'check_sync_pool_health'
+    'check_sync_pool_health'     # ← Add to exports
 ]

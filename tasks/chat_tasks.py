@@ -84,8 +84,13 @@ from tasks.celery_app import (
     get_global_async_db_pool,
     get_global_redis_pool,
     init_async_pools,
-    check_db_pool_health,      # ← Add this
-    check_redis_pool_health    # ← Add this
+    get_db_connection,      # ← Context manager
+    get_redis_connection    # ← Context manager
+)
+# Import health checks from the shared module:
+from tasks.pool_utils import (
+    check_async_db_pool_health,
+    check_redis_pool_health
 )
 
 # ——— Logging & Env Load ———————————————————————————————————————————————————————————
@@ -516,27 +521,27 @@ async def _setup_connection(conn: asyncpg.Connection):
 
 # ==== Context managers (uses global pool imports) =================
 
-@asynccontextmanager
-async def get_db_connection():
-    """Use global pool"""
-    pool = get_global_async_db_pool()
-    if not pool:
-        await init_async_pools()
-        pool = get_global_async_db_pool()
+# @asynccontextmanager
+# async def get_db_connection():
+#     """Use global pool"""
+#     pool = get_global_async_db_pool()
+#     if not pool:
+#         await init_async_pools()
+#         pool = get_global_async_db_pool()
     
-    async with pool.acquire() as conn:
-        yield conn
+#     async with pool.acquire() as conn:
+#         yield conn
 
-@asynccontextmanager  
-async def get_redis_connection():
-    """Use global Redis pool"""
-    pool = get_global_redis_pool()
-    if not pool:
-        await init_async_pools()
-        pool = get_global_redis_pool()
+# @asynccontextmanager  
+# async def get_redis_connection():
+#     """Use global Redis pool"""
+#     pool = get_global_redis_pool()
+#     if not pool:
+#         await init_async_pools()
+#         pool = get_global_redis_pool()
         
-    async with aioredis.Redis(connection_pool=pool) as redis:
-        yield redis
+#     async with aioredis.Redis(connection_pool=pool) as redis:
+#         yield redis
 
 # @asynccontextmanager
 # async def get_db_connection():
