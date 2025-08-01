@@ -82,7 +82,10 @@ from tasks.celery_app import (
     run_async_in_worker,
     get_global_async_db_pool,
     get_global_redis_pool,
-    init_async_pools
+    init_async_pools,
+    get_global_sync_db_pool,  # ← Add this
+    get_global_async_db_pool, # ← Add this
+    init_async_pools          # ← Add this
 )
 
 # ——— Logging & Env Load ———————————————————————————————————————————————————————————
@@ -204,76 +207,76 @@ class DocumentMetrics:
             'retry_count': self.retry_count
         }
 
-# ——— DB Pool Instances (Initialized once per worker) ————————————————————————————
+# # ——— DB Pool Instances (Initialized once per worker) ————————————————————————————
 
-# Global pool variable
-db_pool: Optional[asyncpg.Pool] = None
+# # Global pool variable
+# db_pool: Optional[asyncpg.Pool] = None
 
-# ——— 1. POOL CLEANUP FUNCTIONS ——————————————————————————————————————————————————
+# # ——— 1. POOL CLEANUP FUNCTIONS ——————————————————————————————————————————————————
 
-async def close_db_pool():
-    """Safely close the database pool"""
-    global db_pool
-    if db_pool is not None:
-        logger.info("🔄 Closing database pool...")
-        try:
-            await db_pool.close()
-            logger.info("✅ Database pool closed successfully")
-        except Exception as e:
-            logger.error(f"❌ Error closing database pool: {e}")
-        finally:
-            db_pool = None
+# async def close_db_pool():
+#     """Safely close the database pool"""
+#     global db_pool
+#     if db_pool is not None:
+#         logger.info("🔄 Closing database pool...")
+#         try:
+#             await db_pool.close()
+#             logger.info("✅ Database pool closed successfully")
+#         except Exception as e:
+#             logger.error(f"❌ Error closing database pool: {e}")
+#         finally:
+#             db_pool = None
 
-def sync_close_db_pool():
-    """Synchronous wrapper for closing the pool"""
-    try:
-        if db_pool is not None:
-            # Create new event loop if none exists
-            try:
-                loop = asyncio.get_event_loop()
-            except RuntimeError:
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
+# def sync_close_db_pool():
+#     """Synchronous wrapper for closing the pool"""
+#     try:
+#         if db_pool is not None:
+#             # Create new event loop if none exists
+#             try:
+#                 loop = asyncio.get_event_loop()
+#             except RuntimeError:
+#                 loop = asyncio.new_event_loop()
+#                 asyncio.set_event_loop(loop)
             
-            # Close the pool
-            loop.run_until_complete(close_db_pool())
-    except Exception as e:
-        logger.error(f"❌ Error in sync pool cleanup: {e}")
+#             # Close the pool
+#             loop.run_until_complete(close_db_pool())
+#     except Exception as e:
+#         logger.error(f"❌ Error in sync pool cleanup: {e}")
 
 # ——— 2. CELERY SIGNAL HANDLERS ————————————————————————————————————————————————————
 
-# @worker_init.connect
-def worker_init_handler(sender=None, **kwargs):
-    """Called when Celery worker starts"""
-    global db_pool
-    logger.info("🚀 Celery worker initializing && db pool resetting...")
+# # @worker_init.connect
+# def worker_init_handler(sender=None, **kwargs):
+#     """Called when Celery worker starts"""
+#     global db_pool
+#     logger.info("🚀 Celery worker initializing && db pool resetting...")
     
-    # Force reset the global pool variable
-    db_pool = None
-    logger.info("🔄 Database pool reset on worker init")
+#     # Force reset the global pool variable
+#     db_pool = None
+#     logger.info("🔄 Database pool reset on worker init")
 
-# Global pool reset on worker init
-worker_init.connect(worker_init_handler)
+# # Global pool reset on worker init
+# worker_init.connect(worker_init_handler)
 
-@worker_shutdown.connect
-def worker_shutdown_handler(sender=None, **kwargs):
-    """Called when Celery worker shuts down"""
-    logger.info("🛑 Celery worker shutting down...")
-    sync_close_db_pool()
+# @worker_shutdown.connect
+# def worker_shutdown_handler(sender=None, **kwargs):
+#     """Called when Celery worker shuts down"""
+#     logger.info("🛑 Celery worker shutting down...")
+#     sync_close_db_pool()
 
-# ——— 3. SYSTEM SIGNAL HANDLERS ————————————————————————————————————————————————————
+# # ——— 3. SYSTEM SIGNAL HANDLERS ————————————————————————————————————————————————————
 
-def signal_handler(signum, frame):
-    """Handle system signals (SIGTERM, SIGINT)"""
-    logger.info(f"🛑 Received signal {signum}, cleaning up...")
-    sync_close_db_pool()
+# def signal_handler(signum, frame):
+#     """Handle system signals (SIGTERM, SIGINT)"""
+#     logger.info(f"🛑 Received signal {signum}, cleaning up...")
+#     sync_close_db_pool()
 
-# Register signal handlers
-signal.signal(signal.SIGTERM, signal_handler)
-signal.signal(signal.SIGINT, signal_handler)
+# # Register signal handlers
+# signal.signal(signal.SIGTERM, signal_handler)
+# signal.signal(signal.SIGINT, signal_handler)
 
-# Register atexit handler as last resort
-atexit.register(sync_close_db_pool)
+# # Register atexit handler as last resort
+# atexit.register(sync_close_db_pool)
 
 # ——— 4. UPDATED get_async_db_pool FUNCTION ———————————————————————————————————————
 
@@ -411,38 +414,38 @@ async def get_async_db_pool() -> asyncpg.Pool:
     return db_pool
 
 # Create a sync database connection pool for gevent
-sync_db_pool = None
+# sync_db_pool = None
 
 # Get Synchronous DB pool
-def get_sync_db_pool():
-    """Get or create a synchronous database connection pool for gevent"""
-    global sync_db_pool
-    if sync_db_pool is None:
-        import urllib.parse
-        parsed = urllib.parse.urlparse(DB_DSN)
-        sync_db_pool = ThreadedConnectionPool(
-            minconn=DB_POOL_MIN_SIZE,
-            maxconn=DB_POOL_MAX_SIZE,
-            host=parsed.hostname,
-            port=parsed.port or 5432,
-            database=parsed.path[1:],  # Remove leading slash
-            user=parsed.username,
-            password=parsed.password,
-            application_name='celery_worker_gevent'
-        )
-    return sync_db_pool
+# def get_sync_db_pool():
+#     """Get or create a synchronous database connection pool for gevent"""
+#     global sync_db_pool
+#     if sync_db_pool is None:
+#         import urllib.parse
+#         parsed = urllib.parse.urlparse(DB_DSN)
+#         sync_db_pool = ThreadedConnectionPool(
+#             minconn=DB_POOL_MIN_SIZE,
+#             maxconn=DB_POOL_MAX_SIZE,
+#             host=parsed.hostname,
+#             port=parsed.port or 5432,
+#             database=parsed.path[1:],  # Remove leading slash
+#             user=parsed.username,
+#             password=parsed.password,
+#             application_name='celery_worker_gevent'
+#         )
+#     return sync_db_pool
 
 # ——— 5. OPTIONAL: MANUAL POOL RESET TASK ————————————————————————————————
 
-@celery_app.task(bind=True)
-def reset_db_pool_task(self):
-    """Manual task to reset the database pool"""
-    try:
-        sync_close_db_pool()
-        return {"status": "success", "message": "Database pool reset successfully"}
-    except Exception as e:
-        logger.error(f"❌ Failed to reset database pool: {e}")
-        return {"status": "error", "message": str(e)}
+# @celery_app.task(bind=True)
+# def reset_db_pool_task(self):
+#     """Manual task to reset the database pool"""
+#     try:
+#         sync_close_db_pool()
+#         return {"status": "success", "message": "Database pool reset successfully"}
+#     except Exception as e:
+#         logger.error(f"❌ Failed to reset database pool: {e}")
+#         return {"status": "error", "message": str(e)}
 
 # ——— 6. Retry Strategies ————————————————————————————————————————————————
 
@@ -487,13 +490,6 @@ logger.info("✅ Metrics collector initialized")
 
 # ——— Helpers & Utilities ——————————————————————————————————————————————————————————
 
-# def _clean_text(text: str) -> str:
-#     """Enhanced text cleaning with unicode normalization."""
-#     import unicodedata
-#     cleaned = text.replace("\x00", "").replace("\ufffd", "")
-#     normalized = unicodedata.normalize('NFKC', cleaned)
-#     return normalized.strip()
-
 def _calculate_stream_hash(stream: io.BytesIO) -> str:
     """Calculate SHA-256 hash from an in-memory stream without consuming it."""
     sha256_hash = hashlib.sha256()
@@ -504,26 +500,11 @@ def _calculate_stream_hash(stream: io.BytesIO) -> str:
     stream.seek(0) # Reset stream position after reading
     return sha256_hash.hexdigest()
 
-# async def _update_document_status(doc_id: str, status: ProcessingStatus, error_message: Optional[str] = None):
-#     """
-#     [DEPRECATED] Async helper to update a document's status in the database (for asyncio)
-#     """
-#     logger.info(f"📋 Doc {doc_id[:8]}... → {status.value}")
-#     pool = await get_async_db_pool()
-#     async with pool.acquire() as conn:
-#         await conn.execute(
-#             """
-#             UPDATE document_sources
-#             SET vector_embed_status = $1, error_message = $2, updated_at = NOW()
-#             WHERE id = $3
-#             """,
-#             status.value, error_message, uuid.UUID(doc_id)
-#         )
 
 def _update_document_status_sync(doc_id: str, status: ProcessingStatus, error_message: str = None):
     """[PER DOCUMENT] Synchronous version of document status update helper (for gevent)"""
     logger.info(f"📋 Doc {doc_id[:8]}... → {status.value}")
-    pool = get_sync_db_pool()
+    pool = get_global_sync_db_pool()
     conn = pool.getconn()
     try:
         with conn.cursor() as cur:
@@ -544,7 +525,7 @@ def _update_batch_progress_sync(batch_id: str, project_id: str, status: BatchPro
     [PER BATCH] Update batch_progress for all documents in a batch
     Fast bulk update - better than individual document updates
     """
-    pool = get_sync_db_pool()
+    pool = get_global_sync_db_pool()
     conn = pool.getconn()
     try:
         with conn.cursor() as cur:
@@ -577,7 +558,12 @@ async def get_embedding_reuse_stats(project_id: str) -> Dict[str, Any]:
     """
     Get statistics about embedding reuse for a project
     """
-    pool = await get_async_db_pool()
+    # Use global async pool instead of local pool
+    pool = get_global_async_db_pool()
+    if not pool:
+        await init_async_pools()
+        pool = get_global_async_db_pool()
+
     async with pool.acquire() as conn:
         stats = await conn.fetchrow(
             '''
@@ -834,7 +820,8 @@ async def _analyze_document_for_workflow(
             raise Exception(f"Failed to download document from {url}")
         
         # ——— Check Processing Type (sync DB lookup) ———————————————————————————————
-        pool = get_sync_db_pool()
+        # Use global pool instead of local pool
+        pool = get_global_sync_db_pool()
         conn = pool.getconn()
         
         try:
@@ -902,7 +889,8 @@ def copy_embeddings_for_project_sync(existing_source_id: str, new_source_id: str
     Returns:
         Dict with copy statistics
     """
-    pool = get_sync_db_pool()
+    # Use global pool instead of local pool
+    pool = get_global_sync_db_pool()
     conn = pool.getconn()
     
     try:
@@ -1264,7 +1252,8 @@ async def _embed_batch_async(doc_id: str, project_id: str, batch_info: List[str]
             }
 
         # ——— 3. Database Insert (Keep your sync pool - it works!) ———————————————
-        pool = get_sync_db_pool()
+        # Use global pool instead of local pool
+        pool = get_global_sync_db_pool()
         conn = pool.getconn()
         try:
             with conn.cursor() as cur:
@@ -1920,7 +1909,8 @@ async def _process_document_async_workflow(
     
     try:
         # ——— 1. INSERT Document Record (Sync DB) ———————————————————————————————————
-        pool = get_sync_db_pool()
+        # Use global pool instead of local pool
+        pool = get_global_sync_db_pool()
         conn = pool.getconn()
         try:
             with conn.cursor() as cur:
@@ -2196,7 +2186,8 @@ def process_reused_document_task(
     
     try:
         # ——— Create New Document Entry + Copy Embeddings ——————————————————————————
-        pool = get_sync_db_pool()
+        # Use global pool instead of local pool
+        pool = get_global_sync_db_pool()
         conn = pool.getconn()
         
         try:
