@@ -512,7 +512,7 @@ async def _setup_connection(conn: asyncpg.Connection):
 #     """Cleanup function for Redis pool"""
 #     logger.info("🧹 Redis pool cleanup triggered")
 
-# ==== Context managers =================
+# ==== Context managers (uses global pool imports) =================
 
 @asynccontextmanager
 async def get_db_connection():
