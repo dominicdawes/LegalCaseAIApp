@@ -28,6 +28,7 @@ from psycopg2.extras import execute_batch
 
 # ===== ASYNC & CONCURRENCY & SOCKET =====
 import asyncio
+import redis.asyncio as aioredis
 import gevent
 import gevent.socket
 import socket

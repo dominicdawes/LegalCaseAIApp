@@ -17,7 +17,7 @@ from datetime import datetime, timezone
 import os
 from dotenv import load_dotenv
 import asyncpg
-import aioredis
+import redis.asyncio as aioredis
 import psycopg2.pool
 
 # ——— Global Variables (CRITICAL: Declare all globals at top) ————————————————————————

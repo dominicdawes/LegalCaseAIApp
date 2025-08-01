@@ -44,7 +44,6 @@ from dotenv import load_dotenv
 # ===== DATABASE POOLS =====
 import asyncpg
 import redis.asyncio as aioredis
-import asyncpg
 from contextlib import asynccontextmanager, contextmanager
 import threading
 
@@ -521,14 +520,13 @@ async def get_db_connection():
 
 @asynccontextmanager  
 async def get_redis_connection():
-    """
-    Simple Redis connection context manager
-    NOTE: add error logging / timeout late
-    """
-    if not redis_pool:
-        await init_worker_pools()
+    """Use global Redis pool"""
+    pool = get_global_redis_pool()
+    if not pool:
+        await init_async_pools()
+        pool = get_global_redis_pool()
         
-    async with aioredis.Redis(connection_pool=redis_pool) as redis:
+    async with aioredis.Redis(connection_pool=pool) as redis:
         yield redis
 
 # @asynccontextmanager
