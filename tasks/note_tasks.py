@@ -121,82 +121,82 @@ DEFAULT_HEADERS = {
     'Upgrade-Insecure-Requests': '1'
 }
 
-# Initialize Redis sync client for pub/sub
-REDIS_LABS_URL = (
-    "redis://default:"
-    + os.getenv("REDIS_PASSWORD")
-    + "@"
-    + os.getenv("REDIS_PUBLIC_ENDPOINT")
-)
-redis_sync = redis.Redis.from_url(REDIS_LABS_URL, decode_responses=True)
+# # Initialize Redis sync client for pub/sub
+# REDIS_LABS_URL = (
+#     "redis://default:"
+#     + os.getenv("REDIS_PASSWORD")
+#     + "@"
+#     + os.getenv("REDIS_PUBLIC_ENDPOINT")
+# )
+# redis_sync = redis.Redis.from_url(REDIS_LABS_URL, decode_responses=True)
 
-# ——— 1. POOL CLEANUP FUNCTIONS ——————————————————————————————————————————————————
+# # ——— 1. POOL CLEANUP FUNCTIONS ——————————————————————————————————————————————————
 
-async def close_db_pool():
-    """Safely close the database pool"""
-    global db_pool
-    if db_pool is not None:
-        logger.info("🔄 Closing database pool...")
-        try:
-            await db_pool.close()
-            logger.info("✅ Database pool closed successfully")
-        except Exception as e:
-            logger.error(f"❌ Error closing database pool: {e}")
-        finally:
-            db_pool = None
+# async def close_db_pool():
+#     """Safely close the database pool"""
+#     global db_pool
+#     if db_pool is not None:
+#         logger.info("🔄 Closing database pool...")
+#         try:
+#             await db_pool.close()
+#             logger.info("✅ Database pool closed successfully")
+#         except Exception as e:
+#             logger.error(f"❌ Error closing database pool: {e}")
+#         finally:
+#             db_pool = None
 
-def sync_close_db_pool():
-    """Synchronous wrapper for closing the pool"""
-    try:
-        if db_pool is not None:
-            # Create new event loop if none exists
-            try:
-                loop = asyncio.get_event_loop()
-            except RuntimeError:
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
+# def sync_close_db_pool():
+#     """Synchronous wrapper for closing the pool"""
+#     try:
+#         if db_pool is not None:
+#             # Create new event loop if none exists
+#             try:
+#                 loop = asyncio.get_event_loop()
+#             except RuntimeError:
+#                 loop = asyncio.new_event_loop()
+#                 asyncio.set_event_loop(loop)
             
-            # Close the pool
-            loop.run_until_complete(close_db_pool())
-    except Exception as e:
-        logger.error(f"❌ Error in sync pool cleanup: {e}")
+#             # Close the pool
+#             loop.run_until_complete(close_db_pool())
+#     except Exception as e:
+#         logger.error(f"❌ Error in sync pool cleanup: {e}")
 
-# ——— 2. CELERY SIGNAL HANDLERS ————————————————————————————————————————————————————
+# # ——— 2. CELERY SIGNAL HANDLERS ————————————————————————————————————————————————————
 
-# @worker_init.connect
-def worker_init_handler(sender=None, **kwargs):
-    """Called when Celery worker starts"""
-    global db_pool
-    logger.info("🚀 Celery worker initializing && db pool resetting...")
+# # @worker_init.connect
+# def worker_init_handler(sender=None, **kwargs):
+#     """Called when Celery worker starts"""
+#     global db_pool
+#     logger.info("🚀 Celery worker initializing && db pool resetting...")
     
-    # Force reset the global pool variable
-    db_pool = None
-    logger.info("🔄 Database pool reset on worker init")
+#     # Force reset the global pool variable
+#     db_pool = None
+#     logger.info("🔄 Database pool reset on worker init")
 
-# Global pool reset on worker init
-worker_init.connect(worker_init_handler)
+# # Global pool reset on worker init
+# worker_init.connect(worker_init_handler)
 
-@worker_shutdown.connect
-def worker_shutdown_handler(sender=None, **kwargs):
-    """Called when Celery worker shuts down"""
-    logger.info("🛑 Celery worker shutting down...")
-    sync_close_db_pool()
+# @worker_shutdown.connect
+# def worker_shutdown_handler(sender=None, **kwargs):
+#     """Called when Celery worker shuts down"""
+#     logger.info("🛑 Celery worker shutting down...")
+#     sync_close_db_pool()
 
-# ——— 3. SYSTEM SIGNAL HANDLERS ————————————————————————————————————————————————————
+# # ——— 3. SYSTEM SIGNAL HANDLERS ————————————————————————————————————————————————————
 
-def signal_handler(signum, frame):
-    """Handle system signals (SIGTERM, SIGINT)"""
-    logger.info(f"🛑 Received signal {signum}, cleaning up...")
-    sync_close_db_pool()
+# def signal_handler(signum, frame):
+#     """Handle system signals (SIGTERM, SIGINT)"""
+#     logger.info(f"🛑 Received signal {signum}, cleaning up...")
+#     sync_close_db_pool()
 
-# Register signal handlers
-signal.signal(signal.SIGTERM, signal_handler)
-signal.signal(signal.SIGINT, signal_handler)
+# # Register signal handlers
+# signal.signal(signal.SIGTERM, signal_handler)
+# signal.signal(signal.SIGINT, signal_handler)
 
-# Register atexit handler as last resort
-atexit.register(sync_close_db_pool)
+# # Register atexit handler as last resort
+# atexit.register(sync_close_db_pool)
 
-# ——— Global Production Instances (Initialized once per worker) —————————————————————
+# # ——— Global Production Instances (Initialized once per worker) —————————————————————
 
 # OpenAI Embeddings Client
 embedding_model = OpenAIEmbeddings(
