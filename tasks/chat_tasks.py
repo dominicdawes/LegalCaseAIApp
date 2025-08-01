@@ -134,11 +134,11 @@ _MODEL_TEMPERATURE_CONFIG = {
 }
 
 # Database 
-DB_DSN = os.getenv("POSTGRES_DSN_POOL") # e.g., Supabase -> Connection -> Get Pool URL
-# DB_POOL_MIN_SIZE = 5  # <-- if i had more compute
-# DB_POOL_MAX_SIZE = 20
-DB_POOL_MIN_SIZE = 2
-DB_POOL_MAX_SIZE = 5
+# DB_DSN = os.getenv("POSTGRES_DSN_POOL") # e.g., Supabase -> Connection -> Get Pool URL
+# # DB_POOL_MIN_SIZE = 5  # <-- if i had more compute
+# # DB_POOL_MAX_SIZE = 20
+# DB_POOL_MIN_SIZE = 2
+# DB_POOL_MAX_SIZE = 5
 
 # Initialize Redis sync client for pub/sub
 REDIS_LABS_URL = (
@@ -186,13 +186,13 @@ def should_use_streaming(user_id: str, project_id: str = None) -> bool:
 # ——— Database and Metrics Variables ———————————————————————————————————————————————————————————
 
 # Persistent event loop per worker process
-worker_loop = None
+# worker_loop = None
 
 # Connection pools
-async_db_pool: Optional[asyncpg.Pool] = None                            # Asyncpg async database connection pool
-redis_pool: Optional[aioredis.ConnectionPool] = None                    # Redis connection pool
+# async_db_pool: Optional[asyncpg.Pool] = None                            # Asyncpg async database connection pool
+# redis_pool: Optional[aioredis.ConnectionPool] = None                    # Redis connection pool
 
-db_pool = async_db_pool                                                 # 🙊 monkey patch
+# db_pool = async_db_pool                                                 # 🙊 monkey patch
 
 # Track pool initialization to prevent race conditions
 _sync_pool_lock = threading.Lock()
@@ -278,42 +278,42 @@ def get_worker_loop():
 #     loop = get_worker_loop()
 #     return loop.run_until_complete(coro)
 
-async def init_worker_pools():
-    """Initialize all async resources once per worker"""
-    global db_pool, redis_pool
+# async def init_worker_pools():
+#     """Initialize all async resources once per worker"""
+#     global db_pool, redis_pool
     
-    if not db_pool:
-        db_pool = await asyncpg.create_pool(
-            dsn=DB_DSN,
-            min_size=2,
-            max_size=10,
-            command_timeout=30,
-            statement_cache_size=0, 
-            server_settings={'application_name': 'rag_worker'}
-        )
-        logger.info("✅ DB pool initialized")
+#     if not db_pool:
+#         db_pool = await asyncpg.create_pool(
+#             dsn=DB_DSN,
+#             min_size=2,
+#             max_size=10,
+#             command_timeout=30,
+#             statement_cache_size=0, 
+#             server_settings={'application_name': 'rag_worker'}
+#         )
+#         logger.info("✅ DB pool initialized")
     
-    if not redis_pool:
-        redis_pool = aioredis.ConnectionPool.from_url(
-            REDIS_LABS_URL,
-            max_connections=20,
-            decode_responses=True
-        )
-        logger.info("✅ Redis pool initialized")
+#     if not redis_pool:
+#         redis_pool = aioredis.ConnectionPool.from_url(
+#             REDIS_LABS_URL,
+#             max_connections=20,
+#             decode_responses=True
+#         )
+#         logger.info("✅ Redis pool initialized")
 
-async def cleanup_worker_pools():
-    """Cleanup all resources"""
-    global db_pool, redis_pool
+# async def cleanup_worker_pools():
+#     """Cleanup all resources"""
+#     global db_pool, redis_pool
     
-    if db_pool:
-        await db_pool.close()
-        db_pool = None
+#     if db_pool:
+#         await db_pool.close()
+#         db_pool = None
     
-    if redis_pool:
-        await redis_pool.disconnect() 
-        redis_pool = None
+#     if redis_pool:
+#         await redis_pool.disconnect() 
+#         redis_pool = None
     
-    logger.info("✅ Worker pools cleaned up")
+#     logger.info("✅ Worker pools cleaned up")
 
 # ——— Database Connection Management ———————————————————————————————————————
 
@@ -402,109 +402,109 @@ async def _setup_connection(conn: asyncpg.Connection):
     except Exception as e:
         logger.warning(f"⚠️ Connection setup failed: {e}")
 
-async def _init_connection(conn: asyncpg.Connection):
-    """Run initialization commands once per connection"""
-    try:
-        # Prepare frequently used statements for better performance
-        await conn.prepare("SELECT 1")
-    except Exception as e:
-        logger.warning(f"⚠️ Connection init failed: {e}")
+# async def _init_connection(conn: asyncpg.Connection):
+#     """Run initialization commands once per connection"""
+#     try:
+#         # Prepare frequently used statements for better performance
+#         await conn.prepare("SELECT 1")
+#     except Exception as e:
+#         logger.warning(f"⚠️ Connection init failed: {e}")
 
-async def _close_db_pool_safely():
-    """Safely close database pool with proper cleanup"""
-    global db_pool
+# async def _close_db_pool_safely():
+#     """Safely close database pool with proper cleanup"""
+#     global db_pool
     
-    if db_pool and not db_pool.is_closing():
-        try:
-            logger.info("🔄 Closing database pool...")
+#     if db_pool and not db_pool.is_closing():
+#         try:
+#             logger.info("🔄 Closing database pool...")
             
-            # Give active connections time to complete
-            await asyncio.wait_for(db_pool.close(), timeout=30)
+#             # Give active connections time to complete
+#             await asyncio.wait_for(db_pool.close(), timeout=30)
             
-            # Wait for all connections to actually close
-            await db_pool.wait_closed()
+#             # Wait for all connections to actually close
+#             await db_pool.wait_closed()
             
-            logger.info("✅ Database pool closed successfully")
-        except asyncio.TimeoutError:
-            logger.warning("⚠️ Database pool close timeout, forcing termination")
-            db_pool.terminate()
-        except Exception as e:
-            logger.error(f"❌ Database pool close error: {e}")
-            db_pool.terminate()
-        finally:
-            db_pool = None
+#             logger.info("✅ Database pool closed successfully")
+#         except asyncio.TimeoutError:
+#             logger.warning("⚠️ Database pool close timeout, forcing termination")
+#             db_pool.terminate()
+#         except Exception as e:
+#             logger.error(f"❌ Database pool close error: {e}")
+#             db_pool.terminate()
+#         finally:
+#             db_pool = None
 
-def _cleanup_db_pool():
-    """Cleanup function for weakref finalization"""
-    # This runs during garbage collection, so avoid complex async operations
-    logger.info("🧹 Database pool cleanup triggered")
+# def _cleanup_db_pool():
+#     """Cleanup function for weakref finalization"""
+#     # This runs during garbage collection, so avoid complex async operations
+#     logger.info("🧹 Database pool cleanup triggered")
     
 # ==== Redis Connection =============
 
-async def initialize_redis_pool() -> aioredis.ConnectionPool:
-    """
-    🔧 IMPROVED: Initialize Redis connection pool with proper error handling
-    """
-    global redis_pool
+# async def initialize_redis_pool() -> aioredis.ConnectionPool:
+#     """
+#     🔧 IMPROVED: Initialize Redis connection pool with proper error handling
+#     """
+#     global redis_pool
     
-    async with _redis_init_lock:
-        # Check if pool already exists and is healthy
-        if redis_pool:
-            try:
-                # Quick health check
-                async with aioredis.Redis(connection_pool=redis_pool) as r:
-                    await asyncio.wait_for(r.ping(), timeout=5)
-                logger.info("✅ Existing Redis pool is healthy")
-                return redis_pool
-            except Exception as e:
-                logger.warning(f"⚠️ Existing Redis pool unhealthy, recreating: {e}")
-                await _close_redis_pool_safely()
+#     async with _redis_init_lock:
+#         # Check if pool already exists and is healthy
+#         if redis_pool:
+#             try:
+#                 # Quick health check
+#                 async with aioredis.Redis(connection_pool=redis_pool) as r:
+#                     await asyncio.wait_for(r.ping(), timeout=5)
+#                 logger.info("✅ Existing Redis pool is healthy")
+#                 return redis_pool
+#             except Exception as e:
+#                 logger.warning(f"⚠️ Existing Redis pool unhealthy, recreating: {e}")
+#                 await _close_redis_pool_safely()
     
-    try:
-        logger.info("🔗 Creating Redis connection pool...")
+#     try:
+#         logger.info("🔗 Creating Redis connection pool...")
         
-        redis_pool = aioredis.ConnectionPool.from_url(
-            REDIS_LABS_URL,
-            max_connections=20,
-            decode_responses=True,
-            socket_timeout=30,
-            socket_connect_timeout=10,
-            retry_on_timeout=True,
-            health_check_interval=30,  # Check connection health every 30s
-        )
+#         redis_pool = aioredis.ConnectionPool.from_url(
+#             REDIS_LABS_URL,
+#             max_connections=20,
+#             decode_responses=True,
+#             socket_timeout=30,
+#             socket_connect_timeout=10,
+#             retry_on_timeout=True,
+#             health_check_interval=30,  # Check connection health every 30s
+#         )
         
-        # Test connection
-        async with aioredis.Redis(connection_pool=redis_pool) as r:
-            pong = await asyncio.wait_for(r.ping(), timeout=10)
-            logger.info(f"✅ Redis pool initialized successfully. Ping: {pong}")
+#         # Test connection
+#         async with aioredis.Redis(connection_pool=redis_pool) as r:
+#             pong = await asyncio.wait_for(r.ping(), timeout=10)
+#             logger.info(f"✅ Redis pool initialized successfully. Ping: {pong}")
         
-        # Register cleanup
-        weakref.finalize(redis_pool, _cleanup_redis_pool)
+#         # Register cleanup
+#         weakref.finalize(redis_pool, _cleanup_redis_pool)
         
-        return redis_pool
+#         return redis_pool
         
-    except Exception as e:
-        logger.error(f"❌ Redis pool initialization failed: {e}")
-        redis_pool = None
-        raise
+#     except Exception as e:
+#         logger.error(f"❌ Redis pool initialization failed: {e}")
+#         redis_pool = None
+#         raise
 
-async def _close_redis_pool_safely():
-    """Safely close Redis pool"""
-    global redis_pool
+# async def _close_redis_pool_safely():
+#     """Safely close Redis pool"""
+#     global redis_pool
     
-    if redis_pool:
-        try:
-            logger.info("🔄 Closing Redis pool...")
-            await redis_pool.disconnect()
-            logger.info("✅ Redis pool closed successfully")
-        except Exception as e:
-            logger.error(f"❌ Redis pool close error: {e}")
-        finally:
-            redis_pool = None
+#     if redis_pool:
+#         try:
+#             logger.info("🔄 Closing Redis pool...")
+#             await redis_pool.disconnect()
+#             logger.info("✅ Redis pool closed successfully")
+#         except Exception as e:
+#             logger.error(f"❌ Redis pool close error: {e}")
+#         finally:
+#             redis_pool = None
 
-def _cleanup_redis_pool():
-    """Cleanup function for Redis pool"""
-    logger.info("🧹 Redis pool cleanup triggered")
+# def _cleanup_redis_pool():
+#     """Cleanup function for Redis pool"""
+#     logger.info("🧹 Redis pool cleanup triggered")
 
 # ==== Context managers =================
 
