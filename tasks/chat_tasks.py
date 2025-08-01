@@ -688,9 +688,15 @@ class StreamingChatManager:
                 logger.warning("⚠️ Resources unhealthy, reinitializing...")
         
         try:
-            # Initialize pools with proper error handling
-            await initialize_async_database_pool()
-            await initialize_redis_pool()
+            # Initialize global pools
+            await init_async_pools()
+            
+            # Verify pools are available
+            db_pool = get_global_async_db_pool()
+            redis_pool = get_global_redis_pool()
+            
+            if not db_pool or not redis_pool:
+                raise RuntimeError("Failed to initialize global pools")
             
             self._initialized = True
             logger.info("🚀 StreamingChatManager initialized successfully")
@@ -699,6 +705,30 @@ class StreamingChatManager:
             logger.error(f"❌ StreamingChatManager initialization failed: {e}")
             self._initialized = False
             raise
+
+    async def _check_db_pool_health(self) -> bool:
+        """Check if database pool is healthy"""
+        try:
+            pool = get_global_async_db_pool()
+            if not pool:
+                return False
+                
+            async with pool.acquire(timeout=5) as conn:
+                await conn.fetchval('SELECT 1')
+            return True
+        except Exception as e:
+            logger.warning(f"⚠️ DB pool health check failed: {e}")
+            return False
+    
+    async def _check_redis_pool_health(self) -> bool:
+        """Check if Redis pool is healthy"""
+        try:
+            async with get_redis_connection() as redis:
+                await redis.ping()
+            return True
+        except Exception as e:
+            logger.warning(f"⚠️ Redis pool health check failed: {e}")
+            return False
 
     async def process_streaming_query(
         self,
