@@ -45,7 +45,9 @@ botocore
 # Supabase & PG dependencies
 supabase==2.5.0 # supabase (will auto-install compatible postgrest-py)
 # postgrest-py
-asyncpg
+aioredis>=2.0.0
+psycopg2-binary>=2.9.0  # For sync pool
+asyncpg>=0.28.0         # For async pool
 psycopg2-binary==2.9.9
 
 # RAG dependencies
