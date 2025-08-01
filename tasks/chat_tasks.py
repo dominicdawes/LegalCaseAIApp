@@ -83,7 +83,9 @@ from tasks.celery_app import (
     run_async_in_worker,
     get_global_async_db_pool,
     get_global_redis_pool,
-    init_async_pools
+    init_async_pools,
+    check_db_pool_health,      # ← Add this
+    check_redis_pool_health    # ← Add this
 )
 
 # ——— Logging & Env Load ———————————————————————————————————————————————————————————
@@ -677,9 +679,9 @@ class StreamingChatManager:
         🔧 IMPROVED: Initialize with better error handling and health checks
         """
         if self._initialized:
-            # Check if existing resources are still healthy
-            db_healthy = await check_db_pool_health()
-            redis_healthy = await check_redis_pool_health()
+            # Use imported global health check functions directly
+            db_healthy = await check_db_pool_health()      # ← Global function
+            redis_healthy = await check_redis_pool_health() # ← Global function
             
             if db_healthy and redis_healthy:
                 logger.info("✅ StreamingChatManager already initialized and healthy")
@@ -706,29 +708,29 @@ class StreamingChatManager:
             self._initialized = False
             raise
 
-    async def _check_db_pool_health(self) -> bool:
-        """Check if database pool is healthy"""
-        try:
-            pool = get_global_async_db_pool()
-            if not pool:
-                return False
+    # async def _check_db_pool_health(self) -> bool:
+    #     """Check if database pool is healthy"""
+    #     try:
+    #         pool = get_global_async_db_pool()
+    #         if not pool:
+    #             return False
                 
-            async with pool.acquire(timeout=5) as conn:
-                await conn.fetchval('SELECT 1')
-            return True
-        except Exception as e:
-            logger.warning(f"⚠️ DB pool health check failed: {e}")
-            return False
+    #         async with pool.acquire(timeout=5) as conn:
+    #             await conn.fetchval('SELECT 1')
+    #         return True
+    #     except Exception as e:
+    #         logger.warning(f"⚠️ DB pool health check failed: {e}")
+    #         return False
     
-    async def _check_redis_pool_health(self) -> bool:
-        """Check if Redis pool is healthy"""
-        try:
-            async with get_redis_connection() as redis:
-                await redis.ping()
-            return True
-        except Exception as e:
-            logger.warning(f"⚠️ Redis pool health check failed: {e}")
-            return False
+    # async def _check_redis_pool_health(self) -> bool:
+    #     """Check if Redis pool is healthy"""
+    #     try:
+    #         async with get_redis_connection() as redis:
+    #             await redis.ping()
+    #         return True
+    #     except Exception as e:
+    #         logger.warning(f"⚠️ Redis pool health check failed: {e}")
+    #         return False
 
     async def process_streaming_query(
         self,
@@ -1362,10 +1364,9 @@ class StreamingChatManager:
         self, session_id: str, message_id: str, chunk: str
     ):
         """🆕 Broadcast content chunk via WebSocket"""
-        # import redis.asyncio as aioredis
-        
         try:
-            async with aioredis.Redis(connection_pool=redis_pool) as r:
+            # Use the global Redis connection context manager
+            async with get_redis_connection() as r:
                 await r.publish(f"chat:{session_id}", json.dumps({
                     "type": "content_delta",
                     "message_id": message_id,
@@ -1379,11 +1380,9 @@ class StreamingChatManager:
             logger.warning(f"⚠️ Broadcast failed: {e}")
 
     async def _broadcast_citations(self, session_id: str, citations: List[Citation]):
-        """🆕 Broadcast new citations"""
-        import redis.asyncio as aioredis
-        
+        """🆕 Broadcast new citations"""       
         try:
-            async with aioredis.Redis(connection_pool=redis_pool) as r:
+            async with get_redis_connection() as r:
                 await r.publish(f"chat:{session_id}", json.dumps({
                     "type": "citations_found",
                     "citations": [
@@ -1401,10 +1400,8 @@ class StreamingChatManager:
 
     async def _broadcast_highlights(self, session_id: str, highlights: List[Highlight]):
         """🆕 Broadcast new highlights"""
-        import redis.asyncio as aioredis
-        
         try:
-            async with aioredis.Redis(connection_pool=redis_pool) as r:
+            async with get_redis_connection() as r:
                 await r.publish(f"chat:{session_id}", json.dumps({
                     "type": "highlights_found",
                     "highlights": [
@@ -1513,10 +1510,8 @@ class StreamingChatManager:
 
     async def _broadcast_completion(self, session_id: str, message_id: str):
         """🆕 Broadcast stream completion"""
-        import redis.asyncio as aioredis
-        
         try:
-            async with aioredis.Redis(connection_pool=redis_pool) as r:
+            async with get_redis_connection() as r:
                 await r.publish(f"chat:{session_id}", json.dumps({
                     "type": "stream_complete",
                     "message_id": message_id,
@@ -1554,10 +1549,8 @@ class StreamingChatManager:
         self, message_id: str, metrics: PerformanceMetrics
     ):
         """🆕 Log performance metrics for monitoring"""
-        import redis.asyncio as aioredis
-        
         try:
-            async with aioredis.Redis(connection_pool=redis_pool) as r:
+            async with get_redis_connection() as r:
                 metric_data = {
                     "message_id": message_id,
                     "embedding_time": metrics.embedding_time,
@@ -2069,33 +2062,32 @@ def worker_shutdown_handler(sender, **kwargs):
 
 # ——— Health Check Functions ————————————————————————————————————————————————
 
-async def check_db_pool_health() -> bool:
-    """Check if database pool is healthy"""
-    if not db_pool or db_pool.is_closing():
-        return False
+# async def check_db_pool_health() -> bool:
+#     """Check if database pool is healthy"""
+#     if not db_pool or db_pool.is_closing():
+#         return False
     
-    try:
-        async with asyncio.timeout(5):
-            async with db_pool.acquire() as conn:
-                await conn.fetchval('SELECT 1')
-        return True
-    except Exception as e:
-        logger.warning(f"⚠️ Database pool health check failed: {e}")
-        return False
+#     try:
+#         async with asyncio.timeout(5):
+#             async with db_pool.acquire() as conn:
+#                 await conn.fetchval('SELECT 1')
+#         return True
+#     except Exception as e:
+#         logger.warning(f"⚠️ Database pool health check failed: {e}")
+#         return False
 
-async def check_redis_pool_health() -> bool:
-    """Check if Redis pool is healthy"""
-    if not redis_pool:
-        return False
-    
-    try:
-        async with asyncio.timeout(5):
-            async with aioredis.Redis(connection_pool=redis_pool) as r:
-                await r.ping()
-        return True
-    except Exception as e:
-        logger.warning(f"⚠️ Redis pool health check failed: {e}")
-        return False
+# async def check_redis_pool_health() -> bool:
+#     """Check if Redis pool is healthy"""
+#     if not redis_pool:
+#         return False
+#     try:
+#         async with asyncio.timeout(5):
+#             async with aioredis.Redis(connection_pool=redis_pool) as r:
+#                 await r.ping()
+#         return True
+#     except Exception as e:
+#         logger.warning(f"⚠️ Redis pool health check failed: {e}")
+#         return False
     
 # ——— [TO BE DELETED] Legacy Compatibility Stubs ————————————————————————————————————————————————
 

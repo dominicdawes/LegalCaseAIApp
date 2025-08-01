@@ -322,6 +322,52 @@ print("📋 Registered tasks:")
 print(list(celery_app.tasks.keys()))
 print("✅ Ready to process tasks")
 
+# ——— Pool Health Checks ——————————————————————————————————————————————————————
+
+async def check_db_pool_health() -> bool:
+    """Check if global database pool is healthy"""
+    if not db_pool or db_pool.is_closing():
+        return False
+    
+    try:
+        async with asyncio.timeout(5):
+            async with db_pool.acquire() as conn:
+                await conn.fetchval('SELECT 1')
+        return True
+    except Exception as e:
+        logger.warning(f"⚠️ Database pool health check failed: {e}")
+        return False
+
+async def check_redis_pool_health() -> bool:
+    """Check if global Redis pool is healthy"""
+    if not redis_pool:
+        return False
+    try:
+        async with asyncio.timeout(5):
+            import redis.asyncio as aioredis
+            async with aioredis.Redis(connection_pool=redis_pool) as r:
+                await r.ping()
+        return True
+    except Exception as e:
+        logger.warning(f"⚠️ Redis pool health check failed: {e}")
+        return False
+
+def check_sync_pool_health() -> bool:
+    """Check if global sync database pool is healthy"""
+    if not sync_db_pool:
+        return False
+    try:
+        conn = sync_db_pool.getconn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute('SELECT 1')
+                cur.fetchone()
+            return True
+        finally:
+            sync_db_pool.putconn(conn)
+    except Exception as e:
+        logger.warning(f"⚠️ Sync pool health check failed: {e}")
+        return False
 
 # ——— Module Exports ————————————————————————————————————————————————————————————————
 __all__ = [
@@ -329,5 +375,8 @@ __all__ = [
     'run_async_in_worker',
     'get_global_async_db_pool',
     'get_global_redis_pool',
-    'init_async_pools'
+    'init_async_pools',
+    'check_db_pool_health',      # ← Add to exports
+    'check_redis_pool_health',   # ← Add to exports
+    'check_sync_pool_health'
 ]
