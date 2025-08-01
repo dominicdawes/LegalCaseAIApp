@@ -73,6 +73,12 @@ from utils.llm_clients.llm_factory import LLMFactory                    # Simple
 from utils.llm_clients.citation_processor import CitationProcessor      # detects citations in streaming chunks
 from utils.llm_clients.performance_monitor import PerformanceMonitor    # 🆕 Performance tracking
 from utils.llm_clients.stream_normalizer import StreamNormalizer        # Format streamed results from several providers
+from utils.supabase_utils import (
+    insert_note_supabase_record,
+    insert_chat_message_supabase_record,
+    supabase_client,
+    log_llm_error,
+)
 from tasks.celery_app import (
     run_async_in_worker,
     get_global_async_db_pool,
