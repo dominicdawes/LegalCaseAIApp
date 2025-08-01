@@ -215,6 +215,245 @@ class DocumentMetrics:
             'retry_count': self.retry_count
         }
 
+# # ——— DB Pool Instances (Initialized once per worker) ————————————————————————————
+
+# # Global pool variable
+# db_pool: Optional[asyncpg.Pool] = None
+
+# # ——— 1. POOL CLEANUP FUNCTIONS ——————————————————————————————————————————————————
+
+# async def close_db_pool():
+#     """Safely close the database pool"""
+#     global db_pool
+#     if db_pool is not None:
+#         logger.info("🔄 Closing database pool...")
+#         try:
+#             await db_pool.close()
+#             logger.info("✅ Database pool closed successfully")
+#         except Exception as e:
+#             logger.error(f"❌ Error closing database pool: {e}")
+#         finally:
+#             db_pool = None
+
+# def sync_close_db_pool():
+#     """Synchronous wrapper for closing the pool"""
+#     try:
+#         if db_pool is not None:
+#             # Create new event loop if none exists
+#             try:
+#                 loop = asyncio.get_event_loop()
+#             except RuntimeError:
+#                 loop = asyncio.new_event_loop()
+#                 asyncio.set_event_loop(loop)
+            
+#             # Close the pool
+#             loop.run_until_complete(close_db_pool())
+#     except Exception as e:
+#         logger.error(f"❌ Error in sync pool cleanup: {e}")
+
+# ——— 2. CELERY SIGNAL HANDLERS ————————————————————————————————————————————————————
+
+# # @worker_init.connect
+# def worker_init_handler(sender=None, **kwargs):
+#     """Called when Celery worker starts"""
+#     global db_pool
+#     logger.info("🚀 Celery worker initializing && db pool resetting...")
+    
+#     # Force reset the global pool variable
+#     db_pool = None
+#     logger.info("🔄 Database pool reset on worker init")
+
+# # Global pool reset on worker init
+# worker_init.connect(worker_init_handler)
+
+# @worker_shutdown.connect
+# def worker_shutdown_handler(sender=None, **kwargs):
+#     """Called when Celery worker shuts down"""
+#     logger.info("🛑 Celery worker shutting down...")
+#     sync_close_db_pool()
+
+# # ——— 3. SYSTEM SIGNAL HANDLERS ————————————————————————————————————————————————————
+
+# def signal_handler(signum, frame):
+#     """Handle system signals (SIGTERM, SIGINT)"""
+#     logger.info(f"🛑 Received signal {signum}, cleaning up...")
+#     sync_close_db_pool()
+
+# # Register signal handlers
+# signal.signal(signal.SIGTERM, signal_handler)
+# signal.signal(signal.SIGINT, signal_handler)
+
+# # Register atexit handler as last resort
+# atexit.register(sync_close_db_pool)
+
+# ——— 4. UPDATED get_async_db_pool FUNCTION ———————————————————————————————————————
+
+# Get Asynchronous DB pool
+async def get_async_db_pool() -> asyncpg.Pool:
+    """Initializes and returns the asyncpg connection pool with connection testing."""
+    global db_pool
+    try:
+        # Always close existing pool if it exists (future-proofing)
+        if db_pool is not None:
+            logger.info("🔄 Closing existing database pool...")
+            await db_pool.close()
+            db_pool = None
+            logger.info("✅ Existing pool closed")
+        
+        if not DB_DSN:
+            raise ValueError("POSTGRES_DSN environment variable not set.")
+        
+        # Log connection attempt (mask sensitive info)
+        masked_dsn = DB_DSN
+        if '@' in masked_dsn:
+            parts = masked_dsn.split('@')
+            if len(parts) == 2:
+                # Show only host:port/db part
+                masked_dsn = f"postgresql://***:***@{parts[1]}"
+        logger.info(f"🔗 Attempting to connect to: {masked_dsn}")
+        
+        # Extract host and port for ping test
+        import urllib.parse
+        parsed = urllib.parse.urlparse(DB_DSN)
+        host = parsed.hostname
+        port = parsed.port or 5432
+        logger.info(f"🎯 Target host: {host}:{port}")
+        
+        # Test basic network connectivity first
+        try:
+            logger.info(f"🔍 Testing network connectivity to {host}:{port}...")
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(10)  # 10 second timeout
+            result = sock.connect_ex((host, port))
+            sock.close()
+            
+            if result == 0:
+                logger.info(f"✅ Network connectivity OK to {host}:{port}")
+            else:
+                logger.error(f"❌ Network connectivity FAILED to {host}:{port} - Error code: {result}")
+                if result == 111:
+                    logger.error("❌ Connection refused - database service may not be running")
+                elif result == 110:
+                    logger.error("❌ Connection timeout - check firewall/network rules")
+                elif result == 101:
+                    logger.error("❌ Network unreachable - check network configuration")
+        except Exception as net_error:
+            logger.error(f"❌ Network test failed: {net_error}")
+        
+        # Create the connection pool with pgBouncer compatibility
+        logger.info("🏊 Creating asyncpg connection pool...")
+        db_pool = await asyncpg.create_pool(
+            dsn=DB_DSN,
+            min_size=DB_POOL_MIN_SIZE,
+            max_size=DB_POOL_MAX_SIZE,
+            command_timeout=30,
+            server_settings={
+                'application_name': 'celery_worker_render',
+            },
+            timeout=60,  # Connection timeout
+            statement_cache_size=0  # 🔑 CRITICAL: Disable prepared statement caching for pgBouncer compatibility
+        )
+        logger.info("✅ Database pool created successfully")
+        
+        # Test the connection with a ping
+        logger.info("🏓 Testing database connection with ping...")
+        async with db_pool.acquire() as conn:
+            # Simple ping query
+            ping_result = await conn.fetchval('SELECT 1 as ping')
+            logger.info(f"🏓 Database ping result: {ping_result}")
+            
+            # Get database info
+            db_version = await conn.fetchval('SELECT version()')
+            logger.info(f"🗄️  Database version: {db_version[:100]}...")  # Truncate long version strings
+            
+            # Test current timestamp
+            current_time = await conn.fetchval('SELECT NOW()')
+            logger.info(f"🕐 Database time: {current_time}")
+            
+            # Check if our main table exists
+            table_exists = await conn.fetchval(
+                "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'document_sources')"
+            )
+            logger.info(f"📋 Table 'document_sources' exists: {table_exists}")
+            
+        logger.info("✅ Database connection verified and working!")
+        
+    except socket.gaierror as e:
+        logger.error(f"❌ DNS resolution failed for {host}: {e}")
+        logger.error("💡 Check if the database hostname is correct and reachable")
+        raise
+    except OSError as e:
+        if e.errno == 101:
+            logger.error(f"❌ Network unreachable to {host}:{port}")
+            logger.error("💡 Possible causes:")
+            logger.error("   - Database server is down")
+            logger.error("   - Firewall blocking connection")
+            logger.error("   - Wrong host/port in connection string")
+            logger.error("   - Network routing issues")
+        elif e.errno == 111:
+            logger.error(f"❌ Connection refused by {host}:{port}")
+            logger.error("💡 Database service may not be running or not accepting connections")
+        elif e.errno == 110:
+            logger.error(f"❌ Connection timeout to {host}:{port}")
+            logger.error("💡 Database may be overloaded or firewall is dropping packets")
+        logger.error(f"❌ OS-level connection error: {e}")
+        raise
+    except asyncpg.InvalidAuthorizationSpecificationError as e:
+        logger.error(f"❌ Database authentication failed: {e}")
+        logger.error("💡 Check username/password in POSTGRES_DSN")
+        raise
+    except asyncpg.InvalidCatalogNameError as e:
+        logger.error(f"❌ Database does not exist: {e}")
+        logger.error("💡 Check database name in POSTGRES_DSN")
+        raise
+    except asyncpg.DuplicatePreparedStatementError as e:
+        logger.error(f"❌ Prepared statement conflict (pgBouncer issue): {e}")
+        logger.error("💡 This should not happen with statement_cache_size=0")
+        # Close the problematic pool and retry once
+        if db_pool is not None:
+            await db_pool.close()
+            db_pool = None
+        raise
+    except Exception as e:
+        logger.error(f"❌ Database connection failed: {e}")
+        logger.error(f"❌ Error type: {type(e).__name__}")
+        raise
+    
+    return db_pool
+
+# Create a sync database connection pool for gevent
+# sync_db_pool = None
+
+# Get Synchronous DB pool
+# def get_sync_db_pool():
+#     """Get or create a synchronous database connection pool for gevent"""
+#     global sync_db_pool
+#     if sync_db_pool is None:
+#         import urllib.parse
+#         parsed = urllib.parse.urlparse(DB_DSN)
+#         sync_db_pool = ThreadedConnectionPool(
+#             minconn=DB_POOL_MIN_SIZE,
+#             maxconn=DB_POOL_MAX_SIZE,
+#             host=parsed.hostname,
+#             port=parsed.port or 5432,
+#             database=parsed.path[1:],  # Remove leading slash
+#             user=parsed.username,
+#             password=parsed.password,
+#             application_name='celery_worker_gevent'
+#         )
+#     return sync_db_pool
+
+# ——— 5. OPTIONAL: MANUAL POOL RESET TASK ————————————————————————————————
+
+# @celery_app.task(bind=True)
+# def reset_db_pool_task(self):
+#     """Manual task to reset the database pool"""
+#     try:
+#         sync_close_db_pool()
+#         return {"status": "success", "message": "Database pool reset successfully"}
+#     except Exception as e:
+#         logger.error(f"❌ Failed to reset database pool: {e}")
+#         return {"status": "error", "message": str(e)}
 
 # ——— 6. Retry Strategies ————————————————————————————————————————————————
 
@@ -1752,6 +1991,141 @@ async def _process_document_async_workflow(
             'chunks_created': 0
         }
 
+# ——— Document Finalization Task (called by embedding chord) ——————————————————————
+
+# @celery_app.task(bind=True, queue=INGEST_QUEUE, acks_late=True)
+# def finalize_document_processing(self, embedding_results: List[Dict], source_id: str) -> Dict[str, Any]:
+#     """
+#     [DOCUMENT FINALIZER] Called after all embeddings for a document complete:
+#     - Analyzes embedding results
+#     - Updates document status appropriately
+#     - Returns final document status for batch coordination
+    
+#     This is called by the chord after all embed_batch_task complete for this document.
+#     """
+#     short_id = source_id[:8]
+#     logger.info(f"🎯 [DOC-{short_id}] Finalizing document with {len(embedding_results)} embedding results")
+    
+#     # Analyze embedding results
+#     successful_embeddings = [r for r in embedding_results if r and r.get('processed_count', 0) > 0]
+#     failed_embeddings = len(embedding_results) - len(successful_embeddings)
+    
+#     # Calculate totals
+#     total_chunks_embedded = sum(r.get('processed_count', 0) for r in successful_embeddings)
+#     total_tokens = sum(r.get('token_count', 0) for r in successful_embeddings)
+    
+#     # Determine final status
+#     if len(successful_embeddings) == 0:
+#         # All embeddings failed
+#         logger.error(f"💥 [DOC-{short_id}] All embedding batches failed")
+#         _update_document_status_sync(source_id, ProcessingStatus.FAILED_EMBEDDING)
+        
+#         return {
+#             'doc_id': source_id,
+#             'processing_type': 'NEW',
+#             'status': 'FAILED',
+#             'error': 'All embedding batches failed',
+#             'chunks_created': 0,
+#             'failed_batches': len(embedding_results)
+#         }
+        
+#     elif failed_embeddings > 0:
+#         # Partial success
+#         logger.warning(f"⚠️ [DOC-{short_id}] Partial embedding success: {len(successful_embeddings)}/{len(embedding_results)} batches")
+#         _update_document_status_sync(source_id, ProcessingStatus.PARTIAL)
+        
+#         return {
+#             'doc_id': source_id,
+#             'processing_type': 'NEW',
+#             'status': 'PARTIAL',
+#             'chunks_created': total_chunks_embedded,
+#             'successful_batches': len(successful_embeddings),
+#             'failed_batches': failed_embeddings,
+#             'total_tokens': total_tokens
+#         }
+        
+#     else:
+#         # Complete success
+#         logger.info(f"✅ [DOC-{short_id}] All embeddings successful: {total_chunks_embedded} chunks embedded")
+#         _update_document_status_sync(source_id, ProcessingStatus.COMPLETE)
+        
+#         return {
+#             'doc_id': source_id,
+#             'processing_type': 'NEW',
+#             'status': 'COMPLETE',
+#             'chunks_created': total_chunks_embedded,
+#             'successful_batches': len(successful_embeddings),
+#             'total_tokens': total_tokens
+#         }
+
+# ——— Task 3: Embed (Fully Async DB) ——————————————————————————————————————————
+
+# @celery_app.task(
+#     bind=True, 
+#     queue=EMBED_QUEUE, 
+#     acks_late=True,
+#     rate_limit=RATE_LIMIT,
+#     autoretry_for=(Exception,),
+#     retry_kwargs={'max_retries': MAX_RETRIES, 'countdown': DEFAULT_RETRY_DELAY}
+# )
+# def embed_batch_task(self, source_id: str, project_id: str, texts: List[str], metadatas: List[Dict]):
+#     try:
+#         return _embed_batch_gevent(self, source_id, project_id, texts, metadatas)
+#     except Exception as exc:
+#         logger.warning(f"Embedding batch for {source_id} failed, letting Celery handle retry: {exc}")
+#         raise
+
+# def _embed_batch_gevent(self, source_id: str, project_id: str, texts: List[str], metadatas: List[Dict]):
+#     """
+#     Gevent-based embedding implementation - more reliable with Celery (does this have retry/circuit breaker logic?)
+#     """
+#     try:
+#         # 1. Generate Embeddings using sync OpenAI client
+#         logger.info(f"🤖 Generating embeddings...")
+        
+#         # Use synchronous OpenAI client instead of async
+#         embeddings = embedding_model.embed_documents(texts)  # ← SYNC method (no await)
+        
+#         # 2. Prepare Data for DB
+#         records_to_insert = []
+#         total_tokens = 0
+#         for text, meta, vec in zip(texts, metadatas, embeddings):
+#             if len(vec) != EXPECTED_EMBEDDING_LEN:
+#                 logger.warning(f"Skipping malformed embedding for source {source_id}")
+#                 continue
+            
+#             token_count = len(tokenizer.encode(text))
+#             total_tokens += token_count
+#             records_to_insert.append((
+#                 str(uuid.uuid4()), str(uuid.UUID(source_id)), str(uuid.UUID(project_id)), text, 
+#                 json.dumps(meta), vec, token_count, datetime.now(timezone.utc)
+#             ))
+
+#         if not records_to_insert:
+#             return {'processed_count': 0, 'token_count': 0}
+
+#         # 3. Use sync database pool (like Task 2)
+#         pool = get_sync_db_pool()
+#         conn = pool.getconn()
+#         try:
+#             with conn.cursor() as cur:
+#                 # Use executemany for bulk insert
+#                 cur.executemany(
+#                     '''INSERT INTO document_vector_store 
+#                     (id, source_id, project_id, content, metadata, embedding, num_tokens, created_at)
+#                     VALUES (%s, %s, %s, %s, %s, %s, %s, %s)''',
+#                     records_to_insert
+#                 )
+#                 conn.commit()
+#         finally:
+#             pool.putconn(conn)
+        
+#         return {'processed_count': len(records_to_insert), 'token_count': total_tokens}
+
+#     except Exception as exc:
+#         logger.warning(f"Embedding batch for {source_id} failed (attempt {self.request.retries + 1}), retrying: {exc}")
+#         raise self.retry(exc=exc, countdown=DEFAULT_RETRY_DELAY * (RETRY_BACKOFF_MULTIPLIER ** self.request.retries))
+
 # ——— Edge Case Processing Tasks ———————————————————————————————————————
 
 async def _handle_duplicate_only_batch(batch_id: str, project_id: str, workflow_metadata: Dict[str, Any], duplicate_docs: List[Dict]) -> Dict[str, Any]:
@@ -1878,6 +2252,146 @@ def process_reused_document_task(
             'status': 'FAILED', 
             'error': str(e)
         }
+
+# ——— Finalization: Batch Coordination & Note Generation ————————————————————————————————————————
+
+# @celery_app.task(bind=True, queue=FINAL_QUEUE, acks_late=True)
+# def finalize_batch_and_create_note_legacy(
+#     self, 
+#     processing_results: List[Dict[str, Any]], 
+#     batch_id: str, 
+#     workflow_metadata: Dict[str, Any]
+# ) -> Dict[str, Any]:
+#     """
+#     [BATCH COORDINATOR] Final coordination point for entire batch:
+#     - Analyzes all document processing results
+#     - Determines batch success/partial/failure status  
+#     - Triggers single RAG note generation with appropriate context
+#     - Handles all resilience cases (full success, partial, complete failure)
+    
+#     ⚠️ This is the ONLY place where rag_note_task gets triggered per batch! (not including the duplicate shortcut)
+#     """
+
+#     project_id = workflow_metadata['project_id']
+#     _update_batch_progress_sync(workflow_metadata['batch_id'], project_id, BatchProgressStatus.BATCH_FINALIZING)
+#     logger.info(f"🎯 [BATCH-{batch_id[:8]}] Finalizing batch with {len(processing_results)} results")
+    
+#     # ——— Analyze Batch Results ————————————————————————————————————————————————————
+#     successful_docs = [r for r in processing_results if r and r.get('status') == 'COMPLETE']
+#     failed_docs = [r for r in processing_results if r and r.get('status') == 'FAILED']
+    
+#     total_docs = workflow_metadata['total_documents']
+#     success_count = len(successful_docs)
+#     failure_count = len(failed_docs)
+    
+#     # Calculate batch statistics
+#     total_chunks = sum(
+#         r.get('chunks_created', 0) + r.get('chunks_reused', 0) 
+#         for r in successful_docs
+#     )
+#     total_tokens_reused = sum(r.get('tokens_reused', 0) for r in successful_docs)
+    
+#     # ——— Determine Batch Status ———————————————————————————————————————————————————
+#     if success_count == total_docs:
+#         batch_status = 'COMPLETE'
+#         final_progress = BatchProgressStatus.BATCH_COMPLETE
+#         note_context = 'All documents processed successfully'
+#     elif success_count > 0:
+#         batch_status = 'PARTIAL' 
+#         final_progress = BatchProgressStatus.BATCH_PARTIAL
+#         note_context = f'{success_count}/{total_docs} documents processed successfully'
+#     else:
+#         batch_status = 'FAILED'
+#         final_progress = BatchProgressStatus.BATCH_FAILED
+#         note_context = 'All documents failed to process'
+    
+#     # Final batch-level logging (view in terminal and in database)
+#     _update_batch_progress_sync(workflow_metadata['batch_id'], project_id, final_progress)
+
+#     logger.info(f"📊 [BATCH-{batch_id[:8]}] Batch analysis:")
+#     logger.info(f"   ✅ Successful: {success_count}/{total_docs}")
+#     logger.info(f"   ❌ Failed: {failure_count}")
+#     logger.info(f"   📄 Total chunks: {total_chunks:,}")
+#     logger.info(f"   🔄 Status: {batch_status}")
+    
+
+#     # ——— Trigger Note Generation (Based on Resilience Rules) ——————————————————————
+    
+#     if workflow_metadata.get('create_note') and batch_status in ['COMPLETE', 'PARTIAL']:
+#         # Enhance metadata with batch context for note generation
+#         note_metadata = {
+#             **workflow_metadata,
+#             'batch_status': batch_status,
+#             'successful_documents': success_count,
+#             'total_documents': total_docs, 
+#             'processing_context': note_context,
+#             'total_chunks_available': total_chunks,
+#             'batch_id': batch_id
+#         }
+        
+#         logger.info(f"🎯 [BATCH-{batch_id[:8]}] Triggering RAG note generation...")
+#         try:
+#             rag_note_task.apply_async(kwargs={
+#                 "user_id": note_metadata["user_id"],
+#                 "note_type": note_metadata["note_type"], 
+#                 "project_id": note_metadata["project_id"],
+#                 "note_title": note_metadata["note_title"],
+#                 "provider": note_metadata.get("provider"),
+#                 "model_name": note_metadata.get("model_name"), 
+#                 "temperature": note_metadata.get("temperature"),
+#                 "addtl_params": {
+#                     **note_metadata.get("addtl_params", {}),
+#                     'batch_context': {
+#                         'batch_id': batch_id,
+#                         'batch_status': batch_status,
+#                         'document_count': success_count,
+#                         'total_chunks': total_chunks
+#                     }
+#                 }
+#             })
+#             logger.info(f"✅ [BATCH-{batch_id[:8]}] RAG note generation triggered")
+            
+#         except Exception as e:
+#             logger.error(f"❌ [BATCH-{batch_id[:8]}] Failed to trigger note generation: {e}")
+#             batch_status = 'NOTE_GENERATION_FAILED'
+            
+#     elif batch_status == 'FAILED':
+#         logger.info(f"⚠️ [BATCH-{batch_id[:8]}] Skipping note generation - all documents failed")
+        
+#     else:
+#         logger.info(f"ℹ️ [BATCH-{batch_id[:8]}] Note generation not requested")
+    
+#     return {
+#         'batch_id': batch_id,
+#         'batch_status': batch_status,
+#         'successful_documents': success_count,
+#         'failed_documents': failure_count,
+#         'total_chunks_processed': total_chunks,
+#         'tokens_saved': total_tokens_reused,
+#         'note_generation_triggered': workflow_metadata.get('create_note') and batch_status in ['COMPLETE', 'PARTIAL']
+#     }
+
+# @celery_app.task(bind=True, queue=FINAL_QUEUE, acks_late=True)
+# def handle_batch_failure(self, batch_id: str, workflow_metadata: Dict[str, Any], errors: List[str]) -> Dict[str, Any]:
+#     """
+#     [FAILURE HANDLER] Handle complete batch failure scenarios:
+#     - Log comprehensive failure information
+#     - Could store failure record for debugging/monitoring
+#     - No note generation for complete failures
+#     """
+#     logger.error(f"💥 [BATCH-{batch_id[:8]}] Complete batch failure:")
+#     for i, error in enumerate(errors, 1):
+#         logger.error(f"   {i}. {error}")
+    
+#     # Optional: Store failure record in database for monitoring
+#     # This could be useful for debugging and user feedback
+    
+#     return {
+#         'batch_id': batch_id,
+#         'batch_status': 'COMPLETE_FAILURE',
+#         'errors': errors,
+#         'note_generation_triggered': False
+#     }
 
 
 # ——— Advanced Monitoring & Maintenance Tasks (Unchanged from v5) —————————————————
