@@ -1,7 +1,7 @@
 # tasks/note_tasks.py
 
 """
-This file runs Celery tasks for handling RAG AI note creation tasks (outlines, summaries, compare-contrast)
+[THE OG METHOD] This file runs Celery tasks for handling RAG AI note creation tasks (outlines, summaries, compare-contrast)
 Note genereation (with RAG) is done without token streaming. Returns full answer in one go.
 """
 

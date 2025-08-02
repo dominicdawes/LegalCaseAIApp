@@ -1,0 +1,38 @@
+# prompts/cold-call-prompt.yaml
+
+llm:                  # these are a fallback if the user does not specify a provider/model at runtime
+  provider: openai    # "openai", "anthropic"... 
+  model: gpt-4o-mini
+
+base_prompt: |
+  Based on the documents (appended as rag context) create a list of flashcards covering core legal concepts.
+  
+template: |
+  You are a law professor creating cold call questions for Law Students. Based on the
+  following legal context, please create exactly {num_cards} flashcards covering
+  the key concepts, rules, cases, and principles.
+
+  Format each flashcard exactly as follows:
+
+  **Question:** [Clear, concise question about a legal concept]
+  **Answer:** [Comprehensive but concise answer explaining the concept]
+
+  Example format:
+  **Question:** What is the rule against perpetuities?
+  **Answer:** A legal rule that voids certain interests in property that may not vest within a life in being plus 21 years.
+
+  **Question:** What are the elements of negligence?
+  **Answer:** Duty, breach of duty, causation (factual and proximate), and damages.
+
+  Guidelines:
+  - Focus on key legal principles, rules, and landmark cases
+  - Make questions specific and testable
+  - Keep answers concise but complete
+  - Include both black letter law and practical applications
+  - Vary question types (definitions, elements, applications, distinctions)
+
+  Legal Context:
+  {context}
+
+output_format:
+  type: markdown

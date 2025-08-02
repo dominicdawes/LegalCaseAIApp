@@ -83,6 +83,7 @@ NOTE_TYPE_YAML_MAP = {
     "case_brief": "case-brief-prompt.yaml",
     "compare_contrast": "compare-contrast-prompt.yaml",
     "flashcards": "flashcards-prompt.yaml",
+    "cold_call": "cold-call-prompt.yaml",
 }
 
 # ——— Enhanced Base Task Class ————————————————————————————————————————————————————
@@ -214,16 +215,36 @@ class AsyncNoteManager:
             )
             generation_time = time.time() - generation_start
             
-            # 🆕 Async note persistence
+            # 🆕 Async note persistence - SPECIAL HANDLING FOR FLASHCARDS
             save_start = time.time()
-            await self._save_note_async(
-                project_id, user_id, note_type, note_title, note_content
-            )
+            if note_type == "flashcards":
+                # Special flashcard processing and storage
+                deck_id, card_count = await self._save_flashcard_deck_and_cards_async(
+                    project_id=project_id,
+                    user_id=user_id,
+                    deck_name=note_title,
+                    llm_output=note_content
+                )
+                logger.info(f"🃏 Created flashcard deck {deck_id} with {card_count} cards")
+                
+                # Store success metrics for flashcards
+                save_metrics = {
+                    "deck_id": deck_id,
+                    "card_count": card_count,
+                    "storage_type": "flashcards"
+                }
+            else:
+                # Regular note types - save to notes table
+                await self._save_note_async(
+                    project_id, user_id, note_type, note_title, note_content
+                )
+                save_metrics = {"storage_type": "regular_note"}
+            
             save_time = time.time() - save_start
             
-            # 🆕 Performance logging
+            # 🆕 Performance logging with flashcard-specific metrics
             total_time = time.time() - start_time
-            await self._log_performance_metrics({
+            performance_metrics = {
                 "note_type": note_type,
                 "project_id": project_id,
                 "setup_time": setup_time,
@@ -233,9 +254,12 @@ class AsyncNoteManager:
                 "total_time": total_time,
                 "chunks_used": len(relevant_chunks),
                 "content_length": len(note_content),
-            })
+                **save_metrics  # Include flashcard-specific metrics
+            }
             
-            logger.info(f"✅ Note generation completed in {total_time*1000:.0f}ms")
+            await self._log_performance_metrics(performance_metrics)
+            
+            logger.info(f"✅ {note_type.title()} generation completed in {total_time*1000:.0f}ms")
             return note_content
             
         except Exception as e:
@@ -361,6 +385,28 @@ class AsyncNoteManager:
                 context=chunk_context, 
                 n_questions=num_questions
             )
+        elif note_type == "flashcards":
+            # Handle flashcard-specific parameters
+            num_cards = addtl_params.get("num_cards", 10)
+            try:
+                context = prompt_template.format(
+                    context=chunk_context, 
+                    num_cards=num_cards
+                )
+            except KeyError:
+                # Fallback if template doesn't have num_cards parameter
+                context = prompt_template.format(context=chunk_context)
+        elif note_type == "cold_call":
+            # Handle flashcard-specific parameters
+            num_cards = addtl_params.get("num_questions", 10)
+            try:
+                context = prompt_template.format(
+                    context=chunk_context, 
+                    num_cards=num_cards
+                )
+            except KeyError:
+                # Fallback if template doesn't have num_cards parameter
+                context = prompt_template.format(context=chunk_context)
         else:
             # For other note types, just use context
             context = prompt_template.format(context=chunk_context)
@@ -409,6 +455,118 @@ class AsyncNoteManager:
             )
         
         logger.info(f"✅ Note saved successfully")
+
+    async def _save_flashcard_deck_and_cards_async(
+        self, 
+        project_id: str, 
+        user_id: str, 
+        deck_name: str, 
+        llm_output: str
+    ) -> tuple:
+        """
+        🆕 Async flashcard processing and database insertion
+        
+        Args:
+            project_id: The project ID
+            user_id: The user ID  
+            deck_name: Name for the flashcard deck
+            llm_output: Raw LLM response containing flashcard content
+            
+        Returns:
+            Tuple of (deck_id, card_count)
+        """
+        try:
+            logger.info(f"🃏 Processing flashcards for deck: {deck_name}")
+            
+            # Initialize processor in thread pool to avoid blocking
+            loop = asyncio.get_event_loop()
+            processor = FlashcardProcessor()
+            
+            # Parse the LLM output in thread pool
+            deck_data, cards_list = await loop.run_in_executor(
+                None, processor.parse_flashcard_content, llm_output, deck_name
+            )
+            
+            # Validate the parsed data
+            is_valid = await loop.run_in_executor(
+                None, processor.validate_flashcard_data, deck_data, cards_list
+            )
+            
+            if not is_valid:
+                raise ValueError("Invalid flashcard data structure")
+            
+            logger.info(f"📋 Parsed {len(cards_list)} flashcards for deck: {deck_name}")
+            
+            # Use async database connection for both operations
+            async with get_db_connection() as conn:
+                # Start transaction
+                async with conn.transaction():
+                    # Insert deck record first
+                    deck_id = await conn.fetchval(
+                        """
+                        INSERT INTO flashcard_decks (
+                            id, user_id, project_id, deck_name, description, 
+                            card_count, created_at, is_active
+                        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                        RETURNING id
+                        """,
+                        str(uuid.uuid4()), user_id, project_id, 
+                        deck_data['deck_name'], deck_data['description'],
+                        deck_data['card_count'], deck_data['created_at'],
+                        deck_data.get('is_active', True)
+                    )
+                    
+                    if not deck_id:
+                        raise Exception("Failed to insert flashcard deck")
+                    
+                    logger.info(f"✅ Inserted flashcard deck with ID: {deck_id}")
+                    
+                    # Prepare individual cards for batch insert
+                    if cards_list:
+                        # Build bulk insert query
+                        card_values = []
+                        for card in cards_list:
+                            card_values.extend([
+                                str(uuid.uuid4()),  # id
+                                deck_id,            # deck_id
+                                user_id,            # user_id
+                                project_id,         # project_id
+                                card['front_content'],  # front_content
+                                card['back_content'],   # back_content
+                                card['card_order'],     # card_order
+                                card['created_at'],     # created_at
+                                card.get('is_active', True)  # is_active
+                            ])
+                        
+                        # Batch insert individual cards
+                        card_count = len(cards_list)
+                        placeholders = []
+                        
+                        for i in range(card_count):
+                            base = i * 9 + 1  # 9 fields per card
+                            placeholders.append(
+                                f"(${base}, ${base+1}, ${base+2}, ${base+3}, "
+                                f"${base+4}, ${base+5}, ${base+6}, ${base+7}, ${base+8})"
+                            )
+                        
+                        query = f"""
+                            INSERT INTO individual_cards (
+                                id, deck_id, user_id, project_id, front_content, 
+                                back_content, card_order, created_at, is_active
+                            ) VALUES {', '.join(placeholders)}
+                        """
+                        
+                        await conn.execute(query, *card_values)
+                        logger.info(f"✅ Inserted {card_count} individual flashcards")
+                        
+                        return deck_id, card_count
+                    else:
+                        logger.warning("⚠️ No cards to insert")
+                        return deck_id, 0
+            
+        except Exception as e:
+            logger.error(f"❌ Error saving flashcard deck and cards: {e}", exc_info=True)
+            raise
 
     async def _log_performance_metrics(self, metrics: Dict):
         """🆕 Log performance metrics for monitoring"""
