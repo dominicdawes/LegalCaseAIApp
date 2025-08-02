@@ -195,7 +195,7 @@ class AsyncNoteManager:
             setup_time = time.time() - start_time
             logger.info(f"📊 Parallel setup completed in {setup_time*1000:.0f}ms")
             
-            # 🆕 Async chunk retrieval
+            # 🆕 Async chunk retrieval (Naive RAG)
             retrieval_start = time.time()
             relevant_chunks = await self._fetch_relevant_chunks_async(
                 embedding, project_id
@@ -215,9 +215,9 @@ class AsyncNoteManager:
             )
             generation_time = time.time() - generation_start
             
-            # 🆕 Async note persistence - SPECIAL HANDLING FOR FLASHCARDS
+            # 🆕 Async note persistence: Nomal Notes (one block) vs Flashcards, Cold Calls (discrete-blocks)
             save_start = time.time()
-            if note_type == "flashcards":
+            if note_type == "flashcards":  
                 # Special flashcard processing and storage
                 deck_id, card_count = await self._save_flashcard_deck_and_cards_async(
                     project_id=project_id,
