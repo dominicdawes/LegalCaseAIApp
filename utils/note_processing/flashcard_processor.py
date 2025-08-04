@@ -191,12 +191,12 @@ class FlashcardProcessor:
             'is_active': True
         }
     
-    def _create_deck_dict(self, deck_name: str, card_count: int) -> Dict:
+    def _create_deck_dict(self, deck_name: str, num_cards: int) -> Dict:
         """Create a standardized deck dictionary"""
         return {
             'deck_name': deck_name,
-            'description': f'AI-generated flashcard deck with {card_count} cards',
-            'card_count': card_count,
+            'description': f'AI-generated flashcard deck with {num_cards} cards',
+            'num_cards': num_cards,
             'created_at': datetime.now(timezone.utc).isoformat(),
             'is_active': True
         }
@@ -218,7 +218,7 @@ class FlashcardProcessor:
         """Validate that flashcard data is properly structured"""
         try:
             # Validate deck data
-            required_deck_fields = ['deck_name', 'card_count', 'created_at']
+            required_deck_fields = ['deck_name', 'num_cards', 'created_at']
             for field in required_deck_fields:
                 if field not in deck_data:
                     logger.error(f"Missing required deck field: {field}")
