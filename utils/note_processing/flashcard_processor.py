@@ -187,7 +187,7 @@ class FlashcardProcessor:
             'front_content': front.strip(),
             'back_content': back.strip(),
             'card_order': order,
-            'created_at': datetime.now(timezone.utc).isoformat(),
+            'created_at': datetime.now(timezone.utc),  # ← Return datetime object, not string
             'is_active': True
         }
     
@@ -197,7 +197,7 @@ class FlashcardProcessor:
             'deck_name': deck_name,
             'description': f'AI-generated flashcard deck with {num_cards} cards',
             'num_cards': num_cards,
-            'created_at': datetime.now(timezone.utc).isoformat(),
+            'created_at': datetime.now(timezone.utc),  # ← Return datetime object, not string
             'is_active': True
         }
     
