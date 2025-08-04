@@ -219,18 +219,18 @@ class AsyncNoteManager:
             save_start = time.time()
             if note_type == "flashcards":  
                 # Special flashcard processing and storage
-                deck_id, card_count = await self._save_flashcard_deck_and_cards_async(
+                deck_id, num_cards = await self._save_flashcard_deck_and_cards_async(
                     project_id=project_id,
                     user_id=user_id,
                     deck_name=note_title,
                     llm_output=note_content
                 )
-                logger.info(f"🃏 Created flashcard deck {deck_id} with {card_count} cards")
+                logger.info(f"🃏 Created flashcard deck {deck_id} with {num_cards} cards")
                 
                 # Store success metrics for flashcards
                 save_metrics = {
                     "deck_id": deck_id,
-                    "card_count": card_count,
+                    "num_cards": num_cards,
                     "storage_type": "flashcards"
                 }
             else:
@@ -473,7 +473,7 @@ class AsyncNoteManager:
             llm_output: Raw LLM response containing flashcard content
             
         Returns:
-            Tuple of (deck_id, card_count)
+            Tuple of (deck_id, num_cards)
         """
         try:
             logger.info(f"🃏 Processing flashcards for deck: {deck_name}")
@@ -506,13 +506,13 @@ class AsyncNoteManager:
                         """
                         INSERT INTO flashcard_decks (
                             id, user_id, project_id, deck_name, description, 
-                            card_count, created_at, is_active
+                            num_cards, created_at, is_active
                         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
                         RETURNING id
                         """,
                         str(uuid.uuid4()), user_id, project_id, 
                         deck_data['deck_name'], deck_data['description'],
-                        deck_data['card_count'], deck_data['created_at'],
+                        deck_data['num_cards'], deck_data['created_at'],
                         deck_data.get('is_active', True)
                     )
                     
@@ -539,10 +539,10 @@ class AsyncNoteManager:
                             ])
                         
                         # Batch insert individual cards
-                        card_count = len(cards_list)
+                        num_cards = len(cards_list)
                         placeholders = []
                         
-                        for i in range(card_count):
+                        for i in range(num_cards):
                             base = i * 9 + 1  # 9 fields per card
                             placeholders.append(
                                 f"(${base}, ${base+1}, ${base+2}, ${base+3}, "
@@ -557,9 +557,9 @@ class AsyncNoteManager:
                         """
                         
                         await conn.execute(query, *card_values)
-                        logger.info(f"✅ Inserted {card_count} individual flashcards")
+                        logger.info(f"✅ Inserted {num_cards} individual flashcards")
                         
-                        return deck_id, card_count
+                        return deck_id, num_cards
                     else:
                         logger.warning("⚠️ No cards to insert")
                         return deck_id, 0
@@ -594,7 +594,7 @@ def save_flashcard_deck_and_cards_sync(project_id, user_id, deck_name, llm_outpu
             'project_id': project_id,
             'deck_name': deck_data['deck_name'],
             'description': deck_data['description'],
-            'card_count': deck_data['card_count'],
+            'num_cards': deck_data['num_cards'],
             'created_at': deck_data['created_at'],
             'is_active': deck_data.get('is_active', True)
         }).execute()
