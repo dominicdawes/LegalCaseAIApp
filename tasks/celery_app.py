@@ -204,9 +204,9 @@ celery_app.conf.update(**celery_config_updates)
 def register_tasks():
     """Register tasks after app is fully configured"""
     import tasks.chat_tasks
-    import tasks.chat_streaming_tasks
     import tasks.upload_tasks
     import tasks.note_tasks
+    import tasks.note_conversion_tasks
     import tasks.sample_tasks
 
 # # Import tasks to register them with Celery
