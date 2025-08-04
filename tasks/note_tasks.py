@@ -229,7 +229,7 @@ class AsyncNoteManager:
                 
                 # Store success metrics for flashcards
                 save_metrics = {
-                    "deck_id": deck_id,
+                    "deck_id": str(deck_id),        # <-- Fix json.dump issue 
                     "num_cards": num_cards,
                     "storage_type": "flashcards"
                 }
