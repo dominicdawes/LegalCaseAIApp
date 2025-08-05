@@ -504,14 +504,14 @@ class AsyncNoteManager:
                     # Insert deck record first
                     deck_id = await conn.fetchval(
                         """
-                        INSERT INTO flashcard_decks (
-                            id, user_id, project_id, deck_name, description, 
+                        INSERT INTO notes (
+                            id, user_id, project_id, title, note_type, description, 
                             num_cards, created_at, is_active
-                        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
                         RETURNING id
                         """,
                         str(uuid.uuid4()), user_id, project_id, 
-                        deck_data['deck_name'], deck_data['description'],
+                        deck_data['deck_name'], "flashcards", deck_data['description'],
                         deck_data['num_cards'], deck_data['created_at'],
                         deck_data.get('is_active', True)
                     )
@@ -528,7 +528,7 @@ class AsyncNoteManager:
                         for card in cards_list:
                             card_values.extend([
                                 str(uuid.uuid4()),  # id
-                                deck_id,            # deck_id
+                                deck_id,            # deck_id (is just a the id from public.notes)
                                 user_id,            # user_id
                                 project_id,         # project_id
                                 card['front_content'],  # front_content
