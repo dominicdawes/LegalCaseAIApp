@@ -5,7 +5,7 @@ from celery.utils.log import get_task_logger
 import httpx
 import io
 import uuid
-from utils.s3_utils import upload_to_s3
+from utils.s3_utils import upload_to_s3, s3_client
 from utils.cloudfront_utils import get_cloudfront_url
 from utils.supabase_utils import supabase_client
 
@@ -29,7 +29,11 @@ def upload_profile_picture_task(self, user_id: str, image_url: str) -> dict:
         key = f"user_pfp/{user_id}_{uuid.uuid4().hex[:8]}.{extension}"
 
         # Step 3: Upload to S3 (in-memory)
-        upload_to_s3(key, image_bytes, content_type="image/jpeg")  # adjust type as needed
+        upload_to_s3(
+            client=s3_client,
+            s3_object_key=key, 
+            file_source=image_bytes
+        )  # adjust type as needed
 
         # Step 4: Generate CloudFront URL
         cdn_url = get_cloudfront_url(key)

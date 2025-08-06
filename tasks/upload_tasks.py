@@ -741,7 +741,7 @@ async def _download_and_prep_doc(client: httpx.AsyncClient, url: str, project_id
             s3_key = f"{project_id}/{uuid.uuid4()}{ext}"
             
             # Stream directly to S3 && AWS CloudFront from the in-memory buffer
-            upload_to_s3(s3_client, content_stream, s3_key)
+            upload_to_s3(client=s3_client, file_source=content_stream, s3_object_key=s3_key)
             cdn_url = get_cloudfront_url(s3_key)
             
             # Leverages my url (AWS Cloudfront) to perform in-memory streaming for the rest of the ingest pipeline

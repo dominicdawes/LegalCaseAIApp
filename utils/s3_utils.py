@@ -76,7 +76,7 @@ def upload_to_s3(client, file_source, s3_object_key, bucket_name=s3_bucket_name,
         transfer_config = TransferConfig(multipart_chunksize=8*1024*1024)
 
         if is_file_like:
-            # Handle file-like objects (BytesIO, etc.)
+            # Handle file-like objects (BytesIO, jpg, etc.)
             file_source.seek(0)  # Ensure we're at the beginning
             client.upload_fileobj(
                 file_source,
