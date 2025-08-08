@@ -55,6 +55,7 @@ from utils.supabase_utils import (
     supabase_client,
     log_llm_error,
 )
+from utils.lightrag.lightrag_utils import lightrag_integration
 from utils.llm_clients.llm_factory import LLMFactory
 from utils.llm_clients.performance_monitor import PerformanceMonitor
 from utils.note_processing.flashcard_processor import FlashcardProcessor

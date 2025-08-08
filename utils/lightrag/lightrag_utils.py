@@ -2,6 +2,8 @@
 """
 LightRAG Integration for Existing RAG Pipeline
 Enhances naive vector RAG with knowledge graph capabilities using DGraph
+
+https://github.com/HKUDS/LightRAG/blob/main/examples/lightrag_openai_demo.py
 """
 
 import os
@@ -263,41 +265,51 @@ class DGraphManager:
 
 class LightRAGManager:
     """
-    Enhanced LightRAG manager that integrates with your existing pipeline
-    Combines vector similarity with knowledge graph capabilities
+    Simplified LightRAG manager that uses DGraph as LightRAG's native storage
+    
+    Key Changes:
+    1. LightRAG handles ALL knowledge graph operations internally
+    2. DGraph is configured as LightRAG's graph storage backend
+    3. No separate DGraphManager - LightRAG manages the graph
+    4. No duplicate entity extraction - LightRAG does this natively
     """
     
     def __init__(self):
         self.lightrag = None
-        self.dgraph_manager = DGraphManager()
-        self.embedding_model = None
         self._initialized = False
     
     async def initialize(self):
-        """Initialize LightRAG and DGraph components"""
+        """Initialize LightRAG with DGraph as the graph storage backend"""
         if self._initialized:
             return
         
         try:
-            # Initialize DGraph
-            await self.dgraph_manager.initialize()
-            
-            # Initialize LightRAG
+            # Configure LightRAG to use DGraph as its graph storage
             self.lightrag = LightRAG(
                 working_dir=LIGHTRAG_WORKING_DIR,
-                llm_model_func=gpt_4o_mini_complete,  # Use your existing LLM setup
-                embedding_func=openai_embedding
+                
+                # LLM configuration
+                llm_model_func=gpt_4o_mini_complete,
+                embedding_func=openai_embedding,
+                
+                # Storage configuration - LightRAG handles the graph internally
+                graph_storage_cls=DGraphStorage,
+                graph_storage_kwargs={
+                    "host": DGRAPH_HOST,
+                    "port": 9080,
+                    # Add any DGraph-specific configuration here
+                },
+                
+                # Vector storage (can be separate or integrated)
+                vector_storage_cls="NanoVectorDBStorage",  # or your preferred vector storage
             )
             
-            # Initialize storage and pipeline
+            # Initialize LightRAG's internal storages (including DGraph)
             await self.lightrag.initialize_storages()
             await self.lightrag.initialize_pipeline_status()
             
-            # Initialize embedding model for manual embeddings
-            self.embedding_model = openai_embedding
-            
             self._initialized = True
-            logger.info("✅ Enhanced LightRAG manager initialized")
+            logger.info("✅ LightRAG manager initialized with DGraph backend")
             
         except Exception as e:
             logger.error(f"❌ LightRAG manager initialization failed: {e}")
@@ -309,212 +321,81 @@ class LightRAGManager:
                                                   project_id: str,
                                                   metadata: Dict = None) -> Dict[str, Any]:
         """
-        Process document through LightRAG + DGraph pipeline
+        Process document through LightRAG system
         
-        This replaces your existing embedding-only approach with:
-        1. LightRAG entity/relationship extraction
-        2. DGraph knowledge graph storage  
-        3. Hybrid vector + graph indexing
+        SIMPLIFIED: LightRAG handles everything internally:
+        1. Entity/relationship extraction
+        2. Knowledge graph storage (in DGraph)
+        3. Vector embedding and storage
+        4. Deduplication and merging
         """
         
         try:
-            logger.info(f"🔍 Processing document {doc_id} with LightRAG + DGraph")
+            logger.info(f"🔍 Processing document {doc_id} with LightRAG")
             
-            # ——— 1. LightRAG Processing (Entity + Relationship Extraction) ———————————
-            logger.info("🧠 Extracting entities and relationships with LightRAG...")
+            # ——— 1. LightRAG Processing (Everything happens here) ———————————————————
+            logger.info("🧠 Processing with LightRAG (extraction + graph + vectors)...")
             
-            # Insert document into LightRAG (this triggers entity/relationship extraction)
-            await self.lightrag.ainsert(content)
+            # Add project context to content for better entity resolution
+            contextualized_content = f"[PROJECT: {project_id}] [DOC: {doc_id}]\n\n{content}"
             
-            # ——— 2. Extract Knowledge Graph Data ————————————————————————————————————
-            # Note: LightRAG stores in its internal format, we need to extract for DGraph
-            entities, relationships = await self._extract_kg_from_lightrag(content, doc_id)
+            # LightRAG handles:
+            # - Text chunking
+            # - Entity/relationship extraction  
+            # - Knowledge graph construction
+            # - Vector embedding
+            # - Storage in DGraph + vector DB
+            await self.lightrag.ainsert(contextualized_content)
             
-            # ——— 3. Store in DGraph Knowledge Graph ————————————————————————————————
-            logger.info(f"📊 Storing {len(entities)} entities and {len(relationships)} relationships in DGraph...")
+            # ——— 2. Track Processing Metrics ————————————————————————————————————————
+            # Get stats from LightRAG's internal storage
+            processing_stats = await self._get_processing_stats(project_id)
             
-            entity_uids = {}
-            
-            # Store entities
-            for entity in entities:
-                try:
-                    entity_uid = await self.dgraph_manager.upsert_entity(entity, project_id)
-                    entity_uids[entity.name] = entity_uid
-                except Exception as e:
-                    logger.warning(f"⚠️ Failed to store entity '{entity.name}': {e}")
-            
-            # Store relationships
-            relationship_uids = []
-            for relationship in relationships:
-                try:
-                    source_uid = entity_uids.get(relationship.source_entity)
-                    target_uid = entity_uids.get(relationship.target_entity)
-                    
-                    if source_uid and target_uid:
-                        rel_uid = await self.dgraph_manager.upsert_relationship(
-                            relationship, source_uid, target_uid, project_id
-                        )
-                        relationship_uids.append(rel_uid)
-                    else:
-                        logger.warning(f"⚠️ Missing entity UIDs for relationship: {relationship.relationship_type}")
-                        
-                except Exception as e:
-                    logger.warning(f"⚠️ Failed to store relationship: {e}")
-            
-            # ——— 4. Update Document Status ————————————————————————————————————————————
+            # ——— 3. Update Document Status ————————————————————————————————————————————
             await self._update_document_kg_status(doc_id, 'COMPLETE', {
-                'entities_extracted': len(entities),
-                'relationships_extracted': len(relationships),
-                'entity_uids': list(entity_uids.values()),
-                'relationship_uids': relationship_uids
+                'processed_by': 'lightrag',
+                'entities_estimated': processing_stats.get('entities_count', 0),
+                'relationships_estimated': processing_stats.get('relationships_count', 0),
+                'chunks_processed': processing_stats.get('chunks_count', 0)
             })
             
-            logger.info(f"✅ Knowledge graph processing complete for document {doc_id}")
+            logger.info(f"✅ LightRAG processing complete for document {doc_id}")
             
             return {
                 'success': True,
-                'entities_count': len(entities),
-                'relationships_count': len(relationships),
-                'entity_uids': entity_uids,
-                'relationship_uids': relationship_uids
+                'processing_method': 'lightrag_unified',
+                'entities_count': processing_stats.get('entities_count', 0),
+                'relationships_count': processing_stats.get('relationships_count', 0),
+                'chunks_count': processing_stats.get('chunks_count', 0)
             }
             
         except Exception as e:
-            logger.error(f"❌ Knowledge graph processing failed for document {doc_id}: {e}")
+            logger.error(f"❌ LightRAG processing failed for document {doc_id}: {e}")
             await self._update_document_kg_status(doc_id, 'FAILED', {'error': str(e)})
             raise
     
-    async def _extract_kg_from_lightrag(self, content: str, doc_id: str) -> Tuple[List[EntityExtraction], List[RelationshipExtraction]]:
+    async def _get_processing_stats(self, project_id: str) -> Dict[str, int]:
         """
-        Extract entities and relationships from content using LLMs
-        This is a custom implementation that mimics LightRAG's internal extraction
+        Get processing statistics from LightRAG's internal storage
+        This is optional - mainly for monitoring/debugging
         """
-        
-        # Use your existing LLM factory for entity extraction
-        llm_client = LLMFactory.get_client_for("openai", "gpt-4o-mini", 0.3, False)
-        
-        # Entity extraction prompt
-        entity_prompt = f"""
-        Extract entities from the following text. For each entity, provide:
-        - name: The entity name
-        - type: The entity type (PERSON, ORGANIZATION, LOCATION, CONCEPT, EVENT, etc.)
-        - description: A brief description of the entity
-        - confidence: Confidence score (0.0 to 1.0)
-        
-        Text: {content}
-        
-        Return as JSON array:
-        [
-            {{
-                "name": "entity_name",
-                "type": "ENTITY_TYPE", 
-                "description": "description",
-                "confidence": 0.9
-            }}
-        ]
-        """
-        
-        # Relationship extraction prompt
-        relationship_prompt = f"""
-        Extract relationships between entities from the following text. For each relationship:
-        - source_entity: Source entity name
-        - target_entity: Target entity name
-        - relationship_type: Type of relationship (WORKS_FOR, LOCATED_IN, PART_OF, etc.)
-        - description: Description of the relationship
-        - weight: Relationship strength (0.0 to 1.0)
-        - confidence: Confidence score (0.0 to 1.0)
-        
-        Text: {content}
-        
-        Return as JSON array:
-        [
-            {{
-                "source_entity": "entity1",
-                "target_entity": "entity2",
-                "relationship_type": "RELATIONSHIP_TYPE",
-                "description": "description",
-                "weight": 0.8,
-                "confidence": 0.9
-            }}
-        ]
-        """
-        
         try:
-            # Extract entities
-            entity_response = await asyncio.get_event_loop().run_in_executor(
-                None, llm_client.chat, entity_prompt
-            )
-            entities_data = json.loads(entity_response)
+            # Access LightRAG's internal graph storage to get stats
+            # This would depend on LightRAG's internal API
+            stats = {
+                'entities_count': 0,
+                'relationships_count': 0,
+                'chunks_count': 0
+            }
             
-            # Extract relationships
-            relationship_response = await asyncio.get_event_loop().run_in_executor(
-                None, llm_client.chat, relationship_prompt
-            )
-            relationships_data = json.loads(relationship_response)
+            # If LightRAG exposes storage statistics:
+            # stats = await self.lightrag.get_storage_stats()
             
-            # Convert to our data structures
-            entities = []
-            for entity_data in entities_data:
-                # Generate embeddings for entity name and description
-                name_embedding = await self._generate_embedding(entity_data['name'])
-                desc_embedding = await self._generate_embedding(entity_data['description'])
-                
-                entity = EntityExtraction(
-                    name=entity_data['name'],
-                    entity_type=entity_data['type'],
-                    description=entity_data['description'],
-                    confidence_score=entity_data['confidence'],
-                    source_chunks=[content],  # In practice, you'd track specific chunks
-                    name_embedding=name_embedding,
-                    description_embedding=desc_embedding
-                )
-                entities.append(entity)
-            
-            relationships = []
-            for rel_data in relationships_data:
-                # Generate embedding for relationship description
-                desc_embedding = await self._generate_embedding(rel_data['description'])
-                
-                relationship = RelationshipExtraction(
-                    source_entity=rel_data['source_entity'],
-                    target_entity=rel_data['target_entity'],
-                    relationship_type=rel_data['relationship_type'],
-                    description=rel_data['description'],
-                    weight=rel_data['weight'],
-                    confidence_score=rel_data['confidence'],
-                    source_evidence=[content],  # Track source evidence
-                    description_embedding=desc_embedding
-                )
-                relationships.append(relationship)
-            
-            return entities, relationships
+            return stats
             
         except Exception as e:
-            logger.error(f"❌ Knowledge extraction failed: {e}")
-            return [], []
-    
-    async def _generate_embedding(self, text: str) -> List[float]:
-        """Generate embedding for text"""
-        try:
-            return await self.embedding_model(text)
-        except Exception as e:
-            logger.warning(f"⚠️ Embedding generation failed for text: {e}")
-            return []
-    
-    async def _update_document_kg_status(self, doc_id: str, status: str, metadata: Dict):
-        """Update document knowledge graph processing status"""
-        try:
-            async with get_db_connection() as conn:
-                await conn.execute(
-                    """
-                    UPDATE document_sources 
-                    SET knowledge_graph_status = $1, kg_metadata = $2, updated_at = NOW()
-                    WHERE id = $3
-                    """,
-                    status, json.dumps(metadata), doc_id
-                )
-        except Exception as e:
-            logger.warning(f"⚠️ Failed to update KG status for document {doc_id}: {e}")
+            logger.warning(f"⚠️ Could not retrieve processing stats: {e}")
+            return {'entities_count': 0, 'relationships_count': 0, 'chunks_count': 0}
     
     async def enhanced_retrieval(self, 
                                query: str, 
@@ -522,12 +403,12 @@ class LightRAGManager:
                                mode: str = "hybrid",
                                top_k: int = 10) -> Dict[str, Any]:
         """
-        Enhanced retrieval combining LightRAG + DGraph + your existing vector search
+        Enhanced retrieval using LightRAG + optional vector fallback
         
-        This implements the dual-level retrieval that makes LightRAG powerful:
-        - Low-level: Specific entity/relationship retrieval
-        - High-level: Conceptual theme retrieval
-        - Vector fallback: Your existing semantic similarity
+        SIMPLIFIED: LightRAG does the heavy lifting
+        - mode="lightrag": Pure LightRAG (graph + vector internally)
+        - mode="hybrid": LightRAG + your existing vector search
+        - mode="vector": Your existing vector search only
         """
         
         try:
@@ -536,58 +417,44 @@ class LightRAGManager:
             results = {
                 'query': query,
                 'mode': mode,
-                'entities': [],
-                'relationships': [],
-                'themes': [],
+                'lightrag_response': None,
                 'vector_chunks': [],
-                'lightrag_response': None
+                'combined_context': None
             }
             
-            # ——— 1. LightRAG Query (Dual-level retrieval) ————————————————————————————
+            # ——— 1. LightRAG Query (Handles graph + vector internally) ————————————————
             if mode in ['hybrid', 'lightrag']:
-                logger.info("🧠 Querying LightRAG knowledge graph...")
+                logger.info("🧠 Querying LightRAG system...")
                 
-                # LightRAG has different query modes
+                # Add project context to query for better retrieval
+                contextualized_query = f"[PROJECT: {project_id}] {query}"
+                
+                # LightRAG's internal modes:
+                # - "naive": Vector similarity only
+                # - "local": Low-level entity/relationship queries
+                # - "global": High-level community/theme queries  
+                # - "hybrid": Combined low + high level (recommended)
                 lightrag_mode = "hybrid" if mode == "hybrid" else "local"
+                
                 lightrag_response = await self.lightrag.aquery(
-                    query, 
+                    contextualized_query, 
                     param=QueryParam(mode=lightrag_mode)
                 )
                 results['lightrag_response'] = lightrag_response
             
-            # ——— 2. DGraph Entity/Relationship Queries ——————————————————————————————
-            if mode in ['hybrid', 'graph']:
-                logger.info("📊 Querying DGraph knowledge graph...")
-                
-                # Query relevant entities
-                query_embedding = await self._generate_embedding(query)
-                entities = await self.dgraph_manager.query_entities_by_project(project_id, top_k)
-                
-                # Filter entities by relevance (you could implement vector similarity here)
-                relevant_entities = [e for e in entities if self._is_entity_relevant(e, query)][:top_k//2]
-                results['entities'] = relevant_entities
-                
-                # Query relationships for relevant entities
-                if relevant_entities:
-                    entity_uids = [e['uid'] for e in relevant_entities]
-                    relationships = await self.dgraph_manager.query_relationships_by_entities(entity_uids)
-                    results['relationships'] = relationships
-            
-            # ——— 3. Fallback to Vector Search (Your existing approach) ——————————————————
+            # ——— 2. Optional: Your Existing Vector Search (Fallback/Supplement) ————————
             if mode in ['hybrid', 'vector']:
-                logger.info("🔢 Fallback to vector similarity search...")
+                logger.info("🔢 Querying existing vector search...")
                 
-                # Use your existing vector search function
+                # Use your existing PostgreSQL vector search as supplement
                 vector_chunks = await self._vector_similarity_search(query, project_id, top_k//2)
                 results['vector_chunks'] = vector_chunks
             
-            # ——— 4. Combine and Rank Results ————————————————————————————————————————
+            # ——— 3. Combine Results ————————————————————————————————————————————————————
             combined_context = self._combine_retrieval_results(results)
             results['combined_context'] = combined_context
             
-            logger.info(f"✅ Enhanced retrieval complete: {len(results['entities'])} entities, "
-                       f"{len(results['relationships'])} relationships, "
-                       f"{len(results['vector_chunks'])} vector chunks")
+            logger.info(f"✅ Enhanced retrieval complete")
             
             return results
             
@@ -595,18 +462,8 @@ class LightRAGManager:
             logger.error(f"❌ Enhanced retrieval failed: {e}")
             raise
     
-    def _is_entity_relevant(self, entity: Dict, query: str) -> bool:
-        """Simple relevance check for entity filtering"""
-        query_lower = query.lower()
-        entity_text = f"{entity.get('name', '')} {entity.get('description', '')}".lower()
-        
-        # Simple keyword matching - in practice, you'd use embeddings
-        return any(word in entity_text for word in query_lower.split())
-    
     async def _vector_similarity_search(self, query: str, project_id: str, top_k: int) -> List[Dict]:
-        """Your existing vector similarity search function"""
-        # This would call your existing fetch_relevant_chunks function
-        # or use your PostgreSQL vector search
+        """Your existing PostgreSQL vector similarity search (unchanged)"""
         try:
             # Use your existing embedding model
             query_embedding = await self._generate_embedding(query)
@@ -625,49 +482,57 @@ class LightRAGManager:
             logger.warning(f"⚠️ Vector search fallback failed: {e}")
             return []
     
+    async def _generate_embedding(self, text: str) -> List[float]:
+        """Generate embedding using LightRAG's embedding function"""
+        try:
+            return await openai_embedding([text])
+        except Exception as e:
+            logger.warning(f"⚠️ Embedding generation failed: {e}")
+            return []
+    
     def _combine_retrieval_results(self, results: Dict[str, Any]) -> str:
         """
-        Combine different retrieval results into coherent context
-        This is where LightRAG's power shows - integrating multiple knowledge sources
+        Combine LightRAG response with optional vector search results
         """
         
         context_parts = []
         
-        # Add LightRAG response (already processed and coherent)
+        # Primary: LightRAG response (comprehensive graph + vector analysis)
         if results.get('lightrag_response'):
-            context_parts.append("=== LightRAG Knowledge Graph Response ===")
+            context_parts.append("=== LightRAG Knowledge Graph Analysis ===")
             context_parts.append(results['lightrag_response'])
             context_parts.append("")
         
-        # Add entity information
-        if results.get('entities'):
-            context_parts.append("=== Relevant Entities ===")
-            for entity in results['entities'][:5]:  # Top 5 entities
-                context_parts.append(f"• {entity.get('name', 'Unknown')} ({entity.get('entity_type', 'Unknown')}): {entity.get('description', '')}")
-            context_parts.append("")
-        
-        # Add relationship information
-        if results.get('relationships'):
-            context_parts.append("=== Relevant Relationships ===")
-            for rel in results['relationships'][:5]:  # Top 5 relationships
-                context_parts.append(f"• {rel.get('name', 'Unknown')}: {rel.get('description', '')}")
-            context_parts.append("")
-        
-        # Add vector search results as fallback
+        # Supplementary: Additional vector search results (if hybrid mode)
         if results.get('vector_chunks'):
-            context_parts.append("=== Additional Context (Vector Similarity) ===")
+            context_parts.append("=== Additional Context (Legacy Vector Search) ===")
             for chunk in results['vector_chunks'][:3]:  # Top 3 chunks
-                content = chunk.get('content', '')[:500]  # Truncate for brevity
+                content = chunk.get('content', '')[:300]  # Truncate for brevity
                 context_parts.append(f"• {content}...")
             context_parts.append("")
         
         return "\n".join(context_parts)
+    
+    async def _update_document_kg_status(self, doc_id: str, status: str, metadata: Dict):
+        """Update document knowledge graph processing status"""
+        try:
+            async with get_db_connection() as conn:
+                await conn.execute(
+                    """
+                    UPDATE document_sources 
+                    SET knowledge_graph_status = $1, kg_metadata = $2, updated_at = NOW()
+                    WHERE id = $3
+                    """,
+                    status, json.dumps(metadata), doc_id
+                )
+        except Exception as e:
+            logger.warning(f"⚠️ Failed to update KG status for document {doc_id}: {e}")
 
 # ——— Integration with Existing Pipeline ————————————————————————————————————
 
 class LightRAGPipelineIntegration:
     """
-    Integration layer that plugs LightRAG into your existing upload_tasks.py and note_tasks.py
+    SIMPLIFIED integration that uses LightRAG as a unified system
     """
     
     def __init__(self):
@@ -687,9 +552,9 @@ class LightRAGPipelineIntegration:
                                         metadatas: List[Dict],
                                         project_id: str) -> Dict[str, Any]:
         """
-        Enhance your existing document processing with knowledge graph extraction
+        Enhance your existing document processing with LightRAG
         
-        This plugs into your existing _process_embeddings_async function
+        SIMPLIFIED: Just pass the content to LightRAG
         """
         
         if not self._initialized:
@@ -698,10 +563,10 @@ class LightRAGPipelineIntegration:
         try:
             logger.info(f"🔄 Enhancing document processing for {doc_id} with LightRAG")
             
-            # Combine chunks into full document content for knowledge extraction
+            # Combine chunks into full document content
             full_content = "\n\n".join(chunks)
             
-            # Process with LightRAG + DGraph (runs in parallel with your existing embeddings)
+            # Process with LightRAG (handles everything internally)
             kg_result = await self.lightrag_manager.process_document_with_knowledge_graph(
                 doc_id=doc_id,
                 content=full_content,
@@ -709,13 +574,12 @@ class LightRAGPipelineIntegration:
                 metadata={'chunk_count': len(chunks)}
             )
             
-            logger.info(f"✅ Knowledge graph enhancement complete for {doc_id}: "
-                       f"{kg_result['entities_count']} entities, {kg_result['relationships_count']} relationships")
+            logger.info(f"✅ LightRAG enhancement complete for {doc_id}")
             
             return kg_result
             
         except Exception as e:
-            logger.error(f"❌ Knowledge graph enhancement failed for {doc_id}: {e}")
+            logger.error(f"❌ LightRAG enhancement failed for {doc_id}: {e}")
             # Don't fail the entire pipeline - just log and continue
             return {'success': False, 'error': str(e)}
     
@@ -727,7 +591,7 @@ class LightRAGPipelineIntegration:
         """
         Enhance your existing note generation with LightRAG retrieval
         
-        This plugs into your existing note_tasks.py workflow
+        SIMPLIFIED: LightRAG handles the complexity
         """
         
         if not self._initialized:
@@ -736,12 +600,12 @@ class LightRAGPipelineIntegration:
         try:
             logger.info(f"🔄 Enhancing note generation with LightRAG for query: '{query}'")
             
-            # Use enhanced retrieval instead of just vector search
+            # Use enhanced retrieval 
             retrieval_results = await self.lightrag_manager.enhanced_retrieval(
                 query=query,
                 project_id=project_id,
                 mode=retrieval_mode,
-                top_k=15  # More results due to multi-source retrieval
+                top_k=15
             )
             
             # Return the combined context for your existing note generation
