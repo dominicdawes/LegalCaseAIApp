@@ -182,7 +182,7 @@ class StreamToClientHandler(BaseCallbackHandler):
 # ——— Task: Naieve RAG ———————————————————————————————————————————
 
 @celery_app.task(bind=True, base=BaseTaskWithRetry)
-def rag_note_task(
+def rag_note_conversion_task(
     self,
     user_id,
     note_type,
