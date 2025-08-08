@@ -48,12 +48,22 @@ class DeepSeekClient:
         messages = self._build_messages(prompt, system_prompt)
         return self._client.invoke(messages).content
     
-    def stream_chat(self, prompt: str, system_prompt: str = None):
+    def stream_chat_sync(self, prompt: str, system_prompt: str = None):
+        """Legacy sync version"""
         messages = self._build_messages(prompt, system_prompt)
         for chunk in self._streaming_client.stream(messages):
             if chunk.content:
                 yield chunk.content
-
+    async def stream_chat(self, prompt: str, system_prompt: str = None):
+        """
+        🆕 Async streaming method that yields chunks compatible with 'async for'
+        """
+        messages = self._build_messages(prompt, system_prompt)
+        
+        # Use astream() for async streaming instead of stream()
+        async for chunk in self._streaming_client.astream(messages):
+            if chunk.content:
+                yield chunk.content
     def _build_messages(self, prompt: str, system_prompt: str = None):
         messages = []
         if system_prompt:
