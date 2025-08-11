@@ -1374,7 +1374,7 @@ async def _execute_batch_workflow(batch_id: str, file_urls: List[str], metadata:
         # For NEW documents: Use async delegation pattern
         for doc_info in new_documents:
             # Single task per document - handles everything internally
-            task_sig = process_complete_document_workflow.s(
+            task_sig = process_new_document_wrapper.s(
                 doc_info['doc_data'], 
                 doc_info['project_id'], 
                 {**metadata, 'batch_id': batch_id}
@@ -1602,7 +1602,7 @@ def finalize_batch_and_create_note(
 # NEW documment (create new embedings), REUSED document (reused embeddings) and DUPLICATE document (skip to note generation)
 
 @celery_app.task(bind=True, queue=INGEST_QUEUE, acks_late=True)
-def process_complete_document_wrapper(
+def process_new_document_wrapper(
     self, 
     doc_data: Dict[str, Any], 
     project_id: str, 
@@ -1724,7 +1724,8 @@ async def _process_document_async_workflow(
         logger.info(f"✅ [DOC-{short_id}] Parsed {len(chunks)} chunks")
 
         # --- INTEGRATION ⚙️: This could also be where we can kick off ainsert() with LightRag -------------
-        
+        # You can also add document UUIDs here so that LightRAG can use them in its pipeline for consistency
+
         # ——— 3. EMBEDDING Process, async with concurrency control ————————————————
         logger.info(f"📋 [DOC-{short_id}] → EMBEDDING")
         embedding_result = await _process_embeddings_async(doc_id, project_id, chunks, chunks_metadata)
@@ -2292,7 +2293,7 @@ def initialize_production_pipeline():
 __all__ = [
     # ——— Main Workflow Tasks ———————————————————————————————————————————————————————
     'process_document_batch_workflow',           # NEW: Main entry point (replaces process_document_task)
-    'process_new_document_task',                 # NEW: Handle new documents in workflow
+    'process_new_document_wrapper',              # NEW: Handle new documents in workflow
     'process_reused_document_task',              # NEW: Handle reused documents in workflow
     'finalize_batch_and_create_note',            # NEW: Batch coordination & note triggering
     'handle_batch_failure',                      # NEW: Batch failure handling
