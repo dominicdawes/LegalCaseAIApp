@@ -70,6 +70,7 @@ import psutil
 # ===== PROJECT MODULES =====
 from tasks.celery_app import celery_app
 from tasks.note_tasks import rag_note_task
+from utils.lightrag.lightrag_utils import lightrag_integration
 from utils.s3_utils import upload_to_s3, s3_client
 from utils.cloudfront_utils import get_cloudfront_url
 from utils.supabase_utils import supabase_client
@@ -1618,7 +1619,7 @@ def process_complete_document_workflow(
         
         logger.info(f"🚀 [DOC-{short_id}] Starting complete document processing")
         
-        # ——— 🔥 CRITICAL: Delegate to async function (like your pattern) ————————————
+        # ——— 🔥 CRITICAL: Naive vs LightRag Processing ————————————
         result = run_async_in_worker(
             _process_document_async_workflow(
                 doc_id, doc_data, project_id, workflow_metadata
@@ -1744,6 +1745,94 @@ async def _process_document_async_workflow(
             'chunks_created': 0
         }
 
+async def _lightrag_document_processing_async(
+    doc_id: str,
+    doc_data: Dict[str, Any], 
+    project_id: str, 
+    workflow_metadata: Dict[str, Any]
+) -> Dict[str, Any]:
+    """
+    SIMPLIFIED enhanced document processing
+    
+    This would replace or supplement your existing function in upload_tasks.py
+    """
+    
+    short_id = doc_id[:8]
+    
+    try:
+        logger.info(f"🚀 [DOC-{short_id}] Starting enhanced processing with LightRAG")
+        
+        # ——— 1. Your Existing Document Processing ————————————————————————————————
+        # Keep your existing parsing logic
+        from upload_tasks import _parse_document_async
+        parse_result = await _parse_document_async(doc_id, doc_data['cdn_url'], project_id)
+        
+        if not parse_result.get('success'):
+            return {
+                'doc_id': doc_id,
+                'processing_type': 'NEW',
+                'status': 'FAILED',
+                'error': parse_result.get('error', 'Parsing failed'),
+                'chunks_created': 0
+            }
+        
+        chunks = parse_result['chunks']
+        chunks_metadata = parse_result.get('metadatas', [])
+        
+        # ——— 2. Parallel Processing: Traditional Embeddings + LightRAG ——————————————
+        logger.info(f"⚡ [DOC-{short_id}] Running parallel: embeddings + LightRAG")
+        
+        # Start both processes concurrently
+        from upload_tasks import _process_embeddings_async
+        
+        embedding_task = asyncio.create_task(
+            _process_embeddings_async(doc_id, project_id, chunks, chunks_metadata)
+        )
+        
+        lightrag_task = asyncio.create_task(
+            lightrag_integration.enhance_document_processing(
+                doc_id, chunks, chunks_metadata, project_id
+            )
+        )
+        
+        # Wait for both to complete
+        embedding_result, lightrag_result = await asyncio.gather(
+            embedding_task, lightrag_task, return_exceptions=True
+        )
+        
+        # ——— 3. Analyze Results ———————————————————————————————————————————————————
+        final_status = 'COMPLETE'
+        
+        # Check embedding results
+        if isinstance(embedding_result, Exception) or not embedding_result.get('success'):
+            final_status = 'PARTIAL'
+            logger.warning(f"⚠️ [DOC-{short_id}] Embedding processing failed")
+        
+        # Check LightRAG results (non-critical)
+        if isinstance(lightrag_result, Exception) or not lightrag_result.get('success'):
+            logger.warning(f"⚠️ [DOC-{short_id}] LightRAG processing failed (non-critical)")
+        
+        # ——— 4. Return Enhanced Results ————————————————————————————————————————————
+        return {
+            'doc_id': doc_id,
+            'processing_type': 'NEW_ENHANCED',
+            'status': final_status,
+            'chunks_created': embedding_result.get('chunks_embedded', 0) if not isinstance(embedding_result, Exception) else 0,
+            'entities_extracted': lightrag_result.get('entities_count', 0) if not isinstance(lightrag_result, Exception) else 0,
+            'relationships_extracted': lightrag_result.get('relationships_count', 0) if not isinstance(lightrag_result, Exception) else 0,
+            'lightrag_enabled': not isinstance(lightrag_result, Exception) and lightrag_result.get('success', False)
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ [DOC-{short_id}] Enhanced processing failed: {e}")
+        return {
+            'doc_id': doc_id,
+            'processing_type': 'NEW_ENHANCED',
+            'status': 'FAILED', 
+            'error': str(e),
+            'chunks_created': 0
+        }
+    
 # ——— Edge Case Processing Tasks ———————————————————————————————————————
 
 async def _handle_duplicate_only_batch(batch_id: str, project_id: str, workflow_metadata: Dict[str, Any], duplicate_docs: List[Dict]) -> Dict[str, Any]:
