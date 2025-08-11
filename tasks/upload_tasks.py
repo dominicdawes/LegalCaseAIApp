@@ -1,6 +1,13 @@
 # tasks/upload_tasks.py
 
-"""claude async control"""
+"""
+Edge cases for the Custom + LightRag implementation
+
+1) Reused Docs (~ln 1338): vector embeddings are copied from an existing processed document, but what about copying over the knolwdge graph from DGraph?
+- maybe its an assocuated kg_id, im not sure...
+- maybe still genrate a KG because the old kg is probably merged with other docs so its impossible/expansive to parse it out
+
+"""
 
 # ===== STANDARD LIBRARY IMPORTS =====
 import os
@@ -561,14 +568,17 @@ def get_clean_filename_from_url(url: str, extension: str) -> str:
 
 # ——— Utils: Document Analysis/Classification and Embedding Utils ——————————————————————————————————————————
 
-async def _analyze_document_for_workflow(
+async def _analyze_download_and_store_document_for_workflow(
     client: httpx.AsyncClient, 
     url: str, 
     project_id: str, 
     user_id: str
 ) -> Dict[str, Any]:
     """
-    [ASYNC] Download and analyze document to determine processing type:
+    [ASYNC]
+    1. Download (in-memory stream)
+    2. Persist to AWS and Amazon CloudFront CDN
+    3. Hash to document and analyze document to determine processing type:
     - NEW: Requires full processing pipeline (parse → embed → store)
     - REUSED: Existing processed content can be copied (smart reuse)
     
@@ -713,7 +723,7 @@ def copy_embeddings_for_project_sync(existing_source_id: str, new_source_id: str
 
 async def _download_and_prep_doc(client: httpx.AsyncClient, url: str, project_id: str, user_id: str) -> Optional[Dict]:
     """
-    Helper for `_analyze_document_for_workflow` to download to memory (does not write to Disk),
+    Helper for `_analyze_download_and_store_document_for_workflow` to download to memory (does not write to Disk),
     hash, stream to S3 & Store in AWS CLoudfront, and prep data.
     """
     try:
@@ -1183,7 +1193,7 @@ def process_document_batch_workflow(
             _execute_batch_workflow(batch_id, file_urls, metadata)
         )
         
-        # ✅ FIXED: Handle workflow signature execution (embedding finalization)
+        # ✅ Launch Celery workflow signature execution (embedding finalization)
         if workflow_result['status'] == 'WORKFLOW_READY':
             workflow_signature = workflow_result['workflow_signature']
             _update_batch_progress_sync(batch_id, metadata['project_id'], BatchProgressStatus.BATCH_EMBEDDING)
@@ -1228,7 +1238,7 @@ async def _execute_batch_workflow(batch_id: str, file_urls: List[str], metadata:
 
     async with httpx.AsyncClient(timeout=60.0) as client:
         analysis_tasks = [
-            _analyze_document_for_workflow(client, url, project_id, user_id) 
+            _analyze_download_and_store_document_for_workflow(client, url, project_id, user_id) 
             for url in file_urls
         ]
         analysis_results = await asyncio.gather(*analysis_tasks, return_exceptions=True)
@@ -1240,6 +1250,7 @@ async def _execute_batch_workflow(batch_id: str, file_urls: List[str], metadata:
     duplicate_documents = []  # Track same-project duplicates separately
     failed_downloads = []
     
+    # Classify results, sort into lists
     for result in analysis_results:
         if isinstance(result, Exception):
             failed_downloads.append(str(result))
@@ -1369,6 +1380,8 @@ async def _execute_batch_workflow(batch_id: str, file_urls: List[str], metadata:
                 {**metadata, 'batch_id': batch_id}
             )
             document_tasks.append(task_sig)     # ← Add NEW docs to chord signature
+
+        # --- INTEGRATION ⚙️: This could be where we can kick off ainsert() with LightRag -------------
 
         # For reused documents (keep existing logic)
         for doc_info in reused_documents:
@@ -1589,14 +1602,14 @@ def finalize_batch_and_create_note(
 # NEW documment (create new embedings), REUSED document (reused embeddings) and DUPLICATE document (skip to note generation)
 
 @celery_app.task(bind=True, queue=INGEST_QUEUE, acks_late=True)
-def process_complete_document_workflow(
+def process_complete_document_wrapper(
     self, 
     doc_data: Dict[str, Any], 
     project_id: str, 
     workflow_metadata: Dict[str, Any]
 ) -> Dict[str, Any]:
     """
-    [DOCUMENT PROCESSOR] Thin Celery task that delegates to async processing:
+    [DOCUMENT PROCESSOR] Thin Celery task wrapper that delegates to async processing:
     - Similar pattern to your RAG chat task
     - Single responsibility: coordinate one complete document
     - Delegates complex async work to dedicated function
@@ -1656,7 +1669,7 @@ async def _process_document_async_workflow(
     workflow_metadata: Dict[str, Any]
 ) -> Dict[str, Any]:
     """
-    Processing for a NEW document (async function) that handles the complete workflow: 
+    Asynchronous processing for a NEW document that handles the complete workflow: 
     1. INSERT document into Supaabse
     2. PARSE document into semantic chunks
     3. EMBED chunks using 'smart batching' using OpenAI embeddings
@@ -1709,6 +1722,8 @@ async def _process_document_async_workflow(
         chunks = parse_result['chunks']
         chunks_metadata = parse_result.get('metadatas', [])  # ← Extract metadatas
         logger.info(f"✅ [DOC-{short_id}] Parsed {len(chunks)} chunks")
+
+        # --- INTEGRATION ⚙️: This could also be where we can kick off ainsert() with LightRag -------------
         
         # ——— 3. EMBEDDING Process, async with concurrency control ————————————————
         logger.info(f"📋 [DOC-{short_id}] → EMBEDDING")
@@ -2290,7 +2305,7 @@ __all__ = [
     # ——— Helper Functions ——————————————————————————————————————————————————————————
     'copy_embeddings_for_project_sync',         # KEEP: Used by reused document processing
     '_execute_batch_workflow',                   # NEW: Core workflow execution logic
-    '_analyze_document_for_workflow',            # NEW: Document classification
+    '_analyze_download_and_store_document_for_workflow',            # NEW: Document classification
     '_parse_document_for_workflow',       # NEW: Workflow-optimized parsing
     '_handle_duplicate_only_batch',              # NEW: Handle all-duplicate scenarios
     
