@@ -202,20 +202,24 @@ celery_app.conf.update(**celery_config_updates)
 
 # ——— Task Registration (Import after app is configured) ——————————————————————————
 def register_tasks():
-    """Register tasks after app is fully configured"""
+    """
+    Register tasks and initialize scheduled (beat) tasks.
+    This function is now the single entry point for final setup.
+    """
     import tasks.chat_tasks
     import tasks.upload_tasks  
     import tasks.profile_tasks
     import tasks.note_tasks
     import tasks.note_conversion_tasks
     import tasks.sample_tasks
+    
+    # Import and initialize scheduled tasks for Celery Beat
+    from tasks.system_tasks import initialize_production_pipeline
 
-# # Import tasks to register them with Celery
-# import tasks.chat_tasks
-# import tasks.chat_streaming_tasks
-# import tasks.upload_tasks
-# import tasks.note_tasks
-# import tasks.sample_tasks
+    print("⚙️ Initializing production pipeline and scheduling maintenance tasks...")
+    initialize_production_pipeline()
+    print("✅ Production pipeline initialized.")
+
 
 # Automatically discover tasks in specified modules
 celery_app.autodiscover_tasks(["tasks"])
@@ -224,6 +228,10 @@ celery_app.autodiscover_tasks(["tasks"])
 
 # Sanity check print statement - these should show up in Render logs
 print("🚀 Celery app initialized successfully!")
+
+# Call the final initialization function at the end of the module
+register_tasks()
+
 print("📋 Registered tasks:")
 print(list(celery_app.tasks.keys()))
 print("✅ Ready to process tasks")
@@ -234,6 +242,3 @@ __all__ = [
     'celery_app', 
     'run_async_in_worker',
 ]
-
-# Call this function at the very end
-register_tasks()

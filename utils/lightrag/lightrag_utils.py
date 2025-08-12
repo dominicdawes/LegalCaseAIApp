@@ -314,7 +314,77 @@ class LightRAGManager:
         except Exception as e:
             logger.error(f"❌ LightRAG manager initialization failed: {e}")
             raise
-    
+
+    async def insert_document_into_kg(
+            self, 
+            doc_id: str,
+            content: str, 
+            project_id: str,
+            metadata: Dict = None) -> Dict[str, Any]:
+        """
+        Process document through LightRAG system and add to knowledge graph, and entities and relationships to vdb
+
+        Args:
+            doc_id (str): Unique document identifier
+            content (str): Full document content (as plaintext or a List of chunks)
+            project_id (str): Project identifier for context
+            metadata (Dict): Optional metadata for the document
+        
+        LightRAG handles everything internally:
+            1. Entity/relationship extraction
+            2. Knowledge graph storage (in DGraph)
+            3. Vector embedding and storage
+            4. Deduplication and merging
+        """
+        
+        try:            
+            # ——— 1. LightRAG Processing (Everything happens here) ———————————————————
+            logger.info("🧠 Processing with LightRAG (extraction + graph + vectors)...")
+            
+            # Initialize the result variable
+            concatenated_content = None
+
+            # Check if content is a list & all elem are str
+            if isinstance(content, list) and all(isinstance(elem, str) for elem in content):
+                # If both are true, join the list elements into a single string
+                concatenated_content = "".join(content)
+                print(f"Successfully concatenated chunks!'")
+            else:
+                print("The variable is not a list of strings.")
+
+            # Add project context to content for better entity resolution
+            contextualized_content = f"[PROJECT: {project_id}] [DOC: {doc_id}]\n\n{content}"
+            
+            # async insert with LightRAG
+            await self.lightrag.ainsert(contextualized_content)
+            
+            # ——— 2. Track Processing Metrics ————————————————————————————————————————
+            # Get stats from LightRAG's internal storage
+            processing_stats = await self._get_processing_stats(project_id)
+            
+            # ——— 3. Update Document Status ————————————————————————————————————————————
+            await self._update_document_kg_status(doc_id, 'COMPLETE', {
+                'processed_by': 'lightrag',
+                'entities_estimated': processing_stats.get('entities_count', 0),
+                'relationships_estimated': processing_stats.get('relationships_count', 0),
+                'chunks_processed': processing_stats.get('chunks_count', 0)
+            })
+            
+            logger.info(f"✅ LightRAG processing complete for document {doc_id}")
+            
+            return {
+                'success': True,
+                'processing_method': 'lightrag_unified',
+                'entities_count': processing_stats.get('entities_count', 0),
+                'relationships_count': processing_stats.get('relationships_count', 0),
+                'chunks_count': processing_stats.get('chunks_count', 0)
+            }
+            
+        except Exception as e:
+            logger.error(f"❌ LightRAG processing failed for document {doc_id}: {e}")
+            await self._update_document_kg_status(doc_id, 'FAILED', {'error': str(e)})
+            raise
+
     async def process_document_with_knowledge_graph(self, 
                                                   doc_id: str,
                                                   content: str, 
@@ -624,3 +694,4 @@ class LightRAGPipelineIntegration:
 # ——— Global Manager Instance ————————————————————————————————————————————————
 
 lightrag_integration = LightRAGPipelineIntegration()
+lightrag_client = LightRAGManager()

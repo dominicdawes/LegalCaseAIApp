@@ -36,8 +36,8 @@ from dotenv import load_dotenv
 
 # ===== ASYNC & CONCURRENCY & SOCKET =====
 import asyncio
-import gevent
-import gevent.socket
+# import gevent
+# import gevent.socket
 import socket
 
 # ===== NETWORKING & HTTP =====
@@ -77,7 +77,7 @@ import psutil
 # ===== PROJECT MODULES =====
 from tasks.celery_app import celery_app
 from tasks.note_tasks import rag_note_task
-from utils.lightrag.lightrag_utils import lightrag_integration
+from utils.lightrag.lightrag_utils import lightrag_client, lightrag_integration
 from utils.s3_utils import upload_to_s3, s3_client
 from utils.cloudfront_utils import get_cloudfront_url
 from utils.supabase_utils import supabase_client
@@ -322,10 +322,9 @@ def create_http_session() -> requests.Session:
     session.mount("https://", adapter)
     return session
 
-# Optional: Add a utility function to check embedding reuse stats
 async def get_embedding_reuse_stats(project_id: str) -> Dict[str, Any]:
     """
-    Get statistics about embedding reuse for a project
+    Get statistics about embedding reuse ♻️ for a project
     """
     # Use global async pool instead of local pool
     pool = get_global_async_db_pool()
@@ -524,7 +523,7 @@ def get_file_extension_from_url(url: str) -> str:
     # Final fallback - assume PDF for unknown academic content
     return '.pdf'
 
-def get_clean_filename_from_url(url: str, extension: str) -> str:
+def parse_clean_filename_from_url(url: str, extension: str) -> str:
     """
     Generate a clean filename from URL
     """
@@ -748,7 +747,7 @@ async def _download_and_prep_doc(client: httpx.AsyncClient, url: str, project_id
 
             # Enhanced file extension detection
             ext = get_file_extension_from_url(url)
-            filename = get_clean_filename_from_url(url, ext)
+            filename = parse_clean_filename_from_url(url, ext)
             s3_key = f"{project_id}/{uuid.uuid4()}{ext}"
             
             # Stream directly to S3 && AWS CloudFront from the in-memory buffer
@@ -1163,7 +1162,7 @@ def process_document_batch_workflow(
     create_note: bool = False
 ) -> Dict[str, Any]:
     """
-    [ORCHESTRATOR] 🚶‍➡️ Main entry point for batch document processing, this is the task that gets called by your API/frontend
+    [SYNC ORCHESTRATOR] 🚶‍➡️ Main entry point for batch document processing, this is the task that gets called by your API/frontend
 
     1. Use persistent event loop for coordination/analysis
     - Handles mixed new/reused document scenarios
@@ -1726,6 +1725,10 @@ async def _process_document_async_workflow(
         # --- INTEGRATION ⚙️: This could also be where we can kick off ainsert() with LightRag -------------
         # You can also add document UUIDs here so that LightRAG can use them in its pipeline for consistency
         # LightRAG only accepts full parsed documents so I'll need to concatenate the chunks back into a single document
+        lightrag_client.insert_document_into_kg(
+            doc_id=doc_id,
+            chunks=chunks,
+        )
 
         # ——— 3. EMBEDDING Process, async with concurrency control ————————————————
         logger.info(f"📋 [DOC-{short_id}] → EMBEDDING")
@@ -1977,317 +1980,6 @@ def process_reused_document_task(
             'error': str(e)
         }
 
-
-# ——— Advanced Monitoring & Maintenance Tasks (Unchanged from v5) —————————————————
-# NOTE: The highly-praised health check, cleanup, and optimization tasks are
-# preserved. They are a critical part of the production system.
-
-@celery_app.task(bind=True, queue='monitoring')
-def system_health_check(self) -> Dict[str, Any]:
-    """
-    Comprehensive system health monitoring:
-    - Resource utilization tracking
-    - Queue depth monitoring
-    - Performance baseline validation
-    - Automatic scaling recommendations
-    """
-    
-    try:
-        # System resource metrics
-        cpu_percent = psutil.cpu_percent(interval=1)
-        memory = psutil.virtual_memory()
-        disk = psutil.disk_usage('/')
-        
-        # Queue depth monitoring
-        queue_stats = {}
-        for queue_name in [INGEST_QUEUE, PARSE_QUEUE, EMBED_QUEUE, FINAL_QUEUE]:
-            try:
-                inspect = celery_app.control.inspect()
-                active_tasks = inspect.active()
-                queue_length = len(active_tasks.get(queue_name, [])) if active_tasks else 0
-                queue_stats[queue_name] = queue_length
-            except:
-                queue_stats[queue_name] = -1  # Unable to determine
-        
-        # Performance baselines
-        recent_metrics = metrics_collector.get_recent_performance_metrics()
-        
-        # Health assessment
-        health_status = "healthy"
-        issues = []
-        
-        if cpu_percent > 85:
-            health_status = "degraded"
-            issues.append(f"High CPU usage: {cpu_percent:.1f}%")
-        
-        if memory.percent > 90:
-            health_status = "critical"
-            issues.append(f"High memory usage: {memory.percent:.1f}%")
-        
-        if disk.percent > 90:
-            health_status = "critical"
-            issues.append(f"High disk usage: {disk.percent:.1f}%")
-        
-        # Generate scaling recommendations
-        recommendations = []
-        total_queue_depth = sum(v for v in queue_stats.values() if v > 0)
-        
-        if total_queue_depth > 100:
-            recommendations.append("Consider scaling up worker instances")
-        
-        if cpu_percent < 30 and total_queue_depth < 10:
-            recommendations.append("System is under-utilized, consider scaling down")
-        
-        health_report = {
-            'timestamp': datetime.now(timezone.utc).isoformat(),
-            'status': health_status,
-            'issues': issues,
-            'recommendations': recommendations,
-            'system_metrics': {
-                'cpu_percent': cpu_percent,
-                'memory_percent': memory.percent,
-                'disk_percent': disk.percent,
-                'available_memory_gb': memory.available / (1024**3)
-            },
-            'queue_stats': queue_stats,
-            'performance_metrics': recent_metrics
-        }
-        
-        # Store health report
-        supabase_client.table('system_health_reports') \
-            .insert(health_report).execute()
-        
-        return health_report
-        
-    except Exception as e:
-        logger.error(f"Health check failed: {e}")
-        return {
-            'timestamp': datetime.now(timezone.utc).isoformat(),
-            'status': 'error',
-            'error': str(e)
-        }
-
-@celery_app.task(bind=True, queue='maintenance')
-def cleanup_orphaned_resources(self) -> Dict[str, Any]:
-    """
-    Automated cleanup of orphaned resources:
-    - Remove stale temporary files
-    - Clean up incomplete processing records
-    - Purge old metrics and logs
-    - Optimize database performance
-    """
-    
-    cleanup_stats = {
-        'temp_files_removed': 0,
-        'stale_records_cleaned': 0,
-        'old_metrics_purged': 0,
-        'errors': []
-    }
-    
-    try:
-        # Clean up temporary files older than 24 hours
-        temp_dir = tempfile.gettempdir()
-        cutoff_time = time.time() - (24 * 3600)  # 24 hours ago
-        
-        for filename in os.listdir(temp_dir):
-            filepath = os.path.join(temp_dir, filename)
-            if os.path.isfile(filepath) and os.path.getmtime(filepath) < cutoff_time:
-                try:
-                    os.unlink(filepath)
-                    cleanup_stats['temp_files_removed'] += 1
-                except:
-                    pass
-        
-        # Clean up documents stuck in processing states for > 4 hours
-        four_hours_ago = datetime.now(timezone.utc) - timedelta(hours=4)
-        
-        stale_docs = supabase_client.table('document_sources') \
-            .select('id') \
-            .in_('vector_embed_status', [
-                ProcessingStatus.PARSING.value,
-                ProcessingStatus.EMBEDDING.value
-            ]) \
-            .lt('created_at', four_hours_ago.isoformat()) \
-            .execute()
-        
-        if stale_docs.data:
-            doc_ids = [doc['id'] for doc in stale_docs.data]
-            supabase_client.table('document_sources') \
-                .update({
-                    'vector_embed_status': ProcessingStatus.FAILED_PARSING.value,
-                    'error_message': 'Processing timed out - cleaned up by maintenance task'
-                }) \
-                .in_('id', doc_ids) \
-                .execute()
-            
-            cleanup_stats['stale_records_cleaned'] = len(doc_ids)
-        
-        # Purge old metrics (keep last 30 days)
-        thirty_days_ago = datetime.now(timezone.utc) - timedelta(days=30)
-        
-        old_metrics = supabase_client.table('system_health_reports') \
-            .delete() \
-            .lt('timestamp', thirty_days_ago.isoformat()) \
-            .execute()
-        
-        cleanup_stats['old_metrics_purged'] = len(old_metrics.data) if old_metrics.data else 0
-        
-        logger.info(f"Cleanup completed: {cleanup_stats}")
-        return cleanup_stats
-        
-    except Exception as e:
-        cleanup_stats['errors'].append(str(e))
-        logger.error(f"Cleanup task failed: {e}")
-        return cleanup_stats
-
-# ——— Production Performance Optimization Tasks ————————————————————————————————————
-
-@celery_app.task(bind=True, queue='optimization')
-def optimize_embedding_performance(self) -> Dict[str, Any]:
-    """
-    Automated performance optimization:
-    - Analyze embedding performance patterns
-    - Adjust batch sizes based on historical data
-    - Optimize rate limits based on API performance
-    - Generate performance improvement recommendations
-    """
-    
-    try:
-        # Analyze recent performance data
-        performance_data = metrics_collector.get_performance_analysis()
-        
-        # Calculate optimal batch size based on throughput
-        optimal_batch_size = batch_processor.calculate_optimal_batch_size(
-            performance_data.get('avg_processing_time', 10.0),
-            performance_data.get('avg_memory_usage', 50.0)
-        )
-        
-        # Generate optimization recommendations
-        recommendations = {
-            'current_batch_size': batch_processor.current_batch_size,
-            'recommended_batch_size': optimal_batch_size,
-            'performance_improvement_est': performance_data.get('improvement_estimate', 0),
-            'memory_optimization_tips': [],
-            'scaling_recommendations': []
-        }
-        
-        # Memory optimization tips
-        if performance_data.get('avg_memory_usage', 0) > 80:
-            recommendations['memory_optimization_tips'].extend([
-                "Consider reducing batch size",
-                "Implement more aggressive garbage collection",
-                "Add memory circuit breakers"
-            ])
-        
-        # Scaling recommendations
-        if performance_data.get('avg_queue_depth', 0) > 50:
-            recommendations['scaling_recommendations'].extend([
-                "Scale up embedding workers",
-                "Increase rate limits if API allows",
-                "Consider load balancing across regions"
-            ])
-        
-        # Apply optimizations
-        if abs(optimal_batch_size - batch_processor.current_batch_size) > 2:
-            batch_processor.current_batch_size = optimal_batch_size
-            logger.info(f"Batch size optimized to {optimal_batch_size}")
-        
-        return {
-            'timestamp': datetime.now(timezone.utc).isoformat(),
-            'optimizations_applied': recommendations,
-            'performance_data': performance_data
-        }
-        
-    except Exception as e:
-        logger.error(f"Performance optimization failed: {e}")
-        return {'error': str(e)}
-
-# ——— Utility Functions for Production Deployment ————————————————————————————————————
-
-def validate_production_readiness() -> Dict[str, Any]:
-    """
-    Validate that all production requirements are met
-    """
-    checks = {
-        'environment_variables': True,
-        'database_connectivity': True,
-        'external_services': True,
-        'resource_limits': True,
-        'monitoring_setup': True
-    }
-    
-    issues = []
-    
-    # Check environment variables
-    required_vars = ['OPENAI_API_KEY', 'SUPABASE_URL', 'SUPABASE_KEY', 'AWS_ACCESS_KEY_ID']
-    for var in required_vars:
-        if not os.getenv(var):
-            checks['environment_variables'] = False
-            issues.append(f"Missing environment variable: {var}")
-    
-    # Check database connectivity
-    try:
-        supabase_client.table('document_sources').select('id').limit(1).execute()
-    except Exception as e:
-        checks['database_connectivity'] = False
-        issues.append(f"Database connectivity failed: {e}")
-    
-    # Check resource limits
-    memory_gb = psutil.virtual_memory().total / (1024**3)
-    if memory_gb < 2:
-        checks['resource_limits'] = False
-        issues.append(f"Insufficient memory: {memory_gb:.1f}GB < 2GB minimum")
-    
-    return {
-        'ready_for_production': all(checks.values()),
-        'checks': checks,
-        'issues': issues,
-        'recommendations': [
-            "Set up comprehensive monitoring and alerting",
-            "Configure auto-scaling based on queue depth",
-            "Implement proper backup and disaster recovery",
-            "Set up log aggregation and analysis"
-        ]
-    }
-
-# ——— Production Deployment & Initialization ————————————————————————————————————————
-
-def initialize_production_pipeline():
-    """
-    Initialize the production pipeline with all required components
-    """
-    logger.info("Initializing production RAG pipeline...")
-    
-    # Initialize global components
-    global memory_manager, metrics_collector, batch_processor, downloader
-    
-    # Validate production readiness
-    readiness_check = validate_production_readiness()
-    if not readiness_check['ready_for_production']:
-        logger.error(f"Production readiness check failed: {readiness_check['issues']}")
-        raise RuntimeError("Pipeline not ready for production deployment")
-    
-    # Schedule periodic maintenance tasks
-    from celery.schedules import crontab
-    
-    # Health checks every 5 minutes
-    celery_app.conf.beat_schedule = {
-        'system-health-check': {
-            'task': 'system_health_check',
-            'schedule': 300.0,  # 5 minutes
-        },
-        'cleanup-orphaned-resources': {
-            'task': 'cleanup_orphaned_resources',
-            'schedule': crontab(hour=2, minute=0),  # Daily at 2 AM
-        },
-        'optimize-performance': {
-            'task': 'optimize_embedding_performance',
-            'schedule': crontab(minute=0),  # Every hour
-        }
-    }
-    
-    logger.info("Production RAG pipeline initialized successfully!")
-    return True
 
 # ——— Module Exports ————————————————————————————————————————————————————————————————
 
