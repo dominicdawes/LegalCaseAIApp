@@ -1725,6 +1725,8 @@ async def _process_document_async_workflow(
         # --- INTEGRATION ⚙️: This could also be where we can kick off ainsert() with LightRag -------------
         # You can also add document UUIDs here so that LightRAG can use them in its pipeline for consistency
         # LightRAG only accepts full parsed documents so I'll need to concatenate the chunks back into a single document
+        
+        # @TODO: ADD IN A SWITCH FOR LIGHTRAG INTEGRATION
         lightrag_client.insert_document_into_kg(
             doc_id=doc_id,
             chunks=chunks,
