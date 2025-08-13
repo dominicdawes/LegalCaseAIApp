@@ -82,7 +82,7 @@ from utils.supabase_utils import (
 
 from tasks.celery_app import run_async_in_worker
 from tasks.database import get_db_connection, get_redis_connection, get_global_async_db_pool, get_global_redis_pool, init_async_pools, check_db_pool_health
-from utils.yaml_processor import load_yaml_prompt, build_chat_messages_from_yaml
+from utils.prompt_utils import load_yaml_prompt, build_chat_messages_from_yaml
 
 # ——— Logging & Env Load ———————————————————————————————————————————————————————————
 
