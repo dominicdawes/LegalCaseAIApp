@@ -15,14 +15,20 @@ from typing import List, Dict, Any, Optional, Tuple
 from datetime import datetime, timezone
 from dataclasses import dataclass
 
-# LightRAG and graph libraries
+# LightRAG core
 from lightrag import LightRAG, QueryParam
-from lightrag.llm import gpt_4o_mini_complete
-from lightrag.embedding import openai_embedding
+from lightrag.kg.neo4j_impl import Neo4JStorage
 
+# LLM and embedding functions
+from lightrag.utils import EmbeddingFunc
+from lightrag.llm.openai import (
+    gpt_4o_mini_complete,
+    openai_embed
+)
 # DGraph integration
 import pydgraph
 from pydgraph import DgraphClient, DgraphClientStub
+
 
 # Your existing imports
 from utils.llm_clients.llm_factory import LLMFactory
@@ -278,42 +284,52 @@ class LightRAGManager:
         self.lightrag = None
         self._initialized = False
     
-    async def initialize(self):
-        """Initialize LightRAG with DGraph as the graph storage backend"""
-        if self._initialized:
-            return
+async def initialize(self):
+    """Initialize LightRAG with DGraph as the graph storage backend"""
+    if self._initialized:
+        return
+    
+    try:
+        # Configure LightRAG to use DGraph as its graph storage
+        self.lightrag = LightRAG(
+            working_dir=LIGHTRAG_WORKING_DIR,
+            
+            # LLM configuration
+            llm_model_func=gpt_4o_mini_complete,
+            
+            # Embedding configuration - wrap openai_embed properly
+            embedding_func=EmbeddingFunc(
+                embedding_dim=1536,  # OpenAI ada-002 dimension
+                max_token_size=8192,
+                func=lambda texts: openai_embed(
+                    texts=texts,
+                    model="text-embedding-ada-002",
+                    api_key=os.getenv("OPENAI_API_KEY"),
+                    base_url=os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
+                )
+            ),
+            
+            # Storage configuration - LightRAG handles the graph internally (eventually add and DGraphStorage... for now i have Neo4JStorage)
+            graph_storage_cls=Neo4JStorage,
+            graph_storage_kwargs={
+                "host": DGRAPH_HOST,
+                "port": 9080, 
+            },
+            
+            # Vector storage (can be separate or integrated)
+            vector_storage_cls="NanoVectorDBStorage",
+        )
         
-        try:
-            # Configure LightRAG to use DGraph as its graph storage
-            self.lightrag = LightRAG(
-                working_dir=LIGHTRAG_WORKING_DIR,
-                
-                # LLM configuration
-                llm_model_func=gpt_4o_mini_complete,
-                embedding_func=openai_embedding,
-                
-                # Storage configuration - LightRAG handles the graph internally
-                graph_storage_cls=DGraphStorage,
-                graph_storage_kwargs={
-                    "host": DGRAPH_HOST,
-                    "port": 9080,
-                    # Add any DGraph-specific configuration here
-                },
-                
-                # Vector storage (can be separate or integrated)
-                vector_storage_cls="NanoVectorDBStorage",  # or your preferred vector storage
-            )
-            
-            # Initialize LightRAG's internal storages (including DGraph)
-            await self.lightrag.initialize_storages()
-            await self.lightrag.initialize_pipeline_status()
-            
-            self._initialized = True
-            logger.info("✅ LightRAG manager initialized with DGraph backend")
-            
-        except Exception as e:
-            logger.error(f"❌ LightRAG manager initialization failed: {e}")
-            raise
+        # Initialize LightRAG's internal storages (including DGraph)
+        await self.lightrag.initialize_storages()
+        await self.lightrag.initialize_pipeline_status()
+        
+        self._initialized = True
+        logger.info("✅ LightRAG manager initialized with DGraph backend")
+        
+    except Exception as e:
+        logger.error(f"❌ LightRAG manager initialization failed: {e}")
+        raise
 
     async def insert_document_into_kg(
             self, 
