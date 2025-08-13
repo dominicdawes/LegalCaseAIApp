@@ -38,7 +38,7 @@ from tasks.upload_tasks import process_document_batch_workflow
 # from tasks.upload_tasks import test_celery_log_task
 # from tasks.upload_tasks import append_document_task  <-- need to revive this later
 from tasks.sample_tasks import addition_task
-from tasks.chat_streaming_tasks import rag_chat_streaming_task
+# from tasks.chat_streaming_tasks import rag_chat_streaming_task
 from tasks.chat_tasks import rag_chat_task, persist_user_query
 from tasks.note_tasks import rag_note_task 
 
@@ -552,35 +552,35 @@ async def rag_chat(request: RagQueryRequest):
 #     except Exception as e:
 #         raise HTTPException(status_code=400, detail=str(e))
 
-@app.post("/rag-chat/regenerate/")
-async def rag_chat_regenerate(request: RagRegenerateRequest):
-    """
-    Endpoint for regenerating a "FAILED" RAG query (token streaming not ENABLED)
+# @app.post("/rag-chat/regenerate/")
+# async def rag_chat_regenerate(request: RagRegenerateRequest):
+#     """
+#     Endpoint for regenerating a "FAILED" RAG query (token streaming not ENABLED)
     
-    Raw json:
-    ----------
-    {
-        "user_id": "...",
-        "chat_session_id": "...",
-        "query": "...",
-        "project_id": "...",
-        "model_name": "..." 
-    }
-    """
-    try:
-        # Trigger the RAG task asynchronously and add it to the queue
-        task = rag_chat_streaming_task.apply_async(args=[
-            request.user_id,
-            request.message_id,
-            request.query,
-            request.project_id,
-            request.model_name
-        ])
+#     Raw json:
+#     ----------
+#     {
+#         "user_id": "...",
+#         "chat_session_id": "...",
+#         "query": "...",
+#         "project_id": "...",
+#         "model_name": "..." 
+#     }
+#     """
+#     try:
+#         # Trigger the RAG task asynchronously and add it to the queue
+#         task = rag_chat_streaming_task.apply_async(args=[
+#             request.user_id,
+#             request.message_id,
+#             request.query,
+#             request.project_id,
+#             request.model_name
+#         ])
         
-        # Return the task ID to the client
-        return {"task_id": task.id}
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+#         # Return the task ID to the client
+#         return {"task_id": task.id}
+#     except Exception as e:
+#         raise HTTPException(status_code=400, detail=str(e))
 
 # @app.post("/rag-chat-stream/regenerate/")
 # async def rag_chat_stream_regenerate(request: RagQueryRequest):
