@@ -2008,7 +2008,7 @@ __all__ = [
     '_handle_duplicate_only_batch',              # NEW: Handle all-duplicate scenarios
     
     # ——— System Management Tasks ———————————————————————————————————————————————————
-    'test_celery_log_task',                      # KEEP: Testing functionality
+    # 'test_celery_log_task',                      # KEEP: Testing functionality
     'system_health_check',                       # KEEP: If you have this
     'cleanup_orphaned_resources',                # KEEP: If you have this
     'optimize_embedding_performance',            # KEEP: If you have this

@@ -402,10 +402,10 @@ async def initialize(self):
             raise
 
     async def process_document_with_knowledge_graph(self, 
-                                                  doc_id: str,
-                                                  content: str, 
-                                                  project_id: str,
-                                                  metadata: Dict = None) -> Dict[str, Any]:
+                                                    doc_id: str,
+                                                    content: str, 
+                                                    project_id: str,
+                                                    metadata: Dict = None) -> Dict[str, Any]:
         """
         Process document through LightRAG system
         
@@ -484,10 +484,10 @@ async def initialize(self):
             return {'entities_count': 0, 'relationships_count': 0, 'chunks_count': 0}
     
     async def enhanced_retrieval(self, 
-                               query: str, 
-                               project_id: str,
-                               mode: str = "hybrid",
-                               top_k: int = 10) -> Dict[str, Any]:
+                                query: str, 
+                                project_id: str,
+                                mode: str = "hybrid",
+                                top_k: int = 10) -> Dict[str, Any]:
         """
         Enhanced retrieval using LightRAG + optional vector fallback
         
