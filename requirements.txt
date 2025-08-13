@@ -58,8 +58,8 @@ promptic
 
 # LightRAG and dependencies
 lightrag-hku
-nano-vectordb>=0.1.0
+nano-vectordb>=0.0.4.3
 pydgraph>=21.12.0
 
 # Optional: LightRAG server features
-# lightrag[api]==1.3.7
+# lightrag-hku[api]==1.3.7
