@@ -110,6 +110,7 @@ logger.propagate = False
 load_dotenv()
 
 # ——— Configuration & Constants ————————————————————————————————————————————————————
+USE_LIGHTRAG_INTEGRATION = False
 
 # Queue configuration
 INGEST_QUEUE = 'ingest'
@@ -1727,10 +1728,11 @@ async def _process_document_async_workflow(
         # LightRAG only accepts full parsed documents so I'll need to concatenate the chunks back into a single document
         
         # @TODO: ADD IN A SWITCH FOR LIGHTRAG INTEGRATION
-        lightrag_client.insert_document_into_kg(
-            doc_id=doc_id,
-            chunks=chunks,
-        )
+        if USE_LIGHTRAG_INTEGRATION:
+            lightrag_client.insert_document_into_kg(
+                doc_id=doc_id,
+                chunks=chunks,
+            )
 
         # ——— 3. EMBEDDING Process, async with concurrency control ————————————————
         logger.info(f"📋 [DOC-{short_id}] → EMBEDDING")

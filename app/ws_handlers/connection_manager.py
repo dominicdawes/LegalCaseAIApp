@@ -18,6 +18,7 @@ class ConnectionManager:
     def __init__(self):
         self.active_connections: Dict[str, Set[WebSocket]] = {}
         self.user_sessions: Dict[str, Set[str]] = {}  # user_id -> session_ids
+        self._lock = asyncio.Lock()  # Add lock for thread safety
         
     async def connect(self, websocket: WebSocket, session_id: str, user_id: str = None):
         """Connect a WebSocket to a chat session"""
@@ -53,25 +54,46 @@ class ConnectionManager:
     
     async def send_to_session(self, session_id: str, message: dict):
         """Send message to all connections in a session"""
-        if session_id in self.active_connections:
-            dead_connections = set()
+        # Create a copy of connections to avoid modification during iteration
+        async with self._lock:
+            connections = self.active_connections.get(session_id, set()).copy()
+        
+        if not connections:
+            logger.warning(f"No active connections for session {session_id}")
+            return
             
-            for connection in self.active_connections[session_id]:
-                try:
-                    await connection.send_text(json.dumps(message))
-                except Exception as e:
-                    logger.warning(f"⚠️ Failed to send to connection: {e}")
-                    dead_connections.add(connection)
+        dead_connections = set()
+        message_json = json.dumps(message)
+        
+        # Send to all connections
+        for connection in connections:
+            try:
+                await connection.send_text(message_json)
+                logger.debug(f"✅ Sent message to connection in session {session_id}: {message.get('type', 'unknown')}")
+            except Exception as e:
+                logger.warning(f"⚠️ Failed to send to connection in session {session_id}: {e}")
+                dead_connections.add(connection)
+        
+        # Clean up dead connections
+        if dead_connections:
+            async with self._lock:
+                if session_id in self.active_connections:
+                    for dead_conn in dead_connections:
+                        self.active_connections[session_id].discard(dead_conn)
+                    
+                    # Remove empty session
+                    if not self.active_connections[session_id]:
+                        del self.active_connections[session_id]
             
-            # Clean up dead connections
-            for dead_conn in dead_connections:
-                self.active_connections[session_id].discard(dead_conn)
+            logger.info(f"🧹 Cleaned up {len(dead_connections)} dead connections from session {session_id}")
     
     async def send_to_user(self, user_id: str, message: dict):
         """Send message to all sessions for a user"""
-        if user_id in self.user_sessions:
-            for session_id in self.user_sessions[user_id]:
-                await self.send_to_session(session_id, message)
+        async with self._lock:
+            session_ids = self.user_sessions.get(user_id, set()).copy()
+        
+        for session_id in session_ids:
+            await self.send_to_session(session_id, message)
 
     def get_stats(self):
         """Get connection statistics"""
