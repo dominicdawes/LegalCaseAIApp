@@ -1694,11 +1694,11 @@ async def _process_document_async_workflow(
             with conn.cursor() as cur:
                 if workflow_metadata['essential_course']:
                     cur.execute(
-                        '''INSERT INTO essential_sources 
-                        (id, essential_course, essential_section, cdn_url, content_hash, project_id, content_tags, uploaded_by, 
+                        '''INSERT INTO document_sources 
+                        (id, essential_course, essential_section, is_essential, cdn_url, content_hash, project_id, content_tags, uploaded_by, 
                         vector_embed_status, filename, file_size_bytes, file_extension, created_at, processing_metadata)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)''',
-                        (doc_id, doc_data['essential_course'], doc_data['essential_section'], doc_data['cdn_url'], doc_data['content_hash'], 
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)''',
+                        (doc_id, workflow_metadata['essential_course'], workflow_metadata['essential_section'], workflow_metadata['essential_section'], doc_data['cdn_url'], doc_data['content_hash'], 
                         project_id, doc_data.get('content_tags', []), workflow_metadata['user_id'],
                         ProcessingStatus.PENDING.value, doc_data['filename'], 
                         doc_data['file_size_bytes'], os.path.splitext(doc_data['filename'])[1].lower(),
