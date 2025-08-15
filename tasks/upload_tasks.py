@@ -1375,9 +1375,9 @@ async def _execute_batch_workflow(batch_id: str, file_urls: List[str], metadata:
         for doc_info in new_documents:
             # Single task per document - handles everything internally
             task_sig = process_new_document_wrapper.s(
-                doc_info['doc_data'], 
-                doc_info['project_id'], 
-                {**metadata, 'batch_id': batch_id}
+                doc_data=doc_info['doc_data'], 
+                project_id=doc_info['project_id'], 
+                workflow_metadata={**metadata, 'batch_id': batch_id}
             )
             document_tasks.append(task_sig)     # ← Add NEW docs to chord signature
 
@@ -1615,7 +1615,7 @@ def process_new_document_wrapper(
     - Delegates complex async work to dedicated function
     - Clean error handling and state management
     """
-    doc_id = str(uuid.uuid4())
+    doc_id = str(uuid.uuid4())  # create a new uuid
     doc_data['id'] = doc_id
     short_id = doc_id[:8]
     
@@ -1679,6 +1679,9 @@ async def _process_document_async_workflow(
     - Can use async/await for I/O operations
     - Clean error handling
     - Returns final result
+
+    doc_id (str): created earlier in task
+    doc_data (Dict): document metadata
     """
     short_id = doc_id[:8]
     
@@ -1689,18 +1692,32 @@ async def _process_document_async_workflow(
         conn = pool.getconn()
         try:
             with conn.cursor() as cur:
-                cur.execute(
-                    '''INSERT INTO document_sources 
-                    (id, cdn_url, content_hash, project_id, content_tags, uploaded_by, 
-                    vector_embed_status, filename, file_size_bytes, file_extension, created_at, processing_metadata)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)''',
-                    (doc_id, doc_data['cdn_url'], doc_data['content_hash'], 
-                    project_id, doc_data.get('content_tags', []), workflow_metadata['user_id'],
-                    ProcessingStatus.PENDING.value, doc_data['filename'], 
-                    doc_data['file_size_bytes'], os.path.splitext(doc_data['filename'])[1].lower(),
-                    datetime.now(timezone.utc), Json(workflow_metadata))
-                )
-                conn.commit()
+                if workflow_metadata['essential_course']:
+                    cur.execute(
+                        '''INSERT INTO essential_sources 
+                        (id, essential_course, essential_section, cdn_url, content_hash, project_id, content_tags, uploaded_by, 
+                        vector_embed_status, filename, file_size_bytes, file_extension, created_at, processing_metadata)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)''',
+                        (doc_id, doc_data['essential_course'], doc_data['essential_section'], doc_data['cdn_url'], doc_data['content_hash'], 
+                        project_id, doc_data.get('content_tags', []), workflow_metadata['user_id'],
+                        ProcessingStatus.PENDING.value, doc_data['filename'], 
+                        doc_data['file_size_bytes'], os.path.splitext(doc_data['filename'])[1].lower(),
+                        datetime.now(timezone.utc), Json(workflow_metadata))
+                    )
+                    conn.commit()
+                else:
+                    cur.execute(
+                        '''INSERT INTO document_sources 
+                        (id, cdn_url, content_hash, project_id, content_tags, uploaded_by, 
+                        vector_embed_status, filename, file_size_bytes, file_extension, created_at, processing_metadata)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)''',
+                        (doc_id, doc_data['cdn_url'], doc_data['content_hash'], 
+                        project_id, doc_data.get('content_tags', []), workflow_metadata['user_id'],
+                        ProcessingStatus.PENDING.value, doc_data['filename'], 
+                        doc_data['file_size_bytes'], os.path.splitext(doc_data['filename'])[1].lower(),
+                        datetime.now(timezone.utc), Json(workflow_metadata))
+                    )
+                    conn.commit()
         finally:
             pool.putconn(conn)
         

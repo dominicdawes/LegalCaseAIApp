@@ -386,56 +386,6 @@ async def create_new_rag_project(
         logger.error(f"Error creating new RAG project: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Error creating RAG project: {str(e)}")
 
-@app.post("/generate-ai-note/", response_model=GenericTaskResponse)
-async def generate_ai_note(
-    request: NewGeneratedNoteRequest, 
-    background_tasks: BackgroundTasks
-):
-    '''LIVE (06-03-2025)
-    Endpoint to generate note for an EXISTING project
-        - rag_note_task():
-            input: request.metadata
-            returns: None
-        
-    Request contains:
-        request.metadata (json): {
-            project_id:,
-            chat_session_id:,
-            note_type:,
-            ...
-            model_name
-        }
-    '''
-    try:
-        # ——— Data Validation ————————————————————————————————
-
-        if not request.metadata.get('project_id'):
-            raise HTTPException(status_code=400, detail="project_id is required in metadata")
-        if not request.metadata.get('user_id'):
-            raise HTTPException(status_code=400, detail="user_id is required in metadata")
-
-
-        # ——— Celery Task Enqueue ————————————————————————————————
-
-        # Apply async job to generate ai notes (grounded w/ RAG)
-        job = rag_note_task.apply_async(    
-            kwargs={
-                "user_id":       request.metadata["user_id"],       # ← maps to your user_id param
-                "note_type":     request.metadata["note_type"],     # ← maps to your note_type param
-                "project_id":    request.metadata["project_id"],    # ← maps to your project_id param  
-                "note_title":    request.metadata["note_title"],    # ← "project_name: question type"
-                "provider":      request.metadata["provider"],
-                "model_name":    request.metadata["model_name"],    # ← maps to your model_name param
-                "temperature":   request.metadata["temperature"],
-                "addtl_params":  request.metadata["addtl_params"]       # ← Dict passed in by weweb/postman 
-            }
-        )
-        # Poll in postman: "my_domain.com/task-status/{task_id}"
-        return {"task_id": job.id}
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
 @app.post("/embed-new-docs/", response_model=RagPipelineNewDocumentsResponse)
 async def append_sources_to_project(request: RagPipelineNewDocumentsRequest, background_tasks: BackgroundTasks):
     '''
@@ -455,12 +405,10 @@ async def append_sources_to_project(request: RagPipelineNewDocumentsRequest, bac
     '''
 
     try:
-        # Apply async job to append new docs to an existing project (grounded w/ RAG)
-        job = process_document_task.apply_async(
-            args=[
-                request.files, 
-                request.metadata
-            ]
+        # Apply async job to append new docs to an existing project (NO NOTES CREATION)
+        job = process_document_batch_workflow.apply_async(
+            args=[request.files, request.metadata],
+            kwargs={"create_note": False}
         )
         return {"embedding_task_id": job.id}
 
