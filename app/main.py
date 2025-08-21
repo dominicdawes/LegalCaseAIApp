@@ -264,7 +264,7 @@ class RagRegenerateRequest(BaseModel):
 
 class NewGeneratedNoteRequest(BaseModel):
     ''' 
-    Pydantic struct for `POST/generate-ai-note/` to kick off of a creation of a New Generate NOte
+    Pydantic struct for `POST/generate-note/` to kick off of a creation of a New Generate Note
     Files → S3/CF upload → Vector embedding
     '''
     # files: List[str]  # List of URLs or file paths of the PDFs
@@ -736,32 +736,45 @@ async def get_task_status(task_id: str):
 #          RAG GENERATIVE NOTES ENDPOINTS
 # ================================================ #
 
-# @app.post("/generate-rag-note/")
-# async def generate_rag_note(request: RagQueryRequest):
-#     """
-#     postman raw json body:
-#     {
-#         "user_id": "",
-#         "chat_session_id": "",
-#         "query": "",
-#         "project_id": "",
-#         "model_name": "" 
-#     }
-#     """
-#     try:
-#         # Trigger the RAG task asynchronously and add it to the queue
-#         task = rag_chat_task.apply_async(args=[
-#             request.user_id,
-#             request.chat_session_id,
-#             request.query,
-#             request.project_id,
-#             request.model_name
-#         ])
+@app.post("/generate-note/", response_model=GenericTaskResponse)
+async def generate_note(
+    request: NewGeneratedNoteRequest, 
+    background_tasks: BackgroundTasks
+):
+    '''LIVE (08-20-2025)
+    Endpoint to generate note for an EXISTING project
+        - rag_note_task():
+            input: request.metadata
+            returns: None
         
-#         # Return the task ID to the client
-#         return {"task_id": task.id}
-#     except Exception as e:
-#         raise HTTPException(status_code=400, detail=str(e))
+    Request contains:
+        request.metadata (json): {
+            project_id:,
+            chat_session_id:,
+            note_type:,
+            ...
+            model_name
+        }
+    '''
+    try:
+        # Apply async job to generate ai notes (grounded w/ RAG)
+        job = rag_note_task.apply_async(    
+            kwargs={
+                "user_id":       request.metadata["user_id"],       # ← maps to your user_id param
+                "note_type":     request.metadata["note_type"],     # ← maps to your note_type param
+                "project_id":    request.metadata["project_id"],    # ← maps to your project_id param  
+                "note_title":    request.metadata["note_title"],    # ← "project_name: question type"
+                "provider":      request.metadata["provider"],
+                "model_name":    request.metadata["model_name"],    # ← maps to your model_name param
+                "temperature":   request.metadata["temperature"],
+                "addtl_params":  request.metadata["addtl_params"]       # ← Dict passed in by WeWeb/postman 
+            }
+        )
+        # Poll in postman: "my_domain.com/task-status/{task_id}"
+        return {"task_id": job.id}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # ================================================ #
