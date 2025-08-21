@@ -59,6 +59,8 @@ redis_pub = aioredis.from_url(REDIS_LABS_URL, decode_responses=True)
 origins = [
     "https://app.weweb.io",  # Replace with the actual WeWeb domain if different
     "https://editor.weweb.io",
+    "https://www.legalnote.io",  # Add your new domain
+    "https://legalnote.io",      # Also add without www in case
     # Add other domains as needed
 ]
 
