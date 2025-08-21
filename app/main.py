@@ -482,24 +482,6 @@ async def rag_chat(request: RagQueryRequest):
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-# @app.post("/rag-chat-stream/")
-# async def rag_chat_stream(request: RagQueryRequest):
-#     """Endpoint for the rag query responses (token streaming not ENABLED), still a WORK IN PROGRESS !!! """
-#     try:
-#         # Trigger the RAG task asynchronously and add it to the queue
-#         task = rag_chat_streaming_task.apply_async(args=[
-#             request.user_id,
-#             request.chat_session_id,
-#             request.query,
-#             request.project_id,
-#             request.model_name
-#         ])
-        
-#         # Return the task ID to the client
-#         return {"task_id": task.id}
-#     except Exception as e:
-#         raise HTTPException(status_code=400, detail=str(e))
-
 # @app.post("/rag-chat/regenerate/")
 # async def rag_chat_regenerate(request: RagRegenerateRequest):
 #     """
@@ -530,26 +512,8 @@ async def rag_chat(request: RagQueryRequest):
 #     except Exception as e:
 #         raise HTTPException(status_code=400, detail=str(e))
 
-# @app.post("/rag-chat-stream/regenerate/")
-# async def rag_chat_stream_regenerate(request: RagQueryRequest):
-#     """@TODO Endpoint for regenerating a failed RAG query (token streaming IS ENABLED), still a WORK IN PROGRESS !!! """
-#     try:
-#         # Trigger the RAG task asynchronously and add it to the queue
-#         task = rag_chat_streaming_task.apply_async(args=[
-#             request.user_id,
-#             request.chat_session_id,
-#             request.query,
-#             request.project_id,
-#             request.model_name
-#         ])
-        
-#         # Return the task ID to the client
-#         return {"task_id": task.id}
-#     except Exception as e:
-#         raise HTTPException(status_code=400, detail=str(e))
-
 # ================================================ #
-#                SRATUS ENDPOINTS
+#                STATUS ENDPOINTS
 # ================================================ #
 
 @app.get("/pdf-upload-task-status/{task_id}")
