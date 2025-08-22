@@ -1692,7 +1692,7 @@ async def _process_document_async_workflow(
         conn = pool.getconn()
         try:
             with conn.cursor() as cur:
-                if workflow_metadata['essential_course']:
+                if workflow_metadata['is_essential']:
                     cur.execute(
                         '''INSERT INTO document_sources 
                         (id, essential_course, essential_section, is_essential, cdn_url, content_hash, project_id, content_tags, uploaded_by, 
