@@ -1691,22 +1691,29 @@ async def _process_document_async_workflow(
         pool = get_global_sync_db_pool()
         conn = pool.getconn()
         try:
-            logger.info(f"📋 [DOC-workflow_meta → {workflow_metadata}")
+            logger.info(f"📋 [DOC-{short_id}] workflow_meta → {workflow_metadata}")
             with conn.cursor() as cur:
-                if workflow_metadata['is_essential']:
+                # FIXED: Use .get() with default value instead of direct key access
+                is_essential = workflow_metadata.get('is_essential', False)
+                
+                if is_essential:
+                    # Get essential course and section with defaults
+                    essential_course = workflow_metadata.get('essential_course')
+                    essential_section = workflow_metadata.get('essential_section')
+                    
                     cur.execute(
                         '''INSERT INTO document_sources 
                         (id, essential_course, essential_section, is_essential, cdn_url, content_hash, project_id, content_tags, uploaded_by, 
                         vector_embed_status, filename, file_size_bytes, file_extension, created_at, processing_metadata)
                         VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)''',
-                        (doc_id, workflow_metadata['essential_course'], workflow_metadata['essential_section'], workflow_metadata['is_essential'], doc_data['cdn_url'], doc_data['content_hash'], 
+                        (doc_id, essential_course, essential_section, is_essential, doc_data['cdn_url'], doc_data['content_hash'], 
                         project_id, doc_data.get('content_tags', []), workflow_metadata['user_id'],
                         ProcessingStatus.PENDING.value, doc_data['filename'], 
                         doc_data['file_size_bytes'], os.path.splitext(doc_data['filename'])[1].lower(),
                         datetime.now(timezone.utc), Json(workflow_metadata))
                     )
-                    conn.commit()
                 else:
+                    # Non-essential document - use standard insert
                     cur.execute(
                         '''INSERT INTO document_sources 
                         (id, cdn_url, content_hash, project_id, content_tags, uploaded_by, 
@@ -1718,7 +1725,7 @@ async def _process_document_async_workflow(
                         doc_data['file_size_bytes'], os.path.splitext(doc_data['filename'])[1].lower(),
                         datetime.now(timezone.utc), Json(workflow_metadata))
                     )
-                    conn.commit()
+                conn.commit()
         finally:
             pool.putconn(conn)
         
