@@ -48,7 +48,7 @@ ENV CELERY_HIJACK_ROOT_LOGGER=False
 #    CMD ["sh", "-c", "celery -A tasks.celery_app worker --loglevel=info --concurrency=2"]
 
 # Asyncio
-CMD ["sh", "-c", "echo '🧹 Purging queues on startup...' && celery -A tasks.celery_app purge -f && echo '✅ Queues purged, 🔀 starting worker [ASYNCIO]...' && celery -A tasks.celery_app worker --loglevel=info --concurrency=100 -Q celery,ingest,parsing,embedding,finalize -P threads"]
+CMD ["sh", "-c", "echo '🧹 Purging queues on startup...' && celery -A tasks.celery_app purge -f && echo '✅ Queues purged, 🔀 starting worker [ASYNCIO]...' && celery -A tasks.celery_app worker --loglevel=info --concurrency=100 -Q celery,ingest,parsing,embedding,finalize,notes -P threads"]
 
 # Gevent (greenlets)
 # CMD ["sh", "-c", "echo '🧹 Purging queues on startup...' && celery -A tasks.celery_app purge -f && echo '✅ Queues purged, starting worker...' && celery -A tasks.celery_app worker --loglevel=info --concurrency=100 -Q celery,ingest,parsing,embedding,finalize -P gevent"]

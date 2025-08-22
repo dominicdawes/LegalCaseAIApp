@@ -66,6 +66,15 @@ logger.propagate = False
 load_dotenv()
 
 # ——— Configuration & Constants ————————————————————————————————————————————————————
+USE_LIGHTRAG_INTEGRATION = False
+
+# Queue configuration
+NOTES_QUEUE = 'notes'
+# PARSE_QUEUE = 'parsing'
+# EMBED_QUEUE = 'embedding'
+# FINAL_QUEUE = 'finalize'
+
+# ——— Configuration & Constants ————————————————————————————————————————————————————
 
 # Performance, Retries & Batching
 MAX_RETRIES = 5
