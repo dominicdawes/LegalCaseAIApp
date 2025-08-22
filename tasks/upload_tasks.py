@@ -1691,6 +1691,7 @@ async def _process_document_async_workflow(
         pool = get_global_sync_db_pool()
         conn = pool.getconn()
         try:
+            logger.info(f"📋 [DOC-workflow_meta → {workflow_metadata}")
             with conn.cursor() as cur:
                 if workflow_metadata['is_essential']:
                     cur.execute(
