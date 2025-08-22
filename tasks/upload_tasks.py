@@ -1274,6 +1274,7 @@ async def _execute_batch_workflow(batch_id: str, file_urls: List[str], metadata:
     _update_batch_progress_sync(batch_id, project_id, BatchProgressStatus.BATCH_PROCESSING)
 
     # flattened dictionary
+    logger.info(f"🪲 DEBUG: Original metadata keys: {list(metadata.keys())}")
     workflow_metadata = {
         **metadata,
         'batch_id': batch_id,
@@ -1633,6 +1634,7 @@ def process_new_document_wrapper(
         logger.info(f"🚀 [DOC-{short_id}] Starting complete document processing")
         
         # ——— 🔥 CRITICAL: Naive vs LightRag Processing ————————————
+        logger.info(f"🪲 DEBUG: Workflow metadata keys: {list(workflow_metadata.keys())}")
         result = run_async_in_worker(
             _process_document_async_workflow(
                 doc_id, doc_data, project_id, workflow_metadata
