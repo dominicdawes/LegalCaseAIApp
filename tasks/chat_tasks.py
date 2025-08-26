@@ -521,7 +521,10 @@ class StreamingChatManager:
     async def _fetch_relevant_chunks_async(
         self, embedding: List[float], project_id: str, k: int = 10
     ) -> List[Dict]:
-        """🆕 Async chunk retrieval with project isolation"""
+        """
+        Async chunk retrieval with project isolation
+        This function only fetches chunks from the available docs related to <==> project_id
+        """
         
         # Convert Python list to pgvector string format: [0.1,0.2,0.3]
         vector_str = '[' + ','.join(map(str, embedding)) + ']'
@@ -1181,7 +1184,7 @@ def rag_chat_task(
             model_name = "o4-mini"
 
         # ———— 🔀 STREAMING VS LEGACY MODE DECISION ————————————————————————————
-        use_streaming = should_use_streaming(user_id, project_id)
+        # use_streaming = should_use_streaming(user_id, project_id)
         use_streaming = True  # Force streaming as per your logs
 
         if use_streaming:
