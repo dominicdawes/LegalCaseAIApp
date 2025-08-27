@@ -236,7 +236,8 @@ class AsyncNoteManager:
                     project_id=project_id,
                     user_id=user_id,
                     deck_name=note_title,
-                    llm_output=note_content
+                    llm_output=note_content,
+                    is_essential=(addtl_params or {}).get('is_essential', False),
                 )
                 logger.info(f"🃏 Created flashcard deck {deck_id} with {num_cards} cards")
                 
@@ -249,7 +250,12 @@ class AsyncNoteManager:
             else:
                 # Regular note types - save to notes table
                 await self._save_note_async(
-                    project_id, user_id, note_type, note_title, note_content
+                    project_id, 
+                    user_id, 
+                    note_type, 
+                    note_title, 
+                    note_content,
+                    is_essential=(addtl_params or {}).get('is_essential', False),
                 )
                 save_metrics = {"storage_type": "regular_note"}
             
@@ -531,7 +537,8 @@ class AsyncNoteManager:
         user_id: str, 
         note_type: str, 
         note_title: str, 
-        content: str
+        content: str,
+        is_essential: bool
     ):
         """🆕 Async note persistence with connection pooling"""
         
@@ -542,11 +549,11 @@ class AsyncNoteManager:
                 """
                 INSERT INTO notes (
                     id, user_id, project_id, title, content_markdown, 
-                    note_type, is_generated, is_shareable, created_at
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                    note_type, is_generated, is_shareable, created_at, is_essential
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
                 """,
                 str(uuid.uuid4()), user_id, project_id, note_title, content,
-                note_type, True, False, datetime.now(timezone.utc)
+                note_type, True, False, datetime.now(timezone.utc), is_essential
             )
         
         logger.info(f"✅ Note saved successfully")
@@ -556,7 +563,8 @@ class AsyncNoteManager:
         project_id: str, 
         user_id: str, 
         deck_name: str, 
-        llm_output: str
+        llm_output: str,
+        is_essential: bool
     ) -> tuple:
         """
         🆕 Async flashcard processing and database insertion
@@ -601,14 +609,14 @@ class AsyncNoteManager:
                         """
                         INSERT INTO notes (
                             id, user_id, project_id, title, note_type, description, 
-                            num_cards, created_at, is_active
-                        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                            num_cards, created_at, is_active, is_essential
+                        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
                         RETURNING id
                         """,
                         str(uuid.uuid4()), user_id, project_id, 
                         deck_data['deck_name'], "flashcards", deck_data['description'],
                         deck_data['num_cards'], deck_data['created_at'],
-                        deck_data.get('is_active', True)
+                        deck_data.get('is_active', True), is_essential
                     )
                     
                     if not deck_id:
