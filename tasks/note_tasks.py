@@ -472,12 +472,32 @@ class AsyncNoteManager:
         note_type: str, 
         addtl_params: Dict
     ) -> str:
-        """🆕 Build context for note generation with smart parameter handling"""
+        """
+        Build context for note generation with smart parameter 
+        handling (organized by page numbers)
+        """
         
-        # Build chunk context
-        chunk_context = "\n\n".join(
-            chunk["content"] for chunk in relevant_chunks
-        )
+        # Group chunks by page number for better organization
+        pages_dict = {}
+        for chunk in relevant_chunks:
+            page_num = chunk.get('page_number') or 'Unknown'
+            if page_num not in pages_dict:
+                pages_dict[page_num] = []
+            pages_dict[page_num].append(chunk)
+        
+        # Build page-organized context
+        page_contexts = []
+        for page_num in sorted(pages_dict.keys(), key=lambda x: x if isinstance(x, int) else float('inf')):
+            chunks_on_page = pages_dict[page_num]
+            page_content = "\n".join(chunk["content"] for chunk in chunks_on_page)
+            
+            page_contexts.append(
+                f"=== Page {page_num} ===\n"
+                f"Source: {chunks_on_page[0].get('title', 'Unknown Document')}\n"
+                f"{page_content}\n"
+            )
+        
+        chunk_context = "\n".join(page_contexts)
         
         # Handle note-type specific parameters
         if note_type == "exam_questions":

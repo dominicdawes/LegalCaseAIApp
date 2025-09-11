@@ -670,10 +670,10 @@ def copy_embeddings_for_project_sync(existing_source_id: str, new_source_id: str
             # Get vector embeddings from the existing document (via matching source_id)
             cur.execute(
                 '''
-                SELECT content, metadata, embedding, num_tokens 
+                SELECT content, metadata, embedding, num_tokens, page_number, chunk_index
                 FROM document_vector_store 
                 WHERE source_id = %s AND embedding IS NOT NULL
-                ORDER BY created_at
+                ORDER BY page_number, chunk_index
                 ''',
                 (existing_source_id,)
             )
@@ -697,6 +697,8 @@ def copy_embeddings_for_project_sync(existing_source_id: str, new_source_id: str
                     embedding_row['metadata'],       # metadata  (keep original)
                     embedding_row['embedding'],      # embedding (reuse existing)
                     embedding_row['num_tokens'],     # num_tokens
+                    embedding_row['page_number'],    # Copy page number
+                    embedding_row['chunk_index'],    # Copy chunk index
                     user_id,                         # user_id NEW USER (already string)
                     datetime.now(timezone.utc)       # created_at
                 ))
@@ -705,8 +707,8 @@ def copy_embeddings_for_project_sync(existing_source_id: str, new_source_id: str
             # Bulk insert the copied embeddings
             cur.executemany(
                 '''INSERT INTO document_vector_store 
-                (id, source_id, project_id, content, metadata, embedding, num_tokens, user_id, created_at)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)''',
+                (id, source_id, project_id, content, metadata, embedding, num_tokens, page_number, chunk_index, user_id, created_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)''',
                 records_to_insert
             )
             conn.commit()
@@ -1006,6 +1008,10 @@ async def _embed_batch_async(doc_id: str, project_id: str, batch_info: List[str]
             token_count = len(tokenizer.encode(text))
             total_tokens += token_count
             
+            # Extract page number from metadata
+            page_number = meta.get('page') if isinstance(meta, dict) else None
+            chunk_index = meta.get('chunk_index') if isinstance(meta, dict) else None
+            
             records_to_insert.append((
                 str(uuid.uuid4()), 
                 str(uuid.UUID(doc_id)), 
@@ -1013,7 +1019,9 @@ async def _embed_batch_async(doc_id: str, project_id: str, batch_info: List[str]
                 text, 
                 json.dumps(meta), 
                 vec, 
-                token_count, 
+                token_count,
+                page_number,  # Add page number
+                chunk_index,  # Add chunk index for ordering
                 datetime.now(timezone.utc)
             ))
 
@@ -1031,8 +1039,8 @@ async def _embed_batch_async(doc_id: str, project_id: str, batch_info: List[str]
             with conn.cursor() as cur:
                 cur.executemany(
                     '''INSERT INTO document_vector_store 
-                    (id, source_id, project_id, content, metadata, embedding, num_tokens, created_at)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)''',
+                    (id, source_id, project_id, content, metadata, embedding, num_tokens, page_number, chunk_index, created_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)''',
                     records_to_insert
                 )
                 conn.commit()

@@ -210,6 +210,15 @@ class Citation:
     # Metadata for future expansion
     metadata: Dict[str, Any] = field(default_factory=dict)
 
+    def format_citation(self) -> str:
+        """Format citation with page number"""
+        base = f"{self.title or 'Document'}"
+        if self.page_number:
+            base += f", Page {self.page_number}"
+        if self.url:
+            base += f" ({self.url})"
+        return base
+
 @dataclass
 class Highlight:
     """Content highlight data structure"""
@@ -531,8 +540,12 @@ class StreamingChatManager:
         
         async with get_db_connection() as conn:
             rows = await conn.fetch(
-                "SELECT * FROM match_document_chunks_hnsw($1, $2, $3)",
-                project_id, vector_str, k  # ← Pass as string
+                """
+                SELECT *, similarity 
+                FROM match_document_chunks_hnsw($1, $2, $3)
+                ORDER BY page_number ASC, chunk_index ASC, similarity DESC
+                """,
+                project_id, vector_str, k
             )
         
         chunks = [dict(row) for row in rows]
@@ -808,42 +821,78 @@ class StreamingChatManager:
         
         logger.info(f"🔢 Token budget: {available_tokens} available for chunks")
         
-        # Sort chunks by relevance (similarity score)
+        # Sort chunks by page number first, then by similarity
         sorted_chunks = sorted(
             chunks, 
-            key=lambda x: x.get('similarity', 0), 
-            reverse=True
+            key=lambda x: (x.get('page_number', float('inf')), -x.get('similarity', 0))
         )
         
-        # Add chunks until we hit token limit
+        # Group by page for better context organization
         final_chunks = []
         chunk_tokens = 0
+        current_page = None
+        page_chunks = []
         
         for chunk in sorted_chunks:
-            chunk_text = f"[CHUNK {len(final_chunks) + 1}]\nSource: {chunk.get('title', 'Unknown')}\nContent: {chunk.get('content', '')}\n"
-            chunk_token_count = len(tokenizer.encode(chunk_text))
+            chunk_page = chunk.get('page_number')
             
-            if chunk_tokens + chunk_token_count <= available_tokens:
-                final_chunks.append(chunk)
-                chunk_tokens += chunk_token_count
-            else:
-                logger.info(f"⚠️ Trimmed context: using {len(final_chunks)}/{len(chunks)} chunks")
-                break
+            # If we've moved to a new page, process the previous page
+            if current_page is not None and chunk_page != current_page:
+                if page_chunks:
+                    page_context = self._build_page_context(current_page, page_chunks)
+                    page_token_count = len(tokenizer.encode(page_context))
+                    
+                    if chunk_tokens + page_token_count <= available_tokens:
+                        final_chunks.extend(page_chunks)
+                        chunk_tokens += page_token_count
+                        page_chunks = []
+                    else:
+                        break
+            
+            current_page = chunk_page
+            page_chunks.append(chunk)
         
-        # Build final context with trimmed chunks
-        numbered_chunks = []
-        for i, chunk in enumerate(final_chunks, 1):
-            chunk_text = f"[CHUNK {i}]\nSource: {chunk.get('title', 'Unknown')}\nPage: {chunk.get('page_number', 'N/A')}\nContent: {chunk.get('content', '')}\n"
-            numbered_chunks.append(chunk_text)
+        # Process final page
+        if page_chunks:
+            page_context = self._build_page_context(current_page, page_chunks)
+            page_token_count = len(tokenizer.encode(page_context))
+            if chunk_tokens + page_token_count <= available_tokens:
+                final_chunks.extend(page_chunks)
         
-        chunk_context = "\n".join(numbered_chunks)
+        # Build page-organized context
+        numbered_contexts = []
+        pages_dict = {}
         
+        for chunk in final_chunks:
+            page_num = chunk.get('page_number', 'Unknown')
+            if page_num not in pages_dict:
+                pages_dict[page_num] = []
+            pages_dict[page_num].append(chunk)
+        
+        for page_num in sorted(pages_dict.keys(), key=lambda x: x if isinstance(x, int) else float('inf')):
+            chunks_on_page = pages_dict[page_num]
+            page_content = "\n".join(f"[Chunk {i+1}] {chunk.get('content', '')}" 
+                                    for i, chunk in enumerate(chunks_on_page))
+            
+            numbered_contexts.append(
+                f"=== PAGE {page_num} ===\n"
+                f"Document: {chunks_on_page[0].get('title', 'Unknown')}\n"
+                f"{page_content}\n"
+            )
+        
+        chunk_context = "\n".join(numbered_contexts)
         final_context = f"{user_context}\n\nRelevant Context:\n{chunk_context}"
         
-        final_tokens = len(tokenizer.encode(final_context)) + system_tokens
-        logger.info(f"📊 Final context: {final_tokens}/{max_tokens} tokens ({len(final_chunks)} chunks)")
-        
         return final_context, final_chunks
+
+    def _build_page_context(self, page_num, chunks):
+        """Helper to build context for a single page"""
+        page_content = "\n".join(chunk.get('content', '') for chunk in chunks)
+        return (
+            f"=== PAGE {page_num} ===\n"
+            f"Document: {chunks[0].get('title', 'Unknown')}\n"
+            f"{page_content}\n"
+        )
 
     def _format_chat_history(self, history: List[Dict]) -> str:
         """Format chat history for context"""
@@ -1247,6 +1296,8 @@ def rag_chat_task(
 #         temperature=temperature
 #     )
 
+# ——— ⌛ Legacy RAG Workflow (Original Non-Streaming Implementation) ————————————————————————————
+
 async def _execute_legacy_workflow(message_id, user_id, chat_session_id, query, project_id, provider, model_name, temperature):
     """All Legacy async operations happen here"""
     # 🧼 CLEAN: One async event loop per task
@@ -1254,8 +1305,6 @@ async def _execute_legacy_workflow(message_id, user_id, chat_session_id, query, 
         message_id, user_id, chat_session_id,
         query, project_id, provider, model_name, temperature
     )
-
-# ——— Legacy RAG Workflow (Original Non-Streaming Implementation) ————————————————————————————
 
 async def process_legacy_rag(
     message_id: str,
@@ -1352,7 +1401,7 @@ async def generate_rag_answer_legacy(
         system_instructions = ""
 
     # Original context building
-    chat_history = fetch_chat_history(chat_session_id)[-max_chat_history:]
+    chat_history = fetch_chat_history_legacy(chat_session_id)[-max_chat_history:]
     formatted_history = format_chat_history(chat_history) if chat_history else ""
     chunk_context = "\n\n".join(c["content"] for c in relevant_chunks)
 
@@ -1458,11 +1507,14 @@ def trim_context_length(full_context, query, relevant_chunks, model_name, max_to
     
     return history
 
-# ——— Session Management (Enhanced from Original) ————————————————————————————————
+# ——— Chat Session Management (Enhanced from Original) ————————————————————————————————
 
 @celery_app.task(bind=True, base=BaseTaskWithRetry)
 def new_chat_session(self, user_id, project_id):
-    """🔄 Enhanced chat session creation (maintains legacy interface)"""
+    """
+    Enhanced chat session creation (maintains legacy interface)
+    This aimed to refresh a chat with a new blank chat (can also include a swap of model type)
+    """
     try:
         logger.info(f"🆕 Creating new chat session for user {user_id}, project {project_id}")
         
