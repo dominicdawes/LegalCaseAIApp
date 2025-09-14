@@ -10,3 +10,5 @@ _temp/*
 _local/*
 test/*
 prompt_engineering/*
+
+utils/available_models.txt

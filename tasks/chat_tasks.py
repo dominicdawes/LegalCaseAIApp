@@ -527,6 +527,32 @@ class StreamingChatManager:
         logger.info(f"🤖 LLM client setup: {provider}/{model_name}")
         return client, provider     # Return both for downstream use
 
+    # async def _fetch_relevant_chunks_async(
+    #     self, embedding: List[float], project_id: str, k: int = 10
+    # ) -> List[Dict]:
+    #     """
+    #     THREW AN ERROR
+    #     Async chunk retrieval with project isolation
+    #     This function only fetches chunks from the available docs related to <==> project_id
+    #     """
+        
+    #     # Convert Python list to pgvector string format: [0.1,0.2,0.3]
+    #     vector_str = '[' + ','.join(map(str, embedding)) + ']'
+        
+    #     async with get_db_connection() as conn:
+    #         rows = await conn.fetch(
+    #             """
+    #             SELECT *, similarity 
+    #             FROM match_document_chunks_hnsw($1, $2, $3)
+    #             ORDER BY page_number ASC, chunk_index ASC, similarity DESC
+    #             """,
+    #             project_id, vector_str, k
+    #         )
+        
+    #     chunks = [dict(row) for row in rows]
+    #     logger.info(f"🎯 Project-specific chunks retrieved: {len(chunks)}")
+    #     return chunks
+
     async def _fetch_relevant_chunks_async(
         self, embedding: List[float], project_id: str, k: int = 10
     ) -> List[Dict]:
@@ -540,16 +566,12 @@ class StreamingChatManager:
         
         async with get_db_connection() as conn:
             rows = await conn.fetch(
-                """
-                SELECT *, similarity 
-                FROM match_document_chunks_hnsw($1, $2, $3)
-                ORDER BY page_number ASC, chunk_index ASC, similarity DESC
-                """,
-                project_id, vector_str, k
+                "SELECT * FROM match_document_chunks_hnsw($1, $2, $3)",
+                project_id, vector_str, k  # Pass as string
             )
         
         chunks = [dict(row) for row in rows]
-        logger.info(f"🎯 Project-specific chunks retrieved: {len(chunks)}")
+        logger.info(f"🎯Project-specific chunks retrieved: {len(chunks)}")
         return chunks
 
     async def _create_assistant_message(
@@ -824,7 +846,7 @@ class StreamingChatManager:
         # Sort chunks by page number first, then by similarity
         sorted_chunks = sorted(
             chunks, 
-            key=lambda x: (x.get('page_number', float('inf')), -x.get('similarity', 0))
+            key=lambda x: (x.get('page_number', float('inf')), x.get('chunk_index', 0))
         )
         
         # Group by page for better context organization
