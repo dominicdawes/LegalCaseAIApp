@@ -1,0 +1,20 @@
+[
+    {
+        "subscription_tier":"Starter",
+        "feature_list":[
+            "Unlimited daily chats",
+            "Limited daily chats",
+            "Limited document uploads and AI note generation"
+        ]
+    },
+    {
+        "subscription_tier":"Pro",
+        "feature_list":[
+            "All the features in Starter",
+            "Unlimited daily chats",
+            "Access to the latest AI models",
+            "1L Essentials Access",
+            "Cold call flashcards"
+        ]
+    }
+]
