@@ -331,6 +331,7 @@ class StreamingChatManager:
         self.performance_monitor = PerformanceMonitor()
         self.normalizer = StreamNormalizer()
         self._initialized = False
+        self._active_tasks = {}  # Track active streaming tasks
         
     async def initialize(self):
         """
@@ -392,6 +393,14 @@ class StreamingChatManager:
 
         start_time = time.time()
         assistant_message_id = str(uuid.uuid4())
+
+        # Store task info for cancellation
+        task_key = f"{chat_session_id}:{message_id}"
+        self._active_tasks[task_key] = {
+            "message_id": message_id,
+            "session_id": chat_session_id,
+            "cancelled": False
+        }
         
         try:
             logger.info(f"🎯 Starting streaming query for session {chat_session_id}")
@@ -430,6 +439,12 @@ class StreamingChatManager:
                 assistant_message_id, user_id, chat_session_id, message_id
             )
             
+
+            # Check for cancellation 🛑 before streaming
+            if self._is_cancelled(task_key):
+                await self._handle_cancellation(message_id, chat_session_id)
+                return message_id
+            
             # 🆕 Stream response with real-time updates
             llm_start = time.time()
             streaming_response = await self._stream_rag_response(
@@ -467,6 +482,9 @@ class StreamingChatManager:
             logger.error(f"❌ Streaming query failed: {e}", exc_info=True)
             await self._handle_streaming_error(assistant_message_id, str(e))
             raise
+        finally:
+            # Clean up task tracking
+            self._active_tasks.pop(task_key, None)
 
     async def _get_embedding_cached(self, query: str) -> List[float]:
         """🆕 Get query embedding with global caching (not project-specific)"""
@@ -521,37 +539,12 @@ class StreamingChatManager:
         logger.info(f"📚 Fetched {len(history)} history messages")
         return history
 
+
     async def _setup_llm_client(self, provider: str, model_name: str, temperature: float):
         """🎯 ONE LINE: Factory handles the routing complexity"""
         client = LLMFactory.get_client_for(provider, model_name, temperature, streaming=True)
         logger.info(f"🤖 LLM client setup: {provider}/{model_name}")
         return client, provider     # Return both for downstream use
-
-    # async def _fetch_relevant_chunks_async(
-    #     self, embedding: List[float], project_id: str, k: int = 10
-    # ) -> List[Dict]:
-    #     """
-    #     THREW AN ERROR
-    #     Async chunk retrieval with project isolation
-    #     This function only fetches chunks from the available docs related to <==> project_id
-    #     """
-        
-    #     # Convert Python list to pgvector string format: [0.1,0.2,0.3]
-    #     vector_str = '[' + ','.join(map(str, embedding)) + ']'
-        
-    #     async with get_db_connection() as conn:
-    #         rows = await conn.fetch(
-    #             """
-    #             SELECT *, similarity 
-    #             FROM match_document_chunks_hnsw($1, $2, $3)
-    #             ORDER BY page_number ASC, chunk_index ASC, similarity DESC
-    #             """,
-    #             project_id, vector_str, k
-    #         )
-        
-    #     chunks = [dict(row) for row in rows]
-    #     logger.info(f"🎯 Project-specific chunks retrieved: {len(chunks)}")
-    #     return chunks
 
     async def _fetch_relevant_chunks_async(
         self, embedding: List[float], project_id: str, k: int = 10
@@ -577,21 +570,23 @@ class StreamingChatManager:
     async def _create_assistant_message(
         self, assistant_id: str, user_id: str, chat_session_id: str, parent_id: str
     ):
-        """🆕 Create streaming assistant message placeholder"""
+        """
+        Create streaming assistant message placeholder
+        """
         
         async with get_db_connection() as conn:
             await conn.execute(
                 """
                 INSERT INTO messages (
                     id, user_id, chat_session_id, role, content, 
-                    status, format, parent_message_id, created_at
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
+                    status, format, parent_message_id, streaming_complete, created_at
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
                 """,
                 assistant_id, user_id, chat_session_id, 'assistant', '',
-                'streaming', 'markdown', parent_id
+                'streaming', 'markdown', parent_id, False
             )
         
-        logger.info(f"📝 Created assistant message placeholder: {assistant_id}")
+        logger.debug(f"📝 Created assistant message placeholder: {assistant_id}")
         
     async def _stream_rag_response(
         self,
@@ -601,15 +596,23 @@ class StreamingChatManager:
         relevant_chunks: List[Dict],
         chat_history: List[Dict],
         llm_client: Any,
-        provider: str
+        provider: str,
+        task_key: str,
     ) -> StreamingResponse:
         """
-        Core streaming response generator with professional-grade smart buffering
-        
-        Uses intelligent chunking strategy similar to Claude/ChatGPT:
-        - Buffers tokens until word/sentence boundaries
-        - Sends chunks every 20-30ms for optimal UX
-        - Prioritizes perceived speed over raw latency
+        Description:
+            Core streaming response generator with professional-grade smart buffering
+            
+            Uses intelligent chunking strategy similar to Claude/ChatGPT:
+            - Buffers tokens until word/sentence boundaries
+            - Sends chunks every 20-30ms for optimal UX
+            - Prioritizes perceived speed over raw latency
+            - Also accounts for client-side cancellation 🛑
+
+        Args:
+            - chat_history (List) : list of user/assistant/system instructions
+            - provider (str) : ai llm provider
+            - task_key (str) : uuid used to cancel a currently streaming chat
         """
 
         # Build enhanced context with system instructions (from YAML)
@@ -659,6 +662,12 @@ class StreamingChatManager:
             
             # 🔀 Process each token from LLM with intelligent buffering
             async for raw_chunk in llm_client.stream_chat(context):
+
+                # Check for cancellation on each chunk (early break)...
+                if self._is_cancelled(task_key):
+                    logger.info(f"🛑 Task cancelled: {task_key}")
+                    await self._handle_cancellation(assistant_message_id, chat_session_id)
+                    break
                 
                 # 🎯 NORMALIZE: Convert provider-specific format to text
                 chunk_text = self.normalizer.extract_text(raw_chunk, provider)
@@ -1123,6 +1132,34 @@ class StreamingChatManager:
                     "UPDATE messages SET status = $1, updated_at = NOW() WHERE id = $2",
                     status, message_id
                 )
+
+    def _is_cancelled(self, task_key: str) -> bool:
+        """Check if task has been cancelled (Client-side trigger)"""
+        return self._active_tasks.get(task_key, {}).get("cancelled", False)
+    
+    def cancel_task(self, chat_session_id: str, message_id: str):
+        """Mark a task as cancelled"""
+        task_key = f"{chat_session_id}:{message_id}"
+        if task_key in self._active_tasks:
+            self._active_tasks[task_key]["cancelled"] = True
+
+    async def _handle_cancellation(self, message_id: str, chat_session_id: str):
+        """Handle task cancellation - simplified for your schema"""
+        async with get_db_connection() as conn:
+            await conn.execute(
+                """
+                UPDATE messages 
+                SET status = 'cancelled',
+                    query_response_status = 'cancelled',
+                    content = COALESCE(content, '') || '\n\n[Response cancelled by user]',
+                    streaming_complete = true,
+                    completed_at = NOW(),
+                    updated_at = NOW(),
+                    error_message = 'User cancelled streaming response'
+                WHERE id = $1
+                """,
+                message_id
+            )
 
     async def _handle_streaming_error(self, message_id: str, error_message: str):
         """🆕 Handle streaming errors gracefully"""

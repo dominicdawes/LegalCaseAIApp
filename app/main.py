@@ -23,6 +23,7 @@ from utils.pdf_utils import extract_text_from_pdf
 from celery import chain, chord, group, states
 from celery.result import AsyncResult
 
+
 # FastAPI
 from fastapi import FastAPI, BackgroundTasks, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -41,6 +42,8 @@ from tasks.sample_tasks import addition_task
 # from tasks.chat_streaming_tasks import rag_chat_streaming_task
 from tasks.chat_tasks import rag_chat_task, persist_user_query
 from tasks.note_tasks import rag_note_task 
+from tasks.celery_app import celery_app  # Import the Celery app instance (see celery_app.py for LocalHost config)
+
 
 # Configure logging (basic example, adjust as needed)
 logging.basicConfig(level=logging.INFO)
@@ -417,25 +420,6 @@ async def append_sources_to_project(request: RagPipelineNewDocumentsRequest, bac
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# @app.post("/rag-chat/original")
-# async def rag_chat_original(request: RagQueryRequest):
-#     """DEPRECATED... Endpoint for the rag query responses (token streaming not enabled)"""
-#     try:
-#         # Trigger the RAG task asynchronously and add it to the queue
-#         task = rag_chat_task.apply_async(args=[
-#             request.user_id,
-#             request.chat_session_id,
-#             request.query,
-#             request.project_id,
-#             request.provider,
-#             request.model_name,
-#             request.temperature,
-#         ])
-        
-#         # Return the task ID to the client
-#         return {"task_id": task.id}
-#     except Exception as e:
-#         raise HTTPException(status_code=400, detail=str(e))
 
 @app.post("/rag-chat/")
 async def rag_chat(request: RagQueryRequest):
@@ -484,6 +468,45 @@ async def rag_chat(request: RagQueryRequest):
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
+
+@app.post("/rag-chat-reset/")
+async def rag_chat_reset(request: RagQueryRequest):
+    """
+    Endpoint for the rag query responses (token streaming not enabled)
+    Uses Celery chain to perform persist → rag back-to-back
+    
+    **FYI NOT CURRENTLY IN USE
+
+    Raw json:
+    ----------
+    {
+        "user_id": "ae3df626-12cc-40c1-9d40-1d8249deea2e",
+        "chat_session_id": "...",
+        "query": "...",
+        "project_id": "...",
+        "provider": "..." 
+        "model_name": "..." 
+        "temperature": "..." 
+    }
+    """
+    try:
+        pass
+        # # Trigger the RAG task asynchronously and add it to the queue
+        # task = rag_chat_task.apply_async(args=[
+        #     request.user_id,
+        #     request.chat_session_id,
+        #     request.query,
+        #     request.project_id,
+        #     request.provider,
+        #     request.model_name,
+        #     request.temperature,
+        # ])
+        
+        # Return the task ID to the client
+        return {"task_id": task.id}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
 # @app.post("/rag-chat/regenerate/")
 # async def rag_chat_regenerate(request: RagRegenerateRequest):
 #     """
@@ -513,6 +536,35 @@ async def rag_chat(request: RagQueryRequest):
 #         return {"task_id": task.id}
 #     except Exception as e:
 #         raise HTTPException(status_code=400, detail=str(e))
+
+@app.post("/rag-chat/cancel/{task_id}")
+async def cancel_rag_chat(task_id: str):
+    """Cancel a streaming RAG chat task"""
+    try:
+        # Get the Celery task
+        task_result = AsyncResult(task_id)
+        
+        if task_result.state in ['PENDING', 'STARTED']:
+            # Revoke the task
+            celery_app.control.revoke(task_id, terminate=True, signal='SIGKILL')
+            
+            # Send cancellation notice via WebSocket
+            # You'll need to get the session_id from task metadata
+            if hasattr(task_result, 'info') and isinstance(task_result.info, dict):
+                session_id = task_result.info.get('chat_session_id')
+                if session_id:
+                    await manager.send_to_session(session_id, {
+                        "type": "task_cancelled",
+                        "task_id": task_id,
+                        "timestamp": datetime.now().isoformat()
+                    })
+            
+            return {"status": "cancelled", "task_id": task_id}
+        else:
+            return {"status": "cannot_cancel", "current_state": task_result.state}
+            
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 # ================================================ #
 #                STATUS ENDPOINTS
