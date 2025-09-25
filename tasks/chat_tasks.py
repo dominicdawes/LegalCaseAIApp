@@ -438,7 +438,6 @@ class StreamingChatManager:
             await self._create_assistant_message(
                 assistant_message_id, user_id, chat_session_id, message_id
             )
-            
 
             # Check for cancellation 🛑 before streaming
             if self._is_cancelled(task_key):
@@ -597,7 +596,7 @@ class StreamingChatManager:
         chat_history: List[Dict],
         llm_client: Any,
         provider: str,
-        task_key: str,
+        task_key: str = None,
     ) -> StreamingResponse:
         """
         Description:

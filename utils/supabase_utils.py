@@ -281,6 +281,7 @@ def log_llm_error(
             "chat_session_id": chat_session_id,
             "user_id": user_id,
             "created_at": datetime.now(timezone.utc).isoformat(),
+            "role": "assistant",
         }
     elif table_name == "notes":
         payload = {
