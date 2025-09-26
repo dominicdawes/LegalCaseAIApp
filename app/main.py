@@ -32,14 +32,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.ws_handlers import setup_websocket_routes, manager     # from ws_handlers.endpoints import setup_websocket_routes
 # from ws_handlers.connection_manager import manager
 
-# Project modules
+# `Task/` module imports
 from tasks.profile_tasks import upload_profile_picture_task
 from tasks.podcast_generate_tasks import validate_and_generate_audio_task, generate_dialogue_only_task
 from tasks.upload_tasks import process_document_batch_workflow
-# from tasks.upload_tasks import test_celery_log_task
+from tasks.chat_tasks import streaming_manager
+from celery.result import AsyncResult
 # from tasks.upload_tasks import append_document_task  <-- need to revive this later
 from tasks.sample_tasks import addition_task
-# from tasks.chat_streaming_tasks import rag_chat_streaming_task
 from tasks.chat_tasks import rag_chat_task, persist_user_query
 from tasks.note_tasks import rag_note_task 
 from tasks.celery_app import celery_app  # Import the Celery app instance (see celery_app.py for LocalHost config)
@@ -539,61 +539,48 @@ async def rag_chat_reset(request: RagQueryRequest):
 
 @app.post("/rag-chat/cancel/{task_id}")
 async def cancel_rag_chat(task_id: str):
-    """Cancel a streaming RAG chat task"""
-    logger.info(f"🛑 CANCEL REQUEST received for task: {task_id}")
+    """
+    Gracefully cancels a streaming RAG chat task.
     
+    This flow performs two actions:
+    1.  Sets an internal flag in the StreamingChatManager to stop the asyncio stream.
+    2.  Revokes the Celery task to prevent it from running if it's still in the queue.
+    """
+    logger.info(f"🛑 CANCEL REQUEST received for task: {task_id}")
+
     try:
-        # Get the Celery task with proper app reference
-        task_result = AsyncResult(task_id, app=celery_app)
-        logger.info(f"🛑 Task {task_id} current state: {task_result.state}")
+        # Step 1: Cooperatively cancel the running stream (see... chat_task.StreamingManager.cancel_task() )
+        session_id_to_notify = streaming_manager.cancel_task(task_id)
+
+        # Step 2: Revoke the task from Celery.
+        # This prevents the task from running if it hasn't started yet.
+        celery_app.control.revoke(task_id)
         
-        if task_result.state in ['PENDING', 'STARTED']:
-            # 1. Mark streaming tasks as cancelled FIRST
-            cancelled_sessions = []
-            if hasattr(streaming_manager, '_active_tasks'):
-                for task_key, task_info in list(streaming_manager._active_tasks.items()):
-                    # Mark as cancelled so the streaming loop will stop
-                    streaming_manager._active_tasks[task_key]["cancelled"] = True
-                    session_id = task_info.get("session_id")
-                    if session_id:
-                        cancelled_sessions.append(session_id)
-                    logger.info(f"🛑 Marked streaming task as cancelled: {task_key}")
-            
-            # 2. Revoke the Celery task (use SIGTERM for graceful shutdown)
-            celery_app.control.revoke(task_id, terminate=True, signal='SIGTERM')
-            logger.info(f"🛑 Revoked Celery task: {task_id}")
-            
-            # 3. Send WebSocket notifications to affected sessions
-            for session_id in cancelled_sessions:
-                try:
-                    # imported from app.ws_handlers.manager 
-                    await manager.send_to_session(session_id, {
-                        "type": "stream_cancelled",
-                        "task_id": task_id,
-                        "message": "Stream cancelled by user",
-                        "timestamp": datetime.now().isoformat()
-                    })
-                    logger.info(f"📡 Sent cancellation notice to session: {session_id}")
-                except Exception as ws_error:
-                    logger.warning(f"⚠️ WebSocket notification failed for {session_id}: {ws_error}")
-            
-            return {
-                "status": "cancelled", 
+        message = "Task cancellation requested."
+        
+        # Step 3: Notify the client immediately via WebSocket
+        if session_id_to_notify:
+            logger.info(f"📡 Sending cancellation notice to session: {session_id_to_notify}")
+            await websocket_manager.send_to_session(session_id_to_notify, {
+                "type": "stream_cancelled",
                 "task_id": task_id,
-                "cancelled_sessions": len(cancelled_sessions),
-                "message": "Task cancellation requested"
-            }
+                "message": "Stream cancelled by user 🚫.",
+                "timestamp": datetime.now(timezone.utc).isoformat()
+            })
+            message = f"Cancellation signal sent to running task in session {session_id_to_notify}."
         else:
-            logger.info(f"🛑 Cannot cancel task {task_id} - state: {task_result.state}")
-            return {
-                "status": "cannot_cancel", 
-                "current_state": task_result.state,
-                "message": f"Task is in '{task_result.state}' state"
-            }
-            
+            logger.info(f"Task {task_id} was not actively streaming, but was revoked from the queue.")
+
+        return {
+            "status": "cancellation_requested",
+            "task_id": task_id,
+            "message": message
+        }
+
     except Exception as e:
-        logger.error(f"❌ Cancel request failed: {e}", exc_info=True)
+        logger.error(f"❌ Cancel request failed for task {task_id}: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Failed to cancel task: {str(e)}")
+
 
 # ================================================ #
 #                STATUS ENDPOINTS
