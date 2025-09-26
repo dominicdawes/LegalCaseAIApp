@@ -469,7 +469,7 @@ async def rag_chat(request: RagQueryRequest):
         raise HTTPException(status_code=400, detail=str(e))
 
 
-@app.post("/rag-chat-reset/")
+@app.post("/rag-chat/reset/")
 async def rag_chat_reset(request: RagQueryRequest):
     """
     Endpoint for the rag query responses (token streaming not enabled)

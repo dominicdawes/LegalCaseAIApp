@@ -182,22 +182,44 @@ def insert_chat_message_supabase_record(
 
         raw = {"raw": "boiler plate"}
 
-        response = (
-            client.table(table_name)
-            .insert(
-                {
-                    "user_id": user_id,
-                    "chat_session_id": chat_session_id,
-                    "role": dialogue_role,  # enum(user, assistant)
-                    "content": message_content,
-                    "status": query_response_status,  # status for SUCCESS or FAILED llm query response
-                    "format": format,
-                    "raw_response": raw,
-                    "created_at": created_at,
-                }
+        if dialogue_role=="user":
+            response = (
+                client.table(table_name)
+                .insert(
+                    {
+                        "user_id": user_id,
+                        "chat_session_id": chat_session_id,
+                        "role": dialogue_role,  # enum(user, assistant)
+                        "content": message_content,
+                        "status": query_response_status,  # status for SUCCESS or FAILED llm query response
+                        "format": format,
+                        "raw_response": raw,
+                        "created_at": created_at,
+                        "streaming_complete": True,
+                        "status": "complete"
+                    }
+                )
+                .execute()
             )
-            .execute()
-        )
+            
+        else:
+            response = (
+                client.table(table_name)
+                .insert(
+                    {
+                        "user_id": user_id,
+                        "chat_session_id": chat_session_id,
+                        "role": dialogue_role,  # enum(user, assistant)
+                        "content": message_content,
+                        "status": query_response_status,  # status for SUCCESS or FAILED llm query response
+                        "format": format,
+                        "raw_response": raw,
+                        "created_at": created_at,
+                    }
+                )
+                .execute()
+            )
+            
         return response
     except Exception as e:
         raise Exception(f"Error saving to public.messages: {e}")
