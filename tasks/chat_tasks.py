@@ -443,6 +443,7 @@ class StreamingChatManager:
 
             # Check for cancellation 🛑 before streaming
             if self._is_cancelled(task_id):
+                logger.log("Chat stream has been cancelled 💔...")
                 await self._handle_cancellation(assistant_message_id, chat_session_id)
                 return assistant_message_id
             
@@ -1144,6 +1145,7 @@ class StreamingChatManager:
         Mark a task as cancelled and return its session_id for WebSocket notification.
         """
         task_key = task_id
+        logger.info(f" Inside cancellation class method for task: {task_id}...")
         if task_key in self._active_tasks:
             self._active_tasks[task_key]["cancelled"] = True
             logger.info(f"🛑 Cancellation flag set for task: {task_id}")
