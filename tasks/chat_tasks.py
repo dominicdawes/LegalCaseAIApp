@@ -333,6 +333,7 @@ class StreamingChatManager:
         self._initialized = False
         # 🔑 Use the Celery Task ID as the key for unambiguous lookups
         self._active_tasks: Dict[str, Dict[str, Any]] = {}
+        self.task_id = None
         
     async def initialize(self):
         """
@@ -397,6 +398,7 @@ class StreamingChatManager:
         assistant_message_id = str(uuid.uuid4())
 
         # Store task info for cancellation
+        self.task_id = task_id
         task_key = f"{chat_session_id}:{message_id}"
         self._active_tasks[task_key] = {
             "message_id": message_id,
@@ -456,8 +458,8 @@ class StreamingChatManager:
                 relevant_chunks=relevant_chunks,
                 chat_history=chat_history,
                 llm_client=llm_client,
-                provider=provider_name,
-                task_key=task_id
+                provider=provider_name
+                # task_key=task_id
             )
             llm_time = time.time() - llm_start
             
@@ -665,10 +667,9 @@ class StreamingChatManager:
             
             # 🔀 Process each token from LLM with intelligent buffering
             async for raw_chunk in llm_client.stream_chat(context):
-
-                # Check for cancellation on each chunk (early break)...
-                if self._is_cancelled(task_key):
-                    logger.info(f"🛑 Task cancelled: {task_key}")
+                # 👈 MODIFIED: The check is now an awaitable async call
+                if await self._is_cancelled():
+                    logger.info(f"🛑 Task cancelled via Redis signal: {self.task_id}")
                     await self._handle_cancellation(assistant_message_id, chat_session_id)
                     break
                 
@@ -1136,22 +1137,36 @@ class StreamingChatManager:
                     status, message_id
                 )
 
-    def _is_cancelled(self, task_key: str) -> bool:
-        """Check if task has been cancelled (Client-side trigger)"""
-        return self._active_tasks.get(task_key, {}).get("cancelled", False)
+    async def _is_cancelled(self) -> bool:
+        """ 🆕 Checks Redis for a cancellation key for the current task. """
+        if not self.task_id:
+            return False
+        
+        try:
+            cancel_key = f"cancel-task:{self.task_id}"
+            async with get_redis_connection() as r:
+                # The exists command is very fast. It returns 1 if the key exists, 0 otherwise.
+                exists = await r.exists(cancel_key)
+                if exists:
+                    logger.info(f"🛑 Cancellation notice found in Redis for task: {self.task_id}")
+                    return True
+        except Exception as e:
+            logger.warning(f"⚠️ Redis check for cancellation failed: {e}")
+            
+        return False
 
-    def cancel_task(self, task_id: str) -> Optional[str]:
-        """
-        Mark a task as cancelled and return its session_id for WebSocket notification.
-        """
-        task_key = task_id
-        logger.info(f" Inside cancellation class method for task: {task_id}...")
-        if task_key in self._active_tasks:
-            self._active_tasks[task_key]["cancelled"] = True
-            logger.info(f"🛑 Cancellation flag set for task: {task_id}")
-            # Return the session_id so the API can notify the client
-            return self._active_tasks[task_key].get("session_id")
-        return None
+    # def cancel_task(self, task_id: str) -> Optional[str]:
+    #     """
+    #     OBSOLETE
+    #     """
+    #     task_key = task_id
+    #     logger.info(f" Inside cancellation class method for task: {task_id}...")
+    #     if task_key in self._active_tasks:
+    #         self._active_tasks[task_key]["cancelled"] = True
+    #         logger.info(f"🛑 Cancellation flag set for task: {task_id}")
+    #         # Return the session_id so the API can notify the client
+    #         return self._active_tasks[task_key].get("session_id")
+    #     return None
 
     async def _handle_cancellation(self, message_id: str, chat_session_id: str):
         """Handle task cancellation - Update Supabase DB of cancellation"""
