@@ -1290,7 +1290,7 @@ def rag_chat_task(
     - Same FastAPI chain integration
     - Same error handling patterns
     """
-    
+    celery_task_id = self.request.id
     try:
         # Set explicit start time metadata
         self.update_state(
