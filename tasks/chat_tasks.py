@@ -331,7 +331,8 @@ class StreamingChatManager:
         self.performance_monitor = PerformanceMonitor()
         self.normalizer = StreamNormalizer()
         self._initialized = False
-        self._active_tasks = {}  # Track active streaming tasks
+        # 🔑 Use the Celery Task ID as the key for unambiguous lookups
+        self._active_tasks: Dict[str, Dict[str, Any]] = {}
         
     async def initialize(self):
         """
@@ -369,6 +370,7 @@ class StreamingChatManager:
 
     async def process_streaming_query(
         self,
+        task_id: str,
         message_id: str,  # From persist_user_query task
         user_id: str,
         chat_session_id: str,
@@ -440,11 +442,11 @@ class StreamingChatManager:
             )
 
             # Check for cancellation 🛑 before streaming
-            if self._is_cancelled(task_key):
-                await self._handle_cancellation(message_id, chat_session_id)
-                return message_id
+            if self._is_cancelled(task_id):
+                await self._handle_cancellation(assistant_message_id, chat_session_id)
+                return assistant_message_id
             
-            # 🆕 Stream response with real-time updates
+            # Stream response with real-time updates
             llm_start = time.time()
             streaming_response = await self._stream_rag_response(
                 assistant_message_id=assistant_message_id,
@@ -453,7 +455,8 @@ class StreamingChatManager:
                 relevant_chunks=relevant_chunks,
                 chat_history=chat_history,
                 llm_client=llm_client,
-                provider=provider_name
+                provider=provider_name,
+                task_key=task_id
             )
             llm_time = time.time() - llm_start
             
@@ -1135,15 +1138,21 @@ class StreamingChatManager:
     def _is_cancelled(self, task_key: str) -> bool:
         """Check if task has been cancelled (Client-side trigger)"""
         return self._active_tasks.get(task_key, {}).get("cancelled", False)
-    
-    def cancel_task(self, chat_session_id: str, message_id: str):
-        """Mark a task as cancelled"""
-        task_key = f"{chat_session_id}:{message_id}"
+
+    def cancel_task(self, task_id: str) -> Optional[str]:
+        """
+        Mark a task as cancelled and return its session_id for WebSocket notification.
+        """
+        task_key = task_id
         if task_key in self._active_tasks:
             self._active_tasks[task_key]["cancelled"] = True
+            logger.info(f"🛑 Cancellation flag set for task: {task_id}")
+            # Return the session_id so the API can notify the client
+            return self._active_tasks[task_key].get("session_id")
+        return None
 
     async def _handle_cancellation(self, message_id: str, chat_session_id: str):
-        """Handle task cancellation - simplified for your schema"""
+        """Handle task cancellation - Update Supabase DB of cancellation"""
         async with get_db_connection() as conn:
             await conn.execute(
                 """
@@ -1159,6 +1168,7 @@ class StreamingChatManager:
                 """,
                 message_id
             )
+            logger.info(f"🚫 Task {message_id} handled cancellation gracefully.")
 
     async def _handle_streaming_error(self, message_id: str, error_message: str):
         """🆕 Handle streaming errors gracefully"""
@@ -1249,7 +1259,7 @@ def persist_user_query(self, user_id, chat_session_id, query, project_id, model_
 @celery_app.task(bind=True, base=BaseTaskWithRetry)
 def rag_chat_task(
     self,
-    message_id,  # ← From persist_user_query task (legacy interface maintained)
+    message_id,
     user_id,
     chat_session_id,
     query,
@@ -1273,6 +1283,7 @@ def rag_chat_task(
     - Global query embedding cache
     - Connection pooling and batched writes
     - Comprehensive performance monitoring
+    - Allows for chat streaming cancellation 🚫
     
     🔄 MAINTAINS LEGACY INTERFACE:
     - Same function signature as original
@@ -1300,8 +1311,15 @@ def rag_chat_task(
             # 🔥 CRITICAL FIX: pass async def function into persistent loop (COTROUTINE → EVENT LOOP)
             result = run_async_in_worker(
                 streaming_manager.process_streaming_query(
-                    message_id, user_id, chat_session_id, query, 
-                    project_id, provider, model_name, temperature
+                    task_id=celery_task_id, # 👈 PASS THE ID HERE
+                    message_id=message_id,
+                    user_id=user_id, 
+                    chat_session_id=chat_session_id, 
+                    query=query, 
+                    project_id=project_id, 
+                    provider=provider, 
+                    model_name=model_name, 
+                    temperature=temperature
                 )
             )
         else:
