@@ -589,7 +589,7 @@ class StreamingChatManager:
                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
                 """,
                 assistant_id, user_id, chat_session_id, 'assistant', '',
-                'streaming', 'markdown', parent_id, False
+                'streaming', 'markdown', False
             )
         
         logger.debug(f"📝 Created assistant message placeholder: {assistant_id}")
