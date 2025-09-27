@@ -548,7 +548,7 @@ async def cancel_rag_chat(task_id: str):
         # Step 1: Write a cancellation key to Redis with a 60-second expiry
         # This is the "cancellation notice" for the worker.
         cancel_key = f"cancel-task:{task_id}"
-        await redis_client.set(cancel_key, "1", ex=60) # ex=60 sets a 60-second TTL
+        await redis_pub.set(cancel_key, "1", ex=60) # ex=60 sets a 60-second TTL
         logger.info(f"✅ Cancellation notice posted to Redis for key: {cancel_key}")
 
         # Step 2: Revoke the task from Celery (in case it hasn't started yet)
