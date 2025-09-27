@@ -298,6 +298,7 @@ def log_llm_error(
     """Insert a log row for LLM related errors for `public.messages` and `public.notes`"""
     if table_name == "messages":
         payload = {
+            "content": None,
             "task_name": task_name,
             "error_message": error_message,
             "chat_session_id": chat_session_id,

@@ -579,13 +579,14 @@ class StreamingChatManager:
         Create streaming assistant message placeholder
         """
         
+        # I removed the 'parent_message_id' key, it was unecessary
         async with get_db_connection() as conn:
             await conn.execute(
                 """
                 INSERT INTO messages (
                     id, user_id, chat_session_id, role, content, 
-                    status, format, parent_message_id, streaming_complete, created_at
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
+                    status, format, streaming_complete, created_at
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
                 """,
                 assistant_id, user_id, chat_session_id, 'assistant', '',
                 'streaming', 'markdown', parent_id, False
