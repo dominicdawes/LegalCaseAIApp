@@ -2,54 +2,102 @@
 
 llm:                  # these are a fallback if the user does not specify a provider/model at runtime
   provider: openai    # "openai", "anthropic"... 
-  model: gpt-4o-mini
+  model: gpt-4o       
 
 base_prompt: |
-  Generate a list of exam questions based on the following documents.
-  
+  You are an expert Law Professor with decades of experience in creating rigorous and effective law school examinations. Your task is to generate exam questions based on the provided legal documents and user specifications.
+
 template: |
-  You are a law professor writing sample exam questions. Based on the
-  following legal context, please draft exactly {n_questions} multiple-choice
-  questions (with 4 answer choices each). After listing all questions, insert
-  a page break (i.e. a line containing exactly `---`), then list all
-  corresponding answers in order.
+  You are a law professor writing sample exam questions. Based ONLY on the legal context provided, draft exam questions according to the user's request.
 
-  Format exactly as follows (with a Markdown page break line `---` in between):
-  
-  Exam Questions:
-  1. Question 1 text…
-    A. Choice A
-    B. Choice B
-    C. Choice C
-    D. Choice D
+  If the user requests an **issue spotter exam**:
+  Your goal is to create a complex, realistic fact-pattern hypothetical that tests a student's ability to identify legal issues, recall the relevant legal rules from the provided materials, apply those rules to the specific facts, and analyze potential outcomes.
 
-  2. Question 2 text…
-    A. …
-    B. …
-    …
+  Draft exactly {n_questions} fact-pattern hypotheticals. Each hypothetical should:
+  1.  **Be a Realistic Narrative:** Create a detailed story with multiple characters and a chronological sequence of events.
+  2.  **Embed Legal Issues:** Weave multiple, distinct legal issues from the provided context into the narrative. Include some obvious issues and some that are more subtle.
+  3.  **Use All Relevant Facts:** Ensure every fact in the narrative is potentially relevant to the analysis of at least one legal issue. You may include some minor "red herrings" (facts that seem legally significant but are not) to test the student's discernment.
+  4.  **Create Ambiguity:** Present facts that could be argued in different ways, forcing the student to analyze competing arguments rather than just state a conclusion.
+  5.  **End with a Clear Call of the Question:** Conclude each hypothetical with a clear, open-ended prompt directing the student on how to answer. For example:
+      - "Discuss the rights and liabilities of all parties."
+      - "Analyze all potential claims Party A may have against Party B, and any defenses Party B might raise."
+      - "You are the supervising attorney. Write a memo identifying the legal issues, stating the governing rules, applying the rules to the facts, and analyzing the likely outcomes."
 
-  …
+  **Output Formatting:**
+  - The response must be valid Markdown.
+  - Begin with the first fact pattern.
+  - Follow it with the "Call of the Question" in bold.
+  - After all requested questions, insert a Markdown horizontal rule (`---`).
+  - Below the rule, provide a detailed **Answer Key & Analysis**. For each question, this key should:
+      -   List the major legal issues a student should have identified.
+      -   For each issue, provide a model analysis that follows the **IRAC (Issue, Rule, Application, Conclusion)** structure.
+          -   **Issue:** State the legal question.
+          -   **Rule:** State the relevant legal rule(s) from the provided materials.
+          -   **Application:** This is the most important part. Methodically apply the rule to the specific facts of the hypothetical, showing your work. Analyze the arguments both sides would make.
+          -   **Conclusion:** State a likely outcome for that specific issue.
 
-  {n_questions}. Question {n_questions} text…
-    A. …
-    B. …
-    …
+  Refer to the `example_issue_spotter` below for a gold-standard model of a question and a corresponding IRAC-based analysis.
+
+# This example provides a clear, one-shot reference for the LLM.
+example_issue_spotter: |
+  **Sample Question (Torts):**
+
+  Paul, a delivery driver for a local bakery, "Sweet Treats," was running late on his afternoon route. To make up time, he decided to take a shortcut through a residential neighborhood, where the posted speed limit was 25 mph. Distracted by his GPS, Paul was driving at 40 mph when he saw a child, Chloe, suddenly dart into the street chasing a ball from behind a parked car. Paul slammed on his brakes but was unable to stop in time, striking Chloe and causing her to suffer a broken leg.
+
+  The accident was witnessed by Chloe's mother, Maria, who was standing on her porch about 50 feet away. Maria saw the entire event and suffered severe emotional distress, for which she later required psychiatric treatment.
+
+  An investigation later revealed that the brakes on the Sweet Treats delivery van were worn beyond the manufacturer's recommended safety limit. Sweet Treats' policy was to have their vehicles inspected every six months, but due to a recent change in management, the van Paul was driving was overdue for its inspection by two months.
+
+  **Call of the Question:** Discuss all potential tort claims that Chloe and Maria may have, and any defenses that might be raised.
 
   ---
-  Exam Answers:
-  1. Answer 1…
-  2. Answer 2…
-  …
-  {n_questions}. Answer {n_questions}…
-  
-  Legal Context:
-  {context}
 
-abbreviations: 
-  When using abbreviations clarify the first time the abbreviation is used (e.g., “SCOTUS” = Supreme Court of the United States”
+  **Answer Key & Analysis:**
 
-escape_hatch: 
-  if you cannot find adequate information to adquately asnwer the prompt, please return (not enouch sources)
+  This fact pattern raises issues of negligence, negligence per se, negligent infliction of emotional distress (NIED), and vicarious liability.
+
+  **1. Chloe v. Paul (Negligence)**
+
+  * **Issue:** Was Paul negligent in his operation of the delivery van?
+  * **Rule:** Negligence requires the plaintiff to prove four elements: duty, breach, causation (actual and proximate), and damages.
+      * **Duty:** A driver has a duty to operate their vehicle as a reasonably prudent person would under similar circumstances. This includes obeying traffic laws.
+      * **Breach:** Paul breached this duty. A reasonably prudent person would not drive 40 mph in a 25 mph residential zone while distracted. This is a clear breach of the standard of care.
+          * **Negligence Per Se:** Furthermore, Paul violated a statute (the speed limit). This violation can establish negligence per se if the statute was designed to protect against the type of harm that occurred (a traffic accident) and the victim was in the class of persons the statute was designed to protect (pedestrians). Here, both conditions are met, which creates a strong, if not conclusive, presumption of breach of duty.
+      * **Causation:**
+          * **Actual Cause:** "But for" Paul's speeding and inattention, he likely would have been able to stop in time to avoid hitting Chloe. Thus, his breach was the actual cause of the injury.
+          * **Proximate Cause:** It is foreseeable that speeding in a residential neighborhood could result in hitting a pedestrian, especially a child. There are no intervening causes that would break the chain of causation. The harm was a direct and foreseeable result of the breach.
+      * **Damages:** Chloe suffered a broken leg, which constitutes clear physical damages.
+  * **Conclusion:** Chloe has a very strong claim for negligence against Paul.
+  * **Defenses:** Paul might argue that Chloe was contributorily/comparatively negligent by darting into the street without looking. The success of this defense depends on the jurisdiction's rules regarding the negligence of a child (judged by a standard of a child of similar age, intelligence, and experience) and whether it follows contributory or comparative negligence rules.
+
+  **2. Chloe v. Sweet Treats (Vicarious Liability & Direct Negligence)**
+
+  * **Issue 1: Vicarious Liability:** Is Sweet Treats liable for Paul's negligence?
+  * **Rule:** Under the doctrine of *respondeat superior*, an employer is vicariously liable for the torts of an employee committed within the scope of their employment.
+  * **Application:** Paul was a delivery driver, making deliveries on his route. Even though he took a shortcut, minor deviations ("detours") are typically considered within the scope of employment. His actions were in furtherance of the employer's business.
+  * **Conclusion:** Sweet Treats is likely vicariously liable for Paul's negligence.
+
+  * **Issue 2: Direct Negligence:** Was Sweet Treats independently negligent?
+  * **Rule:** A business has a duty to exercise reasonable care in maintaining its equipment and supervising its employees.
+  * **Application:** Sweet Treats allowed the van's brakes to become worn and failed to follow its own inspection policy. This is a breach of its duty to maintain its vehicles in a safe condition. This breach was a cause of the accident, as properly maintained brakes might have allowed Paul to stop in time, even while speeding.
+  * **Conclusion:** Chloe has a strong claim for direct negligence against Sweet Treats for negligent maintenance.
+
+  **3. Maria v. Paul & Sweet Treats (NIED)**
+
+  * **Issue:** Can Maria recover for Negligent Infliction of Emotional Distress (NIED)?
+  * **Rule:** Jurisdictions vary, but most follow either the "zone of danger" rule or the *Dillon/Thing* bystander rule.
+      * **Zone of Danger Rule:** Requires the plaintiff to have been in physical danger of harm themselves and to have suffered a physical manifestation of the distress.
+      * **Bystander Rule (*Thing* factors):** Requires the plaintiff to be (1) closely related to the victim, (2) present at the scene and aware of the injury-producing event, and (3) suffer serious emotional distress beyond that of a disinterested witness.
+  * **Application:**
+      * Under the zone of danger rule, Maria would likely lose. She was 50 feet away on her porch and not in physical danger herself.
+      * Under the bystander rule, Maria has a strong claim. (1) She is Chloe's mother (closely related). (2) She was present at the scene and witnessed the accident as it occurred. (3) She suffered severe distress requiring psychiatric treatment, which qualifies as "serious."
+  * **Conclusion:** Depending on the jurisdiction's rule for NIED, Maria may have a valid claim. The claim would be against Paul (as the tortfeasor) and Sweet Treats (vicariously).
+
+abbreviations:
+  When using abbreviations, clarify the first time the abbreviation is used (e.g., “SCOTUS” = Supreme Court of the United States).
+
+escape_hatch:
+  If you cannot find adequate information in the provided context to answer the prompt properly, please return the phrase: "(Insufficient legal context provided to generate exam questions.)"
 
 output_format:
   type: markdown

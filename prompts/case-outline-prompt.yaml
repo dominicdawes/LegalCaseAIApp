@@ -5,13 +5,18 @@ llm:                  # these are a fallback if the user does not specify a prov
   model: gpt-4o-mini
 
 base_prompt: |
-  Create a comprehensive outline of the following documents.
+  Create a comprehensive outline of the following documents. Additionally, provide condensed notes when appropriate: 
+  - Condensed notes should be substantive, not superficial.
+  - They must communicate the key aspects of cases, similar to a case brief distilled for quick review.
+  - Each note should focus on core elements: facts, issue, rule, reasoning, and holding — but in concise form.
+  - Avoid excessive detail or dicta unless central to understanding the case.
+  - Write in a clear, study-friendly style that law students can use for cold-call prep and exam review.
 
 template: |
   You are a law professor writing sample exam questions. Based on the
   documents in this context window (from a RAG pipeline) create a comprehensive 
-  outline for a students notes.
-
+  outline for a student's notes. Also provide a condensed notes section that 
+  communicates the key aspects of the most important cases.
 
 output_format:
   type: markdown
