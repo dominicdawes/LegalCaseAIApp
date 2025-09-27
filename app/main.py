@@ -37,7 +37,6 @@ from tasks.profile_tasks import upload_profile_picture_task
 from tasks.podcast_generate_tasks import validate_and_generate_audio_task, generate_dialogue_only_task
 from tasks.upload_tasks import process_document_batch_workflow
 from tasks.chat_tasks import streaming_manager
-from celery.result import AsyncResult
 # from tasks.upload_tasks import append_document_task  <-- need to revive this later
 from tasks.sample_tasks import addition_task
 from tasks.chat_tasks import rag_chat_task, persist_user_query

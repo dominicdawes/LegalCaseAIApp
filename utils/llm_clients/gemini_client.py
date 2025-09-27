@@ -122,15 +122,66 @@ class GeminiClient:
         except Exception as e:
             raise RuntimeError(f"Gemini API error: {e}")
 
-    def stream_chat(self, prompt: str, system_prompt: str = None):
-        """Stream chat response with optional system prompt"""
-        try:
-            if system_prompt:
-                full_prompt = f"{system_prompt}\n\n{prompt}"
-            else:
-                full_prompt = prompt
+    # def stream_chat(self, prompt: str, system_prompt: str = None):
+    #     """Stream chat response with optional system prompt"""
+    #     try:
+    #         if system_prompt:
+    #             full_prompt = f"{system_prompt}\n\n{prompt}"
+    #         else:
+    #             full_prompt = prompt
             
-            # Only pass safety_settings if enabled
+    #         # Only pass safety_settings if enabled
+    #         kwargs = {
+    #             "generation_config": self.generation_config,
+    #             "stream": True
+    #         }
+    #         if self.safety_settings:
+    #             kwargs["safety_settings"] = self.safety_settings
+            
+    #         response_stream = self._model.generate_content(full_prompt, **kwargs)
+            
+    #         for chunk in response_stream:
+    #             if chunk.text:
+    #                 yield chunk.text
+                    
+    #     except Exception as e:
+    #         raise RuntimeError(f"Gemini streaming error: {e}")
+
+    # # Add retry methods for consistency with other clients
+    # def chat_with_retry(self, prompt: str, max_retries: int = 3, system_prompt: str = None) -> str:
+    #     """Chat with automatic retry on provider outage"""
+    #     for attempt in range(max_retries):
+    #         try:
+    #             return self.chat(prompt, system_prompt)
+    #         except Exception as e:
+    #             if attempt == max_retries - 1:
+    #                 raise Exception(f"Gemini failed after {max_retries} attempts: {e}")
+                
+    #             wait_time = 2 ** attempt
+    #             print(f"⚠️ Gemini attempt {attempt + 1} failed: {e}. Retrying in {wait_time}s...")
+    #             time.sleep(wait_time)
+
+    # async def stream_chat_with_retry(self, prompt: str, max_retries: int = 3, system_prompt: str = None):
+    #     """Streaming chat with retry logic"""
+    #     for attempt in range(max_retries):
+    #         try:
+    #             for chunk in self.stream_chat(prompt, system_prompt):
+    #                 yield chunk
+    #             return
+    #         except Exception as e:
+    #             if attempt == max_retries - 1:
+    #                 raise Exception(f"Gemini streaming failed after {max_retries} attempts: {e}")
+                
+    #             wait_time = 2 ** attempt
+    #             print(f"⚠️ Gemini streaming attempt {attempt + 1} failed: {e}. Retrying in {wait_time}s...")
+    #             await asyncio.sleep(wait_time)
+
+    #  Labeled as 'FIX 1'
+    async def stream_chat(self, prompt: str, system_prompt: str = None):
+        """Stream chat response with optional system prompt. Now an async generator."""
+        try:
+            full_prompt = f"{system_prompt}\n\n{prompt}" if system_prompt else prompt
+            
             kwargs = {
                 "generation_config": self.generation_config,
                 "stream": True
@@ -143,11 +194,12 @@ class GeminiClient:
             for chunk in response_stream:
                 if chunk.text:
                     yield chunk.text
+                # Yield control to the event loop to prevent blocking
+                await asyncio.sleep(0)
                     
         except Exception as e:
             raise RuntimeError(f"Gemini streaming error: {e}")
 
-    # Add retry methods for consistency with other clients
     def chat_with_retry(self, prompt: str, max_retries: int = 3, system_prompt: str = None) -> str:
         """Chat with automatic retry on provider outage"""
         for attempt in range(max_retries):
@@ -161,11 +213,12 @@ class GeminiClient:
                 print(f"⚠️ Gemini attempt {attempt + 1} failed: {e}. Retrying in {wait_time}s...")
                 time.sleep(wait_time)
 
+    # Labeled as 'FIX 2'
     async def stream_chat_with_retry(self, prompt: str, max_retries: int = 3, system_prompt: str = None):
-        """Streaming chat with retry logic"""
+        """Streaming chat with retry logic, updated for async iteration."""
         for attempt in range(max_retries):
             try:
-                for chunk in self.stream_chat(prompt, system_prompt):
+                async for chunk in self.stream_chat(prompt, system_prompt):
                     yield chunk
                 return
             except Exception as e:
