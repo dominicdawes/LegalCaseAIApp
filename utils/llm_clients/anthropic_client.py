@@ -10,6 +10,7 @@ ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "").strip()
 if not ANTHROPIC_API_KEY:
     raise ValueError("ANTHROPIC_API_KEY not set")
 
+
 class AnthropicClient:
     def __init__(self, model_name: str = "claude-3-5-sonnet-20241022", temperature: float = 0.7, max_tokens: int = 1024, streaming: bool = False, callback_manager=None, **kwargs):
         self._client = Anthropic(api_key=ANTHROPIC_API_KEY)
@@ -109,21 +110,31 @@ class AnthropicClient:
         # Extract the text content from the response
         return response.content[0].text
 
-    def stream_chat(self, prompt: str, system_prompt: str = None):
+    async def stream_chat(self, prompt: str, system_prompt: str = None):
         """
         Stream a chat response from Claude.
         
         Args:
-            prompt: The user's message/prompt
+            prompt: The user's message/prompt (can be string or dict with context)
             system_prompt: Optional system prompt to set context
             
         Yields:
             Text chunks as they arrive
         """
+        # Handle both string prompts and context dicts
+        if isinstance(prompt, dict):
+            # If prompt is a context dict, extract the actual prompt
+            user_prompt = prompt.get('prompt', '') or prompt.get('query', '') or str(prompt)
+            # You might also want to extract system_prompt from context if not provided
+            if not system_prompt and 'system_prompt' in prompt:
+                system_prompt = prompt['system_prompt']
+        else:
+            user_prompt = prompt
+            
         messages = [
             {
                 "role": "user",
-                "content": prompt
+                "content": user_prompt
             }
         ]
         
@@ -140,6 +151,7 @@ class AnthropicClient:
         if system_prompt:
             request_params["system"] = system_prompt
         
-        with self._client.messages.stream(**request_params) as stream:
-            for text in stream.text_stream:
+        # Use async context manager for streaming
+        async with self._client.messages.stream(**request_params) as stream:
+            async for text in stream.text_stream:
                 yield text
