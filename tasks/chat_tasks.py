@@ -444,7 +444,7 @@ class StreamingChatManager:
             )
 
             # Check for cancellation 🛑 before streaming
-            if self._is_cancelled(task_id):
+            if self._is_cancelled():
                 logger.log("Chat stream has been cancelled 💔...")
                 await self._handle_cancellation(assistant_message_id, chat_session_id)
                 return assistant_message_id
