@@ -1123,19 +1123,35 @@ class StreamingChatManager:
     ):
         """🆕 Update message status efficiently"""
         async with get_db_connection() as conn:
-            update_data = {
-                "status": status,
-                "updated_at": "NOW()"
-            }
+            # The stream is only considered successfully completed if the
+            # final status is 'complete'. For 'error', 'cancelled', etc., it's false.
+            is_stream_complete = (status == 'complete')
+
             if error_message:
+                # This branch handles errors. The status will typically be 'error',
+                # so is_stream_complete will correctly evaluate to False.
                 await conn.execute(
-                    "UPDATE messages SET status = $1, error_message = $2, updated_at = NOW() WHERE id = $3",
-                    status, error_message, message_id
+                    """
+                    UPDATE messages 
+                    SET status = $1, 
+                        error_message = $2, 
+                        streaming_complete = $3, 
+                        updated_at = NOW() 
+                    WHERE id = $4
+                    """,
+                    status, error_message, is_stream_complete, message_id
                 )
             else:
+                # This handles non-error updates (e.g., setting status to 'complete')
                 await conn.execute(
-                    "UPDATE messages SET status = $1, updated_at = NOW() WHERE id = $2",
-                    status, message_id
+                    """
+                    UPDATE messages 
+                    SET status = $1, 
+                        streaming_complete = $2, 
+                        updated_at = NOW() 
+                    WHERE id = $3
+                    """,
+                    status, is_stream_complete, message_id
                 )
 
     async def _is_cancelled(self) -> bool:

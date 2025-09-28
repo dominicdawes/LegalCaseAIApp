@@ -305,6 +305,8 @@ def log_llm_error(
             "user_id": user_id,
             "created_at": datetime.now(timezone.utc).isoformat(),
             "role": "assistant",
+            "status": "error",
+            "Streaming_complete": True,
         }
     elif table_name == "notes":
         payload = {
