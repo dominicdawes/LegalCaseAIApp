@@ -1060,7 +1060,11 @@ class StreamingChatManager:
         user_id: str,
         chat_session_id: str
     ):
-        """🆕 Finalize message with rich content"""
+        """
+        Finalize message with rich content
+        - Provides status updates to DB and to websocket stream
+        - Records RAG chat api usage (robust and has Idempotency fallbacks)
+        """
         
         async with get_db_connection() as conn:
             async with conn.transaction():
@@ -1101,7 +1105,19 @@ class StreamingChatManager:
                         message_id, highlight.text, highlight.highlight_type,
                         highlight.confidence
                     )
-        
+
+                # 4. Increment user usage atomically (specific to user_id)
+                await conn.execute(
+                    """
+                    INSERT INTO public.usage (user_id, day_rag_queries)
+                    VALUES ($1, 1)
+                    ON CONFLICT (user_id) DO UPDATE 
+                    SET day_rag_queries = usage.day_rag_queries + 1,
+                        last_active_at = NOW();
+                    """,
+                    user_id
+                )
+
         # Final broadcast
         await self._broadcast_completion(chat_session_id, message_id)
         logger.info(f"✅ Message finalized with {len(response.citations)} citations, {len(response.highlights)} highlights")

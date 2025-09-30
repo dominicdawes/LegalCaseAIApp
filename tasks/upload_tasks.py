@@ -271,21 +271,52 @@ def _calculate_stream_hash(stream: io.BytesIO) -> str:
     stream.seek(0) # Reset stream position after reading
     return sha256_hash.hexdigest()
 
-def _update_document_status_sync(doc_id: str, status: ProcessingStatus, error_message: str = None):
-    """[PER DOCUMENT] Synchronous version of document status update helper (for gevent)"""
+def _update_document_status_sync(doc_id: str, status: ProcessingStatus, error_message: str = None, stats: Optional[Dict[str, Any]] = None):
+    """
+    [PER DOCUMENT] Synchronous version of document status update helper.
+    Performs Supabase public.document_sources updates for processed documents
+
+    Args:
+    - doc_id: document uuid
+    - status: Enum defined above PENDING, COMPLETE, etc...
+    - stats (Dict): a dict that contains 'total chunks', 'batch_size', etc
+    """
     logger.info(f"📋 Doc {doc_id[:8]}... → {status.value}")
     pool = get_global_sync_db_pool()
     conn = pool.getconn()
     try:
         with conn.cursor() as cur:
-            cur.execute(
-                """
-                UPDATE document_sources
-                SET vector_embed_status = %s, error_message = %s, updated_at = NOW()
-                WHERE id = %s
-                """,
-                (status.value, error_message, doc_id)
-            )
+            # If the process is complete and we have stats, perform a full update
+            if status == ProcessingStatus.COMPLETE and stats:
+                cur.execute(
+                    """
+                    UPDATE document_sources
+                    SET 
+                        vector_embed_status = %s, 
+                        error_message = %s, 
+                        updated_at = NOW(),
+                        total_chunks = %s,
+                        total_tokens = %s
+                    WHERE id = %s
+                    """,
+                    (
+                        status.value, 
+                        error_message, 
+                        stats.get('chunks_created', 0), 
+                        stats.get('total_tokens', 0), 
+                        doc_id
+                    )
+                )
+            else:
+                # Original query for simple status updates or failures
+                cur.execute(
+                    """
+                    UPDATE document_sources
+                    SET vector_embed_status = %s, error_message = %s, updated_at = NOW()
+                    WHERE id = %s
+                    """,
+                    (status.value, error_message, doc_id)
+                )
             conn.commit()
     finally:
         pool.putconn(conn)
@@ -576,6 +607,14 @@ async def _analyze_download_and_store_document_for_workflow(
 ) -> Dict[str, Any]:
     """
     [ASYNC]
+    Description:
+    - Downloads (in-memory stream), hashes, Persist to AWS and Amazon CloudFront CDN and analyzes a document to determine processing type 
+    using a single, robust SQL query.
+    - DUPLICATE: Same hash, same project.
+    - REUSED: Same hash, different project, already processed.
+    - NEW: No match found.
+
+    Definitions:
     1. Download (in-memory stream)
     2. Persist to AWS and Amazon CloudFront CDN
     3. Hash to document and analyze document to determine processing type:
@@ -585,14 +624,12 @@ async def _analyze_download_and_store_document_for_workflow(
     Returns document metadata with processing classification
     """
     try:
-        # ——— Download & Prepare Document (same as existing logic) ——————————————————
-        # keep existing _download_and_prep_doc logic...
+        # ——— 1. Download & Prepare Document ——————————————————
         doc_data = await _download_and_prep_doc(client, url, project_id, user_id)
         if not doc_data:
             raise Exception(f"Failed to download document from {url}")
         
-        # ——— Check Processing Type (sync DB lookup) ———————————————————————————————
-        # Use global pool instead of local pool
+        # ——— 2. Check Processing Type with a Single, Combined Query ——————————
         pool = get_global_sync_db_pool()
         conn = pool.getconn()
         
@@ -600,40 +637,55 @@ async def _analyze_download_and_store_document_for_workflow(
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
                 content_hash = doc_data['content_hash']
                 
-                # First: Check same project (SEARCH for DUPLICATE documents in the CURRENT PROJECT)
+                # This single query finds any match and determines its type
                 cur.execute(
-                    'SELECT id FROM document_sources WHERE content_hash = %s AND project_id = %s',
-                    (content_hash, project_id)
-                )
-                same_project_doc = cur.fetchone()
-                
-                if same_project_doc:
-                    return {
-                        'processing_type': 'DUPLICATE',
-                        'existing_doc_id': str(same_project_doc['id']),
-                        'doc_data': doc_data,
-                        'project_id': project_id
+                    """
+                    SELECT
+                        id,
+                        -- Use a CASE statement to determine the processing type in SQL
+                        CASE
+                            WHEN project_id = %(current_project_id)s THEN 'DUPLICATE'
+                            ELSE 'REUSED'
+                        END as processing_type,
+                        total_chunks
+                    FROM document_sources
+                    WHERE content_hash = %(content_hash)s
+                      AND (
+                           project_id = %(current_project_id)s OR 
+                           (vector_embed_status = 'COMPLETE' AND total_chunks > 0)
+                      )
+                    ORDER BY
+                        -- Prioritize the DUPLICATE case to ensure it's found first
+                        CASE WHEN project_id = %(current_project_id)s THEN 0 ELSE 1 END
+                    LIMIT 1;
+                    """,
+                    {
+                        'content_hash': content_hash,
+                        'current_project_id': project_id
                     }
-                
-                # Second: Check for reusable processed content (SEARCH for matching CONTENT_HASH)
-                cur.execute(
-                    '''SELECT id, project_id, total_chunks 
-                       FROM document_sources 
-                       WHERE content_hash = %s AND vector_embed_status = %s AND total_chunks > 0
-                       LIMIT 1''',
-                    (content_hash, ProcessingStatus.COMPLETE.value)
                 )
-                existing_processed = cur.fetchone()
+                existing_doc = cur.fetchone()
                 
-                if existing_processed:
-                    return {
-                        'processing_type': 'REUSED',
-                        'existing_doc_id': str(existing_processed['id']),
-                        'doc_data': doc_data,
-                        'project_id': project_id,
-                        'chunks_available': existing_processed['total_chunks']
-                    }
+                if existing_doc:
+                    processing_type = existing_doc['processing_type']
+                    
+                    if processing_type == 'DUPLICATE':
+                        return {
+                            'processing_type': 'DUPLICATE',
+                            'existing_doc_id': str(existing_doc['id']),
+                            'doc_data': doc_data,
+                            'project_id': project_id
+                        }
+                    else: # REUSED socument found
+                        return {
+                            'processing_type': 'REUSED',
+                            'existing_doc_id': str(existing_doc['id']),
+                            'doc_data': doc_data,
+                            'project_id': project_id,
+                            'chunks_available': existing_doc['total_chunks']
+                        }
                 else:
+                    # No existing document found, it's NEW
                     return {
                         'processing_type': 'NEW',
                         'doc_data': doc_data,
@@ -1111,7 +1163,8 @@ async def _process_embeddings_async(doc_id: str, project_id: str, chunks: List[s
             return_exceptions=True
         )
         
-        # ——— 3. Analyze Results (Same logic as legacy) ———————————————————————————
+        # ——— 3. Analyze Results  ———————————————————————————
+        results_dict = {}
         successful_batches = []
         failed_batches = []
         total_chunks_embedded = 0
@@ -1129,6 +1182,15 @@ async def _process_embeddings_async(doc_id: str, project_id: str, chunks: List[s
                 error_msg = result.get('error', 'Unknown error') if result else 'No result'
                 logger.error(f"❌ [DOC-{short_id}] Batch failed: {error_msg}")
                 failed_batches.append(error_msg)
+
+        results_dict = {
+            'success': True,
+            'chunks_embedded': total_chunks_embedded,
+            'total_tokens': total_tokens,
+            'successful_batches': len(successful_batches),
+            'failed_batches': len(failed_batches),
+            'processing_time_ms': 0  # Could add timing if needed
+        }
         
         # ——— 4. Determine Final Status ———————————————————————————————————————————
         if len(successful_batches) == 0:
@@ -1141,17 +1203,10 @@ async def _process_embeddings_async(doc_id: str, project_id: str, chunks: List[s
             _update_document_status_sync(doc_id, ProcessingStatus.PARTIAL)
             logger.warning(f"⚠️ [DOC-{short_id}] Partial success: {len(successful_batches)}/{len(embedding_batches)} batches")
         else:
-            _update_document_status_sync(doc_id, ProcessingStatus.COMPLETE)
+            _update_document_status_sync(doc_id, ProcessingStatus.COMPLETE, stats=results_dict)
             logger.info(f"✅ [DOC-{short_id}] All embeddings successful")
         
-        return {
-            'success': True,
-            'chunks_embedded': total_chunks_embedded,
-            'total_tokens': total_tokens,
-            'successful_batches': len(successful_batches),
-            'failed_batches': len(failed_batches),
-            'processing_time_ms': 0  # Could add timing if needed
-        }
+        return results_dict
         
     except Exception as e:
         logger.error(f"❌ [DOC-{short_id}] Embedding processing failed: {e}")
@@ -1623,6 +1678,11 @@ def process_new_document_wrapper(
     - Single responsibility: coordinate one complete document
     - Delegates complex async work to dedicated function
     - Clean error handling and state management
+
+    Args:
+        - doc_data (Dict): filename, document_uuid, other keys... 
+        - project_id (str): project uuid
+        - workflow_metadata: Dict[str, Any]
     """
     doc_id = str(uuid.uuid4())  # create a new uuid
     doc_data['id'] = doc_id
@@ -1650,7 +1710,7 @@ def process_new_document_wrapper(
         )
         
         # Update document status (sync call, like your pattern)
-        _update_document_status_sync(doc_id, ProcessingStatus.COMPLETE)
+        _update_document_status_sync(doc_id, ProcessingStatus.COMPLETE, stats=result)
         
         logger.info(f"✅ [DOC-{short_id}] Document processing completed successfully")
         return result
@@ -1707,7 +1767,7 @@ async def _process_document_async_workflow(
                 is_essential = workflow_metadata.get('is_essential', False)
                 
                 if is_essential:
-                    # Get essential course and section with defaults
+                    # Get "1L Essential" course and section with defaults
                     essential_course = workflow_metadata.get('essential_course')
                     essential_section = workflow_metadata.get('essential_section')
                     
