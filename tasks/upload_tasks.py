@@ -2042,7 +2042,7 @@ def process_reused_document_task(
                     (id, cdn_url, content_hash, project_id, content_tags, uploaded_by, 
                     vector_embed_status, filename, file_size_bytes, file_extension, 
                     total_chunks, total_batches, created_at, processing_metadata)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, s%)''',
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)''', # <-- FIXED HERE: unsupported format character ')' (0x29)
                     (new_doc_id, doc_data['cdn_url'], doc_data['content_hash'], 
                     project_id, doc_data.get('content_tags', []), workflow_metadata['user_id'],
                     ProcessingStatus.COMPLETE.value, doc_data['filename'], 
@@ -2050,6 +2050,7 @@ def process_reused_document_task(
                     source_info['total_chunks'], source_info['total_batches'],
                     datetime.now(timezone.utc), Json(workflow_metadata))
                 )
+                conn.commit() # Commit the insert of the new document source
         finally:
             pool.putconn(conn)
         
@@ -2071,7 +2072,7 @@ def process_reused_document_task(
         }
         
     except Exception as e:
-        logger.error(f"❌ [DOC-{new_doc_id[:8]}] Reused document processing failed: {e}")
+        logger.error(f"❌ [DOC-{new_doc_id[:8]}] Reused document processing failed: {e}", exc_info=True)
         return {
             'doc_id': new_doc_id,
             'processing_type': 'REUSED',
