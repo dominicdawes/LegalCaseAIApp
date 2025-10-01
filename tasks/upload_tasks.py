@@ -1579,7 +1579,9 @@ def finalize_batch_and_create_note(
     
     for doc in successful_docs:
         if isinstance(doc, dict):
-            total_chunks += doc.get('chunks_created', 0)
+            # Check for either key to correctly sum chunks from NEW or REUSED docs
+            chunks_processed = doc.get('chunks_created', 0) or doc.get('chunks_reused', 0)
+            total_chunks += chunks_processed
             total_tokens_reused += doc.get('tokens_reused', 0)
     
     # ——— Determine Final Batch Status ————————————————————————————————————————————
