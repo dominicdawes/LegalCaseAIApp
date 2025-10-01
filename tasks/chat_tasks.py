@@ -895,28 +895,24 @@ class StreamingChatManager:
             if chunk_tokens + page_token_count <= available_tokens:
                 final_chunks.extend(page_chunks)
         
-        # Build page-organized context
+        # Build a clear, citable context that aligns with the prompt's instructions
         numbered_contexts = []
-        pages_dict = {}
-        
-        for chunk in final_chunks:
-            page_num = chunk.get('page_number', 'Unknown')
-            if page_num not in pages_dict:
-                pages_dict[page_num] = []
-            pages_dict[page_num].append(chunk)
-        
-        for page_num in sorted(pages_dict.keys(), key=lambda x: x if isinstance(x, int) else float('inf')):
-            chunks_on_page = pages_dict[page_num]
-            page_content = "\n".join(f"[Chunk {i+1}] {chunk.get('content', '')}" 
-                                    for i, chunk in enumerate(chunks_on_page))
-            
-            numbered_contexts.append(
-                f"=== PAGE {page_num} ===\n"
-                f"Document: {chunks_on_page[0].get('title', 'Unknown')}\n"
-                f"{page_content}\n"
+        for i, chunk in enumerate(final_chunks):
+            # Fetch the title and page number from the chunk dictionary
+            # The .get() method provides a safe default if a key is missing.
+            doc_title = chunk.get('title', 'Unknown Document') 
+            page_num = chunk.get('page_number', 'N/A')
+            content = chunk.get('content', '')
+
+            # This new format explicitly provides the citation info with the content,
+            # making it very easy for the LLM to follow your YAML prompt.
+            context_item = (
+                f"Source {i+1} [Document: {doc_title}, Page: {page_num}]:\n"
+                f'"""\n{content}\n"""'
             )
-        
-        chunk_context = "\n".join(numbered_contexts)
+            numbered_contexts.append(context_item)
+
+        chunk_context = "\n\n".join(numbered_contexts)
         final_context = f"{user_context}\n\nRelevant Context:\n{chunk_context}"
         
         return final_context, final_chunks
