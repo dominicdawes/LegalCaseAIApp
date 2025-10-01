@@ -702,7 +702,8 @@ async def _analyze_download_and_store_document_for_workflow(
 def copy_embeddings_for_project_sync(existing_source_id: str, new_source_id: str, project_id: str, user_id: str) -> Dict[str, Any]:
     """
     [SYNC] Copy embeddings from an existing processed document to a new project
-    [ULTRA-OPTIMIZED] Also used in the ultra-low latency path for 100% reused documents
+    Converts python dict rows into the JSONB rows required by Supabase
+    Also used in the ultra-low latency path for 100% reused documents
     
     Args:
         existing_source_id: Source ID of the already-processed document
@@ -719,7 +720,7 @@ def copy_embeddings_for_project_sync(existing_source_id: str, new_source_id: str
     
     try:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            # Get vector embeddings from the existing document (via matching source_id)
+            # Get vector embeddings from the existing document
             cur.execute(
                 '''
                 SELECT content, metadata, embedding, num_tokens, page_number, chunk_index
@@ -739,20 +740,19 @@ def copy_embeddings_for_project_sync(existing_source_id: str, new_source_id: str
             records_to_insert = []
             total_tokens = 0
             
-            # Copy each existing embedding row to assocuate with the new user's project
             for embedding_row in existing_embeddings:
                 records_to_insert.append((
-                    str(uuid.uuid4()),               # id (converted to string)
-                    new_source_id,                   # source_id (already string)
-                    project_id,                      # project_id NEW DESTINATION (already string) 
-                    embedding_row['content'],        # content   (reuse existing)
-                    embedding_row['metadata'],       # metadata  (keep original)
-                    embedding_row['embedding'],      # embedding (reuse existing)
-                    embedding_row['num_tokens'],     # num_tokens
-                    embedding_row['page_number'],    # Copy page number
-                    embedding_row['chunk_index'],    # Copy chunk index
-                    user_id,                         # user_id NEW USER (already string)
-                    datetime.now(timezone.utc)       # created_at
+                    str(uuid.uuid4()),
+                    new_source_id,
+                    project_id,
+                    embedding_row['content'],
+                    Json(embedding_row['metadata']), # <-- FIXED HERE: Serialize dict back to JSON
+                    embedding_row['embedding'],
+                    embedding_row['num_tokens'],
+                    embedding_row['page_number'],
+                    embedding_row['chunk_index'],
+                    user_id,
+                    datetime.now(timezone.utc)
                 ))
                 total_tokens += embedding_row['num_tokens'] or 0
             
