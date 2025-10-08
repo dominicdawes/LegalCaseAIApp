@@ -53,7 +53,7 @@ import asyncio
 import socket
 
 # ===== LLM & LANGCHAIN =====
-import tiktsoken
+import tiktoken
 from langchain_openai import OpenAIEmbeddings
 from langchain.callbacks.base import BaseCallbackHandler
 
