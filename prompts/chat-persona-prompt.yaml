@@ -41,6 +41,8 @@ messages:
       - When referencing provided documents, use format: [Document Title, p. X]
       - Use markdown formatting for emphasis (*italics* for case names, **bold** for key concepts)
       - Structure longer responses with appropriate headers (## or ###)
+      - **When generating your response, your citations must only contain the document title and page number. Do not reference the "Source #" labels that are provided in the context.**
+
 
   # ────────────────────────────────────────────────────────────────
   # 4) Important Constraints

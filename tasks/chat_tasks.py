@@ -28,6 +28,7 @@ import gc
 import redis
 import hashlib
 import pickle
+from collections import defaultdict
 import urllib
 import time
 import re
@@ -52,7 +53,7 @@ import asyncio
 import socket
 
 # ===== LLM & LANGCHAIN =====
-import tiktoken
+import tiktsoken
 from langchain_openai import OpenAIEmbeddings
 from langchain.callbacks.base import BaseCallbackHandler
 
@@ -832,7 +833,10 @@ class StreamingChatManager:
         model_name: str,
         max_tokens: int
     ) -> Tuple[str, List[Dict]]:
-        """🆕 Smart context trimming that preserves highest-quality chunks"""
+        """
+        Smart context trimming that preserves highest-quality chunks and
+        Creates proper page citations out of the chunks relevant chunks of data
+        """
         
         # Get tokenizer
         model_to_encoding = {
@@ -863,7 +867,8 @@ class StreamingChatManager:
             key=lambda x: (x.get('page_number', float('inf')), x.get('chunk_index', 0))
         )
         
-        # Group by page for better context organization
+        # This section determines which chunks fit into the token budget.
+        # It MUST run before we format the context.
         final_chunks = []
         chunk_tokens = 0
         current_page = None
@@ -895,24 +900,37 @@ class StreamingChatManager:
             if chunk_tokens + page_token_count <= available_tokens:
                 final_chunks.extend(page_chunks)
         
-        # Build a clear, citable context that aligns with the prompt's instructions
+        ## -- Build a clear, citable context that aligns with the prompt's instructions ------ #
+
+        # 1. Group the selected (final_chunks) by their document title
+        grouped_chunks = defaultdict(list)
+        for chunk in final_chunks:
+            doc_title = chunk.get('title', 'Unknown Document')
+            grouped_chunks[doc_title].append(chunk)
+
+        # 2. Build the final context string from the grouped chunks
         numbered_contexts = []
-        for i, chunk in enumerate(final_chunks):
-            # Fetch the title and page number from the chunk dictionary
-            # The .get() method provides a safe default if a key is missing.
-            doc_title = chunk.get('title', 'Unknown Document') 
-            page_num = chunk.get('page_number', 'N/A')
-            content = chunk.get('content', '')
+        source_index = 1
+        for doc_title, chunks_in_doc in grouped_chunks.items():
+            # Each document gets a single, stable "Source" number
+            header = f"Source {source_index}: [Document: {doc_title}]"
+            numbered_contexts.append(header)
+            
+            # Add content from each chunk with its specific page number
+            for chunk in chunks_in_doc:
+                page_num = chunk.get('page_number', 'N/A')
+                content = chunk.get('content', '')
+                context_item = (
+                    f"  (Page: {page_num})\n"
+                    f'  """\n  {content}\n  """'
+                )
+                numbered_contexts.append(context_item)
+            
+            numbered_contexts.append("-" * 20) # Add a separator between documents
+            source_index += 1
 
-            # This new format explicitly provides the citation info with the content,
-            # making it very easy for the LLM to follow your YAML prompt.
-            context_item = (
-                f"Source {i+1} [Document: {doc_title}, Page: {page_num}]:\n"
-                f'"""\n{content}\n"""'
-            )
-            numbered_contexts.append(context_item)
+        chunk_context = "\n".join(numbered_contexts)
 
-        chunk_context = "\n\n".join(numbered_contexts)
         final_context = f"{user_context}\n\nRelevant Context:\n{chunk_context}"
         
         return final_context, final_chunks
