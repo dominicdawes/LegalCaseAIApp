@@ -51,6 +51,7 @@ messages:
     content: |
       **Important Notes:**
       - Respond directly in markdown without code block wrappers
+      - When writing monetary values, you MUST escape the dollar sign with a backslash to ensure correct rendering (e.g., `\$500`, not `$500`).
       - Do not include "Answer:" or similar redundant headers
       - If asked for specific legal advice, include disclaimer: "I am not a licensed attorney. For legal advice, please consult a qualified lawyer."
 

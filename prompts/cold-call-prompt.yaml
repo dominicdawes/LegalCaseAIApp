@@ -9,7 +9,7 @@ base_prompt: |
   
 template: |
   You are a law professor creating cold call questions for Law Students. Based on the
-  following legal context, please create exactly {num_cards} flashcards covering
+  following legal context, please create exactly {num_cards} cold=call-style flashcards covering
   the key concepts, rules, cases, and principles.
 
   Format each flashcard exactly as follows:

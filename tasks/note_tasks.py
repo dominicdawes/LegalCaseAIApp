@@ -230,7 +230,7 @@ class AsyncNoteManager:
             
             # 🆕 Async note persistence: Nomal Notes (one block) vs Flashcards, Cold Calls (discrete-blocks)
             save_start = time.time()
-            if note_type == "flashcards":  
+            if note_type == "flashcards"  or note_type == "cold_call":  
                 # Special flashcard processing and storage
                 deck_id, num_cards = await self._save_flashcard_deck_and_cards_async(
                     project_id=project_id,
@@ -684,71 +684,72 @@ class AsyncNoteManager:
             logger.error(f"❌ Error saving flashcard deck and cards: {e}", exc_info=True)
             raise
 
-    def save_flashcard_deck_and_cards_sync(self, project_id, user_id, deck_name, llm_output):
-        """
-        🔄 LEGACY synchronous wrapper for flashcard processing
-        Maintained for backward compatibility with existing code
-        """
-        logger.warning("⚠️ Using legacy sync flashcard processing - consider upgrading to async")
+    # def save_flashcard_deck_and_cards_sync(self, project_id, user_id, deck_name, llm_output):
+    #     """
+    #     🔄 SUNSET: NOW PLACING FLASHCARDS DIRECT INTO NOTES TABLE
+    #     synchronous wrapper for flashcard processing
+    #     Maintained for backward compatibility with existing code
+    #     """
+    #     logger.warning("⚠️ Using legacy sync flashcard processing - consider upgrading to async")
         
-        try:
-            # Initialize processor
-            processor = FlashcardProcessor()
+    #     try:
+    #         # Initialize processor
+    #         processor = FlashcardProcessor()
             
-            # Parse the LLM output
-            deck_data, cards_list = processor.parse_flashcard_content(llm_output, deck_name)
+    #         # Parse the LLM output
+    #         deck_data, cards_list = processor.parse_flashcard_content(llm_output, deck_name)
             
-            # Validate the parsed data
-            if not processor.validate_flashcard_data(deck_data, cards_list):
-                raise ValueError("Invalid flashcard data structure")
+    #         # Validate the parsed data
+    #         if not processor.validate_flashcard_data(deck_data, cards_list):
+    #             raise ValueError("Invalid flashcard data structure")
             
-            logger.info(f"💾 Parsed {len(cards_list)} flashcards for deck: {deck_name}")
+    #         logger.info(f"💾 Parsed {len(cards_list)} flashcards for deck: {deck_name}")
             
-            # Insert deck record first using Supabase client
-            deck_response = supabase_client.table('flashcard_decks').insert({
-                'user_id': user_id,
-                'project_id': project_id,
-                'deck_name': deck_data['deck_name'],
-                'description': deck_data['description'],
-                'num_cards': deck_data['num_cards'],
-                'created_at': deck_data['created_at'],
-                'is_active': deck_data.get('is_active', True)
-            }).execute()
+    #         # Insert deck record first using Supabase client
+    #         deck_response = supabase_client.table('flashcard_decks').insert({
+    #             'user_id': user_id,
+    #             'project_id': project_id,
+    #             'deck_name': deck_data['deck_name'],
+    #             'description': deck_data['description'],
+    #             'num_cards': deck_data['num_cards'],
+    #             'created_at': deck_data['created_at'],
+    #             'is_active': deck_data.get('is_active', True)
+    #         }).execute()
             
-            if not deck_response.data:
-                raise Exception("Failed to insert flashcard deck")
+    #         if not deck_response.data:
+    #             raise Exception("Failed to insert flashcard deck")
             
-            deck_id = deck_response.data[0]['id']
-            logger.info(f"✅ Inserted flashcard deck with ID: {deck_id}")
+    #         deck_id = deck_response.data[0]['id']
+    #         logger.info(f"✅ Inserted flashcard deck with ID: {deck_id}")
             
-            # Prepare individual cards for batch insert
-            cards_to_insert = []
-            for card in cards_list:
-                cards_to_insert.append({
-                    'deck_id': deck_id,
-                    'user_id': user_id,
-                    'project_id': project_id,
-                    'front_content': card['front_content'],
-                    'back_content': card['back_content'],
-                    'card_order': card['card_order'],
-                    'created_at': card['created_at'],
-                    'is_active': card.get('is_active', True)
-                })
+    #         # Prepare individual cards for batch insert
+    #         cards_to_insert = []
+    #         for card in cards_list:
+    #             cards_to_insert.append({
+    #                 'deck_id': deck_id,
+    #                 'user_id': user_id,
+    #                 'project_id': project_id,
+    #                 'front_content': card['front_content'],
+    #                 'back_content': card['back_content'],
+    #                 'card_order': card['card_order'],
+    #                 'created_at': card['created_at'],
+    #                 'is_active': card.get('is_active', True)
+    #             })
             
-            # Batch insert individual cards
-            if cards_to_insert:
-                cards_response = supabase_client.table('individual_cards').insert(cards_to_insert).execute()
+    #         # Batch insert individual cards
+    #         if cards_to_insert:
+    #             cards_response = supabase_client.table('individual_cards').insert(cards_to_insert).execute()
                 
-                if not cards_response.data:
-                    raise Exception("Failed to insert flashcards")
+    #             if not cards_response.data:
+    #                 raise Exception("Failed to insert flashcards")
                 
-                logger.info(f"✅ Inserted {len(cards_response.data)} individual flashcards")
+    #             logger.info(f"✅ Inserted {len(cards_response.data)} individual flashcards")
             
-            return deck_id, len(cards_list)
+    #         return deck_id, len(cards_list)
             
-        except Exception as e:
-            logger.error(f"Error saving flashcard deck and cards: {e}", exc_info=True)
-            raise
+    #     except Exception as e:
+    #         logger.error(f"Error saving flashcard deck and cards: {e}", exc_info=True)
+    #         raise
 
     async def _log_performance_metrics(self, metrics: Dict):
         """🆕 Log performance metrics for monitoring"""

@@ -9,7 +9,7 @@ Replaces blocking sequential processing with parallel async operations + real-ti
 Models
 - 🤖 o4-mini
 - 🤖 gpt-4.1-nano
-- 🅰️ Claude 4 Sonnet
+- 🅰️ Claude 4.5 Sonnet
 
 i dont think i need a base retry class if celery can handle it built-in:
 @celery_app.task(
@@ -1080,6 +1080,9 @@ class StreamingChatManager:
         - Records RAG chat api usage (robust and has Idempotency fallbacks)
         """
         
+        # Add this line to escape dollar amounts before saving (stops wierd .md mathjax)
+        final_content = re.sub(r'(?<!\\)\$(\d)', r'\\$\1', response.content)
+
         async with get_db_connection() as conn:
             async with conn.transaction():
                 # Update main message
