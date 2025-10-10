@@ -40,6 +40,7 @@ from tasks.chat_tasks import streaming_manager
 # from tasks.upload_tasks import append_document_task  <-- need to revive this later
 from tasks.sample_tasks import addition_task
 from tasks.chat_tasks import rag_chat_task, persist_user_query
+from tasks.note_tasks import cleanup_note_task
 from tasks.note_tasks import rag_note_task 
 from tasks.celery_app import celery_app  # Import the Celery app instance (see celery_app.py for LocalHost config)
 
@@ -190,6 +191,13 @@ class RagPipelineNewDocumentsResponse(BaseModel):
     }
     '''
     embedding_task_id: str      # from vector embedding task
+
+class CleanNoteRequest(BaseModel):
+    note_id: str
+    user_id: str
+    provider: str = "openai"
+    model_name: str = "gpt-4o"
+    temperature: float = 0.5
 
 # <---- Models for new RAG pipeline nested Celery task staus checking ----> #
 class EmbeddingStatusRequest(BaseModel):
@@ -467,14 +475,39 @@ async def rag_chat(request: RagQueryRequest):
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
+@app.post("/clean-notes/", response_model=GenericTaskResponse)
+async def clean_note(request: CleanNoteRequest):
+    """
+    Triggers a background task to clean up and enhance an existing note's content.
+    """
+    try:
+        if not request.note_id or not request.user_id:
+            raise HTTPException(status_code=400, detail="note_id and user_id are required.")
 
+        job = cleanup_note_task.apply_async(
+            kwargs={
+                "note_id": request.note_id,
+                "user_id": request.user_id,
+                "provider": request.provider,
+                "model_name": request.model_name,
+                "temperature": request.temperature,
+            }
+        )
+        
+        logger.info(f"Queued note cleanup task {job.id} for note {request.note_id}")
+        return {"task_id": job.id}
+
+    except Exception as e:
+        logger.error(f"Failed to queue note cleanup task: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+        
 @app.post("/rag-chat/reset/")
 async def rag_chat_reset(request: RagQueryRequest):
     """
     Endpoint for the rag query responses (token streaming not enabled)
     Uses Celery chain to perform persist → rag back-to-back
     
-    **FYI NOT CURRENTLY IN USE
+    **FYI NOT CURRENTLY IN USE (i have a WeWeb Workflow in use instead)
 
     Raw json:
     ----------
@@ -567,47 +600,6 @@ async def cancel_rag_chat(task_id: str):
     except Exception as e:
         logger.error(f"❌ Cancel request failed for task {task_id}: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Failed to cancel task: {str(e)}")
-    # """
-    # Gracefully cancels a streaming RAG chat task.
-    
-    # This flow performs two actions:
-    # 1.  Sets an internal flag in the StreamingChatManager to stop the asyncio stream.
-    # 2.  Revokes the Celery task to prevent it from running if it's still in the queue.
-    # """
-    # logger.info(f"🛑 CANCEL REQUEST received for task: {task_id}")
-
-    # try:
-    #     # Step 1: Cooperatively cancel the running stream (see... chat_task.StreamingManager.cancel_task() )
-    #     session_id_to_notify = streaming_manager.cancel_task(task_id)
-
-    #     # Step 2: Revoke the task from Celery.
-    #     # This prevents the task from running if it hasn't started yet.
-    #     celery_app.control.revoke(task_id)
-        
-    #     message = "Task cancellation requested."
-        
-    #     # Step 3: Notify the client immediately via WebSocket
-    #     if session_id_to_notify:
-    #         logger.info(f"📡 Sending cancellation notice to session: {session_id_to_notify}")
-    #         await websocket_manager.send_to_session(session_id_to_notify, {
-    #             "type": "stream_cancelled",
-    #             "task_id": task_id,
-    #             "message": "Stream cancelled by user 🚫.",
-    #             "timestamp": datetime.now(timezone.utc).isoformat()
-    #         })
-    #         message = f"Cancellation signal sent to running task in session {session_id_to_notify}."
-    #     else:
-    #         logger.info(f"Task {task_id} was not actively streaming, but was revoked from the queue.")
-
-    #     return {
-    #         "status": "cancellation_requested",
-    #         "task_id": task_id,
-    #         "message": message
-    #     }
-
-    # except Exception as e:
-    #     logger.error(f"❌ Cancel request failed for task {task_id}: {e}", exc_info=True)
-    #     raise HTTPException(status_code=500, detail=f"Failed to cancel task: {str(e)}")
 
 
 # ================================================ #
