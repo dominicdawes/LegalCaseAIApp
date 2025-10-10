@@ -375,6 +375,77 @@ class AsyncNoteManager:
             logger.error(f"❌ Enhanced note generation failed: {e}")
             raise
 
+    async def cleanup_note_async(
+        self,
+        note_id: str,
+        user_id: str,
+        provider: str,
+        model_name: str,
+        temperature: float = 0.5
+    ) -> str:
+        """
+        Fetches a user's note, enhances it using an LLM, and updates it in the database.
+        """
+        if not self._initialized:
+            await self.initialize()
+
+        start_time = time.time()
+        logger.info(f"✨ Starting note cleanup for note_id: {note_id}")
+
+        try:
+            original_content = ""
+            # 1. Fetch the existing note content using the async pool
+            async with get_db_connection() as conn:
+                record = await conn.fetchrow(
+                    "SELECT content_markdown FROM notes WHERE id = $1 AND user_id = $2",
+                    uuid.UUID(note_id), uuid.UUID(user_id)
+                )
+                if not record or not record['content_markdown']:
+                    logger.warning(f"⚠️ Note {note_id} not found or is empty. Aborting cleanup.")
+                    return "Note not found or empty."
+                
+                original_content = record['content_markdown']
+
+            # 2. Build the prompt for the LLM
+            prompt = f"""
+            You are an expert editor. Review the following user-written note and enhance it.
+            Your tasks are to:
+            - Correct any spelling, grammar, and punctuation errors.
+            - Improve sentence structure for better clarity and flow.
+            - Format the entire note using clean and readable Markdown.
+            - Do not add any new information or change the original meaning of the note.
+            - Retain the user's original intent and tone.
+            
+            Here is the note to clean up:
+            ---
+            {original_content}
+            ---
+            """
+            # 3. Get LLM client and generate the cleaned content
+            llm_client = await self._setup_llm_client_async(provider, model_name, temperature)
+            cleaned_content = await self._generate_note_content_async(llm_client, prompt, provider)
+
+            # 4. Update the note in the database within a transaction
+            async with get_db_connection() as conn:
+                async with conn.transaction():
+                    await conn.execute(
+                        """
+                        UPDATE notes 
+                        SET content_markdown = $1, updated_at = NOW()
+                        WHERE id = $2 AND user_id = $3
+                        """,
+                        cleaned_content, uuid.UUID(note_id), uuid.UUID(user_id)
+                    )
+            
+            total_time = time.time() - start_time
+            logger.info(f"✅ Note cleanup for {note_id} completed in {total_time:.2f}s.")
+            return cleaned_content
+
+        except Exception as e:
+            logger.error(f"❌ Note cleanup failed for {note_id}: {e}", exc_info=True)
+            # You could potentially log this error to the 'notes' table as well
+            raise
+            
     async def _load_prompt_async(self, note_type: str) -> tuple:
         """Returns the full yaml dict and all keys"""
         
@@ -882,6 +953,55 @@ def rag_note_task(
     finally:
         # Clean up
         gc.collect()
+
+@celery_app.task(
+    bind=True,
+    base=BaseTaskWithRetry,
+    queue='notes', # Or a different queue if you prefer
+    acks_late=True,
+    rate_limit='120/m' # Adjust as needed
+)
+def cleanup_note_task(
+    self,
+    note_id: str,
+    user_id: str,
+    provider: str,
+    model_name: str,
+    temperature: float = 0.5,
+):
+    """
+    Celery task to clean up and enhance a user's existing note.
+    """
+    try:
+        task_id = self.request.id
+        logger.info(f"🚀 Starting cleanup_note_task {task_id} for note: {note_id}")
+        self.update_state(
+            state="STARTED",
+            meta={"start_time": datetime.now(timezone.utc).isoformat()}
+        )
+
+        # Execute the async workflow in the worker's persistent event loop
+        result = run_async_in_worker(
+            note_manager.cleanup_note_async(
+                note_id=note_id,
+                user_id=user_id,
+                provider=provider,
+                model_name=model_name,
+                temperature=temperature,
+            )
+        )
+        
+        logger.info(f"✅ Cleanup task {task_id} completed successfully.")
+        return "Note cleanup successful."
+
+    except Exception as e:
+        logger.error(f"❌ Cleanup task for note {note_id} failed: {e}", exc_info=True)
+        try:
+            raise self.retry(exc=e)
+        except MaxRetriesExceededError:
+            raise RuntimeError(
+                f"Note cleanup failed permanently for note {note_id} after {self.max_retries} retries: {e}"
+            ) from e
 
 # ——— Legacy Support Functions (For Backward Compatibility) ——————————————————————
 
