@@ -1,54 +1,87 @@
+"""For the new 'True In-Memory Streaming' method"""
+
 # utils/document_loaders/docx_loader.py
 
-import os
-import subprocess
-import tempfile
-from typing import List
-
 import textract
+import os
+import io
+import tempfile
+from typing import Iterator, Union, List
 from langchain.schema import Document
 from .base import BaseDocumentLoader
-import docx  # python-docx
+import docx # python-docx
+import docx2txt
+from celery.utils.log import get_task_logger
 
+# ——— Logging & Env Load ———————————————————————————————————————————————————————————
+logger = get_task_logger(__name__)
+logger.propagate = False
+
+# ——— Loader Classes ———————————————————————————————————————————————————————————
 
 class DocxLoader(BaseDocumentLoader):
     """
-    A loader for Microsoft Word files (.doc and .docx) that uses Textract
-    under the hood to extract plain text. Textract auto-detects whether the
-    file is binary .doc or XML-based .docx and invokes the correct converter.
+    ### MODIFIED: A loader for .docx files that operates on in-memory streams.
+    This loader does NOT support the old binary .doc format for in-memory processing.
     """
-
-    def load_documents(self, path: str) -> List[Document]:
+    def stream_documents(self, source: Union[str, io.BytesIO]) -> Iterator[Document]:
         """
-        Returns a list of Document(page_content, metadata) for the given file.
-        - Uses textract.process(...) to get the full Unicode text.
-        - Splits on two consecutive newlines (you can adjust this logic).
-        - Wraps each non-empty paragraph in a Document.
+        ### CHANGE: Uses docx.Document() with a file-like object.
         """
-        if not os.path.isfile(path):
-            raise FileNotFoundError(f"File not found: '{path}'")
-
-        # 1) Let Textract pull out all text from .doc or .docx
         try:
-            raw_bytes = textract.process(path)
-            raw_text = raw_bytes.decode("utf-8", errors="ignore")
-        except Exception as e:
-            raise RuntimeError(f"Textract failed to extract text from '{path}': {e}")
-
-        # 2) Split raw_text into paragraphs (split on two newlines)
-        paragraphs = [p.strip() for p in raw_text.split("\n\n") if p.strip()]
-
-        # 3) Wrap each paragraph in a Document(...) with metadata
-        docs: List[Document] = []
-        for idx, para in enumerate(paragraphs):
-            docs.append(
-                Document(
-                    page_content=para,
-                    metadata={
-                        "source_path": os.path.basename(path),
-                        "paragraph_index": idx,
-                    },
+            document = docx.Document(source)
+            for i, para in enumerate(document.paragraphs):
+                text = para.text.strip()
+                if not text:
+                    continue
+                yield Document(
+                    page_content=text,
+                    metadata={"paragraph_index": i},
                 )
-            )
+        except Exception as e:
+            raise RuntimeError(f"Failed to process DOCX stream: {e}")
 
-        return docs
+class LegacyDocLoader(BaseDocumentLoader):
+    """A loader for legacy .doc files that "converts"??? from .doc to .docx and then
+    uses Textract for in-memory streming."""
+    def stream_documents(self, source: io.BytesIO) -> Iterator[Document]:
+        # Add some basic validation
+        if not isinstance(source, io.BytesIO):
+            raise ValueError("LegacyDocLoader requires BytesIO input")
+            
+        source.seek(0)
+        if len(source.getvalue()) == 0:
+            raise ValueError("Empty document provided")
+        
+        with tempfile.NamedTemporaryFile(suffix='.doc', delete=False) as tmp:
+            source.seek(0)
+            tmp.write(source.read())
+            tmp.flush()
+            
+            try:
+                raw_bytes = textract.process(tmp.name)
+                text = raw_bytes.decode('utf-8', errors='ignore')
+                
+                # Slightly more robust paragraph splitting
+                paragraphs = [p.strip() for p in text.split('\n\n') if p.strip() and len(p.strip()) > 10]
+                
+                logger.info(f"Extracted {len(paragraphs)} paragraphs from LEGACY .doc file")
+                
+            except Exception as e:
+                raise RuntimeError(f"Failed to process legacy .doc file: {e}")
+            finally:
+                try:
+                    os.unlink(tmp.name)
+                except OSError:
+                    pass  # File might already be gone
+            
+            # Stream the results
+            for i, para in enumerate(paragraphs):
+                yield Document(
+                    page_content=para, 
+                    metadata={
+                        "paragraph_index": i, 
+                        "source_type": "legacy_doc",
+                        "total_paragraphs": len(paragraphs)
+                    }
+                )

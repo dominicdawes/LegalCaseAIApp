@@ -1,3 +1,5 @@
+# app/main.py
+
 '''
 Main FastAPI script, this is the heart of the web service
 '''
@@ -20,20 +22,32 @@ from utils.pdf_utils import extract_text_from_pdf
 # Celery task imports
 from celery import chain, chord, group, states
 from celery.result import AsyncResult
+
+
+# FastAPI
+from fastapi import FastAPI, BackgroundTasks, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
+
+# Websocket imports
+from app.ws_handlers import setup_websocket_routes, manager     # from ws_handlers.endpoints import setup_websocket_routes
+# from ws_handlers.connection_manager import manager
+
+# `Task/` module imports
+from tasks.profile_tasks import upload_profile_picture_task
 from tasks.podcast_generate_tasks import validate_and_generate_audio_task, generate_dialogue_only_task
-from tasks.upload_tasks import process_document_task, append_document_task
+from tasks.upload_tasks import process_document_batch_workflow
+from tasks.chat_tasks import streaming_manager
+# from tasks.upload_tasks import append_document_task  <-- need to revive this later
 from tasks.sample_tasks import addition_task
-from tasks.chat_streaming_tasks import rag_chat_streaming_task
 from tasks.chat_tasks import rag_chat_task, persist_user_query
 from tasks.note_tasks import rag_note_task 
+from tasks.celery_app import celery_app  # Import the Celery app instance (see celery_app.py for LocalHost config)
+
 
 # Configure logging (basic example, adjust as needed)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# FastAPI
-from fastapi import FastAPI, BackgroundTasks, HTTPException, WebSocket, WebSocketDisconnect
-from fastapi.middleware.cors import CORSMiddleware
 
 # Load environment variables
 load_dotenv()
@@ -47,6 +61,8 @@ redis_pub = aioredis.from_url(REDIS_LABS_URL, decode_responses=True)
 origins = [
     "https://app.weweb.io",  # Replace with the actual WeWeb domain if different
     "https://editor.weweb.io",
+    "https://www.legalnote.io",  # Add your new domain
+    "https://legalnote.io",      # Also add without www in case
     # Add other domains as needed
 ]
 
@@ -63,7 +79,29 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ======== PYDANTIC MODELS TEST ======== #
+# ================================================ #
+#                  WEBSOCKETS
+# ================================================ #
+
+# After creating app and redis_pub, add this line:
+setup_websocket_routes(app, redis_pub)
+
+# @app.websocket("/ws/chat/{session_id}")
+# async def websocket_chat(session_id: str, websocket: WebSocket):
+#     await websocket.accept()
+#     pubsub = redis_pub.pubsub()
+#     await pubsub.subscribe(f"chat_result:{session_id}")
+
+#     try:
+#         async for message in pubsub.listen():
+#             if message['type'] == 'message':
+#                 await websocket.send_text(message['data'])
+#     except WebSocketDisconnect:
+#         await pubsub.unsubscribe(f"chat_result:{session_id}")
+
+
+# ——— PYDANTIC MODELS TEST ————————————————————————————————————————————————————
+
 class Numbers(BaseModel):
     x: int
     y: int
@@ -81,7 +119,12 @@ class PDFCaptureResponse(BaseModel):
     uuid: str
     url: str
 
-# ======== PYDANTIC MODELS PROD ======== #
+# ——— PYDANTIC MODELS PROD ————————————————————————————————————————————————————
+
+# <---- Define Pydantic model for profile pic upload ----> #
+class ProfilePictureRequest(BaseModel):
+    user_id: str
+    image_url: str
 
 # <---- Define Pydantic model for the PDF extraction response ----> #
 class PDFExtractResponse(BaseModel):
@@ -225,28 +268,11 @@ class RagRegenerateRequest(BaseModel):
 
 class NewGeneratedNoteRequest(BaseModel):
     ''' 
-    Pydantic struct for `POST/generate-ai-note/` to kick off of a creation of a New Generate NOte
+    Pydantic struct for `POST/generate-note/` to kick off of a creation of a New Generate Note
     Files → S3/CF upload → Vector embedding
     '''
     # files: List[str]  # List of URLs or file paths of the PDFs
     metadata: Dict[str, Any]  # A dictionary for any metadata information
-
-# ================================================ #
-#                  WEBSOCKETS
-# ================================================ #
-
-@app.websocket("/ws/chat/{session_id}")
-async def websocket_chat(session_id: str, websocket: WebSocket):
-    await websocket.accept()
-    pubsub = redis_pub.pubsub()
-    await pubsub.subscribe(f"chat_result:{session_id}")
-
-    try:
-        async for message in pubsub.listen():
-            if message['type'] == 'message':
-                await websocket.send_text(message['data'])
-    except WebSocketDisconnect:
-        await pubsub.unsubscribe(f"chat_result:{session_id}")
 
 
 # ================================================ #
@@ -280,20 +306,36 @@ async def celery_test_addition(request: AdditionRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 # ================================================ #
+#                USER UTILS ENDPOINTS
+# ================================================ #
+
+@app.post("/upload-profile-picture/", response_model=GenericTaskResponse)
+async def upload_profile_picture(request: ProfilePictureRequest):
+    """Accepts a user_id + CDN URL, uploads to S3/CloudFront, saves to Supabase."""
+    try:
+        job = upload_profile_picture_task.apply_async(
+            args=[request.user_id, request.image_url]
+        )
+        return {"task_id": job.id}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ================================================ #
 #                RAG CHAT ENDPOINTS
 # ================================================ #
+
 @app.post("/new-rag-project/", response_model=NewRagPipelineResponse)
 async def create_new_rag_project(
     request: NewRagPipelineRequest, 
     background_tasks: BackgroundTasks
 ):
-    '''LIVE (06-03-2025)
-    Endpoint to create a RAG pipeline for user project:
-        - (prior) WeWeb creates a new project
-        - (prior) WeWeb creates a new chat_session and fkeys it to the project
-        - Uploads PDFs to AWS S3 and Supabase
-        - Initiates chunking and embedding tasks
-        - Returns task_id and source_ids for status monitoring
+    '''LIVE (07-20-2025)
+    Endpoint to start document RAG ingest → New AI Note Creation user project id {ID}:
+    - (prior) WeWeb creates a new project
+    - (prior) WeWeb creates a new chat_session and fkeys it to the project
+    - Uploads PDFs to AWS S3 and Supabase
+    - Initiates chunking and embedding tasks
+    - Returns task_id and source_ids for status monitoring
         
     Request contains:
         request.files (List): list of pdf file links
@@ -314,80 +356,39 @@ async def create_new_rag_project(
     '''
     try:
         # Log request information
-        logger.info(f"Starting new RAG project with {len(request.files)} files for project {request.metadata.get('project_id')}")
+        logger.info(f"🚀 Starting new RAG project with {len(request.files)} files for project {request.metadata.get('project_id')}")
         
-        # Data validation
+        # ——— Data Validation ————————————————————————————————
         if not request.files:
-            raise HTTPException(status_code=400, detail="No files provided in request")
-            
+            raise HTTPException(status_code=400, detail="No files provided in request")     
         if not request.metadata.get('project_id'):
             raise HTTPException(status_code=400, detail="project_id is required in metadata")
-            
         if not request.metadata.get('user_id'):
             raise HTTPException(status_code=400, detail="user_id is required in metadata")
         
-        # Apply async job to process PDFs → finalize_document_processing_workflow() → rag_note_task()
-        # job = process_pdf_task.apply_async(
-        #     args=[request.files, request.metadata]
-        # )
-        job = process_document_task.apply_async(
-            args=[
-                request.files, 
-                request.metadata
-            ]
+
+
+        # ——— Celery Task Enqueue ————————————————————————————————
+
+        # [DEBUG] TEST LOGS 
+        # job = test_celery_log_task.apply_async()
+        
+        # Single job for Ingest → New Note (Task #4 Handles Note Generation)
+        job = process_document_batch_workflow.apply_async(
+            args=[request.files, request.metadata],
+            kwargs={"create_note": True}
         )
         
-        # The task will return source_ids when it completes initial DB insertion
-        # But for now, return the job ID for immediate status monitoring
-        logger.info(f"Started RAG project task with ID: {job.id}")
-        
+        # The task will return the job ID for immediate status monitoring
+        logger.info(f"🚀 Started chained RAG workflow (Ingest → New Note) with ID: {job.id}")
         return {
+            # "logging_test_task_id": job.id
             "embedding_task_id": job.id,
-            "message": f"Processing {len(request.files)} files, check status with job ID"
+            "message": f"Processing {len(request.files)} files then generating notes"
         }
     except Exception as e:
         logger.error(f"Error creating new RAG project: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Error creating RAG project: {str(e)}")
-
-@app.post("/generate-ai-note/", response_model=GenericTaskResponse)
-async def generate_ai_note(
-    request: NewGeneratedNoteRequest, 
-    background_tasks: BackgroundTasks
-):
-    '''LIVE (06-03-2025)
-    Endpoint to generate note for an EXISTING project
-        - rag_note_task():
-            input: request.metadata
-            returns: None
-        
-    Request contains:
-        request.metadata (json): {
-            project_id:,
-            chat_session_id:,
-            note_type:,
-            ...
-            model_name
-        }
-    '''
-    try:
-        # Apply async job to generate ai notes (grounded w/ RAG)
-        job = rag_note_task.apply_async(    
-            kwargs={
-                "user_id":       request.metadata["user_id"],       # ← maps to your user_id param
-                "note_type":     request.metadata["note_type"],     # ← maps to your note_type param
-                "project_id":    request.metadata["project_id"],    # ← maps to your project_id param  
-                "note_title":    request.metadata["note_title"],    # ← "project_name: question type"
-                "provider":      request.metadata["provider"],
-                "model_name":    request.metadata["model_name"],    # ← maps to your model_name param
-                "temperature":   request.metadata["temperature"],
-                "addtl_params":  request.metadata["addtl_params"]       # ← Dict passed in by weweb/postman 
-            }
-        )
-        # Poll in postman: "my_domain.com/task-status/{task_id}"
-        return {"task_id": job.id}
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/embed-new-docs/", response_model=RagPipelineNewDocumentsResponse)
 async def append_sources_to_project(request: RagPipelineNewDocumentsRequest, background_tasks: BackgroundTasks):
@@ -408,37 +409,16 @@ async def append_sources_to_project(request: RagPipelineNewDocumentsRequest, bac
     '''
 
     try:
-        # Apply async job to append new docs to an existing project (grounded w/ RAG)
-        job = append_document_task.apply_async(
-            args=[
-                request.files, 
-                request.metadata
-            ]
+        # Apply async job to append new docs to an existing project (NO NOTES CREATION)
+        job = process_document_batch_workflow.apply_async(
+            args=[request.files, request.metadata],
+            kwargs={"create_note": False}
         )
         return {"embedding_task_id": job.id}
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/rag-chat/original")
-async def rag_chat_original(request: RagQueryRequest):
-    """DEPRECATED... Endpoint for the rag query responses (token streaming not enabled)"""
-    try:
-        # Trigger the RAG task asynchronously and add it to the queue
-        task = rag_chat_task.apply_async(args=[
-            request.user_id,
-            request.chat_session_id,
-            request.query,
-            request.project_id,
-            request.provider,
-            request.model_name,
-            request.temperature,
-        ])
-        
-        # Return the task ID to the client
-        return {"task_id": task.id}
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
 
 @app.post("/rag-chat/")
 async def rag_chat(request: RagQueryRequest):
@@ -487,71 +467,152 @@ async def rag_chat(request: RagQueryRequest):
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-@app.post("/rag-chat-stream/")
-async def rag_chat_stream(request: RagQueryRequest):
-    """Endpoint for the rag query responses (token streaming not ENABLED), still a WORK IN PROGRESS !!! """
-    try:
-        # Trigger the RAG task asynchronously and add it to the queue
-        task = rag_chat_streaming_task.apply_async(args=[
-            request.user_id,
-            request.chat_session_id,
-            request.query,
-            request.project_id,
-            request.model_name
-        ])
-        
-        # Return the task ID to the client
-        return {"task_id": task.id}
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
 
-@app.post("/rag-chat/regenerate/")
-async def rag_chat_regenerate(request: RagRegenerateRequest):
+@app.post("/rag-chat/reset/")
+async def rag_chat_reset(request: RagQueryRequest):
     """
-    Endpoint for regenerating a "FAILED" RAG query (token streaming not ENABLED)
+    Endpoint for the rag query responses (token streaming not enabled)
+    Uses Celery chain to perform persist → rag back-to-back
     
+    **FYI NOT CURRENTLY IN USE
+
     Raw json:
     ----------
     {
-        "user_id": "...",
+        "user_id": "ae3df626-12cc-40c1-9d40-1d8249deea2e",
         "chat_session_id": "...",
         "query": "...",
         "project_id": "...",
+        "provider": "..." 
         "model_name": "..." 
+        "temperature": "..." 
     }
     """
     try:
-        # Trigger the RAG task asynchronously and add it to the queue
-        task = rag_chat_streaming_task.apply_async(args=[
-            request.user_id,
-            request.message_id,
-            request.query,
-            request.project_id,
-            request.model_name
-        ])
+        pass
+        # # Trigger the RAG task asynchronously and add it to the queue
+        # task = rag_chat_task.apply_async(args=[
+        #     request.user_id,
+        #     request.chat_session_id,
+        #     request.query,
+        #     request.project_id,
+        #     request.provider,
+        #     request.model_name,
+        #     request.temperature,
+        # ])
         
         # Return the task ID to the client
         return {"task_id": task.id}
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-@app.post("/rag-chat-stream/regenerate/")
-async def rag_chat_stream_regenerate(request: RagQueryRequest):
-    """@TODO Endpoint for regenerating a failed RAG query (token streaming IS ENABLED), still a WORK IN PROGRESS !!! """
-    try:
-        # Trigger the RAG task asynchronously and add it to the queue
-        task = rag_chat_streaming_task.apply_async(args=[
-            request.user_id,
-            request.chat_session_id,
-            request.query,
-            request.project_id,
-            request.model_name
-        ])
+# @app.post("/rag-chat/regenerate/")
+# async def rag_chat_regenerate(request: RagRegenerateRequest):
+#     """
+#     Endpoint for regenerating a "FAILED" RAG query (token streaming not ENABLED)
+    
+#     Raw json:
+#     ----------
+#     {
+#         "user_id": "...",
+#         "chat_session_id": "...",
+#         "query": "...",
+#         "project_id": "...",
+#         "model_name": "..." 
+#     }
+#     """
+#     try:
+#         # Trigger the RAG task asynchronously and add it to the queue
+#         task = rag_chat_streaming_task.apply_async(args=[
+#             request.user_id,
+#             request.message_id,
+#             request.query,
+#             request.project_id,
+#             request.model_name
+#         ])
         
-        # Return the task ID to the client
-        return {"task_id": task.id}
+#         # Return the task ID to the client
+#         return {"task_id": task.id}
+#     except Exception as e:
+#         raise HTTPException(status_code=400, detail=str(e))
+
+@app.post("/rag-chat/cancel/{task_id}")
+async def cancel_rag_chat(task_id: str):
+    """
+    Gracefully cancels a streaming RAG chat task using Redis as a shared state manager.
+    """
+    logger.info(f"🛑 CANCEL REQUEST received for task: {task_id}")
+
+    try:
+        # Step 1: Write a cancellation key to Redis with a 60-second expiry
+        # This is the "cancellation notice" for the worker.
+        cancel_key = f"cancel-task:{task_id}"
+        await redis_pub.set(cancel_key, "1", ex=60) # ex=60 sets a 60-second TTL
+        logger.info(f"✅ Cancellation notice posted to Redis for key: {cancel_key}")
+
+        # Step 2: Revoke the task from Celery (in case it hasn't started yet)
+        celery_app.control.revoke(task_id)
+
+        # Step 3: We don't know the session_id here anymore, so we can't send a
+        # targeted WebSocket message. The client should react to the task
+        # stopping or you can implement a more advanced notification system.
+        # For now, the client will see the stream stop.
+
+        return {
+            "status": "cancellation_requested",
+            "task_id": task_id,
+            "message": "Cancellation signal sent. The stream will stop shortly."
+        }
+
     except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        logger.error(f"❌ Cancel request failed for task {task_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to cancel task: {str(e)}")
+    # """
+    # Gracefully cancels a streaming RAG chat task.
+    
+    # This flow performs two actions:
+    # 1.  Sets an internal flag in the StreamingChatManager to stop the asyncio stream.
+    # 2.  Revokes the Celery task to prevent it from running if it's still in the queue.
+    # """
+    # logger.info(f"🛑 CANCEL REQUEST received for task: {task_id}")
+
+    # try:
+    #     # Step 1: Cooperatively cancel the running stream (see... chat_task.StreamingManager.cancel_task() )
+    #     session_id_to_notify = streaming_manager.cancel_task(task_id)
+
+    #     # Step 2: Revoke the task from Celery.
+    #     # This prevents the task from running if it hasn't started yet.
+    #     celery_app.control.revoke(task_id)
+        
+    #     message = "Task cancellation requested."
+        
+    #     # Step 3: Notify the client immediately via WebSocket
+    #     if session_id_to_notify:
+    #         logger.info(f"📡 Sending cancellation notice to session: {session_id_to_notify}")
+    #         await websocket_manager.send_to_session(session_id_to_notify, {
+    #             "type": "stream_cancelled",
+    #             "task_id": task_id,
+    #             "message": "Stream cancelled by user 🚫.",
+    #             "timestamp": datetime.now(timezone.utc).isoformat()
+    #         })
+    #         message = f"Cancellation signal sent to running task in session {session_id_to_notify}."
+    #     else:
+    #         logger.info(f"Task {task_id} was not actively streaming, but was revoked from the queue.")
+
+    #     return {
+    #         "status": "cancellation_requested",
+    #         "task_id": task_id,
+    #         "message": message
+    #     }
+
+    # except Exception as e:
+    #     logger.error(f"❌ Cancel request failed for task {task_id}: {e}", exc_info=True)
+    #     raise HTTPException(status_code=500, detail=f"Failed to cancel task: {str(e)}")
+
+
+# ================================================ #
+#                STATUS ENDPOINTS
+# ================================================ #
 
 @app.get("/pdf-upload-task-status/{task_id}")
 async def get_pdf_upload_status(task_id: str):
@@ -707,95 +768,6 @@ async def get_rag_chat_status(task_id: str):
     else:
         return {"task_id": task_id, "status": result.state}
 
-# ================================================ #
-#          RAG GENERATIVE NOTES ENDPOINTS
-# ================================================ #
-
-# @app.post("/generate-rag-note/")
-# async def generate_rag_note(request: RagQueryRequest):
-#     """
-#     postman raw json body:
-#     {
-#         "user_id": "",
-#         "chat_session_id": "",
-#         "query": "",
-#         "project_id": "",
-#         "model_name": "" 
-#     }
-#     """
-#     try:
-#         # Trigger the RAG task asynchronously and add it to the queue
-#         task = rag_chat_task.apply_async(args=[
-#             request.user_id,
-#             request.chat_session_id,
-#             request.query,
-#             request.project_id,
-#             request.model_name
-#         ])
-        
-#         # Return the task ID to the client
-#         return {"task_id": task.id}
-#     except Exception as e:
-#         raise HTTPException(status_code=400, detail=str(e))
-
-
-# ================================================ #
-#              PODCAST API ENDPOINTS
-# ================================================ #
-
-@app.post("/pdf-to-dialogue/", response_model=PDFResponse)
-async def pdf_to_dialogue(request: PDFRequest, background_tasks: BackgroundTasks):
-    '''
-    Endpoint to create both a pdf/RAG pipeline and create an AI podcast in one call:
-        - process_pdf_task 
-        - validate_and_generate_audio_task
-    '''
-    try:
-        # Create signatures for the tasks
-        process_pdf_task_signature = process_document_task.s(request.files, request.metadata)
-        validate_and_generate_audio_task_signature = validate_and_generate_audio_task.s(request.files, request.metadata)
-
-        # Create the group
-        task_group = group(
-            process_pdf_task_signature,
-            validate_and_generate_audio_task_signature
-        )
-
-        # Create the chord with the group and callback
-        task_chord = chord(task_group)(insert_sources_media_association_task.s())
-
-        # The result of the chord is the AsyncResult of the callback task
-        chord_result = task_chord
-
-        # Get task IDs
-        process_pdf_task_id = chord_result.parent.results[0].id
-        validate_and_generate_audio_task_id = chord_result.parent.results[1].id
-        insert_task_id = chord_result.id
-
-        # Return the task IDs to the client
-        return {
-            "audio_task_id": validate_and_generate_audio_task_id,
-            "embedding_task_id": process_pdf_task_id,
-            "insert_task_id": insert_task_id,
-        }
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    
-# Endpoint to process PDFs and generate dialogue transcript
-@app.post("/pdf-to-dialogue-transcript/", response_model=PDFResponse)
-async def pdf_to_dialogue_transcript(request: PDFRequest, background_tasks: BackgroundTasks):
-    try:
-        # Enqueue the Celery task for dialogue generation
-        print(f"API DEBUG: {request.files}")
-        task = generate_dialogue_only_task.apply_async(
-            args=[request.files]
-        )
-        
-        # Return the task ID to the client
-        return {"task_id": task.id}
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
 # Combined endpoint to check the status of any Celery task
 @app.get("/task-status/{task_id}")
 async def get_task_status(task_id: str):
@@ -859,14 +831,116 @@ async def get_task_status(task_id: str):
         raise HTTPException(status_code=500, detail=f"Error retrieving task status: {str(e)}")
 
 # ================================================ #
+#          RAG GENERATIVE NOTES ENDPOINTS
+# ================================================ #
+
+@app.post("/generate-note/", response_model=GenericTaskResponse)
+async def generate_note(
+    request: NewGeneratedNoteRequest, 
+    background_tasks: BackgroundTasks
+):
+    '''LIVE (08-20-2025)
+    Endpoint to generate note for an EXISTING project
+        - rag_note_task():
+            input: request.metadata
+            returns: None
+        
+    Request contains:
+        request.metadata (json): {
+            project_id:,
+            chat_session_id:,
+            note_type:,
+            ...
+            model_name
+        }
+    '''
+    try:
+        # Apply async job to generate ai notes (grounded w/ RAG)
+        job = rag_note_task.apply_async(    
+            kwargs={
+                "user_id":       request.metadata["user_id"],       # ← maps to your user_id param
+                "note_type":     request.metadata["note_type"],     # ← maps to your note_type param
+                "project_id":    request.metadata["project_id"],    # ← maps to your project_id param  
+                "note_title":    request.metadata["note_title"],    # ← "project_name: question type"
+                "provider":      request.metadata["provider"],
+                "model_name":    request.metadata["model_name"],    # ← maps to your model_name param
+                "temperature":   request.metadata["temperature"],
+                "addtl_params":  request.metadata["addtl_params"]       # ← Dict passed in by WeWeb/postman 
+            }
+        )
+        # Poll in postman: "my_domain.com/task-status/{task_id}"
+        return {"task_id": job.id}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ================================================ #
+#           LEGACY PODCAST API ENDPOINTS
+# ================================================ #
+
+@app.post("/pdf-to-dialogue/", response_model=PDFResponse)
+async def pdf_to_dialogue(request: PDFRequest, background_tasks: BackgroundTasks):
+    '''
+    Endpoint to create both a pdf/RAG pipeline and create an AI podcast in one call:
+        - process_pdf_task 
+        - validate_and_generate_audio_task
+    '''
+    try:
+        # Create signatures for the tasks
+        process_pdf_task_signature = process_document_task.s(request.files, request.metadata)
+        validate_and_generate_audio_task_signature = validate_and_generate_audio_task.s(request.files, request.metadata)
+
+        # Create the group
+        task_group = group(
+            process_pdf_task_signature,
+            validate_and_generate_audio_task_signature
+        )
+
+        # Create the chord with the group and callback
+        task_chord = chord(task_group)(insert_sources_media_association_task.s())
+
+        # The result of the chord is the AsyncResult of the callback task
+        chord_result = task_chord
+
+        # Get task IDs
+        process_pdf_task_id = chord_result.parent.results[0].id
+        validate_and_generate_audio_task_id = chord_result.parent.results[1].id
+        insert_task_id = chord_result.id
+
+        # Return the task IDs to the client
+        return {
+            "audio_task_id": validate_and_generate_audio_task_id,
+            "embedding_task_id": process_pdf_task_id,
+            "insert_task_id": insert_task_id,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    
+# Endpoint to process PDFs and generate dialogue transcript
+@app.post("/pdf-to-dialogue-transcript/", response_model=PDFResponse)
+async def pdf_to_dialogue_transcript(request: PDFRequest, background_tasks: BackgroundTasks):
+    try:
+        # Enqueue the Celery task for dialogue generation
+        print(f"API DEBUG: {request.files}")
+        task = generate_dialogue_only_task.apply_async(
+            args=[request.files]
+        )
+        
+        # Return the task ID to the client
+        return {"task_id": task.id}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+# ================================================ #
 #              DEV-TOOLS ENDPOINTS
 # ================================================ #
 
 @app.get("/debug-task/{task_id}")
 async def debug_task(task_id: str):
     """
-    Dev-only endpoint to inspect any Celery task’s state, metadata, and result.
-    WARNING: Don’t expose this in production without access control.
+    Dev-only endpoint to inspect any Celery task's state, metadata, and result.
+    WARNING: Don't expose this in production without access control.
     """
     try:
         result = AsyncResult(task_id)

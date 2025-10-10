@@ -13,7 +13,8 @@ RUN apt-get update && \
         libreoffice-core \
         libreoffice-common \
         libreoffice-writer \
-        tesseract-ocr && \
+        tesseract-ocr \
+        redis-tools && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
@@ -33,6 +34,21 @@ RUN pip install pip==24.0 \
 # 5) Copy in your application code
 COPY . /app
 
-# 6) Tell Render how to launch your worker
+# 6) Set environment variables for better logging
+ENV PYTHONUNBUFFERED=1
+ENV CELERY_HIJACK_ROOT_LOGGER=0
+ENV CELERY_LOG_LEVEL=INFO
+ENV CELERY_HIJACK_ROOT_LOGGER=False
+# ENV CELERY_WORKER_HIJACK_ROOT_LOGGER=False
+# ENV CELERY_WORKER_LOG_FORMAT='[%(asctime)s: %(levelname)s] %(message)s'
+
+
+# 7) Tell Render how to launch your worker with explicit logging (Purge queues on startup && Start worker + queues)
 #    (For example, if you run a Celery worker named `celery_worker.py`)
-CMD ["sh", "-c", "celery -A tasks.celery_app worker --loglevel=info --concurrency=2"]
+#    CMD ["sh", "-c", "celery -A tasks.celery_app worker --loglevel=info --concurrency=2"]
+
+# Asyncio
+CMD ["sh", "-c", "echo '🧹 Purging queues on startup...' && celery -A tasks.celery_app purge -f && echo '✅ Queues purged, 🔀 starting worker [ASYNCIO]...' && celery -A tasks.celery_app worker --loglevel=info --concurrency=100 -Q celery,ingest,parsing,embedding,finalize,notes -P threads"]
+
+# Gevent (greenlets)
+# CMD ["sh", "-c", "echo '🧹 Purging queues on startup...' && celery -A tasks.celery_app purge -f && echo '✅ Queues purged, starting worker...' && celery -A tasks.celery_app worker --loglevel=info --concurrency=100 -Q celery,ingest,parsing,embedding,finalize -P gevent"]

@@ -4,6 +4,10 @@ pdf rag and generative podcast
 Conda envirionment (legalnote python=3.12)
 
 
+```
+$ git config --global http.postBuffer 524288000
+git clone https://github.com/dominicdawes/LegalCaseAIApp.git
+```
 
 ## Rough Project Structure
 

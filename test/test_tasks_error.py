@@ -59,7 +59,7 @@ from unittest.mock import patch, MagicMock
 import tasks.chat_tasks as chat_tasks
 import utils.llm_factory as llm_factory
 import tasks.note_tasks as note_tasks
-import tasks.upload_tasks as upload_tasks
+import tasks.upload_tasks_chains_0730 as upload_tasks_chains_0730
 
 
 class DummyResponse:
@@ -116,10 +116,10 @@ def test_finalize_workflow_triggers_note_task():
         types.SimpleNamespace(data=[{"id": "s1", "vector_embed_status": "COMPLETE"}]),
         types.SimpleNamespace(count=1),
     ]
-    with patch.object(upload_tasks, "supabase_client", dummy_supabase), patch.object(
-        upload_tasks, "rag_note_task"
+    with patch.object(upload_tasks_chains_0730, "supabase_client", dummy_supabase), patch.object(
+        upload_tasks_chains_0730, "rag_note_task"
     ) as note_task:
-        upload_tasks.finalize_document_processing_workflow.run(
+        upload_tasks_chains_0730.finalize_document_processing_workflow.run(
             results=[None],
             user_id="u",
             source_ids=["s1"],

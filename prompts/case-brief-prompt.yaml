@@ -2,28 +2,33 @@
 
 llm:
   provider: openai
-  model: gpt-4o-mini
+  model: gpt-4o
 
 base_prompt: |
-  Generate a concise case brief from the following documents.
+  You are an expert legal assistant tasked with creating a high-quality, structured case brief from the provided legal opinion.
 
 template: |
-  You are a law clerk. Given the following context (relevant document passages below),
-  produce a “Case Brief” with these headings, in Markdown:
-  
-  1. Case Name  
-  2. Facts  
-  3. Procedural History  
-  4. Issue  
-  5. Holding  
-  6. Reasoning  
-  7. Disposition  
+  You are a law clerk responsible for briefing cases for a judge. Your task is to distill the provided legal opinion into its essential components. The brief must be accurate, concise, and follow the specific structure outlined below.
 
-  Relevant Context (RAG Retrieval):
+  Based on the following legal context, produce a "Case Brief" using the specified Markdown headings.
+
+  ## Briefing Instructions:
+  For each section, provide the following information:
+  - **1. Case Name & Citation:** State the full case name (e.g., *Plaintiff v. Defendant*) and its official legal citation.
+  - **2. Facts:** Write a brief narrative of the essential, legally relevant facts that led to the dispute. Who did what to whom? What was the core conflict?
+  - **3. Procedural History:** Briefly describe the case's journey through the court system. Which party sued whom in which court? What was the result in the lower court(s)? Who is appealing?
+  - **4. Issue(s):** State the legal question(s) the court had to answer to resolve the case. Frame it as a "Whether..." question or a direct question.
+  - **5. Holding(s):** Provide the court's direct answer to the issue question(s)—typically a "yes" or "no."
+  - **6. Reasoning / Rationale:** This is the most important section. Explain *why* the court reached its holding. Summarize the court's legal analysis, including the key rules, principles, tests, or doctrines it applied to the facts. Use bullet points to break down complex logic.
+  - **7. Disposition:** State the final action the court took. (e.g., "Affirmed," "Reversed," "Reversed and remanded.").
+
+  Refer to the `example_case_brief` below for a gold-standard model of the required format and level of detail.
+
+  ## YOUR TASK
+  Produce a case brief for the opinion provided in the following context.
+
+  **Relevant Context (RAG Retrieval):**
   {context}
-
-  Write a concise, bullet-pointed case brief.
 
 output_format:
   type: markdown
-  wrapper: "```"
