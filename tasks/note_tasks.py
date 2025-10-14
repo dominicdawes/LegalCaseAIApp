@@ -15,6 +15,7 @@ Note genereation (with RAG) is done without token streaming `llm_client.chat` re
 
 # ===== STANDARD LIBRARY IMPORTS =====
 import gc
+import re
 import logging
 import os
 import time
@@ -420,10 +421,26 @@ class AsyncNoteManager:
             ---
             {original_content}
             ---
+            
+            output_format: markdown
+            
+            important formatting: no triple tick wrapping (e.g. ``` ```) or explict language identifier (e.g. ```markdown ```)
             """
             # 3. Get LLM client and generate the cleaned content
             llm_client = await self._setup_llm_client_async(provider, model_name, temperature)
             cleaned_content = await self._generate_note_content_async(llm_client, prompt, provider)
+
+            # NEW: Add this block to remove wrapping markdown code fences
+            # This pattern finds a string that starts with ```, optionally followed by a language name,
+            # captures everything in between (.+?), and ends with ```. It then replaces the
+            # entire match with just the captured group. The re.DOTALL flag is crucial
+            # to ensure that the '.' special character matches newlines.
+            pattern = r"^\s*```[a-zA-Z]*\s*\n?(.*?)\n?\s*```\s*$"
+            match = re.search(pattern, cleaned_content, re.DOTALL)
+            if match:
+                # If the pattern matches, extract the content from the capture group
+                cleaned_content = match.group(1).strip()
+            # END NEW BLOCK
 
             # 4. Update the note in the database within a transaction
             async with get_db_connection() as conn:
@@ -959,7 +976,7 @@ def rag_note_task(
     base=BaseTaskWithRetry,
     queue='notes', # Or a different queue if you prefer
     acks_late=True,
-    rate_limit='120/m' # Adjust as needed
+    rate_limit=RATE_LIMIT # Adjust as needed
 )
 def cleanup_note_task(
     self,

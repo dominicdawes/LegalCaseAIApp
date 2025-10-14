@@ -9,6 +9,7 @@ venv/
 _temp/*
 _local/*
 test/*
+docs/*
 prompt_engineering/*
 
 utils/available_models.txt
