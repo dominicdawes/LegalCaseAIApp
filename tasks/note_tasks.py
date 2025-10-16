@@ -448,7 +448,7 @@ class AsyncNoteManager:
                     await conn.execute(
                         """
                         UPDATE notes 
-                        SET content_markdown = $1, updated_at = NOW()
+                        SET suggested_cleanup = $1, updated_at = NOW()
                         WHERE id = $2 AND user_id = $3
                         """,
                         cleaned_content, uuid.UUID(note_id), uuid.UUID(user_id)
