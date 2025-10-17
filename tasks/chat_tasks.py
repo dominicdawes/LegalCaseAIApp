@@ -791,7 +791,9 @@ class StreamingChatManager:
         - Load system instructions from YAML 
         - Format chat history
         - 🧠 SMART chunk context trimming
-        
+
+        returns:
+           [SYSTEM INSTRUCTIONS] As one block (it will be followed by the formatted chunks)
         """
         
         # Load system instructions from YAML
