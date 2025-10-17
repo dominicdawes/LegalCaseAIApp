@@ -838,6 +838,13 @@ class StreamingChatManager:
         """
         Smart context trimming that preserves highest-quality chunks and
         Creates proper page citations out of the chunks relevant chunks of data
+
+        Return:
+         'Relevant Context:
+            source 1
+            content from text (page 1)
+            content from text (pare 12)
+            source 2 
         """
         
         # Get tokenizer
