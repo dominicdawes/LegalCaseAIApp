@@ -96,7 +96,10 @@ class PDFLoader(BaseDocumentLoader):
                             "page_height": round(page.rect.height, 1)
                         })
                     
-                    yield Document(page_content=text, metadata=metadata)
+                    yield Document(
+                        page_content=text, 
+                        metadata=metadata
+                    )
                     
                 except Exception as e:
                     logger.warning(f"Error processing page {page_num + 1}: {e}")

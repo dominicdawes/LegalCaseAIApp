@@ -897,7 +897,18 @@ async def _call_openai_embeddings_async(texts: List[str]) -> List[List[float]]:
 # ——— Async Helper Functions ——————————————————————————————————————————————————————
 
 async def _parse_document_async(source_id: str, cdn_url: str, project_id: str) -> Dict[str, Any]:
-    """Parse document asynchronously - FIXED for proper async operation"""
+    """
+    Parse single document (or any type) asynchronously.
+    Uses the DocumentLoader class to parse documents
+
+    Returns:
+        Dict: parse results dict including (
+            'success': True,
+            'chunks': all_chunks,
+            'metadatas': all_metadatas,  # Include metadata for embedding
+            'total_pages': processing_summary['total_pages'],
+            'performance_metrics': perf_summary)
+    """
     _update_document_status_sync(source_id, ProcessingStatus.PARSING)
 
     short_id = source_id[:8]
@@ -977,9 +988,12 @@ async def _parse_document_async(source_id: str, cdn_url: str, project_id: str) -
                 
                 # Process document stream into chunks
                 logger.info(f"USING {loader.name} loader to process documents...")
+
+                # Returns a tuple (text, meta). `meta` has keys {paragraph_index, page, estmated_page...}
                 document_stream = loader.stream_documents(file_buffer)
+
                 text_stream = processor.process_documents_streaming(
-                    docments=document_stream, 
+                    documents=document_stream, 
                     source_id=source_id
                 )
 
@@ -1750,7 +1764,7 @@ async def _process_document_async_workflow(
     workflow_metadata: Dict[str, Any]
 ) -> Dict[str, Any]:
     """
-    Asynchronous processing for a NEW document that handles the complete workflow: 
+    Asynchronous processing for a NEW document (one file) that handles the complete workflow: 
     1. INSERT document into Supaabse
     2. PARSE document into semantic chunks
     3. EMBED chunks using 'smart batching' using OpenAI embeddings

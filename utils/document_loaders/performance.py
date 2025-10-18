@@ -21,6 +21,8 @@ class ProcessingMetrics:
     cleaning_time_ms: float = 0
     chunking_time_ms: float = 0
     token_counting_time_ms: float = 0
+    # This will track the actual highest page number from the document metadata
+    highest_page_seen: int = 0
     
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -127,6 +129,10 @@ class StreamingTextProcessor:
                                     source_id: str = None) -> Iterator[Tuple[str, Dict[str, Any]]]:
         """
         Process documents in streaming fashion with performance tracking
+
+        Args:
+            documents: Streamed in page_content
+            source_id: uuid of the paricluar source
         
         Yields:
             Tuple of (cleaned_text, metadata)
@@ -134,9 +140,13 @@ class StreamingTextProcessor:
         start_time = time.time()
         
         try:
-            for page_num, document in enumerate(documents):
-                # Track page processing
-                self.metrics.total_pages += 1
+            # We no longer use enumerate for page counting.
+            for document in documents:
+                # Track page processing by reading the metadata from the loader
+                current_page_num = document.metadata.get('page') or document.metadata.get('estimated_page') or 0
+                if current_page_num > self.metrics.highest_page_seen:
+                    self.metrics.highest_page_seen = current_page_num
+                
                 page_start_time = time.time()
                 
                 # Clean text
@@ -145,7 +155,7 @@ class StreamingTextProcessor:
                 self.metrics.cleaning_time_ms += (time.time() - clean_start) * 1000
                 
                 if len(cleaned_content) < self.min_chunk_length:
-                    logger.debug(f"Skipping short page {page_num + 1}: {len(cleaned_content)} chars")
+                    logger.debug(f"Skipping short content from page {current_page_num}: {len(cleaned_content)} chars")
                     continue
                 
                 self.metrics.total_characters += len(cleaned_content)
@@ -176,10 +186,10 @@ class StreamingTextProcessor:
                         
                         yield chunk.page_content, chunk_metadata
                 
-                # Log progress periodically (every 20 pages)
-                if (page_num + 1) % 20 == 0:
+                # Log progress periodically (every 20 pages that have passed)
+                if self.metrics.highest_page_seen > 0 and (self.metrics.highest_page_seen) % 20 == 0:
                     elapsed_ms = (time.time() - start_time) * 1000
-                    logger.info(f"Processed {page_num + 1} pages, "
+                    logger.info(f"Processed up to page {self.metrics.highest_page_seen}, "
                                 f"{self.metrics.total_chunks} chunks, "
                                 f"{elapsed_ms:.1f}ms elapsed")
         
