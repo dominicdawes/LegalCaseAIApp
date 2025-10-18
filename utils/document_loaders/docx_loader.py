@@ -49,6 +49,7 @@ class DocxLoader(BaseDocumentLoader):
                 
                 # 3. Calculate the estimated page number
                 estimated_page = (cumulative_chars // CHARS_PER_PAGE_ESTIMATE) + 1
+                logger.debug(f"DOC/DOCX estimated_pages: {estimated_page}")
                 
                 yield Document(
                     page_content=text,
