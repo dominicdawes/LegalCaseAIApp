@@ -152,6 +152,7 @@ class CitationProcessor:
             if isinstance(metadata_obj, str):
                 try:
                     return json.loads(metadata_obj)
+                    logger.debug(f"✅ Metadata JSON decoded properly: {metadata_obj[:50]}")
                 except json.JSONDecodeError:
                     logger.warning(f"⚠️ Metadata JSONDecodeError: {metadata_obj[:50]}")
                     return {}
@@ -359,7 +360,8 @@ class CitationProcessor:
         # Look for chunk containing case name and page
         for chunk in relevant_chunks:
             content = chunk.get('content', '').lower()
-            metadata = chunk.get('metadata', {})
+            # metadata = chunk.get('metadata', {})
+            metadata = self._parse_metadata(chunk.get('metadata'))
             
             if (case_name.lower() in content and 
                 chunk.get('page_number') == page_num):
@@ -404,7 +406,7 @@ class CitationProcessor:
 
     def _build_document_title(self, chunk: Dict) -> str:
         """Build human-readable title for document citation"""
-        metadata = chunk.get('metadata', {})
+        metadata = self._parse_metadata(chunk.get('metadata'))
         title = metadata.get('title') or metadata.get('filename', 'Document')
         page = chunk.get('page_number')
         
