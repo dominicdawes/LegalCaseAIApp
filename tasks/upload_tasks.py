@@ -896,7 +896,7 @@ async def _call_openai_embeddings_async(texts: List[str]) -> List[List[float]]:
     
 # ——— Async Helper Functions ——————————————————————————————————————————————————————
 
-async def _parse_document_async(source_id: str, cdn_url: str, project_id: str) -> Dict[str, Any]:
+async def _parse_document_async(source_id: str, source_filename: str, cdn_url: str, project_id: str) -> Dict[str, Any]:
     """
     Parse single document (or any type) asynchronously.
     Uses the DocumentLoader class to parse documents
@@ -993,6 +993,7 @@ async def _parse_document_async(source_id: str, cdn_url: str, project_id: str) -
                 document_stream = loader.stream_documents(file_buffer)
 
                 text_stream = processor.process_documents_streaming(
+                    source_filename=source_filename,
                     documents=document_stream, 
                     source_id=source_id
                 )
@@ -1828,7 +1829,12 @@ async def _process_document_async_workflow(
         logger.info(f"📋 [DOC-{short_id}] → PARSING")
 
         # Parsing contains these subtasks: select optimal loader → in-memory streaming → clean/chunk text
-        parse_result = await _parse_document_async(doc_id, doc_data['cdn_url'], project_id)
+        parse_result = await _parse_document_async(
+            doc_id, 
+            doc_data['filename'],
+            doc_data['cdn_url'], 
+            project_id,
+            )
         
         if not parse_result.get('success'):
             return {
@@ -1909,7 +1915,7 @@ async def _lightrag_document_processing_async(
         # ——— 1. Your Existing Document Processing ————————————————————————————————
         # Keep your existing parsing logic
         from upload_tasks import _parse_document_async
-        parse_result = await _parse_document_async(doc_id, doc_data['cdn_url'], project_id)
+        parse_result = await _parse_document_async(doc_id, doc_data['filename'], doc_data['cdn_url'], project_id)
         
         if not parse_result.get('success'):
             return {

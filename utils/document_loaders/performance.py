@@ -130,6 +130,7 @@ class StreamingTextProcessor:
         self.metrics = ProcessingMetrics()
     
     def process_documents_streaming(self, 
+                                    source_filename: str,
                                     documents: Iterator[Document],
                                     source_id: str = None) -> Iterator[Tuple[str, Dict[str, Any]]]:
         """
@@ -189,6 +190,7 @@ class StreamingTextProcessor:
                         # Enhanced metadata
                         chunk_metadata = {
                             **chunk.metadata,
+                            "title": source_filename,
                             "chunk_index": chunk_idx,
                             "chunk_length": len(chunk.page_content),
                             "source_id": source_id
