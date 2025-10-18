@@ -978,7 +978,10 @@ async def _parse_document_async(source_id: str, cdn_url: str, project_id: str) -
                 # Process document stream into chunks
                 logger.info(f"USING {loader.name} loader to process documents...")
                 document_stream = loader.stream_documents(file_buffer)
-                text_stream = processor.process_documents_streaming(document_stream, source_id)
+                text_stream = processor.process_documents_streaming(
+                    docments=document_stream, 
+                    source_id=source_id
+                )
 
                 # ✅ FIXED: Add async yields for long-running CPU work
                 for chunk_text, chunk_metadata in text_stream:
