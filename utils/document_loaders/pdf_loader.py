@@ -26,6 +26,7 @@ class PDFLoader(BaseDocumentLoader):
             min_page_length: Minimum characters to consider a page valid
             text_flags: PyMuPDF text extraction flags for optimization
         """
+        self.name = "PDFLoader - Standard"
         self.extract_images = extract_images
         self.min_page_length = min_page_length
         
@@ -170,6 +171,8 @@ class HighPerformancePDFLoader(PDFLoader):
             skip_images: Skip image-heavy pages entirely
             fast_text_only: Use fastest possible text extraction
         """
+        self.name = "PDFLoader - HighPerformance"
+
         # Ultra-fast text extraction flags
         text_flags = fitz.TEXT_PRESERVE_IMAGES if not skip_images else 0
         

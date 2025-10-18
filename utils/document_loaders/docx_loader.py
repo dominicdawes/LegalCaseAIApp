@@ -28,6 +28,9 @@ class DocxLoader(BaseDocumentLoader):
     ### MODIFIED: A loader for .docx files that operates on in-memory streams.
     This loader does NOT support the old binary .doc format for in-memory processing.
     """
+    def __init__(self):
+        self.name = "DocxLoader"
+
     def stream_documents(self, source: Union[str, io.BytesIO]) -> Iterator[Document]:
         """
         ### CHANGE: Uses docx.Document() with a file-like object.
@@ -64,8 +67,10 @@ class DocxLoader(BaseDocumentLoader):
             raise RuntimeError(f"Failed to process DOCX stream: {e}")
 
 class LegacyDocLoader(BaseDocumentLoader):
-    """A loader for legacy .doc files that "converts"??? from .doc to .docx and then
-    uses Textract for in-memory streming."""
+    """A loader for legacy .doc files that uses Textract for in-memory streaming."""
+    def __init__(self):
+        self.name = "LegacyDocLoader"
+
     def stream_documents(self, source: io.BytesIO) -> Iterator[Document]:
         # Add some basic validation
         if not isinstance(source, io.BytesIO):
@@ -97,13 +102,71 @@ class LegacyDocLoader(BaseDocumentLoader):
                 except OSError:
                     pass  # File might already be gone
             
+            # --- MODIFICATION START ---
+            # 1. Add a tracker for cumulative character count
+            cumulative_chars = 0
+            
             # Stream the results
             for i, para in enumerate(paragraphs):
+                # 2. Update character count
+                cumulative_chars += len(para) + 2 # Add 2 for the paragraph break
+
+                # 3. Calculate the estimated page number
+                estimated_page = (cumulative_chars // CHARS_PER_PAGE_ESTIMATE) + 1
+                
                 yield Document(
                     page_content=para, 
                     metadata={
                         "paragraph_index": i, 
                         "source_type": "legacy_doc",
-                        "total_paragraphs": len(paragraphs)
+                        "total_paragraphs": len(paragraphs),
+                        # 4. Add the new metadata field for downstream use
+                        "page": estimated_page
                     }
                 )
+            # --- MODIFICATION END ---
+
+# class LegacyDocLoader(BaseDocumentLoader):
+#     """A loader for legacy .doc files that "converts"??? from .doc to .docx and then
+#     uses Textract for in-memory streming."""
+#     def stream_documents(self, source: io.BytesIO) -> Iterator[Document]:
+#         # Add some basic validation
+#         if not isinstance(source, io.BytesIO):
+#             raise ValueError("LegacyDocLoader requires BytesIO input")
+            
+#         source.seek(0)
+#         if len(source.getvalue()) == 0:
+#             raise ValueError("Empty document provided")
+        
+#         with tempfile.NamedTemporaryFile(suffix='.doc', delete=False) as tmp:
+#             source.seek(0)
+#             tmp.write(source.read())
+#             tmp.flush()
+            
+#             try:
+#                 raw_bytes = textract.process(tmp.name)
+#                 text = raw_bytes.decode('utf-8', errors='ignore')
+                
+#                 # Slightly more robust paragraph splitting
+#                 paragraphs = [p.strip() for p in text.split('\n\n') if p.strip() and len(p.strip()) > 10]
+                
+#                 logger.info(f"Extracted {len(paragraphs)} paragraphs from LEGACY .doc file")
+                
+#             except Exception as e:
+#                 raise RuntimeError(f"Failed to process legacy .doc file: {e}")
+#             finally:
+#                 try:
+#                     os.unlink(tmp.name)
+#                 except OSError:
+#                     pass  # File might already be gone
+            
+#             # Stream the results
+#             for i, para in enumerate(paragraphs):
+#                 yield Document(
+#                     page_content=para, 
+#                     metadata={
+#                         "paragraph_index": i, 
+#                         "source_type": "legacy_doc",
+#                         "total_paragraphs": len(paragraphs)
+#                     }
+#                 )

@@ -976,6 +976,7 @@ async def _parse_document_async(source_id: str, cdn_url: str, project_id: str) -
                 logger.info(f"🔄 [PARSE-{short_id}] Starting streaming processing...")
                 
                 # Process document stream into chunks
+                logger.info(f"USING {loader.name} loader to process documents...")
                 document_stream = loader.stream_documents(file_buffer)
                 text_stream = processor.process_documents_streaming(document_stream, source_id)
 

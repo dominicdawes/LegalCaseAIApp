@@ -8,6 +8,9 @@ from .base import BaseDocumentLoader
 
 
 class EpubLoader(BaseDocumentLoader):
+    def __init__(self):
+        self.name = "EpubLoader"
+
     def load_documents(self, path: str) -> List[Document]:
         """
         Extracts all <p> tags text from an EPUB’s items,
