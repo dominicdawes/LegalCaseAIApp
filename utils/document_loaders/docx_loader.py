@@ -56,7 +56,8 @@ class DocxLoader(BaseDocumentLoader):
                     metadata={
                         "paragraph_index": i,
                         # 4. Add the new metadata field
-                        "estimated_page": estimated_page
+                        "estimated_page": estimated_page,
+                        "page": estimated_page
                     },
                 )
         except Exception as e:
