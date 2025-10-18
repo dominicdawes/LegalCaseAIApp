@@ -727,7 +727,9 @@ class StreamingChatManager:
                 
                 # 1) --- Extract citations using your existing processor
                 doc_citations, seen_citations = self.citation_processor.extract_document_citations_from_chunks(
-                    accumulated_content, relevant_chunks, getattr(self, '_seen_citations', set())
+                    accumulated_content, 
+                    relevant_chunks, 
+                    getattr(self, '_seen_citations', set())
                 )
                 if doc_citations:
                     citations.extend(doc_citations)
@@ -784,7 +786,10 @@ class StreamingChatManager:
             raise
 
     async def _build_enhanced_context(
-        self, query: str, chunks: List[Dict], history: List[Dict]
+        self, 
+        query: str, 
+        chunks: List[Dict], 
+        history: List[Dict]
     ) -> str:
         """
         Build enhanced context with RAG retrieval and system instructions
@@ -792,8 +797,24 @@ class StreamingChatManager:
         - Format chat history
         - 🧠 SMART chunk context trimming
 
-        returns:
-           [SYSTEM INSTRUCTIONS] As one block (it will be followed by the formatted chunks)
+        Args:
+            query (str): User chat query
+            chunks (List[Dict]): relevant chunks from RAG retrieval
+            history (List[Dict]): prior chat history
+
+        Returns:
+            [SYSTEM INSTRUCTIONS] 
+            \n
+            Source 1:
+            Chunks formatted as content... (page 1)
+            ---
+            Source 2:
+            Chunks formatted as content... (page 1)
+            Chunks formatted as content... (page 4)
+            ---
+            Source n:
+            Chunks formatted as content... (page 2)
+            Chunks formatted as content... (page 5)
         """
         
         # Load system instructions from YAML
@@ -825,6 +846,7 @@ class StreamingChatManager:
             max_tokens=120_000  # Leave buffer for response
         )
         
+        logger.debug(f"_build_enhanced_context() result:\n{SYSTEM_INSTRUCTIONS}\n\n{trimmed_user_context}")
         return f"{SYSTEM_INSTRUCTIONS}\n\n{trimmed_user_context}"
 
     def _trim_context_smart(
@@ -941,7 +963,7 @@ class StreamingChatManager:
         chunk_context = "\n".join(numbered_contexts)
 
         final_context = f"{user_context}\n\nRelevant Context:\n{chunk_context}"
-        
+        logger.debug(f"_trim_context_smart() result:\n{final_context}, {final_chunks}")
         return final_context, final_chunks
 
     def _build_page_context(self, page_num, chunks):

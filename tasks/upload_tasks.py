@@ -740,6 +740,7 @@ def copy_embeddings_for_project_sync(existing_source_id: str, new_source_id: str
             records_to_insert = []
             total_tokens = 0
             
+            # Parse fetched embeddings
             for embedding_row in existing_embeddings:
                 records_to_insert.append((
                     str(uuid.uuid4()),
@@ -1021,9 +1022,13 @@ async def _parse_document_async(source_id: str, cdn_url: str, project_id: str) -
                 'error': str(e)
             }
 
-async def _embed_batch_async(doc_id: str, project_id: str, batch_info: List[str]) -> Dict[str, Any]:
+async def _embed_batch_async(
+        doc_id: str, 
+        project_id: str, 
+        batch_info: List[str],
+) -> Dict[str, Any]:
     """
-    Process a SIMGLE embedding batch - combines your legacy robustness with async benefits
+    Process a SINGLE embedding batch - combines your legacy robustness with async benefits
     
     This replaces _embed_batch_gevent but keeps all the good parts:
     - Same error handling and retry logic
@@ -1060,8 +1065,8 @@ async def _embed_batch_async(doc_id: str, project_id: str, batch_info: List[str]
             token_count = len(tokenizer.encode(text))
             total_tokens += token_count
             
-            # Extract page number from metadata
-            page_number = meta.get('page') if isinstance(meta, dict) else None
+            # Extract page number from metadata 'page' from PDFs first, but fall back to 'estimated_page' from DOCX.
+            page_number = meta.get('page', meta.get('estimated_page')) if isinstance(meta, dict) else None
             chunk_index = meta.get('chunk_index') if isinstance(meta, dict) else None
             
             records_to_insert.append((
@@ -1439,8 +1444,8 @@ async def _execute_batch_workflow(batch_id: str, file_urls: List[str], metadata:
         for doc_info in new_documents:
             # Single task per document - handles everything internally
             task_sig = process_new_document_wrapper.s(
-                doc_data=doc_info['doc_data'], 
-                project_id=doc_info['project_id'], 
+                doc_data=doc_info['doc_data'],
+                project_id=doc_info['project_id'],
                 workflow_metadata={**metadata, 'batch_id': batch_id}
             )
             document_tasks.append(task_sig)     # ← Add NEW docs to chord signature

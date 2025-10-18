@@ -17,6 +17,10 @@ from celery.utils.log import get_task_logger
 logger = get_task_logger(__name__)
 logger.propagate = False
 
+# 📏 This is your "magic number" heuristic.
+# You will need to tune this based on your typical documents.
+CHARS_PER_PAGE_ESTIMATE = 3000
+
 # ——— Loader Classes ———————————————————————————————————————————————————————————
 
 class DocxLoader(BaseDocumentLoader):
@@ -30,13 +34,29 @@ class DocxLoader(BaseDocumentLoader):
         """
         try:
             document = docx.Document(source)
+            
+            # 1. Add a tracker for cumulative character count
+            cumulative_chars = 0
+            
             for i, para in enumerate(document.paragraphs):
                 text = para.text.strip()
                 if not text:
                     continue
+                
+                # 2. Update character count
+                # Add 2 for an assumed newline/paragraph break
+                cumulative_chars += len(text) + 2
+                
+                # 3. Calculate the estimated page number
+                estimated_page = (cumulative_chars // CHARS_PER_PAGE_ESTIMATE) + 1
+                
                 yield Document(
                     page_content=text,
-                    metadata={"paragraph_index": i},
+                    metadata={
+                        "paragraph_index": i,
+                        # 4. Add the new metadata field
+                        "estimated_page": estimated_page
+                    },
                 )
         except Exception as e:
             raise RuntimeError(f"Failed to process DOCX stream: {e}")
