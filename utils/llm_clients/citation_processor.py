@@ -145,7 +145,7 @@ class CitationProcessor:
             self.http_session = None
 
     def _parse_metadata(self, metadata_obj: Any) -> Dict:
-            """Safely parse metadata that might be a dict or a JSON string."""
+            """Safely parse metadata that might be a dict or a JSON string. Fetched from Postgres (Supabase)"""
             if isinstance(metadata_obj, dict):
                 return metadata_obj
             
