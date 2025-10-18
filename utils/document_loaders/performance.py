@@ -39,7 +39,9 @@ class ProcessingMetrics:
         }
 
 class OptimizedTextCleaner:
-    """High-performance text cleaning with compiled regex patterns"""
+    """A utility class for cleaning raw text using pre-compiled regular expressions (regex)
+    for high efficiency. It can operate in a 'fast' mode for basic cleanup or a
+    'thorough' mode for more intensive normalization."""
     
     def __init__(self):
         # Compile regex patterns once for better performance
@@ -88,7 +90,10 @@ class OptimizedTextCleaner:
 
 class StreamingTextProcessor:
     """
-    High-performance streaming text processor with metrics
+    Orchestrates the entire text processing pipeline. It takes a stream of
+    Document objects (representing pages or paragraphs), cleans their content,
+    splits them into semantic chunks, and yields the final chunks with enriched
+    metadata while tracking performance metrics.
     """
     
     def __init__(self, 
