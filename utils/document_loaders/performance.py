@@ -133,14 +133,19 @@ class StreamingTextProcessor:
                                     documents: Iterator[Document],
                                     source_id: str = None) -> Iterator[Tuple[str, Dict[str, Any]]]:
         """
-        Process documents in streaming fashion with performance tracking
+        Takes a stream of Document objects from a loader, processes them, and
+        yields a stream of cleaned, chunked text along with their metadata.
+
+        This function correctly determines the total page count by inspecting the
+        'page' or 'estimated_page' metadata from the incoming documents.
 
         Args:
-            documents: Streamed in page_content
-            source_id: uuid of the paricluar source
+            documents: An iterator of Document objects from a document loader.
+            source_id: The unique identifier for the source document.
         
         Yields:
-            Tuple of (cleaned_text, metadata)
+            A tuple containing the chunked text (str) and its associated
+            metadata (dict).
         """
         start_time = time.time()
         

@@ -144,6 +144,20 @@ class CitationProcessor:
             await self.http_session.close()
             self.http_session = None
 
+    def _parse_metadata(self, metadata_obj: Any) -> Dict:
+            """Safely parse metadata that might be a dict or a JSON string."""
+            if isinstance(metadata_obj, dict):
+                return metadata_obj
+            
+            if isinstance(metadata_obj, str):
+                try:
+                    return json.loads(metadata_obj)
+                except json.JSONDecodeError:
+                    logger.warning(f"⚠️ Metadata JSONDecodeError: {metadata_obj[:50]}")
+                    return {}
+            
+            return {}
+
     async def extract_citations_from_streaming_text(
         self, 
         accumulated_text: str,
@@ -263,7 +277,8 @@ class CitationProcessor:
                 chunk = relevant_chunks[chunk_idx]
                 
                 # Extract document metadata
-                metadata = chunk.get('metadata', {})
+                metadata = self._parse_metadata(chunk.get('metadata'))
+                # metadata = chunk.get('metadata', {})
                 
                 return Citation(
                     id=f"chunk:{chunk_num}",
@@ -306,7 +321,8 @@ class CitationProcessor:
         # Look for chunk with matching page number
         for chunk in relevant_chunks:
             if chunk.get('page_number') == page_num:
-                metadata = chunk.get('metadata', {})
+                # metadata = chunk.get('metadata', {})
+                metadata = self._parse_metadata(chunk.get('metadata'))
                 
                 return Citation(
                     id=f"page:{page_num}",
