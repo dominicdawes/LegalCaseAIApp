@@ -995,7 +995,8 @@ async def _parse_document_async(source_id: str, source_filename: str, cdn_url: s
                 text_stream = processor.process_documents_streaming(
                     source_filename=source_filename,
                     documents=document_stream, 
-                    source_id=source_id
+                    source_id=source_id,
+                    source_url=cdn_url
                 )
 
                 # ✅ FIXED: Add async yields for long-running CPU work
@@ -1087,6 +1088,7 @@ async def _embed_batch_async(
             # Extract page number from metadata 'page' from PDFs first, but fall back to 'estimated_page' from DOCX.
             page_number = meta.get('page', meta.get('estimated_page')) if isinstance(meta, dict) else None
             chunk_index = meta.get('chunk_index') if isinstance(meta, dict) else None
+            source_url = meta.get('source_id', None)
             
             records_to_insert.append((
                 str(uuid.uuid4()), 
@@ -1098,6 +1100,7 @@ async def _embed_batch_async(
                 token_count,
                 page_number,  # Add page number
                 chunk_index,  # Add chunk index for ordering
+                source_url,
                 datetime.now(timezone.utc)
             ))
 
@@ -1115,8 +1118,8 @@ async def _embed_batch_async(
             with conn.cursor() as cur:
                 cur.executemany(
                     '''INSERT INTO document_vector_store 
-                    (id, source_id, project_id, content, metadata, embedding, num_tokens, page_number, chunk_index, created_at)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)''',
+                    (id, source_id, project_id, content, metadata, embedding, num_tokens, page_number, chunk_index, cdn_url, created_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)''',
                     records_to_insert
                 )
                 conn.commit()
