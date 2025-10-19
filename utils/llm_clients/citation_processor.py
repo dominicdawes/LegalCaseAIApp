@@ -437,49 +437,49 @@ class CitationProcessor:
         
         return excerpt
 
-        def _process_citation_match(
-            self, 
-            match: tuple, 
-            relevant_chunks: List[Dict]
-        ) -> Optional[Citation]:
-            """Process a regex match into a Citation object"""
+    def _process_citation_match(
+        self, 
+        match: tuple, 
+        relevant_chunks: List[Dict]
+    ) -> Optional[Citation]:
+        """Process a regex match into a Citation object"""
+        
+        # Handle different match patterns
+        if len(match) == 2:
+            # [text](citation:N) pattern
+            text, citation_num = match
+            citation_id = f"citation:{citation_num}"
+        elif len(match) == 1:
+            # [N] or (N) pattern
+            citation_num = match[0]
+            citation_id = f"citation:{citation_num}"
+            text = f"Source {citation_num}"
+        else:
+            return None
+        
+        try:
+            chunk_idx = int(citation_num) - 1  # Convert to 0-based index
             
-            # Handle different match patterns
-            if len(match) == 2:
-                # [text](citation:N) pattern
-                text, citation_num = match
-                citation_id = f"citation:{citation_num}"
-            elif len(match) == 1:
-                # [N] or (N) pattern
-                citation_num = match[0]
-                citation_id = f"citation:{citation_num}"
-                text = f"Source {citation_num}"
-            else:
-                return None
-            
-            try:
-                chunk_idx = int(citation_num) - 1  # Convert to 0-based index
+            if 0 <= chunk_idx < len(relevant_chunks):
+                chunk = relevant_chunks[chunk_idx]
                 
-                if 0 <= chunk_idx < len(relevant_chunks):
-                    chunk = relevant_chunks[chunk_idx]
-                    
-                    return Citation(
-                        id=citation_id,
-                        text=text,
-                        url=chunk.get('url', ''),
-                        title=chunk.get('title', ''),
-                        description=chunk.get('description', ''),
-                        source_type=self._classify_source_type(chunk),
-                        relevant_excerpt=self._extract_relevant_excerpt(chunk.get('content', '')),
-                        metadata={
-                            'chunk_index': chunk_idx,
-                            'similarity_score': chunk.get('similarity', 0.0),
-                            'extraction_time': datetime.utcnow().isoformat()
-                        }
-                    )
-            except (ValueError, IndexError) as e:
-                logger.warning(f"⚠️ Invalid citation number: {citation_num} - {e}")
-                return None
+                return Citation(
+                    id=citation_id,
+                    text=text,
+                    url=chunk.get('url', ''),
+                    title=chunk.get('title', ''),
+                    description=chunk.get('description', ''),
+                    source_type=self._classify_source_type(chunk),
+                    relevant_excerpt=self._extract_relevant_excerpt(chunk.get('content', '')),
+                    metadata={
+                        'chunk_index': chunk_idx,
+                        'similarity_score': chunk.get('similarity', 0.0),
+                        'extraction_time': datetime.utcnow().isoformat()
+                    }
+                )
+        except (ValueError, IndexError) as e:
+            logger.warning(f"⚠️ Invalid citation number: {citation_num} - {e}")
+            return None
 
     def _classify_source_type(self, chunk: Dict) -> str:
         """Classify the source type based on URL and metadata"""
@@ -613,6 +613,7 @@ class CitationProcessor:
                 enriched_citations.append(citation)
         
         logger.info(f"🔗 Enriched {len([c for c in enriched_citations if c.title])} citations with previews")
+        if len(enriched_citations) > 0: logger.info(f"🔗 Enriched citation idx 0: {enriched_citations[0]} ")
         return enriched_citations
 
     async def _fetch_link_preview(self, url: str) -> Optional[LinkPreview]:
