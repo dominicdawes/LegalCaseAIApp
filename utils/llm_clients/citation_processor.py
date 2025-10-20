@@ -269,10 +269,15 @@ class CitationProcessor:
 
     def extract_inline_citations_from_content(self, content: str) -> List[Dict]:
         """
-        (claude4.5) Extract inline citations from markdown content
+        (claude4.5) 
+        Extract inline citations from markdown content
         
         Pattern: [Document.pdf, p. 5] or [Case Name, p. 10]
         Returns: List of {text, page_number, document_name}
+
+        NOTE: May cause the others functions (extract_citations_from_streaming_text, 
+        extract_document_citations_from_chunks, _create_document_citation, 
+        _find_citation_by_page, _extract_relevant_excerpt, etc...) to be obsolete
         """
         # Pattern: [text, p. number] or [text, Page number]
         pattern = r'\[([^,\]]+),\s*(?:p\.|Page)\s*(\d+)\]'
@@ -304,6 +309,10 @@ class CitationProcessor:
         Match inline citations to document chunks
         
         Returns: Dict mapping citation_text -> Citation object
+
+        NOTE: May cause the others functions (extract_citations_from_streaming_text, 
+        extract_document_citations_from_chunks, _create_document_citation, 
+        _find_citation_by_page, _extract_relevant_excerpt, etc...) to be obsolete
         """
         citation_map = {}
         

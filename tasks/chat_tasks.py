@@ -674,13 +674,13 @@ class StreamingChatManager:
             
             # 🔀 Process each token from LLM with intelligent buffering
             async for raw_chunk in llm_client.stream_chat(context):
-                # 👈 MODIFIED: The check is now an awaitable async call
+                # Check for stream cancellation
                 if await self._is_cancelled():
                     logger.info(f"🛑 Task cancelled via Redis signal: {self.task_id}")
                     await self._handle_cancellation(assistant_message_id, chat_session_id)
                     break
                 
-                # 🎯 NORMALIZE: Convert provider-specific format to text
+                # Normalize chunk
                 chunk_text = self.normalizer.extract_text(raw_chunk, provider)
                 
                 # Skip empty chunks
@@ -696,8 +696,27 @@ class StreamingChatManager:
                 # Accumulate content for final response
                 accumulated_content += chunk_text
                 content_buffer += chunk_text
-                
-                # 🧠 SMART BUFFERING LOGIC (Claude/ChatGPT style)
+
+                # 🆕 REAL-TIME CITATION DETECTION: Only check for citations when we have new content
+                if len(accumulated_content) > len(last_citation_check):
+                    new_citations = await self._extract_citations_from_accumulated_text(
+                        accumulated_content=accumulated_content,
+                        relevant_chunks=relevant_chunks,
+                        seen_citation_ids=seen_citation_ids
+                    )
+                    
+                    if new_citations:
+                        citations.extend(new_citations)
+                        seen_citation_ids.update(c.id for c in new_citations)
+                        
+                        # 🚀 BROADCAST CITATIONS IMMEDIATELY
+                        await self._broadcast_citations(chat_session_id, new_citations)
+                        logger.info(f"📎 Detected {len(new_citations)} new citations during streaming")
+                        logger.info(f"📎 [DEBUG] citation content:\n{new_citations}")
+
+                    last_citation_check = accumulated_content
+
+                # 🧠 Smart buffering logic
                 streaming_buffer += chunk_text
                 time_since_last = (time.time() - last_broadcast) * 1000  # Convert to ms
                 
@@ -769,7 +788,7 @@ class StreamingChatManager:
             
             logger.info(f"🏁 Final content: {len(accumulated_content)} chars")
             logger.info(f"📊 Smart streaming: {chunk_count} broadcasts, avg {(len(accumulated_content)/chunk_count):.1f} chars/chunk")
-            logger.info(f"📊 Complete: {len(enriched_citations)} citations, {len(highlights)} highlights")
+            logger.info(f"📊 Streaming complete: parsed {len(enriched_citations)} citations, and created {len(highlights)} highlights")
             
             return StreamingResponse(
                 content=accumulated_content,
@@ -781,7 +800,8 @@ class StreamingChatManager:
                     "chunks_used": len(relevant_chunks),
                     "total_tokens": len(accumulated_content.split()),
                     "broadcast_count": chunk_count,
-                    "avg_chars_per_chunk": len(accumulated_content) / max(chunk_count, 1)
+                    "avg_chars_per_chunk": len(accumulated_content) / max(chunk_count, 1),
+                    "relevant_chunks": relevant_chunks
                 },
                 is_complete=True
             )
@@ -988,7 +1008,10 @@ class StreamingChatManager:
         ).strip()
 
     def _extract_highlights_from_chunk(self, chunk: str) -> List[Highlight]:
-        """🆕 Extract highlights like metrics and key facts"""
+        """
+        [May be Deprecated] This has been replaced with `_extract_citations_from_accumulated_text` a new method from Claude 4.5
+        Extract highlights like metrics and key facts
+        """
         highlights = []
         
         # Patterns for different highlight types
@@ -1008,7 +1031,53 @@ class StreamingChatManager:
                 ))
         
         return highlights
+    
+    async def _extract_citations_from_accumulated_text(
+        self,
+        accumulated_content: str,
+        relevant_chunks: List[Dict],
+        seen_citation_ids: set
+    ) -> List[Citation]:
+        """
+        Extract NEW citations from accumulated text during streaming 📡
+        
+        This checks the current accumulated text for citation patterns
+        and only returns citations we haven't seen before.
 
+        Content: "...authored by Justice Alito [WMNS_Dobbs.pdf, p"  
+        → Check for citations: None yet (incomplete)         
+        
+        Content: "...[WMNS_Dobbs.pdf, p. 1]."                      
+        → Extract citation ✓   
+
+        """
+        try:
+            # Extract inline citations: [Doc.pdf, p. X]
+            inline_citations = self.citation_processor.extract_inline_citations_from_content(
+                accumulated_content
+            )
+            
+            if not inline_citations:
+                return []
+            
+            # Match to chunks
+            citation_map = self.citation_processor.match_inline_citations_to_chunks(
+                inline_citations,
+                relevant_chunks
+            )
+            
+            # Filter out already-seen citations
+            new_citations = [
+                citation for citation_id, citation in citation_map.items()
+                if citation.id not in seen_citation_ids
+            ]
+            
+            return new_citations
+            
+        except Exception as e:
+            logger.warning(f"⚠️ Citation extraction during streaming failed: {e}")
+            return []
+    
     async def _broadcast_content_chunk(
         self, session_id: str, message_id: str, chunk: str
     ):
@@ -1112,8 +1181,10 @@ class StreamingChatManager:
         chat_session_id: str
     ):
         """
-        Finalize message with rich content
+        Finalize message with rich content and citations already extracted during streaming
         - Provides status updates to DB and to websocket stream
+        - Convert inline citations to markdown links
+        - Persis to database (supabase tables: messages, message_citations, message_highlights)
         - Records RAG chat api usage (robust and has Idempotency fallbacks)
         """
         
