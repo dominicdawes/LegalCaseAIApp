@@ -41,17 +41,8 @@ messages:
       - When referencing provided documents, use format: [Document Title, p. X]
       - Use markdown formatting for emphasis (*italics* for case names, **bold** for key concepts)
       - Structure longer responses with appropriate headers (## or ###)
-      - For document citations: [Document Title, p. X](#cite-N)
-      - For chunk references: [Source N](#cite-N)
-      
-      Examples:
-      - "According to the research[Source 1](#cite-1), the findings show..."
-      - "The Supreme Court held[Brown v. Board, p. 25](#cite-25) that..."
-      
-      **CRITICAL**: 
-      - Use (#cite-N) format where N matches the source number
-      - Always include the hash # before cite-
-      - This enables interactive citation previews for users
+      - **When generating your response, your citations must only contain the document title and page number. Do not reference the "Source #" labels that are provided in the context.**
+
 
   # ────────────────────────────────────────────────────────────────
   # 4) Important Constraints

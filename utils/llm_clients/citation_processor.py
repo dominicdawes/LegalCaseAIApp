@@ -267,6 +267,105 @@ class CitationProcessor:
         
         return new_citations, seen_citations
 
+    def extract_inline_citations_from_content(self, content: str) -> List[Dict]:
+        """
+        (claude4.5) Extract inline citations from markdown content
+        
+        Pattern: [Document.pdf, p. 5] or [Case Name, p. 10]
+        Returns: List of {text, page_number, document_name}
+        """
+        # Pattern: [text, p. number] or [text, Page number]
+        pattern = r'\[([^,\]]+),\s*(?:p\.|Page)\s*(\d+)\]'
+        
+        citations_found = []
+        for match in re.finditer(pattern, content):
+            full_text = match.group(0)  # [Document.pdf, p. 5]
+            doc_name = match.group(1).strip()  # Document.pdf
+            page_num = int(match.group(2))  # 5
+            
+            citations_found.append({
+                'full_text': full_text,
+                'document_name': doc_name,
+                'page_number': page_num,
+                'start_pos': match.start(),
+                'end_pos': match.end()
+            })
+        
+        logger.info(f"📚 Found {len(citations_found)} inline citations in content")
+        return citations_found
+
+    def match_inline_citations_to_chunks(
+        self, 
+        inline_citations: List[Dict],
+        relevant_chunks: List[Dict]
+    ) -> Dict[str, Citation]:
+        """
+        (claude4.5)
+        Match inline citations to document chunks
+        
+        Returns: Dict mapping citation_text -> Citation object
+        """
+        citation_map = {}
+        
+        for inline_cite in inline_citations:
+            doc_name = inline_cite['document_name']
+            page_num = inline_cite['page_number']
+            
+            # Find matching chunk by page number and document name
+            for chunk in relevant_chunks:
+                chunk_page = chunk.get('page_number')
+                metadata = self._parse_metadata(chunk.get('metadata', {}))
+                chunk_doc_name = metadata.get('title') or metadata.get('filename', '')
+                
+                # Match by page number (primary) and document name (secondary)
+                if chunk_page == page_num and doc_name in chunk_doc_name:
+                    citation_id = f"cite-{doc_name.replace('.pdf', '')}-p{page_num}".replace(' ', '-')
+                    
+                    citation = Citation(
+                        id=citation_id,
+                        text=inline_cite['full_text'],
+                        source_type="document",
+                        page_number=page_num,
+                        document_title=chunk_doc_name,
+                        source_id=chunk.get('source_id'),
+                        confidence=chunk.get('similarity', 0.8),
+                        relevant_excerpt=self._extract_relevant_excerpt(
+                            chunk.get('content', ''), max_length=300
+                        ),
+                        url=f"/documents/{chunk.get('source_id')}#page={page_num}",
+                        metadata={
+                            'chunk_id': chunk.get('id'),
+                            'chunk_index': relevant_chunks.index(chunk),
+                            'similarity_score': chunk.get('similarity')
+                        }
+                    )
+                    
+                    citation_map[inline_cite['full_text']] = citation
+                    logger.info(f"✅ Matched citation: {inline_cite['full_text']} -> {citation_id}")
+                    break
+        
+        return citation_map
+
+    def convert_inline_citations_to_markdown_links(
+        self,
+        content: str,
+        citation_map: Dict[str, Citation]
+    ) -> str:
+        """
+        (claude4.5)
+        Convert [Document.pdf, p. 5] to [Document.pdf, p. 5](#cite-id)
+        
+        This creates clickable citations that work with LinkPreviewManager
+        """
+        modified_content = content
+        
+        for citation_text, citation_obj in citation_map.items():
+            # Replace [Document.pdf, p. 5] with [Document.pdf, p. 5](#cite-id)
+            citation_link = f"[{citation_text.strip('[]')}](#{citation_obj.id})"
+            modified_content = modified_content.replace(citation_text, citation_link)
+        
+        return modified_content
+
     def _create_document_citation(
         self, chunk_num: str, relevant_chunks: List[Dict], citation_type: str
     ) -> Optional[Citation]:

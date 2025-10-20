@@ -82,7 +82,7 @@ from utils.supabase_utils import (
 )
 
 from tasks.celery_app import run_async_in_worker
-from tasks.database import get_db_connection, get_redis_connection, get_global_async_db_pool, get_global_redis_pool, init_async_pools, check_db_pool_health
+from tasks.database import get_db_connection, get_redis_connection, get_global_async_db_pool, get_global_redis_pool, init_async_pools, check_db_pool_health, check_redis_pool_health
 from utils.prompt_utils import load_yaml_prompt, build_chat_messages_from_yaml
 
 # ——— Logging & Env Load ———————————————————————————————————————————————————————————
@@ -609,6 +609,7 @@ class StreamingChatManager:
         """
         Description:
             Core streaming response generator with professional-grade smart buffering
+            with real-time citation extraction during streaming loop
             
             Uses intelligent chunking strategy similar to Claude/ChatGPT:
             - Buffers tokens until word/sentence boundaries
@@ -632,6 +633,10 @@ class StreamingChatManager:
         highlights = []
         last_db_update = time.time()
         content_buffer = ""
+
+        # 🆕 Citation tracking
+        seen_citation_ids = set()
+        last_citation_check = ""  # Track last checked content
         
         # 🚀 SMART BUFFERING STATE (Professional streaming)
         streaming_buffer = ""
@@ -725,11 +730,12 @@ class StreamingChatManager:
                     logger.info(f"📡 Broadcasting reason: {send_reason} (after {time_since_last:.1f}ms)")
                     await smart_broadcast_chunk()
                 
-                # 1) --- Extract citations using your existing processor
+                # 1) --- 🧙‍♂️ Extract citations using your existing processor
+                logger.info("🧙‍♂️ Wizard is extracting citations...")
                 doc_citations, seen_citations = self.citation_processor.extract_document_citations_from_chunks(
-                    accumulated_content, 
-                    relevant_chunks, 
-                    getattr(self, '_seen_citations', set())
+                    accumulated_content=accumulated_content, 
+                    relevant_chunks=relevant_chunks, 
+                    citation_processor=getattr(self, '_seen_citations', set())
                 )
                 if doc_citations:
                     citations.extend(doc_citations)
@@ -1091,7 +1097,7 @@ class StreamingChatManager:
             # Validate citations
             validated_citations = self.citation_processor.validate_citations(enriched_citations)
             
-            logger.info(f"🔗 Enriched {len(validated_citations)}/{len(citations)} citations")
+            logger.info(f"🔗 Enriched {len(validated_citations)}/{len(citations)} citations 📚")
             return validated_citations
             
         except Exception as e:
