@@ -333,7 +333,10 @@ class CitationProcessor:
                 chunk_doc_name = metadata.get('title') or metadata.get('filename', '')
                 
                 # Match by page number (primary) and document name (secondary)
-                if chunk_page == page_num and doc_name in chunk_doc_name:
+                # 🆕 More robust, case-insensitive, and bidirectional matching
+                if chunk_page == page_num and \
+                   (doc_name.lower() in chunk_doc_name.lower() or \
+                    chunk_doc_name.lower() in doc_name.lower()):
                     citation_id = f"cite-{doc_name.replace('.pdf', '')}-p{page_num}".replace(' ', '-')
                     
                     citation = Citation(
