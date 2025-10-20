@@ -297,6 +297,7 @@ class CitationProcessor:
             })
         
         logger.info(f"📚 Found {len(citations_found)} inline citations in content")
+        # logger.info(f"   Found content object:\n{citations_found}")
         return citations_found
 
     def match_inline_citations_to_chunks(
