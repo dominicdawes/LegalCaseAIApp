@@ -810,8 +810,8 @@ class StreamingChatManager:
                     "chunks_used": len(relevant_chunks),
                     "total_tokens": len(accumulated_content.split()),
                     "broadcast_count": chunk_count,
-                    "avg_chars_per_chunk": len(accumulated_content) / max(chunk_count, 1),
-                    "relevant_chunks": relevant_chunks
+                    "avg_chars_per_chunk": len(accumulated_content) / max(chunk_count, 1)
+                    # ❌ Remove: "relevant_chunks": relevant_chunks
                 },
                 is_complete=True
             )
@@ -1229,7 +1229,7 @@ class StreamingChatManager:
                         **response.metadata,
                         'citation_count': len(response.citations),
                         'citations_extracted_during_streaming': True
-                    }, cls=UUIDEncoder),  # ✅ Use custom encoder
+                    }),
                     message_id
                 )
 
