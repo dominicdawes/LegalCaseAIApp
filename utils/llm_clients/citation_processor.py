@@ -323,6 +323,11 @@ class CitationProcessor:
             
             # Find matching chunk by page number and document name
             for chunk in relevant_chunks:
+                logger.debug(f"Citation_matching...")
+                logger.debug(f"chunk filename: {metadata.get('filename', 'no filename')}")
+                logger.debug(f"chunk title: {metadata.get('title', 'no title')}")
+                logger.debug(f"chunk page num: {}")
+                
                 chunk_page = chunk.get('page_number')
                 metadata = self._parse_metadata(chunk.get('metadata', {}))
                 chunk_doc_name = metadata.get('title') or metadata.get('filename', '')
