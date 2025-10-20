@@ -1187,9 +1187,21 @@ class StreamingChatManager:
         - Persis to database (supabase tables: messages, message_citations, message_highlights)
         - Records RAG chat api usage (robust and has Idempotency fallbacks)
         """
+        # 1️⃣ Get citation map from streaming response
+        citation_map = {
+            citation.text: citation  # Map original text to Citation object
+            for citation in response.citations
+        }
         
-        # Add this line to escape dollar amounts before saving (stops wierd .md mathjax)
-        final_content = re.sub(r'(?<!\\)\$(\d)', r'\\$\1', response.content)
+        # 2️⃣ Convert to markdown links: [Doc, p. X] → [Doc, p. X](#cite-id)
+        enhanced_content = self.citation_processor.convert_inline_citations_to_markdown_links(
+            response.content,
+            citation_map
+        )
+
+        # Add this line to escape dollar amounts before saving (stops wierd .md mathjax $-sign formatting)
+        # final_content = re.sub(r'(?<!\\)\$(\d)', r'\\$\1', response.content)
+        final_content = re.sub(r'(?<!\\)\$(\d)', r'\\$\1', enhanced_content)
 
         async with get_db_connection() as conn:
             async with conn.transaction():
@@ -1202,22 +1214,59 @@ class StreamingChatManager:
                         metadata = $2
                     WHERE id = $3
                     """,
-                    response.content, json.dumps(response.metadata), message_id
+                    final_content,
+                    json.dumps({
+                        **response.metadata,
+                        'citation_count': len(response.citations),
+                        'citations_extracted_during_streaming': True
+                    }),
+                    message_id
                 )
+
+                #     """
+                #     UPDATE messages 
+                #     SET content = $1, status = 'complete', 
+                #         streaming_complete = true, completed_at = NOW(),
+                #         metadata = $2
+                #     WHERE id = $3
+                #     """,
+                #     response.content, json.dumps(response.metadata), message_id
+                # )
                 
-                # Insert citations
+                # Persist citations to public.message_citations
                 for citation in response.citations:
                     await conn.execute(
                         """
                         INSERT INTO message_citations 
-                        (message_id, citation_id, url, title, description, 
-                        source_type, confidence, relevant_excerpt)
-                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                        (message_id, citation_id, citation_key, title, 
+                        page_number, document_title, relevant_excerpt, 
+                        source_type, confidence, metadata)
+                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                        ON CONFLICT (message_id, citation_id) DO NOTHING
                         """,
-                        message_id, citation.id, citation.url, citation.title,
-                        citation.description, citation.source_type, 
-                        citation.confidence, citation.relevant_excerpt
+                        message_id,
+                        citation.id,
+                        citation.id,  # citation_key
+                        citation.document_title,
+                        citation.page_number,
+                        citation.document_title,
+                        citation.relevant_excerpt,
+                        citation.source_type,
+                        citation.confidence,
+                        json.dumps(citation.metadata)
                     )
+                # for citation in response.citations:
+                #     await conn.execute(
+                #         """
+                #         INSERT INTO message_citations 
+                #         (message_id, citation_id, url, title, description, 
+                #         source_type, confidence, relevant_excerpt)
+                #         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                #         """,
+                #         message_id, citation.id, citation.url, citation.title,
+                #         citation.description, citation.source_type, 
+                #         citation.confidence, citation.relevant_excerpt
+                #     )
                 
                 # Insert highlights
                 for highlight in response.highlights:
@@ -1245,7 +1294,7 @@ class StreamingChatManager:
 
         # Final broadcast
         await self._broadcast_completion(chat_session_id, message_id)
-        logger.info(f"✅ Message finalized with {len(response.citations)} citations, {len(response.highlights)} highlights")
+        logger.info(f"✅ Message finalized (persist to db) with {len(response.citations)} citations, and {len(response.highlights)} highlights")
 
     async def _broadcast_completion(self, session_id: str, message_id: str):
         """🆕 Broadcast stream completion"""
