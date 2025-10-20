@@ -307,7 +307,16 @@ class EmbeddingCache:
                 logger.info(f"💾 Cached embedding for future use")
         except Exception as e:
             logger.warning(f"⚠️ Cache storage failed: {e}")
-
+            
+class UUIDEncoder(json.JSONEncoder):
+    """Custom JSON encoder that handles UUIDs and datetime objects"""
+    def default(self, obj):
+        if isinstance(obj, uuid.UUID):
+            return str(obj)
+        if isinstance(obj, datetime):
+            return obj.isoformat()
+        return super().default(obj)
+        
 # ——— Streaming Chat Manager (Core New Component) ——————————————————————————————————
 
 class StreamingChatManager:
@@ -1220,7 +1229,7 @@ class StreamingChatManager:
                         **response.metadata,
                         'citation_count': len(response.citations),
                         'citations_extracted_during_streaming': True
-                    }),
+                    }, cls=UUIDEncoder),  # ✅ Use custom encoder
                     message_id
                 )
 
