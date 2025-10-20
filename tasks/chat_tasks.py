@@ -714,8 +714,9 @@ class StreamingChatManager:
                         seen_citation_ids=seen_citation_ids
                     )
                     
-                    if new_citations:
-                        logger.info("🧙‍♂️ Wizard is extracting citations...")
+                    if len(new_citations)>0:
+                        logger.info(f"🧙‍♂️ Wizard is extracting {len(new_citations)} citations...")
+                        # logger.info(f"Citation content\n:{new_citations}")
                         citations.extend(new_citations)
                         seen_citation_ids.update(c.id for c in new_citations)
                         
