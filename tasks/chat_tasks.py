@@ -706,6 +706,7 @@ class StreamingChatManager:
                     )
                     
                     if new_citations:
+                        logger.info("🧙‍♂️ Wizard is extracting citations...")
                         citations.extend(new_citations)
                         seen_citation_ids.update(c.id for c in new_citations)
                         
@@ -749,19 +750,19 @@ class StreamingChatManager:
                     logger.info(f"📡 Broadcasting reason: {send_reason} (after {time_since_last:.1f}ms)")
                     await smart_broadcast_chunk()
                 
-                # 1) --- 🧙‍♂️ Extract citations using your existing processor
-                logger.info("🧙‍♂️ Wizard is extracting citations...")
-                doc_citations, seen_citations = self.citation_processor.extract_document_citations_from_chunks(
-                    accumulated_content=accumulated_content, 
-                    relevant_chunks=relevant_chunks, 
-                    citation_processor=getattr(self, '_seen_citations', set())
-                )
-                if doc_citations:
-                    citations.extend(doc_citations)
-                    self._seen_citations = seen_citations
-                    await self._broadcast_citations(chat_session_id, doc_citations)
+                # # 1) --- DEPRECATED: Extract citations using your citation_processor
+                # logger.info("🧙‍♂️ Wizard is extracting citations...")
+                # doc_citations, seen_citations = self.citation_processor.extract_document_citations_from_chunks(
+                #     accumulated_content=accumulated_content, 
+                #     relevant_chunks=relevant_chunks, 
+                #     citation_processor=getattr(self, '_seen_citations', set())
+                # )
+                # if doc_citations:
+                #     citations.extend(doc_citations)
+                #     self._seen_citations = seen_citations
+                #     await self._broadcast_citations(chat_session_id, doc_citations)
                 
-                # 2) --- Extract highlights (your existing method)
+                # 2) --- Extract highlights (unchanged)
                 new_highlights = self._extract_highlights_from_chunk(chunk_text)
                 if new_highlights:
                     highlights.extend(new_highlights)
