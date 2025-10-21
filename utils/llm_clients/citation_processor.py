@@ -296,8 +296,8 @@ class CitationProcessor:
                 'end_pos': match.end()
             })
         
-        logger.info(f"📚 Found {len(citations_found)} inline citations in content")
-        logger.info(f"   Found content object:\n{citations_found}")
+        logger.info(f"📚 Found {len(citations_found)} inline citation(s) in content")
+        logger.info(f"  🙌 Found citation object:\n{citations_found}")
         return citations_found
 
     def match_inline_citations_to_chunks(
@@ -323,20 +323,23 @@ class CitationProcessor:
             
             # Find matching chunk by page number and document name
             for chunk in relevant_chunks:
-                logger.debug(f"Citation_matching...")
-                logger.debug(f"chunk filename: {metadata.get('filename', 'no filename')}")
-                logger.debug(f"chunk title: {metadata.get('title', 'no title')}")
-                logger.debug(f"chunk page num: {inline_cite['page_number']}")
-                
+
+                # 🔴 FIX: Define variables FIRST
                 chunk_page = chunk.get('page_number')
                 metadata = self._parse_metadata(chunk.get('metadata', {}))
                 chunk_doc_name = metadata.get('title') or metadata.get('filename', '')
                 
+                # 🟢 NOW you can safely log them
+                logger.debug(f"  Checking against chunk:")
+                logger.debug(f"    chunk source_id: {chunk.get('source_id')}")
+                logger.debug(f"    chunk filename: {metadata.get('filename', 'no filename')}")
+                logger.debug(f"    chunk title: {metadata.get('title', 'no title')}")
+                logger.debug(f"    chunk page num: {chunk_page}")
+                
                 # Match by page number (primary) and document name (secondary)
                 # 🆕 More robust, case-insensitive, and bidirectional matching
-                if chunk_page == page_num and \
-                   (doc_name.lower() in chunk_doc_name.lower() or \
-                    chunk_doc_name.lower() in doc_name.lower()):
+                if chunk_page == page_num and (doc_name.lower() in chunk_doc_name.lower() or chunk_doc_name.lower() in doc_name.lower()):
+                    
                     citation_id = f"cite-{doc_name.replace('.pdf', '')}-p{page_num}".replace(' ', '-')
                     
                     citation = Citation(
