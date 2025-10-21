@@ -306,7 +306,7 @@ def log_llm_error(
             "created_at": datetime.now(timezone.utc).isoformat(),
             "role": "assistant",
             "status": "error",
-            "Streaming_complete": True,
+            "streaming_complete": True, # <-- There is an error being logged, and streaming is complete frees up the front-end UI, 
         }
     elif table_name == "notes":
         payload = {

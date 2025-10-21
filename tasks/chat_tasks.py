@@ -1109,7 +1109,11 @@ class StreamingChatManager:
             logger.warning(f"⚠️ Broadcast failed: {e}")
 
     async def _broadcast_citations(self, session_id: str, citations: List[Citation]):
-        """🆕 Broadcast new citations"""       
+        """
+        Broadcast new citations
+        Function publishes a JSON object to Redis with {"type": "citations_found", "citations": [...]}.
+
+        """       
         try:
             async with get_redis_connection() as r:
                 await r.publish(f"chat:{session_id}", json.dumps({
@@ -1124,6 +1128,7 @@ class StreamingChatManager:
                         } for c in citations
                     ]
                 }))
+            logger.info(f"🛰️ Citation broadcast success len-{len(citations)}")
         except Exception as e:
             logger.warning(f"⚠️ Citation broadcast failed: {e}")
 
@@ -1226,11 +1231,16 @@ class StreamingChatManager:
                     WHERE id = $3
                     """,
                     final_content,
+                    # json.dumps({
+                    #     **response.metadata,
+                    #     'citation_count': len(response.citations),
+                    #     'citations_extracted_during_streaming': True
+                    # }),
                     json.dumps({
                         **response.metadata,
                         'citation_count': len(response.citations),
                         'citations_extracted_during_streaming': True
-                    }),
+                    }, cls=UUIDEncoder), # <-- ADD THIS
                     message_id
                 )
 
@@ -1264,7 +1274,7 @@ class StreamingChatManager:
                         citation.relevant_excerpt,
                         citation.source_type,
                         citation.confidence,
-                        json.dumps(citation.metadata)
+                        json.dumps(citation.metadata, cls=UUIDEncoder)
                     )
                 # for citation in response.citations:
                 #     await conn.execute(

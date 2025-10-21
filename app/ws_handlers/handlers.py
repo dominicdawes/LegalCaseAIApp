@@ -32,6 +32,7 @@ async def listen_redis_and_forward(pubsub, session_id: str):
                     # Parse the Redis message
                     data = json.loads(message['data'])
                     
+                    # payload type can be: 'hello_ack', 'content_delta', 'citation_found', 'stream_cancelled' etc...
                     logger.info(f"📡 Redis message for session {session_id}: {data.get('type', 'unknown')}")
                     
                     # Forward to all connections in this session
