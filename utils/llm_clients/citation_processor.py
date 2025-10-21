@@ -326,7 +326,7 @@ class CitationProcessor:
                 logger.debug(f"Citation_matching...")
                 logger.debug(f"chunk filename: {metadata.get('filename', 'no filename')}")
                 logger.debug(f"chunk title: {metadata.get('title', 'no title')}")
-                logger.debug(f"chunk page num: {}")
+                logger.debug(f"chunk page num: {inline_cite['page_number']}")
                 
                 chunk_page = chunk.get('page_number')
                 metadata = self._parse_metadata(chunk.get('metadata', {}))
