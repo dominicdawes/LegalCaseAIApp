@@ -759,18 +759,6 @@ class StreamingChatManager:
                     logger.info(f"📡 Broadcasting reason: {send_reason} (after {time_since_last:.1f}ms)")
                     await smart_broadcast_chunk()
                 
-                # # 1) --- DEPRECATED: Extract citations using your citation_processor
-                # logger.info("🧙‍♂️ Wizard is extracting citations...")
-                # doc_citations, seen_citations = self.citation_processor.extract_document_citations_from_chunks(
-                #     accumulated_content=accumulated_content, 
-                #     relevant_chunks=relevant_chunks, 
-                #     citation_processor=getattr(self, '_seen_citations', set())
-                # )
-                # if doc_citations:
-                #     citations.extend(doc_citations)
-                #     self._seen_citations = seen_citations
-                #     await self._broadcast_citations(chat_session_id, doc_citations)
-                
                 # 2) --- Extract highlights (unchanged)
                 new_highlights = self._extract_highlights_from_chunk(chunk_text)
                 if new_highlights:
@@ -1246,19 +1234,11 @@ class StreamingChatManager:
                         }, cls=UUIDEncoder), # <-- ADD THIS
                         message_id
                     )
-
-                    #     """
-                    #     UPDATE messages 
-                    #     SET content = $1, status = 'complete', 
-                    #         streaming_complete = true, completed_at = NOW(),
-                    #         metadata = $2
-                    #     WHERE id = $3
-                    #     """,
-                    #     response.content, json.dumps(response.metadata), message_id
-                    # )
                     
                     # Persist citations to public.message_citations
                     for citation in response.citations:
+                        logger.info(f"ABOUT TO INSERT CITATION: {citation}")
+
                         await conn.execute(
                             """
                             INSERT INTO message_citations

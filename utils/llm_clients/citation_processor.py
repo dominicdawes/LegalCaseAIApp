@@ -363,6 +363,7 @@ class CitationProcessor:
                     
                     citation_map[inline_cite['full_text']] = citation
                     logger.info(f"✅ Matched citation: {inline_cite['full_text']} -> {citation_id}")
+                    logger.info(f"CREATED CITATION OBJECT: {citation}")
                     break
         
         return citation_map
