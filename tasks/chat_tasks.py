@@ -475,7 +475,7 @@ class StreamingChatManager:
             
             # 🆕 Finalize with rich content
             await self._finalize_streaming_message(
-                assistant_message_id, streaming_response, user_id, chat_session_id
+                project_id, assistant_message_id, streaming_response, user_id, chat_session_id
             )
             
             # 🆕 Performance tracking
@@ -715,8 +715,7 @@ class StreamingChatManager:
                     )
                     
                     if len(new_citations)>0:
-                        logger.info(f"🧙‍♂️ Wizard is found {len(new_citations)} new citations...")
-                        # logger.info(f"Citation content\n:{new_citations}")
+                        logger.info(f"🧙‍♂️ Wizard has found {len(new_citations)} new citations...")
                         citations.extend(new_citations)
                         seen_citation_ids.update(c.id for c in new_citations)
                         
@@ -1193,6 +1192,7 @@ class StreamingChatManager:
 
     async def _finalize_streaming_message(
         self,
+        project_id: str,
         message_id: str,
         response: StreamingResponse,
         user_id: str,
@@ -1205,119 +1205,134 @@ class StreamingChatManager:
         - Persis to database (supabase tables: messages, message_citations, message_highlights)
         - Records RAG chat api usage (robust and has Idempotency fallbacks)
         """
-        # 1️⃣ Get citation map from streaming response
-        citation_map = {
-            citation.text: citation  # Map original text to Citation object
-            for citation in response.citations
-        }
-        
-        # 2️⃣ Convert to markdown links: [Doc, p. X] → [Doc, p. X](#cite-id)
-        enhanced_content = self.citation_processor.convert_inline_citations_to_markdown_links(
-            response.content,
-            citation_map
-        )
+        try:
+            # 1️⃣ Get citation map from streaming response
+            citation_map = {
+                citation.text: citation  # Map original text to Citation object
+                for citation in response.citations
+            }
+            
+            # 2️⃣ Convert to markdown links: [Doc, p. X] → [Doc, p. X](#cite-id)
+            enhanced_content = self.citation_processor.convert_inline_citations_to_markdown_links(
+                response.content,
+                citation_map
+            )
 
-        # Add this line to escape dollar amounts before saving (stops wierd .md mathjax $-sign formatting)
-        # final_content = re.sub(r'(?<!\\)\$(\d)', r'\\$\1', response.content)
-        final_content = re.sub(r'(?<!\\)\$(\d)', r'\\$\1', enhanced_content)
+            # Add this line to escape dollar amounts before saving (stops wierd .md mathjax $-sign formatting)
+            # final_content = re.sub(r'(?<!\\)\$(\d)', r'\\$\1', response.content)
+            final_content = re.sub(r'(?<!\\)\$(\d)', r'\\$\1', enhanced_content)
 
-        async with get_db_connection() as conn:
-            async with conn.transaction():
-                # Update main message
-                await conn.execute(
-                    """
-                    UPDATE messages 
-                    SET content = $1, status = 'complete', 
-                        streaming_complete = true, completed_at = NOW(),
-                        metadata = $2
-                    WHERE id = $3
-                    """,
-                    final_content,
-                    # json.dumps({
-                    #     **response.metadata,
-                    #     'citation_count': len(response.citations),
-                    #     'citations_extracted_during_streaming': True
-                    # }),
-                    json.dumps({
-                        **response.metadata,
-                        'citation_count': len(response.citations),
-                        'citations_extracted_during_streaming': True
-                    }, cls=UUIDEncoder), # <-- ADD THIS
-                    message_id
-                )
-
-                #     """
-                #     UPDATE messages 
-                #     SET content = $1, status = 'complete', 
-                #         streaming_complete = true, completed_at = NOW(),
-                #         metadata = $2
-                #     WHERE id = $3
-                #     """,
-                #     response.content, json.dumps(response.metadata), message_id
-                # )
-                
-                # Persist citations to public.message_citations
-                for citation in response.citations:
+            async with get_db_connection() as conn:
+                async with conn.transaction():
+                    # Update main message
                     await conn.execute(
                         """
-                        INSERT INTO message_citations 
-                        (message_id, citation_id, citation_key, title, 
-                        page_number, document_title, relevant_excerpt, 
-                        source_type, confidence, metadata)
-                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-                        ON CONFLICT (message_id, citation_id) DO NOTHING
+                        UPDATE messages 
+                        SET content = $1, status = 'complete', 
+                            streaming_complete = true, completed_at = NOW(),
+                            metadata = $2
+                        WHERE id = $3
                         """,
-                        message_id,
-                        citation.id,
-                        citation.id,  # citation_key
-                        citation.document_title,
-                        citation.page_number,
-                        citation.document_title,
-                        citation.relevant_excerpt,
-                        citation.source_type,
-                        citation.confidence,
-                        json.dumps(citation.metadata, cls=UUIDEncoder)
+                        final_content,
+                        # json.dumps({
+                        #     **response.metadata,
+                        #     'citation_count': len(response.citations),
+                        #     'citations_extracted_during_streaming': True
+                        # }),
+                        json.dumps({
+                            **response.metadata,
+                            'citation_count': len(response.citations),
+                            'citations_extracted_during_streaming': True
+                        }, cls=UUIDEncoder), # <-- ADD THIS
+                        message_id
                     )
-                # for citation in response.citations:
-                #     await conn.execute(
-                #         """
-                #         INSERT INTO message_citations 
-                #         (message_id, citation_id, url, title, description, 
-                #         source_type, confidence, relevant_excerpt)
-                #         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-                #         """,
-                #         message_id, citation.id, citation.url, citation.title,
-                #         citation.description, citation.source_type, 
-                #         citation.confidence, citation.relevant_excerpt
-                #     )
-                
-                # Insert highlights
-                for highlight in response.highlights:
+
+                    #     """
+                    #     UPDATE messages 
+                    #     SET content = $1, status = 'complete', 
+                    #         streaming_complete = true, completed_at = NOW(),
+                    #         metadata = $2
+                    #     WHERE id = $3
+                    #     """,
+                    #     response.content, json.dumps(response.metadata), message_id
+                    # )
+                    
+                    # Persist citations to public.message_citations
+                    for citation in response.citations:
+                        await conn.execute(
+                            """
+                            INSERT INTO message_citations
+                            (message_id, citation_id, citation_key, title, url,  -- Added url here
+                            page_number, document_title, relevant_excerpt,
+                            source_type, confidence, metadata)
+                            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) -- Increased value count
+                            ON CONFLICT (message_id, citation_id) DO NOTHING
+                            """,
+                            message_id,                 # $1
+                            citation.id,                # $2
+                            citation.id,                # $3 citation_key
+                            citation.title,             # $4 title (Changed from document_title)
+                            citation.url,               # $5 <-- ADDED citation.url HERE
+                            citation.page_number,       # $6
+                            citation.document_title,    # $7
+                            citation.relevant_excerpt,  # $8
+                            citation.source_type,       # $9
+                            citation.confidence,        # $10
+                            json.dumps(citation.metadata, cls=UUIDEncoder) # $11
+                        )
+                    # for citation in response.citations:
+                    #     await conn.execute(
+                    #         """
+                    #         INSERT INTO message_citations 
+                    #         (message_id, citation_id, url, title, description, 
+                    #         source_type, confidence, relevant_excerpt)
+                    #         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                    #         """,
+                    #         message_id, citation.id, citation.url, citation.title,
+                    #         citation.description, citation.source_type, 
+                    #         citation.confidence, citation.relevant_excerpt
+                    #     )
+                    
+                    # Insert highlights
+                    for highlight in response.highlights:
+                        await conn.execute(
+                            """
+                            INSERT INTO message_highlights 
+                            (message_id, text, highlight_type, confidence)
+                            VALUES ($1, $2, $3, $4)
+                            """,
+                            message_id, highlight.text, highlight.highlight_type,
+                            highlight.confidence
+                        )
+
+                    # 4. Increment user usage atomically (specific to user_id)
                     await conn.execute(
                         """
-                        INSERT INTO message_highlights 
-                        (message_id, text, highlight_type, confidence)
-                        VALUES ($1, $2, $3, $4)
+                        INSERT INTO public.usage (user_id, day_rag_queries)
+                        VALUES ($1, 1)
+                        ON CONFLICT (user_id) DO UPDATE 
+                        SET day_rag_queries = usage.day_rag_queries + 1,
+                            last_active_at = NOW();
                         """,
-                        message_id, highlight.text, highlight.highlight_type,
-                        highlight.confidence
+                        user_id
                     )
 
-                # 4. Increment user usage atomically (specific to user_id)
-                await conn.execute(
-                    """
-                    INSERT INTO public.usage (user_id, day_rag_queries)
-                    VALUES ($1, 1)
-                    ON CONFLICT (user_id) DO UPDATE 
-                    SET day_rag_queries = usage.day_rag_queries + 1,
-                        last_active_at = NOW();
-                    """,
-                    user_id
-                )
+            # Final broadcast
+            await self._broadcast_completion(chat_session_id, message_id)
+            logger.info(f"✅ Message finalized (persist to db) with {len(response.citations)} citations, and {len(response.highlights)} highlights")
 
-        # Final broadcast
-        await self._broadcast_completion(chat_session_id, message_id)
-        logger.info(f"✅ Message finalized (persist to db) with {len(response.citations)} citations, and {len(response.highlights)} highlights")
+        except Exception as e:
+            logger.error(f"❌ Assistant citations persistence failed: {e}", exc_info=True)
+            log_llm_error(
+                client=supabase_client,
+                table_name="messages",
+                task_name="persist_response_citations",
+                error_message=str(e),
+                project_id=project_id,
+                chat_session_id=chat_session_id,
+                user_id=user_id,
+            )
+            raise self.retry(exc=e)
 
     async def _broadcast_completion(self, session_id: str, message_id: str):
         """🆕 Broadcast stream completion"""
