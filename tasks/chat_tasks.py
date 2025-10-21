@@ -715,7 +715,7 @@ class StreamingChatManager:
                     )
                     
                     if len(new_citations)>0:
-                        logger.info(f"🧙‍♂️ Wizard is extracting {len(new_citations)} citations...")
+                        logger.info(f"🧙‍♂️ Wizard is found {len(new_citations)} new citations...")
                         # logger.info(f"Citation content\n:{new_citations}")
                         citations.extend(new_citations)
                         seen_citation_ids.update(c.id for c in new_citations)
@@ -1063,6 +1063,8 @@ class StreamingChatManager:
 
         """
         try:
+            logger.info(f"🧙‍♂️ Wizard is filtering for new citations...")
+
             # Extract inline citations: [Doc.pdf, p. X]
             inline_citations = self.citation_processor.extract_inline_citations_from_content(
                 accumulated_content
@@ -1128,7 +1130,7 @@ class StreamingChatManager:
                         } for c in citations
                     ]
                 }))
-            logger.info(f"🛰️ Citation broadcast success len-{len(citations)}")
+            logger.info(f"🛰️ New Citation broadcast success len-{len(citations)}")
         except Exception as e:
             logger.warning(f"⚠️ Citation broadcast failed: {e}")
 
