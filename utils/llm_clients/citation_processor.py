@@ -330,12 +330,12 @@ class CitationProcessor:
                 chunk_doc_name = metadata.get('title') or metadata.get('filename', '')
                 
                 # 🟢 NOW you can safely log them
-                logger.debug(f"  Checking against chunk:")
+                logger.debug(f"  :")
                 logger.debug(f"    chunk source_id: {chunk.get('source_id')}")
                 logger.debug(f"    chunk filename: {metadata.get('filename', 'no filename')}")
                 logger.debug(f"    chunk title: {metadata.get('title', 'no title')}")
                 logger.debug(f"    chunk page num: {chunk_page}")
-                
+
                 # Match by page number (primary) and document name (secondary)
                 # 🆕 More robust, case-insensitive, and bidirectional matching
                 if chunk_page == page_num and (doc_name.lower() in chunk_doc_name.lower() or chunk_doc_name.lower() in doc_name.lower()):
@@ -866,13 +866,25 @@ class CitationProcessor:
             logger.warning(f"⚠️ Cache storage failed: {e}")
 
     def validate_citations(self, citations: List[Citation]) -> List[Citation]:
-        """Validate and clean citations"""
+        """
+        Validate and clean citations:
+        This method handles both:
+        - external urls
+        - internal document citation urls 'document/source_id/#page_num'
+        """
         valid_citations = []
         seen_urls = set()
         
         for citation in citations:
             # Skip duplicates
             if citation.url in seen_urls:
+                continue
+
+            # Skip URL validation for internal document links
+            if citation.url and citation.url.startswith('/documents/'):
+                valid_citations.append(citation)
+                seen_urls.add(citation.url)
+                logger.warning(f"📑 found internal deocument citation URL: {citation.url}")
                 continue
             
             # Skip invalid URLs
