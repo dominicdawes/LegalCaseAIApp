@@ -1,4 +1,4 @@
-// Add CSS dynamically if not already added
+// Javascript action to add CSS dynamically if not already added (done on pageLoad or in a Workflow)
 if (!document.getElementById('link-preview-styles')) {
   const style = document.createElement('style');
   style.id = 'link-preview-styles';
