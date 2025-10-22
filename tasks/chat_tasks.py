@@ -988,7 +988,7 @@ class StreamingChatManager:
         chunk_context = "\n".join(numbered_contexts)
 
         final_context = f"{user_context}\n\nRelevant Context:\n{chunk_context}"
-        # logger.info(f"_trim_context_smart() result:\n{final_context}, {final_chunks}")
+        logger.info(f"_trim_context_smart() result:\n{final_context}, {final_chunks}")
         return final_context, final_chunks
 
     def _build_page_context(self, page_num, chunks):
