@@ -296,8 +296,8 @@ class CitationProcessor:
                 'end_pos': match.end()
             })
         
-        logger.info(f"📚 Found {len(citations_found)} inline citation(s) in content")
-        logger.info(f"  🙌 Found citation object:\n{citations_found}")
+        logger.info(f"📚 Found {len(citations_found)} inline citation(s) in accumulated content")
+        logger.debug(f"  🙌 Found citation object:\n{citations_found}")
         return citations_found
 
     def match_inline_citations_to_chunks(
@@ -330,11 +330,11 @@ class CitationProcessor:
                 chunk_doc_name = metadata.get('title') or metadata.get('filename', '')
                 
                 # 🟢 NOW you can safely log them
-                logger.info(f"  :")
-                logger.info(f"    chunk source_id: {chunk.get('source_id')}")
-                logger.info(f"    chunk filename: {metadata.get('filename', 'no filename')}")
-                logger.info(f"    chunk title: {metadata.get('title', 'no title')}")
-                logger.info(f"    chunk page num: {chunk_page}")
+                logger.debug(f"  :")
+                logger.debug(f"    chunk source_id: {chunk.get('source_id')}")
+                logger.debug(f"    chunk filename: {metadata.get('filename', 'no filename')}")
+                logger.debug(f"    chunk title: {metadata.get('title', 'no title')}")
+                logger.debug(f"    chunk page num: {chunk_page}")
 
                 # Match by page number (primary) and document name (secondary)
                 # 🆕 More robust, case-insensitive, and bidirectional matching
@@ -363,8 +363,8 @@ class CitationProcessor:
                     )
                     
                     citation_map[inline_cite['full_text']] = citation
-                    logger.info(f"✅ Matched citation: {inline_cite['full_text']} -> {citation_id}")
-                    logger.info(f"CREATED CITATION OBJECT: {citation}")
+                    logger.info(f"🧙‍♂️ Wizard atched citation: {inline_cite['full_text']} -> {citation_id} ✅")
+                    logger.debug(f"CREATED CITATION OBJECT: {citation}")
                     break
         
         return citation_map
@@ -886,7 +886,7 @@ class CitationProcessor:
             if citation.url and citation.url.startswith('/documents/'):
                 valid_citations.append(citation)
                 seen_urls.add(citation.url)
-                logger.warning(f"📑 found internal deocument citation URL: {citation.url}")
+                logger.warning(f"📌 found internal document citation URL: {citation.url}")
                 continue
             
             # Skip invalid URLs
