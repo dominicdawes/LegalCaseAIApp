@@ -967,8 +967,9 @@ class StreamingChatManager:
         numbered_contexts = []
         source_index = 1
         for doc_title, chunks_in_doc in grouped_chunks.items():
+
             # Each document gets a single, stable "Source" number
-            header = f"Source {source_index}: [Document: {doc_title}]"
+            header = f"Source {source_index}: [Document: {doc_title}]"      # LLM Gets the header `Source 1: [Document: IRB_-_Hadley_v_Baxendale_1854_.pdf]` so it knows what to cite in citation_processor regex
             numbered_contexts.append(header)
             
             # Add content from each chunk with its specific page number

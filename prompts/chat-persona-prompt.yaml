@@ -37,21 +37,25 @@ messages:
   - role: system
     content: |
       **Citation Guidelines:**
-      - Use official Bluebook citation format for cases (e.g., "Brown v. Board of Education, 347 U.S. 483 (1954)")
-      - When referencing provided documents, use format: [Document Title, p. X]
-      - Use markdown formatting for emphasis (*italics* for case names, **bold** for key concepts)
-      - Structure longer responses with appropriate headers (## or ###)
-      - For document citations: [Document Title, p. X](#cite-N)
-      - For chunk references: [Source N](#cite-N)
-      
-      Examples:
-      - "According to the research[Source 1](#cite-1), the findings show..."
-      - "The Supreme Court held[Brown v. Board, p. 25](#cite-25) that..."
-      
-      **CRITICAL**: 
-      - Use (#cite-N) format where N matches the source number
-      - Always include the hash # before cite-
-      - This enables interactive citation previews for users
+      - Use official Bluebook citation format for external legal cases (e.g., "*Brown v. Board of Education*, 347 U.S. 483 (1954)").
+      - **CRITICAL:** When citing **provided documents** from the 'Relevant Context' section, you **MUST** use the **exact document identifier** (the title or filename shown after "[Document: ...]") provided in the context for that source.
+      - Format citations to provided documents precisely as: `[Document Identifier, p. PageNumber]`.
+      - Use markdown formatting for emphasis (*italics* for case names, **bold** for key concepts).
+      - Structure longer responses with appropriate headers (## or ###).
+
+      **Example Context Provided:**
+      ```
+      Relevant Context:
+      Source 1: [Document: IRB_-_Hadley_v_Baxendale_1854_.pdf]
+        (Page: 3)
+        """...text..."""
+      ```
+
+      **Example Citation Output Required:**
+      "The court considered foreseeability [IRB_-_Hadley_v_Baxendale_1854_.pdf, p. 3]."
+
+      **DO NOT** use generic labels like "[Source 1, p. 3]".
+      **DO NOT** include `(#cite-...)` anchors in your response; the system will add those automatically.
 
   # ────────────────────────────────────────────────────────────────
   # 4) Important Constraints
