@@ -1244,10 +1244,10 @@ class StreamingChatManager:
                         await conn.execute(
                             """
                             INSERT INTO message_citations
-                            (message_id, citation_id, citation_key, title, url,  -- Added url here
+                            (message_id, citation_id, citation_key, title, url,
                             page_number, document_title, relevant_excerpt,
-                            source_type, confidence, metadata)
-                            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) -- Increased value count
+                            source_type, confidence, metadata, source_id) -- Added source_id column
+                            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) -- Increased value count
                             ON CONFLICT (message_id, citation_id) DO NOTHING
                             """,
                             message_id,                 # $1
@@ -1261,7 +1261,7 @@ class StreamingChatManager:
                             citation.source_type,       # $9
                             citation.confidence,        # $10
                             json.dumps(citation.metadata, cls=UUIDEncoder), # $11
-                            citation.source_id
+                            citation.source_id # $12
                         )
                     # for citation in response.citations:
                     #     await conn.execute(

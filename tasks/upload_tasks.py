@@ -1001,6 +1001,11 @@ async def _parse_document_async(source_id: str, source_filename: str, cdn_url: s
 
                 # ✅ FIXED: Add async yields for long-running CPU work
                 for chunk_text, chunk_metadata in text_stream:
+
+                    if isinstance(chunk_metadata, dict): # Check if metadata is a dict
+                        chunk_metadata['filename'] = source_filename
+                        chunk_metadata['title'] = source_filename # Use filename as title for now
+                    
                     all_chunks.append(chunk_text)
                     all_metadatas.append(chunk_metadata)
                     
