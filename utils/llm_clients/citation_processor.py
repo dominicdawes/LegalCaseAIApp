@@ -316,57 +316,125 @@ class CitationProcessor:
         _find_citation_by_page, _extract_relevant_excerpt, etc...) to be obsolete
         """
         citation_map = {}
-        
-        for inline_cite in inline_citations:
-            doc_name = inline_cite['document_name']
-            page_num = inline_cite['page_number']
-            
-            # Find matching chunk by page number and document name
-            for chunk in relevant_chunks:
+        # Ensure relevant_chunks is a list, even if empty
+        relevant_chunks = relevant_chunks if relevant_chunks else []
 
-                # 🔴 FIX: Define variables FIRST
-                chunk_page = chunk.get('page_number')
-                metadata = self._parse_metadata(chunk.get('metadata', {}))
-                chunk_doc_name = metadata.get('title') or metadata.get('filename', '')
-                
-                # 🟢 NOW you can safely log them
-                logger.debug(f"  :")
-                logger.debug(f"    chunk source_id: {chunk.get('source_id')}")
-                logger.debug(f"    chunk filename: {metadata.get('filename', 'no filename')}")
-                logger.debug(f"    chunk title: {metadata.get('title', 'no title')}")
-                logger.debug(f"    chunk page num: {chunk_page}")
+        try: # Outer try block for the main loop over inline citations
+            for inline_cite in inline_citations:
+                try: # Inner try block for processing a single inline citation
+                    # --- 🐞 DEBUG: Log the citation we're trying to match ---
+                    logger.debug(f"--- Attempting to match Citation: {inline_cite.get('full_text', 'N/A')} ---")
 
-                # Match by page number (primary) and document name (secondary)
-                # 🆕 More robust, case-insensitive, and bidirectional matching
-                if chunk_page == page_num and (doc_name.lower() in chunk_doc_name.lower() or chunk_doc_name.lower() in doc_name.lower()):
-                    
-                    citation_id = f"cite-{doc_name.replace('.pdf', '')}-p{page_num}".replace(' ', '-')
-                    
-                    citation = Citation(
-                        id=citation_id,
-                        title=chunk_doc_name,
-                        text=inline_cite['full_text'],
-                        source_type="document",
-                        page_number=page_num,
-                        document_title=chunk_doc_name,
-                        source_id=chunk.get('source_id'),
-                        confidence=chunk.get('similarity', 0.8),
-                        relevant_excerpt=self._extract_relevant_excerpt(
-                            chunk.get('content', ''), max_length=300
-                        ),
-                        url=f"/documents/{chunk.get('source_id')}#page={page_num}",
-                        metadata={
-                            'chunk_id': chunk.get('id'),
-                            'chunk_index': relevant_chunks.index(chunk),
-                            'similarity_score': chunk.get('similarity')
-                        }
-                    )
-                    
-                    citation_map[inline_cite['full_text']] = citation
-                    logger.info(f"🧙‍♂️ Wizard atched citation: {inline_cite['full_text']} -> {citation_id} ✅")
-                    logger.debug(f"CREATED CITATION OBJECT: {citation}")
-                    break
-        
+                    # Extract required info, handle potential missing keys
+                    doc_name = inline_cite.get('document_name')
+                    page_num = inline_cite.get('page_number')
+                    full_text = inline_cite.get('full_text')
+
+                    if not doc_name or page_num is None or not full_text:
+                        logger.warning(f"⚠️ Skipping invalid inline citation data: {inline_cite}")
+                        continue # Skip to the next inline_cite
+
+                    found_match = False # Flag to check if a match was found for this inline_cite
+
+                    # --- Loop through retrieved chunks to find a match ---
+                    for chunk_idx, chunk in enumerate(relevant_chunks):
+                        try: # Innermost try block for processing a single chunk
+                            # --- 🐞 DEBUG: Log chunk details ---
+                            chunk_id = chunk.get('id', 'N/A')
+                            logger.debug(f"  Comparing with Chunk Index: {chunk_idx}, Chunk ID: {chunk_id}")
+
+                            # Safely get chunk page number and metadata
+                            chunk_page = chunk.get('page_number')
+                            metadata = self._parse_metadata(chunk.get('metadata', {}))
+                            chunk_doc_name = metadata.get('title') or metadata.get('filename', '')
+                            source_id = chunk.get('source_id') # Get source_id for URL generation
+
+                            # --- 🐞 DEBUG: Log comparison details ---
+                            logger.info(
+                                f"    Inline Cite Details: (doc='{doc_name}', page={page_num})"
+                            )
+                            logger.debug(
+                                f"    Chunk Details      : (doc='{chunk_doc_name}', page={chunk_page})"
+                            )
+
+                            # Perform matching
+                            page_match = chunk_page == page_num
+                            # Robust, case-insensitive, bidirectional name matching
+                            doc_match = False
+                            if chunk_doc_name: # Ensure chunk_doc_name is not empty
+                                doc_match = (doc_name.lower() in chunk_doc_name.lower() or
+                                             chunk_doc_name.lower() in doc_name.lower())
+
+                            logger.info(f"    Page match: {page_match}, Doc match: {doc_match}")
+
+                            # If match found, create Citation object
+                            if page_match and doc_match:
+                                logger.info(f"    ✅ MATCH FOUND for chunk {chunk_idx}")
+
+                                # Generate unique citation ID (e.g., cite-MyDocument-p5)
+                                citation_id = f"cite-{doc_name.replace('.pdf', '').replace('.docx', '').replace(' ', '-')}-p{page_num}"
+
+                                # Generate internal URL, handle missing source_id gracefully
+                                url = f"/documents/{source_id}#page={page_num}" if source_id else ""
+                                if not url:
+                                    logger.warning(f"⚠️ Could not generate URL for citation {citation_id} - missing source_id in chunk {chunk_id}")
+
+
+                                citation = Citation(
+                                    id=citation_id,
+                                    title=chunk_doc_name, # Use matched chunk's title/filename
+                                    text=full_text, # The original text from LLM, e.g., "[Doc.pdf, p. 5]"
+                                    source_type="document",
+                                    page_number=page_num,
+                                    document_title=chunk_doc_name, # Redundant but fine for DB schema
+                                    source_id=source_id,
+                                    confidence=chunk.get('similarity', 0.8), # Use similarity score if available
+                                    relevant_excerpt=self._extract_relevant_excerpt(
+                                        chunk.get('content', ''), max_length=300
+                                    ),
+                                    url=url, # Generated internal URL
+                                    metadata={
+                                        'chunk_id': chunk.get('id'),
+                                        # Use index from enumerate for robustness
+                                        'chunk_index': chunk_idx,
+                                        'similarity_score': chunk.get('similarity')
+                                    }
+                                )
+
+                                # --- 🐞 DEBUG: Log the created object ---
+                                logger.debug(f"    CREATED CITATION OBJECT: {citation}")
+
+                                citation_map[full_text] = citation
+                                found_match = True
+                                break # Stop searching chunks for this inline_cite once matched
+
+                            # --- 🐞 DEBUG: (Optional) Log if no match for this chunk ---
+                            # else:
+                            #     logger.debug(f"    ❌ NO MATCH for chunk {chunk_idx}")
+
+                        except Exception as chunk_error:
+                            logger.error(f"❌ Error processing chunk index {chunk_idx} (ID: {chunk.get('id', 'N/A')}): {chunk_error}", exc_info=False)
+                            # Continue to the next chunk
+
+                    # --- 🐞 DEBUG: Log if no match was found after checking all chunks ---
+                    if not found_match:
+                        logger.warning(f"⚠️ No matching chunk found for inline citation: {full_text}")
+
+                except KeyError as ke:
+                    logger.error(f"❌ Missing key in inline citation data '{inline_cite}': {ke}", exc_info=False)
+                    # Continue to the next inline_cite
+                except Exception as inner_error:
+                    logger.error(f"❌ Error processing inline citation '{inline_cite.get('full_text', 'N/A')}': {inner_error}", exc_info=False)
+                    # Continue to the next inline_cite
+
+        except Exception as outer_error:
+            logger.error(f"💥 Unexpected error during citation matching loop: {outer_error}", exc_info=True) # Log full traceback here
+            # Depending on desired resilience, you could 'pass' or 'raise outer_error'
+            # Returning the partially built map allows processing to continue.
+            pass
+
+        # --- 🐞 DEBUG: Log the final map ---
+        logger.info(f"--- Finished Matching: Returning citation_map with {len(citation_map)} entries ---")
         return citation_map
 
     def convert_inline_citations_to_markdown_links(
