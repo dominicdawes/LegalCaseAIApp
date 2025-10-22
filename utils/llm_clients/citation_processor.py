@@ -16,6 +16,7 @@ import json
 import asyncio
 import aiohttp
 import hashlib
+from fuzzywuzzy import fuzz
 from typing import List, Dict, Optional, Any, Tuple
 from dataclasses import dataclass, asdict, field
 from urllib.parse import urlparse, urljoin
@@ -272,7 +273,7 @@ class CitationProcessor:
         (claude4.5) 
         Extract inline citations from markdown content
         
-        Pattern: [Document.pdf, p. 5] or [Case Name, p. 10]
+        Pattern: [Document.pdf, p. 5] or [Case Name, p. 10] or [IRB_-_Hadley_v_Baxendale_1854_.pdf, p. 3]
         Returns: List of {text, page_number, document_name}
 
         NOTE: May cause the others functions (extract_citations_from_streaming_text, 
@@ -351,21 +352,40 @@ class CitationProcessor:
 
                             # --- 🐞 DEBUG: Log comparison details ---
                             logger.info(
-                                f"    Inline Cite Details: (doc='{doc_name}', page={page_num})"
+                                f"    Inline Cite Details: (doc_name='{doc_name}', page={page_num})"
                             )
-                            logger.debug(
-                                f"    Chunk Details      : (doc='{chunk_doc_name}', page={chunk_page})"
+                            logger.info(
+                                f"    Chunk Details      : (chunk_docname='{chunk_doc_name}', page={chunk_page})"
                             )
 
-                            # Perform matching
+                            # # === Perform matching (ALSOLUTE TEXT MATCHING) ================
+                            # page_match = chunk_page == page_num
+                            # # Robust, case-insensitive, bidirectional name matching
+                            # doc_match = False
+                            # if chunk_doc_name: # Ensure chunk_doc_name is not empty
+                            #     doc_match = (doc_name.lower() in chunk_doc_name.lower() or
+                            #                  chunk_doc_name.lower() in doc_name.lower())
+
+                            # logger.info(f"    Page match: {page_match}, Doc match: {doc_match}")
+                            
+                            # === Perform matching (FUZZY LOGIC -- LLM Practical) =============
                             page_match = chunk_page == page_num
-                            # Robust, case-insensitive, bidirectional name matching
                             doc_match = False
-                            if chunk_doc_name: # Ensure chunk_doc_name is not empty
-                                doc_match = (doc_name.lower() in chunk_doc_name.lower() or
-                                             chunk_doc_name.lower() in doc_name.lower())
+                            similarity_threshold = 85 # Adjust as needed (e.g., 85%)
 
-                            logger.info(f"    Page match: {page_match}, Doc match: {doc_match}")
+                            if doc_name and chunk_doc_name: # Check if both names exist
+                                # Calculate similarity ratio (0-100)
+                                ratio = fuzz.ratio(doc_name.lower(), chunk_doc_name.lower())
+                                partial_ratio = fuzz.partial_ratio(doc_name.lower(), chunk_doc_name.lower())
+
+                                # Consider it a match if either ratio is above the threshold
+                                if ratio >= similarity_threshold or partial_ratio >= similarity_threshold:
+                                    doc_match = True
+                                    logger.info(f"    Fuzzy Match: ratio={ratio}, partial={partial_ratio} (Threshold={similarity_threshold})")
+                                else:
+                                    logger.info(f"    Fuzzy Match Failed: ratio={ratio}, partial={partial_ratio} (Threshold={similarity_threshold})")
+
+                            logger.info(f"    Page match: {page_match}, Doc match (Fuzzy): {doc_match}")
 
                             # If match found, create Citation object
                             if page_match and doc_match:
