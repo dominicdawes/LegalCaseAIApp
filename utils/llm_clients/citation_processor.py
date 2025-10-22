@@ -464,16 +464,29 @@ class CitationProcessor:
     ) -> str:
         """
         (claude4.5)
-        Convert [Document.pdf, p. 5] to [Document.pdf, p. 5](#cite-id)
+        [DEPRECATED] Convert [Document.pdf, p. 5] to [Document.pdf, p. 5](#cite-id)
+        [NEW] Convert [Document.pdf, p. 5] to [Document.pdf, p. 5](#cite-id){.chat-citation-link}
         
-        This creates clickable citations that work with LinkPreviewManager
+        This creates clickable citations that work with LinkPreviewManager and is 
+        readable by the markdown-it-attrs plugin whuch uses the {.class} syntax
         """
         modified_content = content
         
         for citation_text, citation_obj in citation_map.items():
-            # Replace [Document.pdf, p. 5] with [Document.pdf, p. 5](#cite-id)
-            citation_link = f"[{citation_text.strip('[]')}](#{citation_obj.id})"
-            modified_content = modified_content.replace(citation_text, citation_link)
+            # Escape brackets in the original text for safe regex replacement
+            safe_text = re.escape(citation_text)
+            
+            # Create the link with a class attribute for styling
+            # This syntax `{.chat-citation-link}` is for markdown-it-attrs
+            citation_link = f"[{citation_text.strip('[]')}](#{citation_obj.id}){{.chat-citation-link}}"
+            
+            # Use re.sub to replace only exact matches
+            modified_content = re.sub(safe_text, citation_link, modified_content)
+        # [DEPRECATED BLOCK]    
+        # for citation_text, citation_obj in citation_map.items():
+        #     # Replace [Document.pdf, p. 5] with [Document.pdf, p. 5](#cite-id)
+        #     citation_link = f"[{citation_text.strip('[]')}](#{citation_obj.id})"
+        #     modified_content = modified_content.replace(citation_text, citation_link)
         
         return modified_content
 
