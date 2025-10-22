@@ -1113,11 +1113,13 @@ class StreamingChatManager:
                             "text": c.text,
                             "url": c.url,
                             "title": c.title,
-                            "confidence": c.confidence
+                            "confidence": c.confidence,
+                            "document_title": c.document_title,
+                            "source_id": str(c.source_id) if c.source_id else None # Convert UUID to string
                         } for c in citations
                     ]
-                }))
-            logger.info(f"🛰️ New Citation broadcast success len-{len(citations)}")
+                }, cls=UUIDEncoder))
+            logger.info(f"🛰️ New Citation broadcast success quantity-{len(citations)}")
         except Exception as e:
             logger.warning(f"⚠️ Citation broadcast failed: {e}")
 
@@ -1258,7 +1260,8 @@ class StreamingChatManager:
                             citation.relevant_excerpt,  # $8
                             citation.source_type,       # $9
                             citation.confidence,        # $10
-                            json.dumps(citation.metadata, cls=UUIDEncoder) # $11
+                            json.dumps(citation.metadata, cls=UUIDEncoder), # $11
+                            citation.source_id
                         )
                     # for citation in response.citations:
                     #     await conn.execute(
