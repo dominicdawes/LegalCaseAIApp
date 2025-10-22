@@ -133,7 +133,7 @@ class StreamingTextProcessor:
                                     source_filename: str,
                                     documents: Iterator[Document],
                                     source_id: str = None,
-                                    source_irl: str = None) -> Iterator[Tuple[str, Dict[str, Any]]]:
+                                    source_url: str = None) -> Iterator[Tuple[str, Dict[str, Any]]]:
         """
         Takes a stream of Document objects from a loader, processes them, and
         yields a stream of cleaned, chunked text along with their metadata.
@@ -195,7 +195,7 @@ class StreamingTextProcessor:
                             "chunk_index": chunk_idx,
                             "chunk_length": len(chunk.page_content),
                             "source_id": source_id,
-                            "source_url": source_id,
+                            "source_url": source_url,
                         }
                         
                         yield chunk.page_content, chunk_metadata

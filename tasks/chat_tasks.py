@@ -1263,18 +1263,6 @@ class StreamingChatManager:
                             json.dumps(citation.metadata, cls=UUIDEncoder), # $11
                             citation.source_id # $12
                         )
-                    # for citation in response.citations:
-                    #     await conn.execute(
-                    #         """
-                    #         INSERT INTO message_citations 
-                    #         (message_id, citation_id, url, title, description, 
-                    #         source_type, confidence, relevant_excerpt)
-                    #         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-                    #         """,
-                    #         message_id, citation.id, citation.url, citation.title,
-                    #         citation.description, citation.source_type, 
-                    #         citation.confidence, citation.relevant_excerpt
-                    #     )
                     
                     # Insert highlights
                     for highlight in response.highlights:
