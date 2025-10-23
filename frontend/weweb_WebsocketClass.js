@@ -3,8 +3,11 @@
 // --- IDs from WeWeb ---
 const WS_VAR_ID = '6f50f54e-9341-48cd-ae17-2f0402067d68';   // websocket_message variable id
 const CITATIONS_VAR_ID = '31d36af3-5270-417b-9398-671748331583'; // websocketCitations var id
+const RENDERED_HTML_VAR_ID = 'b83788fa-f60d-44b4-ae7b-fb46580151ad'; // websocketMessageHTMLReRender
 const current_user_id = pluginVariables[/* Supabase Auth user */ '1fa0dd68-5069-436c-9a7d-3b54c340f1fa']['user']?.['id']
 const session_id = variables['85f9b7d7-12bc-4b4f-8d73-991b5532d113']?.id;
+const HTML_STYLE_ID_TAG = 'citation-preview-style'  // also seen in CSS injector class function onLoad [Depreacated]
+const HTML_CONTAINER_SELECTOR = variables[/* citationCssId */'1a1d9dd4-7046-4866-a782-9edef5b000f3'];
 
 // --- Derived ---
 const WS_URL = `wss://law-school-study-ws.onrender.com/ws/chat/${session_id}?user_id=${current_user_id}`;
@@ -145,9 +148,11 @@ function clearResponse() {
   // clean up both websocketText and websocketCitation vars
   streaming = '';
   variables['6f50f54e-9341-48cd-ae17-2f0402067d68'] = "";
-  variables[/* append websocketCitations*/'31d36af3-5270-417b-9398-671748331583']= [];
+  variables[/* append websocketCitations*/'31d36af3-5270-417b-9398-671748331583'] = [];
+  variables[RENDERED_HTML_VAR_ID] = ""; // Clear rendered HTML
 }
 
+// This function now *only* updates the raw markdown variable
 function appendText(chunk) {
   if (isNew) {
     clearResponse();
@@ -157,25 +162,22 @@ function appendText(chunk) {
   variables[/* append Websocket_message*/'6f50f54e-9341-48cd-ae17-2f0402067d68'] = streaming;
 }
 
-/**
- * Appends new citation objects to the WeWeb citations variable.
- * @param {Array<Object>} newCitations - An array of citation objects received from the WebSocket.
- */
+// This function now *only* updates the citation array variable
 function appendCitations(newCitations) {
   // Get the current list of citations from the WeWeb variable, default to an empty array if null/undefined
   const existingCitations = variables[CITATIONS_VAR_ID] || [];
 
   // --- 🐞 ADD DEBUG LOGS HERE ---
-  console.log('--- Debug: appendCitations ---');
-  console.log('Existing Citations (Before Append):', JSON.stringify(existingCitations)); // See what the variable holds
-  console.log('New Citations Received:', JSON.stringify(newCitations)); // See what just arrived
+  // console.log('--- Debug: appendCitations ---');
+  // console.log('Existing Citations (Before Append):', JSON.stringify(existingCitations)); // See what the variable holds
+  // console.log('New Citations Received:', JSON.stringify(newCitations)); // See what just arrived
   // -----------------------------
 
   // Combine the existing citations with the new ones
   const updatedCitations = [...existingCitations, ...newCitations];
 
   // --- 🐞 ADD DEBUG LOG HERE ---
-  console.log('Updated Citations (After Append):', JSON.stringify(updatedCitations)); // See the result before saving
+  // console.log('Updated Citations (After Append):', JSON.stringify(updatedCitations)); // See the result before saving
   // ----------------------------
 
   // Update the WeWeb variable with the combined list
@@ -183,19 +185,6 @@ function appendCitations(newCitations) {
 
   console.log(`📚 Appended ${newCitations.length} citations. Total: ${updatedCitations.length}`);
 }
-// function appendCitations(newCitations) {
-//   // Get the current list of citations from the WeWeb variable, default to an empty array if null/undefined
-//   const existingCitations = variables[/* append websocketCitations*/'31d36af3-5270-417b-9398-671748331583'] || [];
-
-//   // Combine the existing citations with the new ones
-//   // Using spread syntax for immutability (good practice in frameworks like WeWeb/React)
-//   const updatedCitations = [...existingCitations, ...newCitations];
-
-//   // Update the WeWeb variable with the combined list
-//   variables[/* append websocketCitations*/'31d36af3-5270-417b-9398-671748331583'] = updatedCitations;
-
-//   console.log(`📚 Appended ${newCitations.length} citations. Total: ${updatedCitations.length}`);
-// }
 
 function complete(msgId) {
   isNew = true;
@@ -342,6 +331,30 @@ function connect() {
 
     console.log('📨 Received:', data.type, data);
 
+    // --- Helper function to re-render HTML ---
+    const reRenderContent = () => {
+      // 1. Get the latest raw markdown text
+      const markdownText = variables[WS_VAR_ID] || '';
+      if (!markdownText) return;
+
+      // 2. Render markdown to HTML (window.md was created by your startup script)
+      const html = window.md ? window.md.render(markdownText) : markdownText;
+
+      // 3. Update the HTML variable in WeWeb
+      variables[RENDERED_HTML_VAR_ID] = html;
+
+      // 4. Re-initialize link previews on the newly rendered content
+      // We use event delegation now, so we only need to do this ONCE
+      // But for safety, we can call it. The new initializeLinks is smart.
+      setTimeout(() => {
+        if (window.linkPreviewManager) {
+          // This function is now very fast because it just adds/removes listeners
+          // from the *container*, not every single link.
+          window.linkPreviewManager.initializeLinks(HTML_CONTAINER_SELECTOR);
+        }
+      }, 50);
+    };
+
     switch (data.type) {
       case 'hello_ack':
         console.log('🤝 Handshake acknowledged');
@@ -355,16 +368,34 @@ function connect() {
         break;
 
       case 'content_delta':
-        appendText(data.chunk);
+        appendText(data.chunk); // 1. Append raw markdown
+        reRenderContent();      // 2. Re-render HTML from raw markdown during stream
         break;
 
       case 'stream_complete':
         complete(data.message_id);
+        reRenderContent(); // Final render (end of stream)
         break;
 
       case 'citations_found':
         console.log('📚 Citations:', data.citations);
+
+        // 1. Append to citations array
         appendCitations(data.citations);
+
+        // 2. Register new citations with the link manager
+        if (window.linkPreviewManager && data.citations) {
+          data.citations.forEach(citation => {
+            // The backend sends 'title' AND 'document_title', let's prioritize
+            const title = citation.document_title || citation.title || 'Source';
+
+            window.linkPreviewManager.registerCitation(citation.id, {
+              source: title, // Use the real title from the backend
+              text: citation.relevant_excerpt || `Details for ${title}, Page ${citation.page_number || 'N/A'}`,
+              // You can add more fields if you send them from the backend
+            });
+          });
+        }
         break;
 
       case 'message_received':

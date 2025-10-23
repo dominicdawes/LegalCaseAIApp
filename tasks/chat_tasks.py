@@ -1116,7 +1116,8 @@ class StreamingChatManager:
                             "title": c.title,
                             "confidence": c.confidence,
                             "document_title": c.document_title,
-                            "source_id": str(c.source_id) if c.source_id else None # Convert UUID to string
+                            "source_id": str(c.source_id) if c.source_id else None, # Convert UUID to string
+                            "relevant_excerpt": c.relevant_excerpt
                         } for c in citations
                     ]
                 }, cls=UUIDEncoder))
