@@ -1250,7 +1250,7 @@ class StreamingChatManager:
                             (message_id, citation_id, citation_key, title, url,
                             page_number, document_title, relevant_excerpt,
                             source_type, confidence, metadata, source_id, chat_session_id, user_id) -- Added source_id column
-                            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) -- Increased value count
+                            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) -- Increased value count
                             ON CONFLICT (message_id, citation_id) DO NOTHING
                             """,
                             message_id,                 # $1
