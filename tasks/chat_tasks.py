@@ -1249,7 +1249,7 @@ class StreamingChatManager:
                             INSERT INTO message_citations
                             (message_id, citation_id, citation_key, title, url,
                             page_number, document_title, relevant_excerpt,
-                            source_type, confidence, metadata, source_id) -- Added source_id column
+                            source_type, confidence, metadata, source_id, chat_session_id, user_id) -- Added source_id column
                             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) -- Increased value count
                             ON CONFLICT (message_id, citation_id) DO NOTHING
                             """,
@@ -1264,8 +1264,9 @@ class StreamingChatManager:
                             citation.source_type,       # $9
                             citation.confidence,        # $10
                             json.dumps(citation.metadata, cls=UUIDEncoder), # $11
-                            citation.source_id, # $12
-                            chat_session_id             # $13
+                            citation.source_id,         # $12
+                            chat_session_id,            # $13
+                            user_id,                    # $14
                         )
                     
                     # Insert highlights
