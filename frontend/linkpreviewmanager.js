@@ -37,10 +37,10 @@
       }
 
       registerCitation(citationId, data) {
-        // We strip the hash for consistent lookups
-        const cleanId = citationId.replace('#', '');
+        // Robustly clean all potential prefixes '#cite-DOCNAME', 'cite-DOCNAME' or '#DOCNAME'
+        const cleanId = citationId.replace('#cite-', '').replace('cite-', '').replace('#', '');
         this.citationData[cleanId] = data;
-        console.log(`Found & Registered citation: ${cleanId}`, data);
+        console.log(`Found & Registered citation (cleaned key): ${cleanId}`, data);
       }
 
       getLinkType(url, linkElement) {
@@ -116,12 +116,31 @@
         `;
       }
 
+      // Custom documentcitation from backend
       renderCitationPreview(citationData) {
+        // Use the real document_title, or fall back to the 'source' field
+        let sourceTitle = citationData.document_title || citationData.source || 'Citation';
+
+        // Use the real relevant_excerpt, or fall back to the 'text' field
+        let mainText = citationData.relevant_excerpt || citationData.text || '';
+
+        // Add the page number if it exists
+        const pageInfo = citationData.page_number ? `, p. ${citationData.page_number}` : '';
+
+        // --- Truncation Logic ---
+        if (sourceTitle.length > 30) {
+          sourceTitle = sourceTitle.substring(0, 30) + '...';
+        }
+
+        if (mainText.length > 280) {
+          mainText = mainText.substring(0, 280) + '...';
+        }
+        // --- End Truncation ---
+
         return `
           <div class="citation-preview">
-            <div class="citation-preview-source">${this.escapeHtml(citationData.source)}</div>
-            <div>${this.escapeHtml(citationData.text)}</div>
-            ${citationData.author ? `<div style="margin-top: 8px; font-size: 12px; color: #666;">${this.escapeHtml(citationData.author)}${citationData.date ? `, ${citationData.date}` : ''}</div>` : ''}
+            <div class="citation-preview-source">${this.escapeHtml(sourceTitle)}${this.escapeHtml(pageInfo)}</div>
+            <div>${this.escapeHtml(mainText)}</div>
           </div>
         `;
       }
@@ -195,8 +214,10 @@
           }, 10);
 
           if (linkType === 'citation') {
-            // const citationId = link.hash.replace('#', ''); // Get ID from hash
-            const citationId = link.dataset.citation || link.hash.replace('#cite-', '');
+            // Robustly clean all potential prefixes from the link's hash '#cite-DOCNAME', 'cite-DOCNAME' or '#DOCNAME'
+            const hashKey = link.hash.replace('#cite-', '').replace('cite-', '').replace('#', '');
+            const citationId = link.dataset.citation || hashKey;
+
             const citationData = this.getCitationPreview(citationId);
             this.tooltip.innerHTML = this.renderCitationPreview(citationData);
           } else if (linkType === 'external') {
@@ -236,19 +257,20 @@
         // const container = wwLib.getFrontDocument().querySelector(containerSelector);
         if (!container) {
           // Gracefully warn and skip if the element isn't found
-          console.warn(`Link preview container NOT found (${containerSelector}). Skipping initialization ⚠️`);
+          console.warn(`Link preview container with HTML Id (${containerSelector}) NOT found!! Skipping initialization ⚠️`);
           return;
         } else {
-          console.info(`🔎 FOUND LinkPreview containerHTMPId (${containerSelector})!`);
+          console.info(`🔎 FOUND Link preview container with HTML Id (${containerSelector})!`);
         }
 
         // Use event delegation on the container
         // This is MUCH more efficient and works for streaming content
-        container.removeEventListener('mouseenter', this.boundHandleEnter, true); // Remove old listener
-        container.addEventListener('mouseenter', this.boundHandleEnter, true); // Add new one
+        // Use 'mouseover' and 'mouseout' for proper event delegation
+        container.removeEventListener('mouseover', this.boundHandleEnter); // Remove old listener
+        container.addEventListener('mouseover', this.boundHandleEnter); // Add new one
 
-        container.removeEventListener('mouseleave', this.boundHandleLeave, true);
-        container.addEventListener('mouseleave', this.boundHandleLeave, true);
+        container.removeEventListener('mouseout', this.boundHandleLeave);
+        container.addEventListener('mouseout', this.boundHandleLeave);
 
         console.log(`Link previews INITIALIZED on containerHtmlId: ${containerSelector}`);
       }
@@ -278,6 +300,7 @@
   setTimeout(() => {
     if (window.linkPreviewManager) {
       window.linkPreviewManager.initializeLinks(containerSelector);
+      console.log(`Link inside chat wrapper element (${containerSelector}) are now initialized !!!`);
     }
   }, 1000); // 1 second delay
 
