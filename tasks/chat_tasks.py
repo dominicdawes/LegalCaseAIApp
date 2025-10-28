@@ -1310,7 +1310,7 @@ class StreamingChatManager:
                 chat_session_id=chat_session_id,
                 user_id=user_id,
             )
-            raise self.retry(exc=e)
+            raise # self.retry(exc=e)  # <-- CORRECTED
 
     async def _broadcast_completion(self, session_id: str, message_id: str):
         """🆕 Broadcast stream completion"""
