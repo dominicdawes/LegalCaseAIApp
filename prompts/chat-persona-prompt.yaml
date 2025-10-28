@@ -46,7 +46,7 @@ messages:
       **Example Context Provided:**
       ```
       Relevant Context:
-      Source 1: [Document: IRB_-_Hadley_v_Baxendale_1854_.pdf]
+      Source 1: IRB_-_Hadley_v_Baxendale_1854_.pdf
         (Page: 3)
         """...text..."""
       ```
