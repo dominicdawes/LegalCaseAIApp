@@ -145,7 +145,7 @@ class CitationProcessor:
             await self.http_session.close()
             self.http_session = None
 
-    def _parse_page_string(page_str: str) -> list[int]:
+    def _parse_page_string(self, page_str: str) -> list[int]:
         """
         UTIL FUNCTION
         Parses a page string like "3-4" or "1, 3, 10" into a list of numbers.
@@ -503,7 +503,7 @@ class CitationProcessor:
         logger.info(f"--- Finished Matching: Returning citation_map with {len(citation_map)} entries ---")
         return citation_map
 
-    def expand_multi_page_citations(text: str) -> str:
+    def expand_multi_page_citations(self, text: str) -> str:
         """
         Finds multi-page citations and expands them into individual, 
         fully-formatted links.
@@ -519,7 +519,7 @@ class CitationProcessor:
             page_str = match.group(2) # "3-4" or "1, 3, 10"
             
             # Parse the page string into a list of integers
-            pages = _parse_page_string(page_str)
+            pages =self._parse_page_string(page_str)
             
             links = []
             for page in pages:
@@ -1110,7 +1110,7 @@ class CitationProcessor:
         logger.info(f"✅ Validated {len(valid_citations)}/{len(citations)} citations")
         return valid_citations
 
-    def fix_malformed_citations(text: str) -> str:
+    def fix_malformed_citations(self, text: str) -> str:
         """
         Cleans up single-page citations that are missing parts.
         - Adds missing {.chat-citation-link}
