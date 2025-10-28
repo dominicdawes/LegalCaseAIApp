@@ -145,6 +145,32 @@ class CitationProcessor:
             await self.http_session.close()
             self.http_session = None
 
+    def _parse_page_string(page_str: str) -> list[int]:
+        """
+        UTIL FUNCTION
+        Parses a page string like "3-4" or "1, 3, 10" into a list of numbers.
+        """
+        pages = set()
+        parts = page_str.split(',')
+        for part in parts:
+            part = part.strip()
+            if '-' in part:
+                # It's a range, e.g., "3-4"
+                try:
+                    start, end = map(int, part.split('-'))
+                    if end < start:
+                        start, end = end, start # Handle "5-3"
+                    pages.update(range(start, end + 1))
+                except ValueError:
+                    continue # Skip malformed range like "3-"
+            else:
+                # It's a single number
+                try:
+                    pages.add(int(part))
+                except ValueError:
+                    continue # Skip malformed part like "1,"
+        return sorted(list(pages))
+
     def _parse_metadata(self, metadata_obj: Any) -> Dict:
             """Safely parse metadata that might be a dict or a JSON string. Fetched from Postgres (Supabase)"""
             if isinstance(metadata_obj, dict):
@@ -160,121 +186,131 @@ class CitationProcessor:
             
             return {}
 
-    async def extract_citations_from_streaming_text(
-        self, 
-        accumulated_text: str,
-        relevant_chunks: List[Dict],
-        seen_citations: set = None
-    ) -> Tuple[List[Citation], set]:
-        """
-        Extract citations from streaming text in real-time
-        
-        Args:
-            accumulated_text: The text accumulated so far
-            relevant_chunks: Available source chunks for citation
-            seen_citations: Set of already processed citation IDs
-            
-        Returns:
-            Tuple of (new_citations, updated_seen_set)
-        """
-        if seen_citations is None:
-            seen_citations = set()
-        
-        new_citations = []
-        
-        # Try each citation pattern
-        for pattern in self.citation_patterns:
-            matches = re.findall(pattern, accumulated_text, re.IGNORECASE)
-            
-            for match in matches:
-                citation_data = self._process_citation_match(match, relevant_chunks)
-                
-                if citation_data and citation_data.id not in seen_citations:
-                    # Calculate confidence score
-                    citation_data.confidence = self._calculate_confidence(citation_data)
-                    
-                    new_citations.append(citation_data)
-                    seen_citations.add(citation_data.id)
-                    
-                    logger.info(f"📎 New citation extracted: {citation_data.id} ({citation_data.confidence:.2f})")
-        
-        return new_citations, seen_citations
+# --- MAIN FUNCTIONS ----------------------- #
 
-    # ADD this method to CitationProcessor class:
-    def extract_document_citations_from_chunks(
-        self, 
-        accumulated_text: str,
-        relevant_chunks: List[Dict],
-        seen_citations: set = None
-    ) -> Tuple[List[Citation], set]:
-        """
-        Extract document-based citations from streaming text
+    # async def extract_citations_from_streaming_text(
+    #     self, 
+    #     accumulated_text: str,
+    #     relevant_chunks: List[Dict],
+    #     seen_citations: set = None
+    # ) -> Tuple[List[Citation], set]:
+    #     """
+    #     [PROBABLY OBSOLETE]
+    #     Extract citations from streaming text in real-time
         
-        Handles patterns like:
-        - [1] or (1) -> references chunk 1
-        - "Page 25" -> references specific page
-        - [Case Name, p. 45] -> legal case citation
-        """
-        if seen_citations is None:
-            seen_citations = set()
-        
-        new_citations = []
-        
-        # Pattern 1: Simple chunk references [1], [2], (1), etc.
-        chunk_pattern = r'\[(\d+)\]|\((\d+)\)'
-        chunk_matches = re.findall(chunk_pattern, accumulated_text)
-        
-        for match in chunk_matches:
-            chunk_num = match[0] or match[1]  # Handle both [1] and (1) patterns
-            citation_id = f"chunk:{chunk_num}"
+    #     Args:
+    #         accumulated_text: The text accumulated so far
+    #         relevant_chunks: Available source chunks for citation
+    #         seen_citations: Set of already processed citation IDs
             
-            if citation_id not in seen_citations:
-                citation = self._create_document_citation(
-                    chunk_num, relevant_chunks, "chunk_reference"
-                )
-                if citation:
-                    new_citations.append(citation)
-                    seen_citations.add(citation_id)
+    #     Returns:
+    #         Tuple of (new_citations, updated_seen_set)
+    #     """
+    #     if seen_citations is None:
+    #         seen_citations = set()
         
-        # Pattern 2: Page references "Page X", "p. X", "pg. X"
-        page_pattern = r'(?:Page|p\.|pg\.)\s*(\d+)'
-        page_matches = re.findall(page_pattern, accumulated_text, re.IGNORECASE)
+    #     new_citations = []
         
-        for page_num in page_matches:
-            citation_id = f"page:{page_num}"
+    #     # Try each citation pattern
+    #     for pattern in self.citation_patterns:
+    #         matches = re.findall(pattern, accumulated_text, re.IGNORECASE)
             
-            if citation_id not in seen_citations:
-                citation = self._find_citation_by_page(
-                    int(page_num), relevant_chunks
-                )
-                if citation:
-                    new_citations.append(citation)
-                    seen_citations.add(citation_id)
+    #         for match in matches:
+    #             citation_data = self._process_citation_match(match, relevant_chunks)
+                
+    #             if citation_data and citation_data.id not in seen_citations:
+    #                 # Calculate confidence score
+    #                 citation_data.confidence = self._calculate_confidence(citation_data)
+                    
+    #                 new_citations.append(citation_data)
+    #                 seen_citations.add(citation_data.id)
+                    
+    #                 logger.info(f"📎 New citation extracted: {citation_data.id} ({citation_data.confidence:.2f})")
         
-        # Pattern 3: Legal case citations "Case Name, p. X"
-        case_pattern = r'([A-Z][^,]+),\s*p\.\s*(\d+)'
-        case_matches = re.findall(case_pattern, accumulated_text)
+    #     return new_citations, seen_citations
+
+    # def extract_document_citations_from_chunks(
+    #     self, 
+    #     accumulated_text: str,
+    #     relevant_chunks: List[Dict],
+    #     seen_citations: set = None
+    # ) -> Tuple[List[Citation], set]:
+    #     """
+    #     [PROBABLY OBSOLETE]
+    #     Extract document-based citations from streaming text
         
-        for case_name, page_num in case_matches:
-            citation_id = f"case:{case_name.strip()}:p{page_num}"
+    #     Handles patterns like:
+    #     - [1] or (1) -> references chunk 1
+    #     - "Page 25" -> references specific page
+    #     - [Case Name, p. 45] -> legal case citation
+    #     """
+    #     if seen_citations is None:
+    #         seen_citations = set()
+        
+    #     new_citations = []
+        
+    #     # Pattern 1: Simple chunk references [1], [2], (1), etc.
+    #     chunk_pattern = r'\[(\d+)\]|\((\d+)\)'
+    #     chunk_matches = re.findall(chunk_pattern, accumulated_text)
+        
+    #     for match in chunk_matches:
+    #         chunk_num = match[0] or match[1]  # Handle both [1] and (1) patterns
+    #         citation_id = f"chunk:{chunk_num}"
             
-            if citation_id not in seen_citations:
-                citation = self._find_legal_case_citation(
-                    case_name.strip(), int(page_num), relevant_chunks
-                )
-                if citation:
-                    new_citations.append(citation)
-                    seen_citations.add(citation_id)
+    #         if citation_id not in seen_citations:
+    #             citation = self._create_document_citation(
+    #                 chunk_num, relevant_chunks, "chunk_reference"
+    #             )
+    #             if citation:
+    #                 new_citations.append(citation)
+    #                 seen_citations.add(citation_id)
         
-        return new_citations, seen_citations
+    #     # Pattern 2: Page references "Page X", "p. X", "pg. X"
+    #     page_pattern = r'(?:Page|p\.|pg\.)\s*(\d+)'
+    #     page_matches = re.findall(page_pattern, accumulated_text, re.IGNORECASE)
+        
+    #     for page_num in page_matches:
+    #         citation_id = f"page:{page_num}"
+            
+    #         if citation_id not in seen_citations:
+    #             citation = self._find_citation_by_page(
+    #                 int(page_num), relevant_chunks
+    #             )
+    #             if citation:
+    #                 new_citations.append(citation)
+    #                 seen_citations.add(citation_id)
+        
+    #     # Pattern 3: Legal case citations "Case Name, p. X"
+    #     case_pattern = r'([A-Z][^,]+),\s*p\.\s*(\d+)'
+    #     case_matches = re.findall(case_pattern, accumulated_text)
+        
+    #     for case_name, page_num in case_matches:
+    #         citation_id = f"case:{case_name.strip()}:p{page_num}"
+            
+    #         if citation_id not in seen_citations:
+    #             citation = self._find_legal_case_citation(
+    #                 case_name.strip(), int(page_num), relevant_chunks
+    #             )
+    #             if citation:
+    #                 new_citations.append(citation)
+    #                 seen_citations.add(citation_id)
+        
+    #     return new_citations, seen_citations
 
     def extract_inline_citations_from_content(self, content: str) -> List[Dict]:
         """
-        (claude4.5) 
-        Extract inline citations from markdown content
-        
-        Pattern: [Document.pdf, p. 5] or [Case Name, p. 10] or [IRB_-_Hadley_v_Baxendale_1854_.pdf, p. 3]
-        Returns: List of {text, page_number, document_name}
+        Description:
+            Extract inline citations (e.g. [IRB_-_Hadley_v_Baxendale_1854_.pdf, p. 3]) from 
+            streamed 📡 accumulated markdown content. If a multi-page citation is detected
+            it is split before any excerpt matching take place.
+
+            This method can now handle single-page and multipage references
+            - [Doc.pdf, p. 5]
+            - [Doc.pdf, pp. 3-4]
+            - [Doc.pdf, pp. 1, 3, 10]
+
+        Returns: 
+            List of {text, page_number, document_name}
 
         NOTE: May cause the others functions (extract_citations_from_streaming_text, 
         extract_document_citations_from_chunks, _create_document_citation, 
@@ -285,17 +321,23 @@ class CitationProcessor:
         
         citations_found = []
         for match in re.finditer(pattern, content):
-            full_text = match.group(0)  # [Document.pdf, p. 5]
-            doc_name = match.group(1).strip()  # Document.pdf
-            page_num = int(match.group(2))  # 5
+            full_text = match.group(0)
+            doc_name = match.group(1).strip()
+            page_str = match.group(2).strip() # e.g., "5", "3-4", "1, 3, 10"
             
-            citations_found.append({
-                'full_text': full_text,
-                'document_name': doc_name,
-                'page_number': page_num,
-                'start_pos': match.start(),
-                'end_pos': match.end()
-            })
+            # Use your new parser to get a list of pages
+            pages = self._parse_page_string(page_str) # <--- YOUR NEW HELPER `_parse_page_string()`
+            
+            for page_num in pages:
+                # Create a *separate* citation object for each page
+                citations_found.append({
+                    'full_text': full_text, # The *original* text match
+                    'document_name': doc_name,
+                    'page_number': int(page_num),
+                    'start_pos': match.start(),
+                    'end_pos': match.end(),
+                    'is_multi_page_source': len(pages) > 1
+                })
         
         logger.info(f"📚 Found {len(citations_found)} inline citation(s) in accumulated content")
         logger.info(f"  🙌 Extracted citation object:\n{citations_found}")
@@ -307,10 +349,14 @@ class CitationProcessor:
         relevant_chunks: List[Dict]
     ) -> Dict[str, Citation]:
         """
-        (claude4.5)
-        Match inline citations to document chunks
+        Match inline citations to document chunks using fuzzy logic (robust to LLM typos)
         
-        Returns: Dict mapping citation_text -> Citation object
+        Args:
+        - list of inline citations
+        - list of relevent chunk exerpts
+
+        Returns: 
+        - Dict mapping several citation_text -> Citation object
 
         NOTE: May cause the others functions (extract_citations_from_streaming_text, 
         extract_document_citations_from_chunks, _create_document_citation, 
@@ -457,36 +503,92 @@ class CitationProcessor:
         logger.info(f"--- Finished Matching: Returning citation_map with {len(citation_map)} entries ---")
         return citation_map
 
+    def expand_multi_page_citations(text: str) -> str:
+        """
+        Finds multi-page citations and expands them into individual, 
+        fully-formatted links.
+        
+        Example:
+        [Doc.pdf, pp. 3-4] 
+        ...becomes...
+        [Doc.pdf, p. 3](#cite-Doc-p3){.chat-citation-link} [Doc.pdf, p. 4](#cite-Doc-p4){.chat-citation-link}
+        """
+        
+        def replacer(match):
+            doc_name = match.group(1) # "IRB_-_Hadley_v_Baxendale_1854_.pdf"
+            page_str = match.group(2) # "3-4" or "1, 3, 10"
+            
+            # Parse the page string into a list of integers
+            pages = _parse_page_string(page_str)
+            
+            links = []
+            for page in pages:
+                # --- Create the standard cite-id ---
+                # "IRB_-_Hadley_v_Baxendale_1854_.pdf" -> "IRB_-_Hadley_v_Baxendale_1854_"
+                cleaned_doc_name = doc_name.replace('.pdf', '').replace('.docx', '').replace(' ', '-')
+                cite_id = f"cite-{cleaned_doc_name}-p{page}"
+                
+                # --- Build the full, correct markdown link ---
+                display_text = f"[{doc_name}, p. {page}]"
+                link_id = f"(#{cite_id})"
+                link_class = "{.chat-citation-link}"
+                
+                links.append(f"{display_text}{link_id}{link_class}")
+                
+            # Join all the newly created links with a space
+            return " ".join(links)
+
+        # This regex finds:
+        # \[           -> a literal [
+        # ([^,\]]+)    -> Group 1: The document name (anything not a comma or bracket)
+        # ,\s*pp\.\s* -> ", pp. " (with optional whitespace)
+        # ([\d,\-\s]+) -> Group 2: The page numbers/ranges (digits, commas, dashes, whitespace)
+        # \]           -> a literal ]
+        pattern = r'\[([^,\]]+),\s*pp\.\s*([\d,\-\s]+)\]'
+        
+        return re.sub(pattern, replacer, text)
+
     def convert_inline_citations_to_markdown_links(
         self,
         content: str,
         citation_map: Dict[str, Citation]
     ) -> str:
         """
-        (claude4.5)
-        [DEPRECATED] Convert [Document.pdf, p. 5] to [Document.pdf, p. 5](#cite-id)
-        [NEW] Convert [Document.pdf, p. 5] to [Document.pdf, p. 5](#cite-id){.chat-citation-link}
-        
-        This creates clickable citations that work with LinkPreviewManager and is 
+        Description:
+        - Convert [Document.pdf, p. 5] to [Document.pdf, p. 5](#cite-id){.chat-citation-link} =tThis creates clickable citations that work with LinkPreviewManager and is 
         readable by the markdown-it-attrs plugin whuch uses the {.class} syntax
+        
+        - Cleans up any malformed or missed citations.
+
+        Args:
+        - content (str): [Document.pdf, p. 5]
+
+        Returns:
+        - modified_content (str): [Document.pdf, p. 5](#cite-id){.chat-citation-link}
+        
         """
         modified_content = content
         
+        # --- 1. Expand multi-page citations that were in the map ---
+        # This handles the [Doc, pp. 3-4] case
         for citation_text, citation_obj in citation_map.items():
-            # Escape brackets in the original text for safe regex replacement
+            if citation_obj.metadata.get('is_multi_page_source'):
+                # This was a multi-page, but we only have one object for it
+                continue # Skip, let step 2 handle it (...better to use the regex expansion here for consistency)
+            
+            # --- 2. Convert single-page citations from the map, add (#cite-id){.chat-citation-link}---
             safe_text = re.escape(citation_text)
-            
-            # Create the link with a class attribute for styling
-            # This syntax `{.chat-citation-link}` is for markdown-it-attrs
             citation_link = f"[{citation_text.strip('[]')}](#{citation_obj.id}){{.chat-citation-link}}"
-            
-            # Use re.sub to replace only exact matches
             modified_content = re.sub(safe_text, citation_link, modified_content)
-        # [DEPRECATED BLOCK]    
-        # for citation_text, citation_obj in citation_map.items():
-        #     # Replace [Document.pdf, p. 5] with [Document.pdf, p. 5](#cite-id)
-        #     citation_link = f"[{citation_text.strip('[]')}](#{citation_obj.id})"
-        #     modified_content = modified_content.replace(citation_text, citation_link)
+
+        # --- 3. Run your new cleanup functions (from previous chat) ---
+        # These will find and fix *anything* the LLM messed up.
+        
+        # First, expand any multi-page citations the map might have missed
+        modified_content = self.expand_multi_page_citations(modified_content)
+        
+        # Second, fix any malformed single-page links
+        modified_content = self.fix_malformed_citations(modified_content)
         
         return modified_content
 
@@ -968,6 +1070,8 @@ class CitationProcessor:
         except Exception as e:
             logger.warning(f"⚠️ Cache storage failed: {e}")
 
+# --- FIXING AND VALIDATION -------#
+
     def validate_citations(self, citations: List[Citation]) -> List[Citation]:
         """
         Validate and clean citations:
@@ -1005,6 +1109,50 @@ class CitationProcessor:
         
         logger.info(f"✅ Validated {len(valid_citations)}/{len(citations)} citations")
         return valid_citations
+
+    def fix_malformed_citations(text: str) -> str:
+        """
+        Cleans up single-page citations that are missing parts.
+        - Adds missing {.chat-citation-link}
+        - Converts raw [Doc, p. 3] links to the full format
+        """
+        
+        # === 1. Fix Missing Class ===
+        # Finds any "(#cite-...)" that is NOT immediately followed by a "{"
+        # Uses a negative lookahead (?!\{)
+        class_pattern = r'(\(\#cite-[^)]*\))(?!\{)'
+        text = re.sub(class_pattern, r'\1{.chat-citation-link}', text)
+
+        # === 2. Fix Missing ID & Class ===
+        # This finds raw [Doc, p. 3] links that were never processed.
+        
+        def replacer_single(match):
+            doc_name = match.group(1) # "IRB_-_Hadley_v_Baxendale_1854_.pdf"
+            page_num = match.group(2) # "3"
+            
+            # --- Create the standard cite-id ---
+            cleaned_doc_name = doc_name.replace('.pdf', '').replace('.docx', '').replace(' ', '-')
+            cite_id = f"cite-{cleaned_doc_name}-p{page_num}"
+            
+            # --- Build the full, correct markdown link ---
+            display_text = f"[{doc_name}, p. {page_num}]"
+            link_id = f"(#{cite_id})"
+            link_class = "{.chat-citation-link}"
+            
+            return f"{display_text}{link_id}{link_class}"
+
+        # This regex finds:
+        # \[           -> a literal [
+        # ([^,\]]+)    -> Group 1: The document name
+        # ,\s*p\.\s* -> ", p. "
+        # (\d+)        -> Group 2: The page number
+        # \]           -> a literal ]
+        # (?![\(\{])   -> Negative lookahead: asserts the link is NOT followed
+        #                by a ( or { (meaning it's unprocessed)
+        id_class_pattern = r'\[([^,\]]+),\s*p\.\s*(\d+)\](?![\(\{])'
+        text = re.sub(id_class_pattern, replacer_single, text)
+        
+        return text
 
     def _is_valid_url(self, url: str) -> bool:
         """Check if URL is valid"""

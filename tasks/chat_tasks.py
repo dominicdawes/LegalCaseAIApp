@@ -1053,7 +1053,7 @@ class StreamingChatManager:
         try:
             logger.info(f"🧙‍♂️ Wizard is filtering for new citations...")
 
-            # Extract inline citations: [Doc.pdf, p. X]
+            # Extract inline citations that look like: [Doc.pdf, p. X]
             inline_citations = self.citation_processor.extract_inline_citations_from_content(
                 accumulated_content
             )
@@ -1158,7 +1158,9 @@ class StreamingChatManager:
     async def _enrich_citations_with_previews(
         self, citations: List[Citation]
     ) -> List[Citation]:
-        """🆕 Enrich citations with link previews using CitationProcessor"""
+        """
+        Enrich Citation object with (internal/external) url link previews using CitationProcessor
+        """
         if not citations:
             return citations
         
@@ -1173,7 +1175,7 @@ class StreamingChatManager:
                 citations, use_cache=True
             )
             
-            # Validate citations
+            # Validate citations url syntax
             validated_citations = self.citation_processor.validate_citations(enriched_citations)
             
             logger.info(f"🔗 Enriched {len(validated_citations)}/{len(citations)} citations 📚")
