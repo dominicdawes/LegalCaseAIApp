@@ -46,30 +46,33 @@ def upload_to_s3(client, file_source, s3_object_key, bucket_name=s3_bucket_name,
         
         # Auto-detect content type if not provided
         if content_type is None:
-            if is_file_like:
-                # For file-like objects, we need to guess from the s3_object_key
-                if s3_object_key.lower().endswith('.pdf'):
-                    content_type = "application/pdf"
-                elif s3_object_key.lower().endswith(('.txt', '.md')):
-                    content_type = "text/plain"
-                elif s3_object_key.lower().endswith(('.jpg', '.jpeg')):
-                    content_type = "image/jpeg"
-                elif s3_object_key.lower().endswith('.png'):
-                    content_type = "image/png"
-                elif s3_object_key.lower().endswith('.docx'):
-                    content_type = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-                else:
-                    content_type = "binary/octet-stream"
+            # Get the file extension from either the file_source path or s3_object_key
+            file_ext = (file_source.lower() if not is_file_like else s3_object_key.lower())
+            
+            if file_ext.endswith('.pdf'):
+                content_type = "application/pdf"
+            elif file_ext.endswith(('.txt', '.md')):
+                content_type = "text/plain"
+            elif file_ext.endswith(('.jpg', '.jpeg')):
+                content_type = "image/jpeg"
+            elif file_ext.endswith('.png'):
+                content_type = "image/png"
+            elif file_ext.endswith('.docx'):
+                content_type = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            elif file_ext.endswith('.doc'):
+                content_type = "application/msword"
             else:
-                # For file paths, use the original logic
-                content_type = "application/pdf" if file_source.endswith(".pdf") else "binary/octet-stream"
+                content_type = "binary/octet-stream"
 
+        # Extract filename from s3_object_key for Content-Disposition
+        filename = s3_object_key.split('/')[-1]
+        
         # Common upload arguments
         extra_args = {
             'ContentType': content_type,
-            "ContentDisposition": "inline",
-            "CacheControl": "public, max-age=31536000",
-            "Expires": expires_date
+            'ContentDisposition': f'inline; filename="{filename}"',  # inline prevents auto-download
+            'CacheControl': "public, max-age=31536000",
+            'Expires': expires_date
         }
 
         # Transfer config for multipart uploads
@@ -99,35 +102,36 @@ def upload_to_s3(client, file_source, s3_object_key, bucket_name=s3_bucket_name,
         
     except Exception as e:
         raise Exception(f"Failed to upload to S3: {e}")
+    
+    
+# def upload_file_to_s3(client, file_path, s3_object_key, bucket_name=s3_bucket_name):
+#     """
+#     LEGACY: Version of function that uploads a file to the S3 bucket and returns the file URL.
+#     """
+#     try:
 
-def upload_file_to_s3(client, file_path, s3_object_key, bucket_name=s3_bucket_name):
-    """
-    LEGACY: Version of function that uploads a file to the S3 bucket and returns the file URL.
-    """
-    try:
+#         # Calculate the Expires header (1 year from today)
+#         expires_date = (datetime.now(timezone.utc) + timedelta(days=365)).strftime('%a, %d %b %Y %H:%M:%S GMT')
 
-        # Calculate the Expires header (1 year from today)
-        expires_date = (datetime.now(timezone.utc) + timedelta(days=365)).strftime('%a, %d %b %Y %H:%M:%S GMT')
+#         # set pdf content type
+#         content_type = "application/pdf" if file_path.endswith(".pdf") else "binary/octet-stream"
 
-        # set pdf content type
-        content_type = "application/pdf" if file_path.endswith(".pdf") else "binary/octet-stream"
-
-        # Multipart uploads for large PDFs
-        client.upload_file(
-            file_path, 
-            bucket_name, 
-            s3_object_key,
-            ExtraArgs={
-                'ContentType': content_type,                    # Set Content-Type metadata
-                "ContentDisposition": "inline",                 # inline display for preview
-                "CacheControl": "public, max-age=31536000",     # Cache for 1 year
-                "Expires": expires_date
-            },
-            Config = TransferConfig(multipart_chunksize=8*1024*1024)   
-        )
-        return f"https://{bucket_name}.s3.amazonaws.com/{s3_object_key}"
-    except Exception as e:
-        raise Exception(f"Failed to upload to S3: {e}")
+#         # Multipart uploads for large PDFs
+#         client.upload_file(
+#             file_path, 
+#             bucket_name, 
+#             s3_object_key,
+#             ExtraArgs={
+#                 'ContentType': content_type,                    # Set Content-Type metadata
+#                 "ContentDisposition": "inline",                 # inline display for preview
+#                 "CacheControl": "public, max-age=31536000",     # Cache for 1 year
+#                 "Expires": expires_date
+#             },
+#             Config = TransferConfig(multipart_chunksize=8*1024*1024)   
+#         )
+#         return f"https://{bucket_name}.s3.amazonaws.com/{s3_object_key}"
+#     except Exception as e:
+#         raise Exception(f"Failed to upload to S3: {e}")
 
 def generate_presigned_url(client, bucket_name, object_key, expiration=7200):
     """
