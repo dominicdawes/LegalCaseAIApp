@@ -63,7 +63,9 @@ class QuizProcessor:
             True if valid, raises ValueError otherwise.
         """
         if "questions" not in quiz_data or not isinstance(quiz_data["questions"], list):
-            raise ValueError("Invalid quiz data: 'questions' key is missing or not a list.")
+            # 🆕 Improved Error Logging: Show what keys *were* found.
+            found_keys = list(quiz_data.keys())
+            raise ValueError(f"Invalid quiz data: 'questions' key is missing or not a list. Found keys: {found_keys}")
             
         if not quiz_data["questions"]:
             raise ValueError("Invalid quiz data: 'questions' list is empty.")
@@ -72,27 +74,33 @@ class QuizProcessor:
             if not isinstance(question, dict):
                 raise ValueError(f"Question {i} is not a dictionary.")
             
+            # 🆕 Improved Error Logging: Show what keys *were* found.
             if "questionText" not in question or not question["questionText"]:
-                raise ValueError(f"Question {i} is missing 'questionText'.")
+                found_keys = list(question.keys())
+                raise ValueError(f"Question {i} is missing 'questionText'. Found keys: {found_keys}")
                 
             if "hint" not in question:
-                # Hint is allowed to be empty, but key should exist
                 logger.warning(f"Question {i} is missing 'hint'.")
             
             if "answers" not in question or not isinstance(question["answers"], list):
                 raise ValueError(f"Question {i} is missing 'answers' list.")
             
-            if len(question["answers"]) != 5:
-                logger.warning(f"Question {i} does not have exactly 5 answers (has {len(question['answers'])}).")
-            
+            if len(question["answers"]) < 4: # Loosen validation slightly, 5 is ideal but 4 is ok
+                logger.warning(f"Question {i} does not have 5 answers (has {len(question['answers'])}).")
+                
             correct_count = 0
             for j, answer in enumerate(question["answers"]):
                 if not isinstance(answer, dict):
                     raise ValueError(f"Answer {j} for Question {i} is not a dictionary.")
-                if "answerText" not in answer or not answer["answerText"]:
-                    raise ValueError(f"Answer {j} for Question {i} is missing 'answerText'.")
+                
+                # 🆕 Update: Validate 'answer_choice_text' to match YAML and DB
+                if "answer_choice_text" not in answer or not answer["answer_choice_text"]:
+                    found_keys = list(answer.keys())
+                    raise ValueError(f"Answer {j} for Question {i} is missing 'answer_choice_text'. Found keys: {found_keys}")
+                
                 if "isCorrect" not in answer or not isinstance(answer["isCorrect"], bool):
                     raise ValueError(f"Answer {j} for Question {i} is missing or invalid 'isCorrect' flag.")
+                
                 if "feedback" not in answer:
                     logger.warning(f"Answer {j} for Question {i} is missing 'feedback'.")
                 

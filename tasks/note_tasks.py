@@ -1022,7 +1022,7 @@ def rag_note_task(
         return "RAG Note Task success"
 
     except Exception as e:
-        logger.error(f"❌ Note task failed: {e}", exc_info=True)
+        logger.error(f"❌ Note task for {note_type} failed: {e}", exc_info=True)
         
         # Log error synchronously
         log_llm_error(
@@ -1032,6 +1032,7 @@ def rag_note_task(
             error_message=str(e),
             project_id=project_id,
             user_id=user_id,
+            note_type=note_type, # 🆕 FIX: Add missing note_type for error logging
         )
         
         try:

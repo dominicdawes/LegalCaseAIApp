@@ -31,11 +31,29 @@ base_prompt: |
       conforms to the provided JSON schema. Do not include any other text,
       markdown, or explanations outside of the JSON structure.
 
+  Here is an example of the required JSON structure:
+  {
+    "questions": [
+      {
+        "questionText": "What is the primary element of negligence?",
+        "hint": "It involves a level of care owed to another person.",
+        "answers": [
+          {"answer_choice_text": "Intent", "isCorrect": false, "feedback": "Intent is for intentional torts, not negligence."},
+          {"answer_choice_text": "Duty", "isCorrect": true, "feedback": "Correct! It all starts with a duty of care."},
+          {"answer_choice_text": "Strict Liability", "isCorrect": false, "feedback": "This is a separate category of tort."},
+          {"answer_choice_text": "Malice", "isCorrect": false, "feedback": "Malice is generally not required for negligence."},
+          {"answer_choice_text": "Consideration", "isCorrect": false, "feedback": "This is a concept from contract law."}
+        ]
+      }
+    ]
+  }
+
+
 # 3. Prompt Template
 template: |
   Please generate exactly {num_questions} multiple-choice questions based on the
   following legal context. Ensure each question has 5 choices (A-E) and
-  strictly follows the JSON output format.
+  strictly follows the JSON output format defined in the system instructions.
 
   Legal Context:
   {context}
@@ -66,7 +84,7 @@ generation_config:
               items:
                 type: "OBJECT"
                 properties:
-                  answerText:
+                  answer_choice_text:
                     type: "STRING"
                     description: "The text of the answer choice."
                   isCorrect:
@@ -75,6 +93,7 @@ generation_config:
                   feedback:
                     type: "STRING"
                     description: "Explanation for why this answer is correct or incorrect (pitfall)."
-                required: ["answerText", "isCorrect", "feedback"]
+                required: ["answer_choice_text", "isCorrect", "feedback"]
           required: ["questionText", "hint", "answers"]
     required: ["questions"]
+
