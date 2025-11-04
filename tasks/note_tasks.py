@@ -60,6 +60,7 @@ from utils.lightrag.lightrag_utils import lightrag_integration
 from utils.llm_clients.llm_factory import LLMFactory
 from utils.llm_clients.performance_monitor import PerformanceMonitor
 from utils.note_processing.flashcard_processor import FlashcardProcessor
+from utils.note_processing.quiz_processor import QuizProcessor
 
 # ——— Logging & Env Load ———————————————————————————————————————————————————————————
 logger = get_task_logger(__name__)
@@ -95,6 +96,7 @@ NOTE_TYPE_YAML_MAP = {
     "compare_contrast": "compare-contrast-prompt.yaml",
     "flashcards": "flashcards-prompt.yaml",
     "cold_call": "cold-call-prompt.yaml",
+    "quiz": "quiz-prompt.yaml",
 }
 
 # ——— Enhanced Base Task Class ————————————————————————————————————————————————————
@@ -247,6 +249,23 @@ class AsyncNoteManager:
                     "deck_id": str(deck_id),        # <-- Fix json.dump issue 
                     "num_cards": num_cards,
                     "storage_type": "flashcards"
+                }
+            elif note_type=="quiz":
+                # Special quiz processing and storage
+                num_questions_requested = (addtl_params or {}).get('num_questions', 15)
+                
+                quiz_note_id, num_questions_saved = await self._save_quiz_and_questions_async(
+                    project_id=project_id,
+                    user_id=user_id,
+                    quiz_title=note_title,
+                    llm_output=note_content,
+                    num_questions_requested=num_questions_requested,
+                    is_essential=(addtl_params or {}).get('is_essential', False),
+                )
+                save_metrics = {
+                    "quiz_note_id": str(quiz_note_id),
+                    "num_questions": num_questions_saved,
+                    "storage_type": "quiz"
                 }
             else:
                 # Regular note types - save to notes table
@@ -771,73 +790,118 @@ class AsyncNoteManager:
         except Exception as e:
             logger.error(f"❌ Error saving flashcard deck and cards: {e}", exc_info=True)
             raise
+    
+    async def _save_quiz_and_questions_async(
+        self,
+        project_id: str,
+        user_id: str,
+        quiz_title: str,
+        llm_output: str,
+        num_questions_requested: int,
+        is_essential: bool
+    ) -> tuple:
+        """
+        🆕 Async quiz processing and database insertion.
 
-    # def save_flashcard_deck_and_cards_sync(self, project_id, user_id, deck_name, llm_output):
-    #     """
-    #     🔄 SUNSET: NOW PLACING FLASHCARDS DIRECT INTO NOTES TABLE
-    #     synchronous wrapper for flashcard processing
-    #     Maintained for backward compatibility with existing code
-    #     """
-    #     logger.warning("⚠️ Using legacy sync flashcard processing - consider upgrading to async")
-        
-    #     try:
-    #         # Initialize processor
-    #         processor = FlashcardProcessor()
-            
-    #         # Parse the LLM output
-    #         deck_data, cards_list = processor.parse_flashcard_content(llm_output, deck_name)
-            
-    #         # Validate the parsed data
-    #         if not processor.validate_flashcard_data(deck_data, cards_list):
-    #             raise ValueError("Invalid flashcard data structure")
-            
-    #         logger.info(f"💾 Parsed {len(cards_list)} flashcards for deck: {deck_name}")
-            
-    #         # Insert deck record first using Supabase client
-    #         deck_response = supabase_client.table('flashcard_decks').insert({
-    #             'user_id': user_id,
-    #             'project_id': project_id,
-    #             'deck_name': deck_data['deck_name'],
-    #             'description': deck_data['description'],
-    #             'num_cards': deck_data['num_cards'],
-    #             'created_at': deck_data['created_at'],
-    #             'is_active': deck_data.get('is_active', True)
-    #         }).execute()
-            
-    #         if not deck_response.data:
-    #             raise Exception("Failed to insert flashcard deck")
-            
-    #         deck_id = deck_response.data[0]['id']
-    #         logger.info(f"✅ Inserted flashcard deck with ID: {deck_id}")
-            
-    #         # Prepare individual cards for batch insert
-    #         cards_to_insert = []
-    #         for card in cards_list:
-    #             cards_to_insert.append({
-    #                 'deck_id': deck_id,
-    #                 'user_id': user_id,
-    #                 'project_id': project_id,
-    #                 'front_content': card['front_content'],
-    #                 'back_content': card['back_content'],
-    #                 'card_order': card['card_order'],
-    #                 'created_at': card['created_at'],
-    #                 'is_active': card.get('is_active', True)
-    #             })
-            
-    #         # Batch insert individual cards
-    #         if cards_to_insert:
-    #             cards_response = supabase_client.table('individual_cards').insert(cards_to_insert).execute()
-                
-    #             if not cards_response.data:
-    #                 raise Exception("Failed to insert flashcards")
-                
-    #             logger.info(f"✅ Inserted {len(cards_response.data)} individual flashcards")
-            
-    #         return deck_id, len(cards_list)
-            
-    #     except Exception as e:
-    #         logger.error(f"Error saving flashcard deck and cards: {e}", exc_info=True)
-    #         raise
+        Parses LLM JSON output and saves data to `notes`, `quiz_questions`,
+        and `quiz_answers` tables within a single transaction.
+
+        Args:
+            project_id: The project ID
+            user_id: The user ID
+            quiz_title: Name for the quiz (saved to notes.title)
+            llm_output: Raw LLM JSON response string
+            num_questions_requested: The number of questions asked for
+            is_essential: Flag for essential notes
+
+        Returns:
+            Tuple of (quiz_note_id, num_questions_saved)
+        """
+        try:
+            logger.info(f"🧠 Processing quiz: {quiz_title}")
+
+            # 1. Initialize processor and parse/validate content
+            # This part is synchronous but fast (no I/O)
+            processor = QuizProcessor()
+            quiz_data = processor.parse_quiz_content(llm_output)
+            processor.validate_quiz_data(quiz_data)
+
+            questions_list = quiz_data.get("questions", [])
+            num_questions_saved = len(questions_list)
+
+            if num_questions_saved == 0:
+                raise ValueError("No questions found in parsed quiz data.")
+
+            logger.info(f"💾 Saving {num_questions_saved} quiz questions to DB for: {quiz_title}")
+
+            # 2. Use async database connection for all DB operations
+            async with get_db_connection() as conn:
+                # Start a single transaction for all inserts
+                async with conn.transaction():
+                    
+                    # 3. Insert the main 'notes' record (type 'quiz')
+                    quiz_note_id = await conn.fetchval(
+                        """
+                        INSERT INTO notes (
+                            id, user_id, project_id, title, note_type,
+                            num_questions, created_at, is_generated, is_essential
+                        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                        RETURNING id
+                        """,
+                        str(uuid.uuid4()), user_id, project_id,
+                        quiz_title, "quiz", num_questions_saved,
+                        datetime.now(timezone.utc), True, is_essential
+                    )
+
+                    if not quiz_note_id:
+                        raise Exception("Failed to insert quiz 'notes' record.")
+
+                    logger.info(f"✅ Inserted quiz note record with ID: {quiz_note_id}")
+
+                    # 4. Loop and insert all questions and their answers
+                    for question_data in questions_list:
+                        # Insert quiz_questions record
+                        question_db_id = await conn.fetchval(
+                            """
+                            INSERT INTO quiz_questions (
+                                id, quiz_id, user_id, question_text, hint, created_at
+                            ) VALUES ($1, $2, $3, $4, $5, $6)
+                            RETURNING id
+                            """,
+                            str(uuid.uuid4()), quiz_note_id, user_id,
+                            question_data['questionText'], question_data['hint'],
+                            datetime.now(timezone.utc)
+                        )
+
+                        if not question_db_id:
+                            raise Exception(f"Failed to insert question: {question_data['questionText']}")
+
+                        # 5. Prepare and batch insert answers for this question
+                        answers_data = question_data.get("answers", [])
+                        if answers_data:
+                            answer_records = [
+                                (
+                                    str(uuid.uuid4()),  # id
+                                    question_db_id,     # question_id
+                                    ans['answer_choice_text'], # answer_choice_text
+                                    ans['is_correct'],  # is_correct
+                                    ans['feedback'],    # feedback
+                                    datetime.now(timezone.utc) # created_at
+                                ) for ans in answers_data
+                            ]
+                            
+                            await conn.copy_records_to_table(
+                                'quiz_answers',
+                                records=answer_records,
+                                columns=('id', 'question_id', 'answer_choice_text', 'is_correct', 'feedback', 'created_at')
+                            )
+
+                    logger.info(f"✅ Successfully inserted {num_questions_saved} questions and all their answers.")
+                    return quiz_note_id, num_questions_saved
+
+        except Exception as e:
+            logger.error(f"❌ Error saving quiz and questions: {e}", exc_info=True)
+            raise
 
     async def _log_performance_metrics(self, metrics: Dict):
         """🆕 Log performance metrics for monitoring"""
