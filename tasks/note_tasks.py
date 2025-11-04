@@ -833,6 +833,10 @@ class AsyncNoteManager:
             # 1. Initialize processor and parse/validate content
             # This part is synchronous but fast (no I/O)
             processor = QuizProcessor()
+
+            # 🆕 DEBUG PRINT: Log the first 2000 chars of the output
+            logger.info(f"Raw LLM Output ({len(llm_output)} chars) received for quiz:\n{llm_output[:2000]}...")
+
             quiz_data = processor.parse_quiz_content(llm_output)
             processor.validate_quiz_data(quiz_data)
 
@@ -911,6 +915,9 @@ class AsyncNoteManager:
 
         except Exception as e:
             logger.error(f"❌ Error saving quiz and questions: {e}", exc_info=True)
+            # 🆕 DEBUG PRINT: On error, log the *full* problematic output
+            if "llm_output" in locals():
+                logger.error(f"--- FULL FAILED LLM OUTPUT ---\n{llm_output}\n--- END FAILED LLM OUTPUT ---")
             raise
 
     async def _log_performance_metrics(self, metrics: Dict):

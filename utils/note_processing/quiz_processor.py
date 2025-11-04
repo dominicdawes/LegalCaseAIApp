@@ -2,8 +2,8 @@
 
 import json
 import logging
+import re  # 🆕 Import regex
 from typing import Dict, List, Any
-import re
 
 logger = logging.getLogger(__name__)
 
@@ -19,35 +19,50 @@ class QuizProcessor:
         """
         Parses the raw LLM JSON string output into a Python dictionary.
         
+        🆕 Updated with a robust regex extractor to find the JSON blob,
+        even if it's surrounded by other text or markdown.
+        
         Args:
-            llm_output: The raw JSON string from the LLM.
+            llm_output: The raw string from the LLM.
             
         Returns:
             A dictionary representing the quiz data.
             
         Raises:
-            json.JSONDecodeError: If the string is not valid JSON.
-            ValueError: If the top-level structure is not a dictionary.
+            ValueError: If no JSON object is found or parsing fails.
         """
+        
+        # 1. 🆕 Use regex to find the first '{' and the last '}'
+        # This is far more robust than stripping markdown fences.
+        match = re.search(r'\{.*\}', llm_output, re.DOTALL)
+        
+        if not match:
+            logger.error(f"No JSON object found in LLM output. Output was: {llm_output[:500]}...")
+            raise ValueError("No JSON object found in LLM output.")
+            
+        json_string = match.group(0)
+        
+        # 2. Try to parse the extracted string
         try:
-            # First, strip potential markdown fences (```json ... ```)
-            llm_output = llm_output.strip()
-            if llm_output.startswith("```json"):
-                llm_output = llm_output[7:]
-            if llm_output.startswith("```"):
-                llm_output = llm_output[3:]
-            if llm_output.endswith("```"):
-                llm_output = llm_output[:-3]
-            
-            llm_output = llm_output.strip()
-            
-            quiz_data = json.loads(llm_output)
+            quiz_data = json.loads(json_string)
             if not isinstance(quiz_data, dict):
                 raise ValueError("Parsed JSON is not a dictionary.")
             return quiz_data
         except json.JSONDecodeError as e:
-            logger.error(f"Failed to decode JSON from LLM output: {e.doc[e.pos-10:e.pos+10]}", exc_info=True)
-            raise ValueError(f"Invalid JSON format from LLM: {e}")
+            # 3. 🆕 If parsing fails, log the *full extracted string* for debugging.
+            # This is the "debug print" you need.
+            logger.error(f"Failed to decode extracted JSON. Error: {e}")
+            
+            # Log the area around the error
+            snippet_start = max(0, e.pos - 80)
+            snippet_end = min(len(e.doc), e.pos + 80)
+            snippet = e.doc[snippet_start:snippet_end]
+            logger.error(f"Error snippet (char {e.pos}): ...{snippet}...")
+            
+            # 🆕 Log the *full* failed string for inspection
+            logger.debug(f"--- FULL FAILED JSON STRING ---\n{json_string}\n--- END FAILED JSON ---")
+            
+            raise ValueError(f"Invalid JSON format from LLM even after regex extraction: {e}")
         except Exception as e:
             logger.error(f"Error parsing quiz content: {e}", exc_info=True)
             raise
@@ -80,14 +95,14 @@ class QuizProcessor:
                 raise ValueError(f"Question {i} is missing 'questionText'. Found keys: {found_keys}")
                 
             if "hint" not in question:
-                logger.warning(f"Question {i} is missing 'hint'.")
+                 logger.warning(f"Question {i} is missing 'hint'.")
             
             if "answers" not in question or not isinstance(question["answers"], list):
                 raise ValueError(f"Question {i} is missing 'answers' list.")
             
             if len(question["answers"]) < 4: # Loosen validation slightly, 5 is ideal but 4 is ok
-                logger.warning(f"Question {i} does not have 5 answers (has {len(question['answers'])}).")
-                
+                 logger.warning(f"Question {i} does not have 5 answers (has {len(question['answers'])}).")
+                 
             correct_count = 0
             for j, answer in enumerate(question["answers"]):
                 if not isinstance(answer, dict):
@@ -112,3 +127,4 @@ class QuizProcessor:
 
         logger.info("Quiz data validated successfully.")
         return True
+
