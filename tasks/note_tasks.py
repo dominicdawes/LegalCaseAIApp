@@ -625,7 +625,17 @@ class AsyncNoteManager:
                 )
                 # CORRECTLY assemble the prompt using the base_prompt
                 context = f"{base_prompt}\n\n{formatted_template}"
+            elif note_type == "quiz":
+                # 🆕 Get num_questions from addtl_params, with a default of 15
+                num_questions = addtl_params.get("num_questions", 15)
                 
+                # 🆕 Fill in *both* template variables
+                formatted_template = prompt_template.format(
+                    context=chunk_context, 
+                    num_questions=num_questions
+                )
+                # 🆕 Assemble the prompt
+                context = f"{base_prompt}\n\n{formatted_template}"
             else:
                 # For other note types, still combine base_prompt and template
                 # Curly brace "filling in" vars
