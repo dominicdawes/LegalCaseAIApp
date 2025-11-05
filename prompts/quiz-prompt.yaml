@@ -18,24 +18,17 @@ base_prompt: |
 
   You MUST adhere to the following rules:
   1.  The questions must be relevant to the provided legal text.
-  2.  You must generate the *exact* number of questions specified by the user (default 15).
-  3.  Each question MUST have exactly 5 answer choices (A, B, C, D, E).
-  4.  Each question MUST have *exactly one* correct answer.
-  5.  For each *incorrect* answer, you MUST provide a brief "feedback"
-      explanation explaining *why* it is a common pitfall or misconception.
-  6.  For the *correct* answer, the "feedback" should be a brief positive
-      reinforcement (e.g., "Correct!", "That's right!").
-  7.  You MUST provide a "hint" for the question that guides the user
-      to the correct answer without giving it away.
-  8.  You MUST respond ONLY with a valid JSON object that strictly
-      conforms to the provided JSON schema. Do not include any other text,
-      markdown, or explanations outside of the JSON structure.
-  9.  **CRITICAL: Do NOT duplicate keys within a single object.** Each object
+  2.  You must generate the *exact* number of questions specified by the user.
+  3.  You MUST respond ONLY with a valid JSON object that *perfectly conforms*
+      to the provided `responseSchema`. Do not include any other text.
+  4.  **CRITICAL: Do NOT duplicate keys within a single object.** Each object
       must have only ONE "questionText", ONE "hint", etc. Each answer
       object must have only ONE "answer_choice_text", ONE "isCorrect",
       and ONE "feedback".
 
-  Here is an example of the required JSON structure:
+
+  **VERY CRITICAL**
+  Here is an example of the required JSON structure and mandatory keys:
   {
     "questions": [
       {
@@ -61,43 +54,3 @@ template: |
 
   Legal Context:
   {context}
-
-  **IMPORTANT**
-  generation_config:
-    responseMimeType: "application/json"
-    responseSchema:
-      type: "OBJECT"
-      properties:
-        questions:
-          type: "ARRAY"
-          description: "A list of quiz questions. The list length should match num_questions."
-          items:
-            type: "OBJECT"
-            properties:
-              questionText:
-                type: "STRING"
-                description: "The full text of the multiple-choice question."
-              hint:
-                type: "STRING"
-                description: "A small hint to help the user if they are stuck."
-              answers:
-                type: "ARRAY"
-                description: "A list of exactly 5 possible answer choices (A-E)."
-                minItems: 5
-                maxItems: 5
-                items:
-                  type: "OBJECT"
-                  properties:
-                    answer_choice_text:
-                      type: "STRING"
-                      description: "The text of the answer choice."
-                    isCorrect:
-                      type: "BOOLEAN"
-                      description: "True if this is the correct answer, false otherwise."
-                    feedback:
-                      type: "STRING"
-                      description: "Explanation for why this answer is correct or incorrect (pitfall)."
-                  required: ["answer_choice_text", "isCorrect", "feedback"]
-            required: ["questionText", "hint", "answers"]
-      required: ["questions"]
-
