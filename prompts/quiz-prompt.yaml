@@ -8,7 +8,7 @@
 # 1. LLM Fallback Configuration
 llm:
   provider: openai
-  model: gpt-4o-mini # Fallback if not specified at runtime
+  model: gpt-4o # Fallback if not specified at runtime
 
 # 2. Base Prompt (System Instruction)
 base_prompt: |
