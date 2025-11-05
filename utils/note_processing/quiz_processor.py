@@ -12,7 +12,8 @@ logger = logging.getLogger(__name__)
 # It's non-greedy (.*?) and spans newlines (re.DOTALL).
 # 🆕 UPDATED: Now looks for 'questionText' OR 'question_text'
 QUESTION_REGEX = re.compile(
-    r'\{\s*"(questionText|question_text)":.*?"answers":\s*\[.*?\]\s*\}',
+    # ⬇️ ADDED '?:' to make this a non-capturing group
+    r'\{\s*"(?:questionText|question_text)":.*?"answers":\s*\[.*?\]\s*\}',
     re.DOTALL
 )
 

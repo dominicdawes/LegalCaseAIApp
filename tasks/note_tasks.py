@@ -888,12 +888,12 @@ class AsyncNoteManager:
                             RETURNING id
                             """,
                             str(uuid.uuid4()), quiz_note_id, user_id,
-                            question_data['questionText'], question_data['hint'],
+                            question_data['question_text'], question_data['hint'],
                             datetime.now(timezone.utc)
                         )
 
                         if not question_db_id:
-                            raise Exception(f"Failed to insert question: {question_data['questionText']}")
+                            raise Exception(f"Failed to insert question: {question_data['question_text']}")
 
                         # 5. Prepare and batch insert answers for this question
                         answers_data = question_data.get("answers", [])
