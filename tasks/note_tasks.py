@@ -605,7 +605,7 @@ class AsyncNoteManager:
             # Handle note-type specific YAML parameters
             if note_type == "exam_questions":
                 example = prompt_yaml.get("example_issue_spotter", "")
-                num_questions = addtl_params.get("num_questions", 15)
+                num_questions = addtl_params.get("num_questions", 10)
                 
                 final_request = prompt_template.format(
                     context=chunk_context, 
@@ -626,8 +626,8 @@ class AsyncNoteManager:
                 # CORRECTLY assemble the prompt using the base_prompt
                 context = f"{base_prompt}\n\n{formatted_template}"
             elif note_type == "quiz":
-                # 🆕 Get num_questions from addtl_params, with a default of 15
-                num_questions = addtl_params.get("num_questions", 15)
+                # 🆕 Get num_questions from addtl_params, with a default of 10
+                num_questions = addtl_params.get("num_questions", 10)
                 
                 # 🆕 Fill in *both* template variables
                 formatted_template = prompt_template.format(
@@ -837,11 +837,16 @@ class AsyncNoteManager:
             # 🆕 DEBUG PRINT: Log the first 2000 chars of the output
             logger.info(f"Raw LLM Output ({len(llm_output)} chars) received for quiz:\n{llm_output[:2000]}...")
 
-            quiz_data = processor.parse_quiz_content(llm_output)
-            processor.validate_quiz_data(quiz_data)
+            # 🆕 Use the new "Aggressive Coercion" method
+            # This one method replaces both parse_quiz_content and validate_quiz_data
+            quiz_data = processor.parse_and_salvage_quiz(llm_output)
+            # 🛑 REMOVED: processor.validate_quiz_data(quiz_data)
 
             questions_list = quiz_data.get("questions", [])
             num_questions_saved = len(questions_list)
+
+            # 💡 OPTIONAL: Add this log for comparison
+            logger.info(f"Successfully salvaged {num_questions_saved} out of {num_questions_requested} requested questions.")
 
             if num_questions_saved == 0:
                 raise ValueError("No questions found in parsed quiz data.")
