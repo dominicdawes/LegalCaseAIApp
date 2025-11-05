@@ -95,14 +95,14 @@ class QuizProcessor:
                 raise ValueError(f"Question {i} is missing 'questionText'. Found keys: {found_keys}")
                 
             if "hint" not in question:
-                 logger.warning(f"Question {i} is missing 'hint'.")
+                logger.warning(f"Question {i} is missing 'hint'.")
             
             if "answers" not in question or not isinstance(question["answers"], list):
                 raise ValueError(f"Question {i} is missing 'answers' list.")
             
             if len(question["answers"]) < 4: # Loosen validation slightly, 5 is ideal but 4 is ok
-                 logger.warning(f"Question {i} does not have 5 answers (has {len(question['answers'])}).")
-                 
+                logger.warning(f"Question {i} does not have 5 answers (has {len(question['answers'])}).")
+
             correct_count = 0
             for j, answer in enumerate(question["answers"]):
                 if not isinstance(answer, dict):

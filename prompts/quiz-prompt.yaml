@@ -30,6 +30,10 @@ base_prompt: |
   8.  You MUST respond ONLY with a valid JSON object that strictly
       conforms to the provided JSON schema. Do not include any other text,
       markdown, or explanations outside of the JSON structure.
+  9.  **CRITICAL: Do NOT duplicate keys within a single object.** Each object
+      must have only ONE "questionText", ONE "hint", etc. Each answer
+      object must have only ONE "answer_choice_text", ONE "isCorrect",
+      and ONE "feedback".
 
   Here is an example of the required JSON structure:
   {
@@ -58,42 +62,42 @@ template: |
   Legal Context:
   {context}
 
-# 4. Generation Config: Tells the API to *force* a JSON response.
-generation_config:
-  responseMimeType: "application/json"
-  responseSchema:
-    type: "OBJECT"
-    properties:
-      questions:
-        type: "ARRAY"
-        description: "A list of quiz questions. The list length should match num_questions."
-        items:
-          type: "OBJECT"
-          properties:
-            questionText:
-              type: "STRING"
-              description: "The full text of the multiple-choice question."
-            hint:
-              type: "STRING"
-              description: "A small hint to help the user if they are stuck."
-            answers:
-              type: "ARRAY"
-              description: "A list of exactly 5 possible answer choices (A-E)."
-              minItems: 5
-              maxItems: 5
-              items:
-                type: "OBJECT"
-                properties:
-                  answer_choice_text:
-                    type: "STRING"
-                    description: "The text of the answer choice."
-                  isCorrect:
-                    type: "BOOLEAN"
-                    description: "True if this is the correct answer, false otherwise."
-                  feedback:
-                    type: "STRING"
-                    description: "Explanation for why this answer is correct or incorrect (pitfall)."
-                required: ["answer_choice_text", "isCorrect", "feedback"]
-          required: ["questionText", "hint", "answers"]
-    required: ["questions"]
+  **IMPORTANT**
+  generation_config:
+    responseMimeType: "application/json"
+    responseSchema:
+      type: "OBJECT"
+      properties:
+        questions:
+          type: "ARRAY"
+          description: "A list of quiz questions. The list length should match num_questions."
+          items:
+            type: "OBJECT"
+            properties:
+              questionText:
+                type: "STRING"
+                description: "The full text of the multiple-choice question."
+              hint:
+                type: "STRING"
+                description: "A small hint to help the user if they are stuck."
+              answers:
+                type: "ARRAY"
+                description: "A list of exactly 5 possible answer choices (A-E)."
+                minItems: 5
+                maxItems: 5
+                items:
+                  type: "OBJECT"
+                  properties:
+                    answer_choice_text:
+                      type: "STRING"
+                      description: "The text of the answer choice."
+                    isCorrect:
+                      type: "BOOLEAN"
+                      description: "True if this is the correct answer, false otherwise."
+                    feedback:
+                      type: "STRING"
+                      description: "Explanation for why this answer is correct or incorrect (pitfall)."
+                  required: ["answer_choice_text", "isCorrect", "feedback"]
+            required: ["questionText", "hint", "answers"]
+      required: ["questions"]
 
