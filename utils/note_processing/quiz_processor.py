@@ -10,8 +10,9 @@ logger = logging.getLogger(__name__)
 # 1. 🆕 Define a regex to find all substrings that look like a complete
 # question object. This is the core of the "Aggressive Coercion" strategy.
 # It's non-greedy (.*?) and spans newlines (re.DOTALL).
+# 🆕 UPDATED: Now looks for 'questionText' OR 'question_text'
 QUESTION_REGEX = re.compile(
-    r'\{\s*"questionText":.*?"answers":\s*\[.*?\]\s*\}',
+    r'\{\s*"(questionText|question_text)":.*?"answers":\s*\[.*?\]\s*\}',
     re.DOTALL
 )
 
@@ -55,7 +56,8 @@ class QuizProcessor:
                 
                 if coerced_q:
                     # 4. 🆕 Add if valid and not a duplicate
-                    q_text = coerced_q['questionText'].lower().strip()
+                    # 🆕 UPDATED: Key is now 'question_text'
+                    q_text = coerced_q['question_text'].lower().strip()
                     if q_text not in seen_questions:
                         valid_questions.append(coerced_q)
                         seen_questions.add(q_text)
@@ -73,17 +75,18 @@ class QuizProcessor:
     def _coerce_question(self, q_data: dict, index: int) -> dict | None:
         """
         Python version of the 'coerce' logic from handleQuiz.ts.
-        Takes a parsed object and returns a valid question dict or None.
+        Takes a parsed object and returns a valid question dict or None
+        in snake_case format.
         Provides fallbacks for missing data.
         """
         if not isinstance(q_data, dict):
             return None
         
-        # 1. Coerce questionText (fallback)
-        question_text = str(q_data.get("questionText", "")).strip()
+        # 1. 🆕 Coerce question_text (snake_case) with fallback to questionText (camelCase)
+        question_text = str(q_data.get("question_text", q_data.get("questionText", ""))).strip()
         if not question_text:
-            logger.warning(f"Question #{index} is missing 'questionText'. Skipping.")
-            return None # questionText is non-negotiable
+            logger.warning(f"Question #{index} is missing 'question_text' or 'questionText'. Skipping.")
+            return None # question_text is non-negotiable
         
         # 2. Coerce hint (fallback)
         hint = str(q_data.get("hint", "")).strip()
@@ -102,12 +105,13 @@ class QuizProcessor:
             if not isinstance(ans, dict):
                 continue
             
+            # 🆕 Coerce answer_choice_text (already snake_case)
             ans_text = str(ans.get("answer_choice_text", "")).strip()
             if not ans_text:
                 ans_text = f"Salvaged Answer {j + 1}"
             
-            # Check for 'isCorrect' or 'is_correct'
-            is_correct = ans.get("isCorrect", ans.get("is_correct"))
+            # 🆕 Coerce is_correct (snake_case) with fallback to isCorrect (camelCase)
+            is_correct = ans.get("is_correct", ans.get("isCorrect"))
             if not isinstance(is_correct, bool):
                 is_correct = False
                 
@@ -118,28 +122,30 @@ class QuizProcessor:
             if not feedback:
                 feedback = "No feedback provided."
             
+            # 🆕 Ensure keys in the new dict are snake_case for the DB
             coerced_answers.append({
                 "answer_choice_text": ans_text,
-                "isCorrect": is_correct, # Standardize to 'isCorrect' for the validator
+                "is_correct": is_correct, # 🆕 RENAMED from isCorrect
                 "feedback": feedback
             })
 
         # 4. 🆕 Ensure at least one answer is correct (just like handleQuiz.ts)
         if not correct_found and coerced_answers:
             logger.warning(f"Question '{question_text[:50]}...' had no correct answer. Assigning first.")
-            coerced_answers[0]["isCorrect"] = True
+            coerced_answers[0]["is_correct"] = True
         
         # 5. 🆕 Ensure we have 5 answers (pad if necessary)
         while len(coerced_answers) < 5:
             logger.warning(f"Padding answers for question: {question_text[:50]}...")
             coerced_answers.append({
                 "answer_choice_text": "Default Padded Answer",
-                "isCorrect": False,
+                "is_correct": False, # 🆕 RENAMED from isCorrect
                 "feedback": "This is a default answer because the LLM provided too few."
             })
 
+        # 6. 🆕 Return final dict with snake_case keys
         return {
-            "questionText": question_text,
+            "question_text": question_text, # 🆕 RENAMED from questionText
             "hint": hint,
             "answers": coerced_answers[:5] # Take only 5
         }

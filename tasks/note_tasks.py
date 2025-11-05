@@ -252,7 +252,7 @@ class AsyncNoteManager:
                 }
             elif note_type=="quiz":
                 # Special quiz processing and storage
-                num_questions_requested = (addtl_params or {}).get('num_questions', 15)
+                num_questions_requested = (addtl_params or {}).get('num_questions', 10)
                 
                 quiz_note_id, num_questions_saved = await self._save_quiz_and_questions_async(
                     project_id=project_id,

@@ -32,14 +32,14 @@ base_prompt: |
   {
     "questions": [
       {
-        "questionText": "What is the primary element of negligence?",
+        "question_text": "What is the primary element of negligence?",
         "hint": "It involves a level of care owed to another person.",
         "answers": [
-          {"answer_choice_text": "Intent", "isCorrect": false, "feedback": "Intent is for intentional torts, not negligence."},
-          {"answer_choice_text": "Duty", "isCorrect": true, "feedback": "Correct! It all starts with a duty of care."},
-          {"answer_choice_text": "Strict Liability", "isCorrect": false, "feedback": "This is a separate category of tort."},
-          {"answer_choice_text": "Malice", "isCorrect": false, "feedback": "Malice is generally not required for negligence."},
-          {"answer_choice_text": "Consideration", "isCorrect": false, "feedback": "This is a concept from contract law."}
+          {"answer_choice_text": "Intent", "is_correct": false, "feedback": "Intent is for intentional torts, not negligence."},
+          {"answer_choice_text": "Duty", "is_correct": true, "feedback": "Correct! It all starts with a duty of care."},
+          {"answer_choice_text": "Strict Liability", "is_correct": false, "feedback": "This is a separate category of tort."},
+          {"answer_choice_text": "Malice", "is_correct": false, "feedback": "Malice is generally not required for negligence."},
+          {"answer_choice_text": "Consideration", "is_correct": false, "feedback": "This is a concept from contract law."}
         ]
       }
     ]
