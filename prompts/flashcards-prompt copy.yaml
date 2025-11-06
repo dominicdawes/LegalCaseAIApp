@@ -1,7 +1,5 @@
 # prompts/flashcards-prompt.yaml
 
-# DEBUGGING: Look for `yaml_dict.get(...`
-
 llm:                  # these are a fallback if the user does not specify a provider/model at runtime
   provider: openai    # "openai", "anthropic"... 
   model: gpt-4o-mini
@@ -18,19 +16,10 @@ retrieval_prompt: |
 
 # --- Generation Prompt ---
 # This is the main prompt template sent to the LLM *after* RAG.
-system_prompt: |
-  You are an expert law professor and instructional designer. Your goal is to
-  create high-quality, testable flashcards from the provided legal context.
-  You must follow the formatting rules exactly.
-
-# --- Further LLM Formatting instructions ---
-# This is the main prompt template sent to the LLM *after* RAG.
-# **CRITICAL**: Contains variable injections via `{}`
 template: |
-  Based on the legal context below, create exactly {num_cards} flashcards
-  covering the key concepts, rules, cases, and principles.
-
-  Format each flashcard exactly as follows:
+  You are a law professor creating flashcards for students. Based on the
+  following legal context, please create exactly {num_cards} flashcards covering
+  the key concepts, rules, cases, and principles.
 
   Format each flashcard exactly as follows:
 

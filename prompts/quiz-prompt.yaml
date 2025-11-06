@@ -5,13 +5,21 @@
 # schema for generating a multiple-choice quiz from user notes.
 # ---
 
+# DEBUGGING: Look for `yaml_dict.get(...`
+
 # 1. LLM Fallback Configuration
 llm:
   provider: openai
   model: gpt-4o # Fallback if not specified at runtime
 
-# 2. Base Prompt (System Instruction)
-base_prompt: |
+# NEW: This prompt is ONLY for embedding to find relevant chunks
+retrieval_prompt: |
+  A comprehensive review of core legal concepts, black letter law, key definitions,
+  legal tests, and specific facts of a case. This text contains material
+  suitable for multiple-choice questions and quizzes.
+
+# System Prompt (System Instruction)
+system_prompt: |
   You are an expert instructional designer and law professor.
   Your role is to generate a set of high-quality, multiple-choice questions
   based on the user-provided text (notes).
@@ -45,8 +53,9 @@ base_prompt: |
     ]
   }
 
-
-# 3. Prompt Template
+# --- Template (For Generation) ---
+# This is the main prompt template. It contains ALL instructions, variables, examples, and the RAG context.
+# **CRITICAL**: Contains variable injections via `{}`
 template: |
   Please generate exactly {num_questions} multiple-choice questions based on the
   following legal context. Ensure each question has 5 choices (A-E) and

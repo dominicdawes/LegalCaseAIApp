@@ -208,7 +208,7 @@ class AsyncNoteManager:
             setup_time = time.time() - start_time
             logger.info(f"📊 Parallel setup completed in {setup_time*1000:.0f}ms")
             
-            # 🆕 Async chunk retrieval (Naive RAG)
+            # Async chunk retrieval (Naive RAG)
             retrieval_start = time.time()
             relevant_chunks = await self._fetch_relevant_chunks_async(
                 embedding, project_id
@@ -216,7 +216,7 @@ class AsyncNoteManager:
             retrieval_time = time.time() - retrieval_start
             logger.info(f"🔍 Retrieved {len(relevant_chunks)} chunks in {retrieval_time*1000:.0f}ms")
             
-            # 🆕 Build context and generate note
+            # Build context and generate note (typicaly BASE_PROMPT + TEMPLATE + CHUNKS)
             generation_start = time.time()
             context = self._build_note_context(
                 prompt_yaml, 
@@ -502,9 +502,13 @@ class AsyncNoteManager:
         return yaml_dict
 
     async def _get_embedding_async(self, note_type: str) -> List[float]:
-        """🆕 Async 'note prompt' embedding generation with caching"""
+        """Async 'note prompt' embedding generation with caching
+        Description:
+            Converts baseline prompts to vector representation. Note embeddings are not seen by the LLM only vector-similarity lookup.
+            Base prompts should be instructive/SEO based to to match with the most relevant chunk vectors. 
+            i.e. packed with domain specific search terms: "core legal concepts, black letter law, claim, olding, etc..."
+        """
         
-        # Use note_type as cache key (embeddings are similar for same note types)
         if note_type in self._embedding_cache:
             logger.info(f"🎯 Cache HIT for {note_type} embedding")
             return self._embedding_cache[note_type]
@@ -512,17 +516,21 @@ class AsyncNoteManager:
         # Load prompt to get base query
         yaml_file = NOTE_TYPE_YAML_MAP.get(note_type)
         yaml_dict = load_yaml_prompt(yaml_file)
-        base_query = yaml_dict.get("base_prompt")
         
+        # Look for the new key. Fallback to base_prompt for older files.
+        retrieval_query = yaml_dict.get("retrieval_prompt", yaml_dict.get("base_prompt"))
+
+        if not retrieval_query:
+            logger.error(f"No retrieval_prompt or base_prompt found in {yaml_file}")
+            raise ValueError(f"Missing prompt for embedding in {note_type}")
+
         logger.info(f"🤖 Generating embedding for {note_type}")
         
-        # Generate embedding in thread pool
         loop = asyncio.get_event_loop()
         embedding = await loop.run_in_executor(
-            None, self._generate_embedding_sync, base_query
+            None, self._generate_embedding_sync, retrieval_query
         )
         
-        # Cache for future use
         self._embedding_cache[note_type] = embedding
         logger.info(f"💾 Cached embedding for {note_type}")
         
@@ -550,9 +558,16 @@ class AsyncNoteManager:
         return client
 
     async def _fetch_relevant_chunks_async(
-        self, embedding: List[float], project_id: str, k: int = 10
+        self, 
+        embedding: List[float], 
+        project_id: str, 
+        k: int = 10
     ) -> List[Dict]:
-        """🆕 Async chunk retrieval with connection pooling"""
+        """🆕 Async chunk retrieval with connection pooling
+        Args:
+        - embedding (List): vectorized question prompt
+        - k (int): Top k relevant chunks, (default is 10)
+        """
         
         # Convert to pgvector format
         vector_str = '[' + ','.join(map(str, embedding)) + ']'
@@ -596,11 +611,11 @@ class AsyncNoteManager:
                     f"{page_content}\n"
                 )
             chunk_context = "\n".join(page_contexts)
-            
-
+        
             # Format yaml prompt dictionary
-            base_prompt = prompt_yaml.get("base_prompt", "")        # directly accesses the yaml dict
-            prompt_template = build_prompt_template_from_yaml(prompt_yaml)      # fetched the full dict (so unique keys are included "example_issue_spotter"...)
+            # We now fetch the system_prompt, (NOT the old base_prompt)
+            system_prompt = prompt_yaml.get("system_prompt", "")  # Use system_prompt
+            prompt_template = build_prompt_template_from_yaml(prompt_yaml)
             
             # Handle note-type specific YAML parameters
             if note_type == "exam_questions":
@@ -612,35 +627,33 @@ class AsyncNoteManager:
                     n_questions=num_questions
                 )
                 # Assemble with the special example
-                context = f"{base_prompt}\n\n## GOLD-STANDARD EXAMPLE\n{example}\n\n## YOUR TASK\n{final_request}"
+                # USE system_prompt
+                context = f"{system_prompt}\n\n## GOLD-STANDARD EXAMPLE\n{example}\n\n## YOUR TASK\n{final_request}"
 
             elif note_type in ["flashcards", "cold_call"]:
-                # Use "num_cards" as the consistent parameter key
                 num_cards = addtl_params.get("num_cards", 10)
                 
-                # Curly brace "filling in" vars
                 formatted_template = prompt_template.format(
                     context=chunk_context, 
                     num_cards=num_cards
                 )
-                # CORRECTLY assemble the prompt using the base_prompt
-                context = f"{base_prompt}\n\n{formatted_template}"
+                # USE system_prompt
+                context = f"{system_prompt}\n\n{formatted_template}"
+
             elif note_type == "quiz":
-                # 🆕 Get num_questions from addtl_params, with a default of 10
                 num_questions = addtl_params.get("num_questions", 10)
                 
-                # 🆕 Fill in *both* template variables
                 formatted_template = prompt_template.format(
                     context=chunk_context, 
                     num_questions=num_questions
                 )
-                # 🆕 Assemble the prompt
-                context = f"{base_prompt}\n\n{formatted_template}"
+                # USE system_prompt
+                context = f"{system_prompt}\n\n{formatted_template}"
             else:
-                # For other note types, still combine base_prompt and template
-                # Curly brace "filling in" vars
+                # For other note types
                 formatted_template = prompt_template.format(context=chunk_context)
-                context = f"{base_prompt}\n\n{formatted_template}"
+                # USE system_prompt
+                context = f"{system_prompt}\n\n{formatted_template}"
             
             logger.info(f"📝 Built context: {len(context)} characters")
             return context
