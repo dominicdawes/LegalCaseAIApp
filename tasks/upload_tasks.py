@@ -283,68 +283,110 @@ def _update_document_status_sync(doc_id: str, status: ProcessingStatus, error_me
     """
     logger.info(f"📋 Doc {doc_id[:8]}... → {status.value}")
     pool = get_global_sync_db_pool()
-    conn = pool.getconn()
-    try:
-        with conn.cursor() as cur:
-            # If the process is complete and we have stats, perform a full update
-            if status == ProcessingStatus.COMPLETE and stats:
-                cur.execute(
-                    """
-                    UPDATE document_sources
-                    SET 
-                        vector_embed_status = %s, 
-                        error_message = %s, 
-                        updated_at = NOW(),
-                        total_chunks = %s,
-                        total_tokens = %s
-                    WHERE id = %s
-                    """,
-                    (
-                        status.value, 
-                        error_message, 
-                        stats.get('chunks_created', 0), 
-                        stats.get('total_tokens', 0), 
-                        doc_id
+    retries = 3
+
+    for attempt in range(retries):
+        conn = None
+        try:
+            conn = pool.getconn()
+            with conn.cursor() as cur:
+                if status == ProcessingStatus.COMPLETE and stats:
+                    cur.execute(
+                        """
+                        UPDATE document_sources
+                        SET 
+                            vector_embed_status = %s, 
+                            error_message = %s, 
+                            updated_at = NOW(),
+                            total_chunks = %s,
+                            total_tokens = %s
+                        WHERE id = %s
+                        """,
+                        (
+                            status.value, 
+                            error_message, 
+                            stats.get('chunks_created', 0), 
+                            stats.get('total_tokens', 0), 
+                            doc_id
+                        )
                     )
-                )
-            else:
-                # Original query for simple status updates or failures
-                cur.execute(
-                    """
-                    UPDATE document_sources
-                    SET vector_embed_status = %s, error_message = %s, updated_at = NOW()
-                    WHERE id = %s
-                    """,
-                    (status.value, error_message, doc_id)
-                )
+                else:
+                    cur.execute(
+                        """
+                        UPDATE document_sources
+                        SET vector_embed_status = %s, error_message = %s, updated_at = NOW()
+                        WHERE id = %s
+                        """,
+                        (status.value, error_message, doc_id)
+                    )
             conn.commit()
-    finally:
-        pool.putconn(conn)
+            return # Success
+
+        except (psycopg2.OperationalError, psycopg2.DatabaseError) as e:
+            logger.warning(f"⚠️ DB Connection failed in doc update (attempt {attempt+1}/{retries}): {e}")
+            if conn:
+                try:
+                    pool.putconn(conn, close=True)
+                except Exception:
+                    pass
+                conn = None
+            
+            if attempt == retries - 1:
+                raise e
+            time.sleep(0.5)
+            
+        finally:
+            if conn:
+                pool.putconn(conn)
 
 def _update_batch_progress_sync(batch_id: str, project_id: str, status: BatchProgressStatus):
     """
     [PER BATCH] Update batch_progress for all documents in a batch
-    Fast bulk update - better than individual document updates
+    Includes retry logic for stale connections.
     """
     pool = get_global_sync_db_pool()
-    conn = pool.getconn()
-    try:
-        with conn.cursor() as cur:
-            # Use batch_id from processing_metadata to identify batch documents
-            cur.execute(
-                """
-                UPDATE document_sources 
-                SET batch_progress = %s, updated_at = NOW()
-                WHERE project_id = %s 
-                AND processing_metadata->>'batch_id' = %s
-                """,
-                (status.value, project_id, batch_id)
-            )
-            rows_updated = cur.rowcount
+    retries = 3
+    
+    for attempt in range(retries):
+        conn = None
+        try:
+            conn = pool.getconn()
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE document_sources 
+                    SET batch_progress = %s, updated_at = NOW()
+                    WHERE project_id = %s 
+                    AND processing_metadata->>'batch_id' = %s
+                    """,
+                    (status.value, project_id, batch_id)
+                )
+                rows_updated = cur.rowcount
             conn.commit()
             logger.info(f"📊 [BATCH-{batch_id[:8]}] Progress → {status.value} ({rows_updated} docs)")
-    finally:
-        pool.putconn(conn)
+            return # Success, exit loop
+
+        except (psycopg2.OperationalError, psycopg2.DatabaseError) as e:
+            logger.warning(f"⚠️ DB Connection failed in batch update (attempt {attempt+1}/{retries}): {e}")
+            if conn:
+                # CRITICAL: Return the bad connection to the pool with close=True
+                # This forces the pool to discard it and create a new one next time
+                try:
+                    pool.putconn(conn, close=True)
+                except Exception:
+                    pass
+                conn = None
+            
+            if attempt == retries - 1:
+                logger.error(f"❌ Failed to update batch progress after {retries} attempts")
+                raise e
+            
+            # Small backoff before retry
+            time.sleep(0.5)
+
+        finally:
+            if conn:
+                pool.putconn(conn)
 
 def create_http_session() -> requests.Session:
     """Helper to create a requests session with retry strategy"""
