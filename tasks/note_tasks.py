@@ -97,6 +97,7 @@ NOTE_TYPE_YAML_MAP = {
     "flashcards": "flashcards-prompt.yaml",
     "cold_call": "cold-call-prompt.yaml",
     "quiz": "quiz-prompt.yaml",
+    "attack_outline": "attack-outline-prompt.yaml",
 }
 
 # ——— Enhanced Base Task Class ————————————————————————————————————————————————————

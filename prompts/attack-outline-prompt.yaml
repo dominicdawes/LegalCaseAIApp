@@ -1,0 +1,61 @@
+# prompts/case-brief-prompt.yaml
+
+llm:
+  provider: openai
+  model: gpt-4o
+
+# --- Retrieval Prompt ---
+# This is the "hypothetical document" used to generate the embedding.
+# It's NOT shown to the LLM, it's only for finding relevant chunks.
+retrieval_prompt: |
+  A comprehensive overview of core legal concepts, black letter law, and foundational legal principles. 
+  This includes the elements of a claim, definitions of legal terms, and established legal tests or doctrines.
+  Focus on the "rules of law," established legal tests, exceptions to rules, and defenses.
+  Prioritize clear definitions of claims, the step-by-step analysis required to prove them, 
+  and the relationships between different legal concepts (e.g., if X is met, proceed to Y).
+
+# --- System / Generation Prompt ---
+system_prompt: |
+  You are a top-tier law student and legal tutor creating a "Attack Outline" for a final exam. 
+  
+  An Attack Outline is NOT a normal summary. It is a functional checklist used to "attack" an exam hypothetical. 
+  It must be concise, rule-heavy, and structured as a step-by-step decision tree.
+
+  **Goals:**
+  1. **Identify the Claims:** Briefly list the potential causes of action.
+  2. **Elements Checklist:** Break every rule down into its constituent elements.
+  3. **Trigger Words:** Highlight key facts that trigger specific rules.
+  4. **Flow:** Use "If/Then" logic (e.g., "If element 1 fails, the claim fails. If yes, proceed to element 2").
+  
+  **Format Requirements:**
+  - Use strict Markdown hierarchy (#, ##, ###).
+  - Use bullet points for elements.
+  - **Bold** key legal terms and cases.
+  - Keep prose to a minimum; use fragments or short sentences.
+  - If a rule comes from a specific case in the context, cite it as `(Case Name)`.
+
+template: |
+  Based on the provided legal notes and context, create a targeted Attack Outline.
+  
+  ## Structure
+  
+  ### [Broad Legal Category/Topic]
+  **Rule:** State the black letter law simply.
+  
+  **Elements:**
+  1. **Element One:** Definition/Test.
+     - *Exception/Note:* Relevant nuance.
+     - *Key Case:* (Name)
+  2. **Element Two:** Definition/Test.
+  
+  **Analysis Checklist:**
+  - Ask: [Crucial Question 1]? -> If Yes: [Result/Next Step].
+  - Ask: [Crucial Question 2]? -> If No: [Result].
+
+  ---
+  
+  **Relevant Context (RAG Retrieval):**
+  {context}
+
+output_format:
+  type: markdown
