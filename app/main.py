@@ -7,9 +7,9 @@ Main FastAPI script, this is the heart of the web service
 import os
 import re       # regex
 from dotenv import load_dotenv
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from datetime import datetime, timezone
-from typing import List, Dict, Any, Literal
+from typing import List, Dict, Any, Literal, Optional
 import uuid
 from fastapi import FastAPI, HTTPException, Query
 import logging
@@ -35,6 +35,8 @@ from app.ws_handlers import setup_websocket_routes, manager     # from ws_handle
 # `Task/` module imports
 from tasks.profile_tasks import upload_profile_picture_task
 from tasks.podcast_generate_tasks import validate_and_generate_audio_task, generate_dialogue_only_task
+from tasks.exam_grading_tasks import grade_exam_question_workflow
+from tasks.conversions import convert_chat_to_note_task
 from tasks.upload_tasks import process_document_batch_workflow
 from tasks.chat_tasks import streaming_manager
 # from tasks.upload_tasks import append_document_task  <-- need to revive this later
@@ -282,6 +284,23 @@ class NewGeneratedNoteRequest(BaseModel):
     # files: List[str]  # List of URLs or file paths of the PDFs
     metadata: Dict[str, Any]  # A dictionary for any metadata information
 
+class ChatToNoteRequest(BaseModel):
+    '''
+    Request model for converting chat content to a persistent note
+    '''
+    note_content: str = Field(..., description="The markdown text from the chat")
+    user_id: str
+    project_id: str
+    note_type: str = "chat"
+
+class ExamGradingRequest(BaseModel):
+    user_id: str
+    question: str
+    user_answer: str
+    professor_example: Optional[str] = None
+    outline_url: Optional[str] = None # Optional CDN link to PDF/Doc
+    project_id: str # Required for RAG isolation and DB constraints
+    model_name: str = "gpt-4o"
 
 # ================================================ #
 #               TEST ENDPOINTS
@@ -329,7 +348,7 @@ async def upload_profile_picture(request: ProfilePictureRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 # ================================================ #
-#                RAG CHAT ENDPOINTS
+#                RAG CHAT ENDPOINTS (ONLY)
 # ================================================ #
 
 @app.post("/new-rag-project/", response_model=NewRagPipelineResponse)
@@ -427,7 +446,6 @@ async def append_sources_to_project(request: RagPipelineNewDocumentsRequest, bac
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-
 @app.post("/rag-chat/")
 async def rag_chat(request: RagQueryRequest):
     """
@@ -475,32 +493,6 @@ async def rag_chat(request: RagQueryRequest):
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-@app.post("/clean-notes/", response_model=GenericTaskResponse)
-async def clean_note(request: CleanNoteRequest):
-    """
-    Triggers a background task to clean up and enhance an existing note's content.
-    """
-    try:
-        if not request.note_id or not request.user_id:
-            raise HTTPException(status_code=400, detail="note_id and user_id are required.")
-
-        job = cleanup_note_task.apply_async(
-            kwargs={
-                "note_id": request.note_id,
-                "user_id": request.user_id,
-                "provider": request.provider,
-                "model_name": request.model_name,
-                "temperature": request.temperature,
-            }
-        )
-        
-        logger.info(f"Queued note cleanup task {job.id} for note {request.note_id}")
-        return {"task_id": job.id}
-
-    except Exception as e:
-        logger.error(f"Failed to queue note cleanup task: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
-        
 @app.post("/rag-chat/reset/")
 async def rag_chat_reset(request: RagQueryRequest):
     """
@@ -543,7 +535,7 @@ async def rag_chat_reset(request: RagQueryRequest):
 # async def rag_chat_regenerate(request: RagRegenerateRequest):
 #     """
 #     Endpoint for regenerating a "FAILED" RAG query (token streaming not ENABLED)
-    
+
 #     Raw json:
 #     ----------
 #     {
@@ -600,6 +592,99 @@ async def cancel_rag_chat(task_id: str):
     except Exception as e:
         logger.error(f"❌ Cancel request failed for task {task_id}: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Failed to cancel task: {str(e)}")
+
+
+# ================================================ #
+#                CHAT / STUDY FEATURES ENDPOINTS
+# ================================================ #
+
+@app.post("/grade-exam-question/", response_model=GenericTaskResponse)
+async def grade_exam_question(request: ExamGradingRequest):
+    """
+    Ingests a law exam answer, optionally ingests a course outline,
+    and runs a multi-stage grading and feedback pipeline.
+    """
+    try:
+        # Validate UUIDs
+        try:
+            uuid.UUID(request.user_id)
+            uuid.UUID(request.project_id)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid user_id or project_id UUID format")
+
+        job = grade_exam_question_workflow.apply_async(
+            kwargs={
+                "user_id": request.user_id,
+                "project_id": request.project_id,
+                "question": request.question,
+                "user_answer": request.user_answer,
+                "professor_example": request.professor_example,
+                "outline_url": request.outline_url,
+                "model_name": request.model_name
+            }
+        )
+        
+        logger.info(f"🎓 Queued Exam Grading Task {job.id} for User {request.user_id}")
+        return {"task_id": job.id}
+
+    except Exception as e:
+        logger.error(f"Failed to queue exam grading: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/clean-notes/", response_model=GenericTaskResponse)
+async def clean_note(request: CleanNoteRequest):
+    """
+    Triggers a background task to clean up and enhance an existing note's content.
+    """
+    try:
+        if not request.note_id or not request.user_id:
+            raise HTTPException(status_code=400, detail="note_id and user_id are required.")
+
+        job = cleanup_note_task.apply_async(
+            kwargs={
+                "note_id": request.note_id,
+                "user_id": request.user_id,
+                "provider": request.provider,
+                "model_name": request.model_name,
+                "temperature": request.temperature,
+            }
+        )
+        
+        logger.info(f"Queued note cleanup task {job.id} for note {request.note_id}")
+        return {"task_id": job.id}
+
+    except Exception as e:
+        logger.error(f"Failed to queue note cleanup task: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/convert-chat-to-note/", response_model=GenericTaskResponse)
+async def convert_chat_to_note(request: ChatToNoteRequest):
+    """
+    Endpoint to take chat content and persist it as a note in public.notes.
+    Handled asynchronously via conversions.py.
+    """
+    try:
+        # Validate inputs roughly before queuing
+        if not request.Note_content:
+            raise HTTPException(status_code=400, detail="Note_content cannot be empty")
+
+        job = convert_chat_to_note_task.apply_async(
+            kwargs={
+                "user_id": request.user_id,
+                "project_id": request.project_id,
+                "content": request.Note_content,
+                "note_type": request.note_type,
+            }
+        )
+        
+        logger.info(f"Queued chat conversion task {job.id} for user {request.user_id}")
+        return {"task_id": job.id}
+
+    except Exception as e:
+        logger.error(f"Failed to queue chat conversion: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 
 # ================================================ #
@@ -669,6 +754,7 @@ async def get_pdf_upload_status(task_id: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Status check error: {e}")
 
+
 @app.post("/embedding-pipeline-task-status", response_model=EmbeddingStatusResponse, summary="Check embedding status for a batch of documents")
 async def embedding_pipeline_task_status(
     req: EmbeddingStatusRequest
@@ -718,6 +804,7 @@ async def embedding_pipeline_task_status(
             detail=f"Could not fetch embedding statuses: {e}"
         )
 
+
 @app.get("/rag-chat-status/{task_id}")
 async def get_rag_chat_status(task_id: str):
     """
@@ -759,6 +846,7 @@ async def get_rag_chat_status(task_id: str):
         return {"task_id": task_id, "status": "FAILURE", "error": str(result.result)}
     else:
         return {"task_id": task_id, "status": result.state}
+
 
 # Combined endpoint to check the status of any Celery task
 @app.get("/task-status/{task_id}")
@@ -821,6 +909,7 @@ async def get_task_status(task_id: str):
     except Exception as e:
         # Handle any unexpected exceptions
         raise HTTPException(status_code=500, detail=f"Error retrieving task status: {str(e)}")
+
 
 # ================================================ #
 #          RAG GENERATIVE NOTES ENDPOINTS
@@ -908,7 +997,8 @@ async def pdf_to_dialogue(request: PDFRequest, background_tasks: BackgroundTasks
         }
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
-    
+
+
 # Endpoint to process PDFs and generate dialogue transcript
 @app.post("/pdf-to-dialogue-transcript/", response_model=PDFResponse)
 async def pdf_to_dialogue_transcript(request: PDFRequest, background_tasks: BackgroundTasks):
@@ -923,6 +1013,7 @@ async def pdf_to_dialogue_transcript(request: PDFRequest, background_tasks: Back
         return {"task_id": task.id}
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
+
 
 # ================================================ #
 #              DEV-TOOLS ENDPOINTS
