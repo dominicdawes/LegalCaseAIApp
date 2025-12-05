@@ -1,0 +1,35 @@
+# prompts/rubrics/fact-pattern.yaml
+
+name: "Fact-Finding / Issue Spotting"
+description: "Standard law school exam analysis based on a fictional fact pattern."
+
+# Used to instruct the LLM on how to weigh the score
+grading_criteria: |
+  1. Issue Spotting (30%): Identify major + sub-issues; avoid irrelevant ones.
+  2. Rule Statements (20%): Accurate black-letter law; include tests & exceptions.
+  3. Application / IRAC Analysis (30%): Deep fact-specific reasoning; argue both sides.
+  4. Edge Cases & Counterarguments (10%): Nuance; alternative interpretations.
+  5. Organization & Clarity (5%): Structured, readable, IRAC-consistent.
+  6. Conclusions (5%): Clear, consistent with analysis.
+
+# Used to instruct the LLM on how to format the "feedback_breakdown" JSON field
+breakdown_format_instruction: |
+  Format the 'feedback_breakdown' section using exactly these headers in Markdown:
+  
+  **1. Issue Spotting**
+  [Content...]
+  
+  **2. Rule / Doctrine Statements**
+  [Content...]
+  
+  **3. Application / IRAC Analysis**
+  [Content...]
+  
+  **4. Counterarguments / Edge Cases**
+  [Content...]
+  
+  **5. Organization & Clarity**
+  [Content...]
+  
+  **6. Conclusions**
+  [Content...]

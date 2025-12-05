@@ -1,0 +1,81 @@
+# prompts/exam-feedback.yaml
+
+system_prompt: |
+  You are an expert Law School Professor and Bar Exam Grader. You possess deep knowledge of Black Letter Law across all domains (Torts, Contracts, Constitutional Law, Criminal Law, Property, Civil Procedure, etc.). You are strict, fair, and constructive.
+
+rubric_generation_prompt: |
+  Analyze the following Fact Pattern Question.
+  1. Infer the specific specific domain of law (e.g., Torts, Contracts, Evidence).
+  2. Create a strict grading rubric. Identify the key legal issues, necessary rules (IRAC), and arguments that a student MUST address to receive full credit.
+  
+  Fact Pattern:
+  {question}
+  
+  Output Format (JSON):
+  {{
+    "course_type": "Inferred Course Name",
+    "rubric_markdown": "Markdown formatted rubric..."
+  }}
+
+grading_prompt: |
+  Grade the Student Answer based on the Rubric provided.
+  
+  Context:
+  {context_chunks}
+
+  Fact Pattern:
+  {question}
+  
+  Rubric:
+  {rubric}
+  
+  Professor Example (if available):
+  {professor_example}
+  
+  Student Answer:
+  {user_answer}
+  
+  Task:
+  Assign a letter grade (A+, A, A-, B+, B, B-, C+, C, C-, D, F). Be strict. High grades require spotting all issues and applying rules correctly.
+  
+  Output only the letter grade (e.g., "B+").
+
+ideal_answer_prompt: |
+  Write a perfect, "A+" caliber Model Answer for the following Fact Pattern.
+  
+  Constraints:
+  - Use standard IRAC (Issue, Rule, Analysis, Conclusion) format where appropriate.
+  - Reference ONLY fundamental/canonical case law that is widely taught in ABA-accredited law schools. Do not hallucinate obscure cases.
+  - Address all issues identified in the grading rubric.
+  
+  Fact Pattern:
+  {question}
+  
+  Rubric:
+  {rubric}
+
+feedback_prompt: |
+  Based on the context below compare the User Answer and the Ideal Answer. Identify positives, shortcomings, areas to improve for full points, and exam day suggestions.
+  
+  User Answer:
+  {user_answer}
+  
+  Ideal Model Answer:
+  {ideal_answer}
+  
+  Format Requirements:
+  - Output in clean Markdown.
+  - Do NOT use surrounding triple ticks (```).
+  - Use the following headers:
+  
+  # Main Argument Analysis
+  ### Pros
+  ### Cons 
+  
+  # Legal Issues
+  ### Correctly Identified
+  ### Missed Issues
+  
+  # Structure & Style
+  
+  # Exam Day Suggestions

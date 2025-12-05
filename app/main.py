@@ -295,13 +295,13 @@ class ChatToNoteRequest(BaseModel):
 
 class ExamGradingRequest(BaseModel):
     user_id: str
+    project_id: str  # Required for RAG isolation and DB constraints
     question: str
     user_answer: str
-    professor_example: Optional[str] = None
-    outline_url: Optional[str] = None # Optional CDN link to PDF/Doc
-    project_id: str # Required for RAG isolation and DB constraints
+    question_type: str = "fact_pattern" # Default rubric
+    professor_example: Optional[str] = None # Optional CDN link to PDF/Doc
+    outline_url: Optional[str] = None
     model_name: str = "gpt-4o"
-
 # ================================================ #
 #               TEST ENDPOINTS
 # ================================================ #
