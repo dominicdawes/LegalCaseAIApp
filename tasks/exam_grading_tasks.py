@@ -260,8 +260,8 @@ class AsyncExamGradingManager:
         course_type, rubric_prompts, main_prompts, model_name
     ) -> Dict:
         """
-        Step 7: The Big One.
-        Generates score and all feedback sections in one JSON object.
+        Step 7: The Big One... ALL FEEDBACK
+        Generates score (89/A-) and all feedback sections in one JSON object.
         """
         llm = LLMFactory.get_client_for("openai", model_name, temperature=0.2, streaming=False)
         
