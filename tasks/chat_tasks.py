@@ -1220,12 +1220,15 @@ class StreamingChatManager:
 
             async with get_db_connection() as conn:
                 async with conn.transaction():
-                    # Update main message
+                    # Final pdate to main message row
                     await conn.execute(
                         """
                         UPDATE messages 
-                        SET content = $1, status = 'complete', 
-                            streaming_complete = true, completed_at = NOW(),
+                        SET content = $1, 
+                            status = 'complete', 
+                            query_response_status = 'query_complete',
+                            streaming_complete = true, 
+                            completed_at = NOW(),
                             metadata = $2
                         WHERE id = $3
                         """,
@@ -1574,10 +1577,10 @@ def rag_chat_task(
                 )
             )
         
-        # Update message status (sync call)
-        supabase_client.table("messages").update({
-            "query_response_status": "complete"
-        }).eq("id", message_id).execute()
+        # # Update message status (sync call)
+        # supabase_client.table("messages").update({
+        #     "query_response_status": "complete"
+        # }).eq("id", message_id).execute()
         
         mode = "streaming" if use_streaming else "legacy"
         logger.info(f"✅ RAG task completed successfully ({mode} mode)")
