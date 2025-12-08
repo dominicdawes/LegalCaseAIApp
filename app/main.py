@@ -666,14 +666,14 @@ async def convert_chat_to_note(request: ChatToNoteRequest):
     """
     try:
         # Validate inputs roughly before queuing
-        if not request.Note_content:
-            raise HTTPException(status_code=400, detail="Note_content cannot be empty")
+        if not request.note_content:
+            raise HTTPException(status_code=400, detail="note_content cannot be empty")
 
         job = convert_chat_to_note_task.apply_async(
             kwargs={
                 "user_id": request.user_id,
                 "project_id": request.project_id,
-                "content": request.Note_content,
+                "content": request.note_content,
                 "note_type": request.note_type,
             }
         )
