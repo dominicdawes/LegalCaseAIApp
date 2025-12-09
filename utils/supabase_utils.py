@@ -143,6 +143,7 @@ def insert_note_supabase_record(
     is_generated,
     is_shareable,
     created_at,
+    num_sources=0,
 ):
     """INSERT note into table public.note"""
     try:
@@ -158,6 +159,7 @@ def insert_note_supabase_record(
                     "created_at": created_at,
                     "is_generated": is_generated,
                     "is_shareable": is_shareable,
+                    "num_sources_based_on": num_sources,
                 }
             )
             .execute()

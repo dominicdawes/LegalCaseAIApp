@@ -164,6 +164,7 @@ class AsyncNoteManager:
         note_title: str,
         provider: str,
         model_name: str,
+        num_sources: int,
         temperature: float = 0.7,
         addtl_params: Optional[Dict] = None,
     ) -> str:
@@ -242,6 +243,7 @@ class AsyncNoteManager:
                     deck_name=note_title,
                     llm_output=note_content,
                     is_essential=(addtl_params or {}).get('is_essential', False),
+                    num_sources=num_sources,
                 )
                 logger.info(f"🃏 Created flashcard deck {deck_id} with {num_cards} cards")
                 
@@ -262,6 +264,7 @@ class AsyncNoteManager:
                     llm_output=note_content,
                     num_questions_requested=num_questions_requested,
                     is_essential=(addtl_params or {}).get('is_essential', False),
+                    num_sources=num_sources,
                 )
                 save_metrics = {
                     "quiz_note_id": str(quiz_note_id),
@@ -277,6 +280,7 @@ class AsyncNoteManager:
                     note_title, 
                     note_content,
                     is_essential=(addtl_params or {}).get('is_essential', False),
+                    num_sources=1
                 )
                 save_metrics = {"storage_type": "regular_note"}
             
@@ -682,7 +686,8 @@ class AsyncNoteManager:
         note_type: str, 
         note_title: str, 
         content: str,
-        is_essential: bool
+        is_essential: bool,
+        num_sources: int,
     ):
         """🆕 Async note persistence with connection pooling"""
         
@@ -693,11 +698,11 @@ class AsyncNoteManager:
                 """
                 INSERT INTO notes (
                     id, user_id, project_id, title, content_markdown, 
-                    note_type, is_generated, is_shareable, created_at, is_essential
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                    note_type, is_generated, is_shareable, created_at, is_essential, num_sources_based_on
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
                 """,
                 str(uuid.uuid4()), user_id, project_id, note_title, content,
-                note_type, True, False, datetime.now(timezone.utc), is_essential
+                note_type, True, False, datetime.now(timezone.utc), is_essential, num_sources
             )
         
         logger.info(f"✅ Note saved successfully")
@@ -708,7 +713,8 @@ class AsyncNoteManager:
         user_id: str, 
         deck_name: str, 
         llm_output: str,
-        is_essential: bool
+        is_essential: bool,
+        num_sources: int,
     ) -> tuple:
         """
         🆕 Async flashcard processing and database insertion
@@ -753,14 +759,14 @@ class AsyncNoteManager:
                         """
                         INSERT INTO notes (
                             id, user_id, project_id, title, note_type, description, 
-                            num_cards, created_at, is_active, is_essential
-                        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                            num_cards, created_at, is_active, is_essential, num_sources_based_on
+                        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10 $11)
                         RETURNING id
                         """,
                         str(uuid.uuid4()), user_id, project_id, 
                         deck_data['deck_name'], "flashcards", deck_data['description'],
                         deck_data['num_cards'], deck_data['created_at'],
-                        deck_data.get('is_active', True), is_essential
+                        deck_data.get('is_active', True), is_essential, num_sources
                     )
                     
                     if not deck_id:
@@ -822,7 +828,8 @@ class AsyncNoteManager:
         quiz_title: str,
         llm_output: str,
         num_questions_requested: int,
-        is_essential: bool
+        is_essential: bool,
+        num_sources: int,
     ) -> tuple:
         """
         🆕 Async quiz processing and database insertion.
@@ -877,13 +884,13 @@ class AsyncNoteManager:
                         """
                         INSERT INTO notes (
                             id, user_id, project_id, title, note_type,
-                            num_questions, created_at, is_generated, is_essential
-                        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                            num_questions, created_at, is_generated, is_essential, num_sources_based_on
+                        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9 $10)
                         RETURNING id
                         """,
                         str(uuid.uuid4()), user_id, project_id,
                         quiz_title, "quiz", num_questions_saved,
-                        datetime.now(timezone.utc), True, is_essential
+                        datetime.now(timezone.utc), True, is_essential, num_sources
                     )
 
                     if not quiz_note_id:
@@ -998,6 +1005,7 @@ def rag_note_task(
     note_title: str,
     provider: str,
     model_name: str,
+    num_sources: int = 1,  # <-- 1 source is the default value
     temperature: float = 0.7,
     addtl_params: Optional[Dict] = None,
 ):
@@ -1039,6 +1047,7 @@ def rag_note_task(
                 note_title=note_title,
                 provider=provider,
                 model_name=model_name,
+                num_sources=num_sources,
                 temperature=temperature,
                 addtl_params=addtl_params,
             )
@@ -1156,6 +1165,7 @@ def save_note(project_id, user_id, note_type, note_title, content):
         is_generated=True,
         is_shareable=False,
         created_at=datetime.now(timezone.utc).isoformat(),
+        num_sources=1,
     )
 
 def trim_context_length(full_context, query, relevant_chunks, model_name, max_tokens):

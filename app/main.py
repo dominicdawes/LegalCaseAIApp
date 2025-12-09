@@ -6,6 +6,7 @@ Main FastAPI script, this is the heart of the web service
 
 import os
 import re       # regex
+from uuid import UUID
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
 from datetime import datetime, timezone
@@ -294,13 +295,13 @@ class ChatToNoteRequest(BaseModel):
     note_type: str = "chat"
 
 class ExamGradingRequest(BaseModel):
-    user_id: str
+    user_id: UUID
     project_id: str  # Required for RAG isolation and DB constraints
     question: str
     user_answer: str
-    question_type: str = "fact_pattern" # Default rubric
-    professor_example: Optional[str] = None # Optional CDN link to PDF/Doc
-    outline_url: Optional[str] = None
+    question_type: str = "fact_pattern"         # Default rubric
+    professor_example: Optional[str] = None     # Optional professor example
+    outline_url: Optional[str] = None           # Optional CDN link to PDF/Doc
     model_name: str = "gpt-4o"
 # ================================================ #
 #               TEST ENDPOINTS
@@ -618,8 +619,8 @@ async def grade_exam_question(request: ExamGradingRequest):
                 "project_id": request.project_id,
                 "question": request.question,
                 "user_answer": request.user_answer,
-                "professor_example": request.professor_example,
-                "outline_url": request.outline_url,
+                "professor_example": request.professor_example,     # Optional professor example
+                "outline_url": request.outline_url,                 # Optional CDN link to PDF/Doc
                 "model_name": request.model_name
             }
         )
@@ -945,8 +946,9 @@ async def generate_note(
                 "note_title":    request.metadata["note_title"],    # ← "project_name: question type"
                 "provider":      request.metadata["provider"],
                 "model_name":    request.metadata["model_name"],    # ← maps to your model_name param
-                "temperature":   request.metadata["temperature"],
-                "addtl_params":  request.metadata["addtl_params"]       # ← Dict passed in by WeWeb/postman 
+                "temperature":   request.metadata["temperature"],   
+                "num_sources":   request.metadata["num_sources"],   # this is new to capture selected source use
+                "addtl_params":  request.metadata["addtl_params"]   # ← Dict passed in by WeWeb/postman (num_questions, num_cards, num_sources)
             }
         )
         # Poll in postman: "my_domain.com/task-status/{task_id}"

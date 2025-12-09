@@ -356,7 +356,7 @@ exam_manager = AsyncExamGradingManager()
 def grade_exam_question_workflow(
     self,
     user_id: str,
-    project_id: str,
+    project_id: Optional[str],
     question: str,
     user_answer: str,
     question_type: str = "fact_pattern",
@@ -368,6 +368,12 @@ def grade_exam_question_workflow(
     Celery task wrapper for the async grading workflow.
     Executes in the persistent worker loop to avoid event loop conflicts.
     """
+
+# Generate a new UUID if project_id is missing
+    if project_id is None: 
+        # uuid4() creates a random UUID, standard for Supabase/Postgres Primary Keys
+        project_id = str(uuid.uuid4())
+
     try:
         self.update_state(state="STARTED")
         
