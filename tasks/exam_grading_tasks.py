@@ -32,7 +32,8 @@ from utils.exam_processor.exam_grading_processor import ExamGradingProcessor
 # ——— CONFIG ———————————————————————————————————————————————————————————————————
 logger = get_task_logger(__name__)
 MAIN_PROMPT_FILE = "exam-feedback.yaml"
-RUBRIC_DIR = "prompts/rubrics/"
+# The loader already assumes we are in the 'prompts' directory
+RUBRIC_DIR = "rubrics/"
 
 class ExamGradingStatus(Enum):
     INITIALIZED = "INITIALIZED"
