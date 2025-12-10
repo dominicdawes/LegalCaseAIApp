@@ -99,7 +99,10 @@ class AsyncExamGradingManager:
             if outline_url:
                 await self._update_status(grading_id, ExamGradingStatus.PROCESSING_OUTLINE)
                 outline_doc_id = await self._ingest_outline(
-                    user_id, project_id, outline_url, grading_id
+                    user_id, 
+                    project_id, 
+                    outline_url, 
+                    grading_id
                 )
             
             # 4. FETCH RAG CONTEXT (If Outline Exists)
@@ -113,13 +116,22 @@ class AsyncExamGradingManager:
 
             # 5. ANALYZE QUESTION & GENERATE RUBRIC
             await self._update_status(grading_id, ExamGradingStatus.ANALYZING_QUESTION)
-            rubric_data = await self._analyze_question(question, model_name, model_provider, main_prompts)
+            rubric_data = await self._analyze_question(
+                question, 
+                model_name, 
+                model_provider, 
+                main_prompts
+            )
             
             # 6. GENERATE IDEAL ANSWER
             # Independent of student answer, useful for "Compare/Contrast"
             await self._update_status(grading_id, ExamGradingStatus.GENERATING_SOLUTION)
             ideal_answer = await self._generate_ideal_answer(
-                question, rubric_data['rubric_markdown'], model_name, model_provider, main_prompts
+                question, 
+                rubric_data['rubric_markdown'], 
+                model_name, 
+                model_provider, 
+                main_prompts
             )
             
             # Save intermediate results
@@ -427,13 +439,13 @@ def grade_exam_question_workflow(
 
     except Exception as e:
         logger.error(f"Exam grading task failed: {e}")
-        # Log to Supabase error table
         log_llm_error(
             supabase_client, 
             table_name="exam_grading", 
             task_name="grade_exam_question_workflow",
             error_message=str(e),
             project_id=project_id,
-            user_id=user_id
+            user_id=user_id,
+            record_id=grading_id # <--- Pass the UUID here!
         )
         raise

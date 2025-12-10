@@ -1,6 +1,10 @@
 # utils/exam_grading_processor.py
 
 import json
+try:
+    from json_repair import repair_json
+except ImportError:
+    repair_json = None
 import re
 import logging
 from typing import Dict, Any, Optional, List
@@ -58,31 +62,49 @@ class ExamGradingProcessor:
         return None
 
     @classmethod
-    def process_and_validate_json(cls, raw_llm_output: str) -> Dict[str, Any]:
-        """
-        Performs multi-step cleanup and parsing of the raw LLM string.
-        Raises ValueError if final output is not valid or missing required keys.
-        """
-        
-        cleaned_text = cls._clean_text_wrapper(raw_llm_output)
-        
-        # 1. Attempt standard JSON load
+    def process_and_validate_json(raw_response):
+        # 1. Try standard cleaning first
+        cleaned_text = ... # your existing cleaning logic
+
         try:
-            data = json.loads(cleaned_text)
-        except json.JSONDecodeError as e:
-            logger.warning(f"Initial JSON decode failed: {e}. Attempting regex salvage.")
+            return json.loads(cleaned_text)
+        except json.JSONDecodeError:
+            # 2. Fallback to json_repair if installed
+            if repair_json:
+                print("⚠️ Standard JSON parse failed, attempting json_repair...")
+                try:
+                    repaired_json = repair_json(cleaned_text)
+                    return json.loads(repaired_json)
+                except Exception:
+                    pass # Fall through to error
+
+            # 3. Raise error if all else fails
+            raise ValueError("Could not find or salvage JSON object from LLM response.")
+    # def process_and_validate_json(cls, raw_llm_output: str) -> Dict[str, Any]:
+    #     """
+    #     Performs multi-step cleanup and parsing of the raw LLM string.
+    #     Raises ValueError if final output is not valid or missing required keys.
+    #     """
+        
+    #     cleaned_text = cls._clean_text_wrapper(raw_llm_output)
+        
+    #     # 1. Attempt standard JSON load
+    #     try:
+    #         data = json.loads(cleaned_text)
+    #     except json.JSONDecodeError as e:
+    #         logger.warning(f"Initial JSON decode failed: {e}. Attempting regex salvage.")
             
-            # 2. Attempt regex salvage
-            salvaged_text = cls._extract_json_with_regex(raw_llm_output)
-            if not salvaged_text:
-                raise ValueError("Could not find or salvage JSON object from LLM response.")
+    #         # 2. Attempt regex salvage
+    #         salvaged_text = cls._extract_json_with_regex(raw_llm_output)
+    #         if not salvaged_text:
+    #             raise ValueError("Could not find or salvage JSON object from LLM response.")
             
-            # 3. Attempt JSON load on salvaged text
-            try:
-                data = json.loads(salvaged_text)
-            except json.JSONDecodeError as e_final:
-                logger.error(f"Final JSON decode failed after salvage: {e_final}")
-                raise ValueError("LLM returned unparsable JSON even after cleanup and salvage.")
+    #         # 3. Attempt JSON load on salvaged text
+    #         try:
+    #             data = json.loads(salvaged_text)
+    #         except json.JSONDecodeError as e_final:
+    #             logger.error(f"Final JSON decode failed after salvage: {e_final}")
+    #             raise ValueError("LLM returned unparsable JSON even after cleanup and salvage.")
         
         # 4. Final Validation
         missing_keys = [key for key in cls.REQUIRED_KEYS if key not in data]

@@ -64,6 +64,7 @@ pydgraph>=21.12.0
 # Fuzzy logic
 fuzzywuzzy==0.18.0
 python-Levenshtein>=0.20.9
+json_repair
 
 # Optional: LightRAG server features
 # lightrag-hku[api]==1.3.7

@@ -303,9 +303,38 @@ def log_llm_error(
     project_id=None, 
     chat_session_id=None, 
     user_id=None, 
-    note_type=None
+    note_type=None,
+    record_id=None
 ):
-    """Insert a log row for LLM related errors for `public.messages` and `public.notes`"""
+    """
+    Insert a log row for LLM related errors for `public.messages` and `public.notes`
+    """
+
+# ——— CASE 1: UPDATE (Exam Grading) —————————————————————————
+    if table_name == "exam_grading":
+        if not record_id:
+            logger.error(f"❌ Cannot update {table_name}: Missing record_id")
+            return
+
+        payload = {
+            "error_msg": error_message,
+            "grading_progress": "ERROR", # Ensure this matches your DB Enum casing!
+            # "user_id": user_id,        # Usually not needed for an update, but safe to keep
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        
+        try:
+            # IMPORTANT: Added .eq('id', record_id)
+            client.table(table_name).update(payload).eq('id', record_id).execute()
+            logger.info(f"✅ Updated error status for exam grading {record_id}")
+        except Exception as e:
+            logger.error(f"❌ Failed to update exam grading error: {e}", exc_info=True)
+            
+        return # <--- CRITICAL: Stop here so we don't try to INSERT below
+
+    # ——— CASE 2: INSERT (Messages / Notes) —————————————————————
+    payload = None
+    
     if table_name == "messages":
         payload = {
             "user_id": user_id,
@@ -316,7 +345,7 @@ def log_llm_error(
             "created_at": datetime.now(timezone.utc).isoformat(),
             "role": "assistant",
             "status": "error",
-            "streaming_complete": True, # <-- There is an error being logged, and streaming is complete frees up the front-end UI, 
+            "streaming_complete": True, 
         }
     elif table_name == "notes":
         payload = {
@@ -327,7 +356,10 @@ def log_llm_error(
             "user_id": user_id,
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
-    try:
-        client.table(table_name).insert(payload).execute()
-    except Exception as e:
-        logger.error(f"Failed to log LLM error: {e}", exc_info=True)
+
+    # Only run insert if we built a payload for messages or notes
+    if payload:
+        try:
+            client.table(table_name).insert(payload).execute()
+        except Exception as e:
+            logger.error(f"❌ Failed to log LLM error: {e}", exc_info=True)
