@@ -296,7 +296,7 @@ class ChatToNoteRequest(BaseModel):
 
 class ExamGradingRequest(BaseModel):
     user_id: UUID
-    project_id: Optional[str] = None # Required for RAG isolation and DB constraints
+    project_id: Optional[UUID] = None  # Change str to UUID here
     question: str
     user_answer: str
     question_type: str = "fact_pattern"         # Default rubric
@@ -606,21 +606,27 @@ async def grade_exam_question(request: ExamGradingRequest):
     and runs a multi-stage grading and feedback pipeline.
     """
     try:
-        # Validate UUIDs
-        try:
-            uuid.UUID(request.user_id)
-            uuid.UUID(request.project_id)
-        except ValueError:
-            raise HTTPException(status_code=400, detail="Invalid user_id or project_id UUID format")
+        # ——— DELETE THIS BLOCK ———
+        # Pydantic already validated user_id. 
+        # Also, checking project_id here would crash if it is None.
+        # try:
+        #     uuid.UUID(request.user_id)
+        #     uuid.UUID(request.project_id)
+        # except ValueError:
+        #     raise HTTPException(status_code=400, detail="Invalid user_id or project_id UUID format")
+        # —————————————————————————
 
+        # Note: You might need to cast user_id back to str for Celery 
+        # if your Celery serializer is JSON (which doesn't support UUID objects natively)
+        
         job = grade_exam_question_workflow.apply_async(
             kwargs={
-                "user_id": request.user_id,
-                "project_id": request.project_id,
+                "user_id": str(request.user_id),          # Cast to string for Celery
+                "project_id": request.project_id,         # Already optional str
                 "question": request.question,
                 "user_answer": request.user_answer,
-                "professor_example": request.professor_example,     # Optional professor example
-                "outline_url": request.outline_url,                 # Optional CDN link to PDF/Doc
+                "professor_example": request.professor_example,
+                "outline_url": request.outline_url,
                 "model_name": request.model_name
             }
         )
