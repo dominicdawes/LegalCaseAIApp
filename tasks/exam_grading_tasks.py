@@ -68,7 +68,8 @@ class AsyncExamGradingManager:
         question_type: str, 
         professor_example: Optional[str],
         outline_url: Optional[str],
-        model_name: str
+        model_name: str,
+        model_provider: str,
     ):
         """Main Orchestrator for the Grading Pipeline"""
         
@@ -112,7 +113,7 @@ class AsyncExamGradingManager:
 
             # 5. ANALYZE QUESTION & GENERATE RUBRIC
             await self._update_status(grading_id, ExamGradingStatus.ANALYZING_QUESTION)
-            rubric_data = await self._analyze_question(question, model_name, main_prompts)
+            rubric_data = await self._analyze_question(question, model_name, model_provider, main_prompts)
             
             # 6. GENERATE IDEAL ANSWER
             # Independent of student answer, useful for "Compare/Contrast"
@@ -143,7 +144,8 @@ class AsyncExamGradingManager:
                 course_type=rubric_data['course_type'],
                 rubric_prompts=rubric_prompts, # Contains specific formatting rules
                 main_prompts=main_prompts,
-                model_name=model_name
+                model_name=model_name,
+                model_provider=model_provider
             )
 
             # 8. DETERMINISTIC LETTER GRADE
@@ -238,18 +240,28 @@ class AsyncExamGradingManager:
 
     # ——— Helper Methods: LLM Interactions ————————————————————————————————————
 
-    async def _analyze_question(self, question, model_name, prompts) -> Dict:
+    async def _analyze_question(self, question, model_name, model_provider, prompts) -> Dict:
         """Step 5: Infer Course Type"""
-        llm = LLMFactory.get_client_for("openai", model_name, temperature=0.2, streaming=False)
+        llm = LLMFactory.get_client_for(
+            provider=model_provider, 
+            model_name=model_name, 
+            temperature=0.2, 
+            streaming=False
+        )
         prompt = f"{prompts['system_prompt']}\n\n{prompts['rubric_generation_prompt']}".format(
             question=question
         )
         response = await asyncio.get_event_loop().run_in_executor(None, llm.chat, prompt)
         return self._parse_json_simple(response)
 
-    async def _generate_ideal_answer(self, question, rubric, model_name, prompts) -> str:
+    async def _generate_ideal_answer(self, question, rubric, model_name, model_provider, prompts) -> str:
         """Step 6: Generate Model 'Legalnote' Answer"""
-        llm = LLMFactory.get_client_for("openai", model_name, temperature=0.3, streaming=False)
+        llm = LLMFactory.get_client_for(
+            provider=model_provider, 
+            model_name=model_name, 
+            temperature=0.3, 
+            streaming=False
+        )
         prompt = prompts['ideal_answer_prompt'].format(
             question=question,
             rubric=rubric
@@ -258,13 +270,18 @@ class AsyncExamGradingManager:
 
     async def _generate_granular_feedback(
         self, question, user_answer, professor_example, ideal_answer, rag_context, 
-        course_type, rubric_prompts, main_prompts, model_name
+        course_type, rubric_prompts, main_prompts, model_name, model_provider
     ) -> Dict:
         """
         Step 7: The Big One... ALL FEEDBACK
         Generates score (89/A-) and all feedback sections in one JSON object.
         """
-        llm = LLMFactory.get_client_for("openai", model_name, temperature=0.2, streaming=False)
+        llm = LLMFactory.get_client_for(
+            provider=model_provider, 
+            model_name=model_name, 
+            temperature=0.2, 
+            streaming=False
+        )
         
         prof_ex_text = professor_example if professor_example else "Not provided."
         
@@ -363,7 +380,8 @@ def grade_exam_question_workflow(
     question_type: str = "fact_pattern",
     professor_example: Optional[str] = None,
     outline_url: Optional[str] = None,
-    model_name: str = "gpt-4o"
+    model_name: str = "gpt-4o",
+    model_provider: str = "opwnai"
 ):
     """
     Celery task wrapper for the async grading workflow.
@@ -387,7 +405,8 @@ def grade_exam_question_workflow(
                 question_type=question_type,
                 professor_example=professor_example,
                 outline_url=outline_url,
-                model_name=model_name
+                model_name=model_name,
+                model_provider=model_provider
             )
         )
         

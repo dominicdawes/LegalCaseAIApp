@@ -303,6 +303,7 @@ class ExamGradingRequest(BaseModel):
     professor_example: Optional[str] = None     # Optional professor example
     outline_url: Optional[str] = None           # Optional CDN link to PDF/Doc
     model_name: str = "gpt-4o"
+    model_provider: str = "openai"
 # ================================================ #
 #               TEST ENDPOINTS
 # ================================================ #
@@ -627,7 +628,8 @@ async def grade_exam_question(request: ExamGradingRequest):
                 "user_answer": request.user_answer,
                 "professor_example": request.professor_example,
                 "outline_url": request.outline_url,
-                "model_name": request.model_name
+                "model_name": request.model_name,
+                "model_provider": request.model_provider
             }
         )
         
