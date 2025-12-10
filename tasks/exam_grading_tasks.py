@@ -119,7 +119,7 @@ class AsyncExamGradingManager:
             # Independent of student answer, useful for "Compare/Contrast"
             await self._update_status(grading_id, ExamGradingStatus.GENERATING_SOLUTION)
             ideal_answer = await self._generate_ideal_answer(
-                question, rubric_data['rubric_markdown'], model_name, main_prompts
+                question, rubric_data['rubric_markdown'], model_name, model_provider, main_prompts
             )
             
             # Save intermediate results
@@ -240,7 +240,13 @@ class AsyncExamGradingManager:
 
     # ——— Helper Methods: LLM Interactions ————————————————————————————————————
 
-    async def _analyze_question(self, question, model_name, model_provider, prompts) -> Dict:
+    async def _analyze_question(
+        self, 
+        question: str, 
+        model_name: str, 
+        model_provider: str, 
+        prompts: str, 
+    ) -> Dict:
         """Step 5: Infer Course Type"""
         llm = LLMFactory.get_client_for(
             provider=model_provider, 
@@ -254,7 +260,14 @@ class AsyncExamGradingManager:
         response = await asyncio.get_event_loop().run_in_executor(None, llm.chat, prompt)
         return self._parse_json_simple(response)
 
-    async def _generate_ideal_answer(self, question, rubric, model_name, model_provider, prompts) -> str:
+    async def _generate_ideal_answer(
+        self, 
+        question: str,  
+        rubric: str, 
+        model_name: str, 
+        model_provider: str,  
+        prompts: str, 
+    ) -> str:
         """Step 6: Generate Model 'Legalnote' Answer"""
         llm = LLMFactory.get_client_for(
             provider=model_provider, 
