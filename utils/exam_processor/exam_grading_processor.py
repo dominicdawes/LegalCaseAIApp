@@ -61,14 +61,21 @@ class ExamGradingProcessor:
             return match.group(0)
         return None
 
-    @classmethod
+    @staticmethod
     def process_and_validate_json(raw_response):
-        # 1. Try standard cleaning first
-        cleaned_text = ... # your existing cleaning logic
+        """
+        Parses LLM output into JSON. 
+        Uses json_repair if standard parsing fails.
+        """
+        
+        # Simple cleanup (strips markdown code blocks)
+        cleaned_text = raw_response.replace("```json", "").replace("```", "").strip()
 
+        # 1. Try standard JSON load
         try:
             return json.loads(cleaned_text)
         except json.JSONDecodeError:
+            
             # 2. Fallback to json_repair if installed
             if repair_json:
                 print("⚠️ Standard JSON parse failed, attempting json_repair...")
