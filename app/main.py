@@ -296,7 +296,7 @@ class ChatToNoteRequest(BaseModel):
 
 class ExamGradingRequest(BaseModel):
     user_id: UUID
-    project_id: str  # Required for RAG isolation and DB constraints
+    project_id: Optional[str] = None # Required for RAG isolation and DB constraints
     question: str
     user_answer: str
     question_type: str = "fact_pattern"         # Default rubric
