@@ -760,7 +760,7 @@ class AsyncNoteManager:
                         INSERT INTO notes (
                             id, user_id, project_id, title, note_type, description, 
                             num_cards, created_at, is_active, is_essential, num_sources_based_on
-                        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10 $11)
+                        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
                         RETURNING id
                         """,
                         str(uuid.uuid4()), user_id, project_id, 
@@ -885,7 +885,7 @@ class AsyncNoteManager:
                         INSERT INTO notes (
                             id, user_id, project_id, title, note_type,
                             num_questions, created_at, is_generated, is_essential, num_sources_based_on
-                        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9 $10)
+                        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
                         RETURNING id
                         """,
                         str(uuid.uuid4()), user_id, project_id,
