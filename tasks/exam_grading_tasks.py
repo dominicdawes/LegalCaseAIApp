@@ -76,11 +76,15 @@ class AsyncExamGradingManager:
         await self.initialize()
         grading_id = str(uuid.uuid4())
         start_time = time.time()
+
+        # Check question_type formatting
+        if question_type == "fact_pattern":
+            yaml_question_type = "fact-pattern"
         
         try:
             # 1. LOAD PROMPTS (Main + Specific Rubric)
             main_prompts = await self._load_yaml(MAIN_PROMPT_FILE)
-            rubric_prompts = await self._load_rubric(question_type)
+            rubric_prompts = await self._load_rubric(yaml_question_type)
 
             # 2. INITIALIZE DB RECORD
             # We persist professor_example immediately so it is safe
@@ -308,19 +312,30 @@ class AsyncExamGradingManager:
             streaming=False
         )
         
-        prof_ex_text = professor_example if professor_example else "Not provided."
-        
-        # Inject dynamic rubric parts into main prompt
-        final_prompt = main_prompts['grading_feedback_prompt'].format(
-            question=question,
-            course_type=course_type,
-            user_answer=user_answer,
-            professor_example=prof_ex_text,
-            ideal_answer=ideal_answer,
-            rag_context=rag_context or "No specific outline provided.",
-            grading_criteria=rubric_prompts['grading_criteria'],
-            breakdown_format_instruction=rubric_prompts['breakdown_format_instruction']
-        )
+        if professor_example:
+            # Case A: Professor Example Provided
+            final_prompt = main_prompts['grading_feedback_prompt_with_professor'].format(
+                question=question,
+                course_type=course_type,
+                user_answer=user_answer,
+                professor_example=professor_example, # <--- Used here
+                ideal_answer=ideal_answer,
+                rag_context=rag_context or "No specific outline provided.",
+                grading_criteria=rubric_prompts['grading_criteria'],
+                breakdown_format_instruction=rubric_prompts['breakdown_format_instruction']
+            )
+        else:
+            # Case B: No Professor Example (Use Base Prompt)
+            final_prompt = main_prompts['grading_feedback_prompt_base'].format(
+                question=question,
+                course_type=course_type,
+                user_answer=user_answer,
+                # professor_example is omitted from format arguments as the prompt won't have the placeholder
+                ideal_answer=ideal_answer,
+                rag_context=rag_context or "No specific outline provided.",
+                grading_criteria=rubric_prompts['grading_criteria'],
+                breakdown_format_instruction=rubric_prompts['breakdown_format_instruction']
+            )
         
         # Call LLM
         raw_response = await asyncio.get_event_loop().run_in_executor(None, llm.chat, final_prompt)

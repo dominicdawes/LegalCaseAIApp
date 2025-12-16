@@ -16,16 +16,79 @@ ideal_answer_prompt: |
   Question: {question}
   Rubric: {rubric}
 
-# Step 3: Grading & Granular Feedback (Updated with CRITICAL instructions)
-grading_feedback_prompt: |
-  You are grading a student's answer against a specific Rubric and, if available, a Professor's Model Answer.
+# Step 3A: Grading & Feedback (Base - NO Professor Example)
+grading_feedback_prompt_base: |
+  You are grading a student's answer against a specific Rubric.
   
   --- CONTEXT ---
   Question: {question}
-  # ... (other context) ...
-
+  Course/Domain: {course_type}
+  
+  Student Answer:
+  {user_answer}
+  
+  AI Generated Ideal Answer (For structural comparison):
+  {ideal_answer}
+  
+  Context/Outline: 
+  {rag_context}
+  
+  --- RUBRIC CRITERIA ---
+  {grading_criteria}
+  
+  --- FORMATTING INSTRUCTIONS ---
+  {breakdown_format_instruction}
+  
   --- TASK ---
-  1. Assign a Score (0-100). If the Student Answer matches the depth of the Professor Example, score highly.
+  1. Assign a Score (0-100). Be strict. 85+ is excellent.
+  2. Generate Overview (2-3 sentences).
+  3. Generate Breakdown (Specific analysis per rubric section).
+  4. Identify Strengths (Bulleted list).
+  5. Identify Weaknesses/Improvements (Bulleted list).
+  
+  --- OUTPUT FORMAT ---
+  **CRITICAL INSTRUCTIONS:**
+  **1. Return ONLY the JSON object.**
+  **2. DO NOT include any surrounding text, markdown wrappers (e.g., ```json or ```), or triple quotes.**
+  **3. All keys and values must conform to valid JSON standards (e.g., all strings must be properly escaped).**
+  
+  Return ONLY valid JSON with these keys:
+  {{
+    "exam_grade_percentage": (integer),
+    "feedback_overview": (markdown string),
+    "feedback_breakdown": (markdown string matching the requested headers),
+    "feedback_strength": (markdown string),
+    "feedback_weakness": (markdown string)
+  }}
+
+# Step 3B: Grading & Feedback (WITH Professor Example)
+grading_feedback_prompt_with_professor: |
+  You are grading a student's answer against a specific Rubric and a Professor's Model Answer.
+  
+  --- CONTEXT ---
+  Question: {question}
+  Course/Domain: {course_type}
+  
+  Student Answer:
+  {user_answer}
+
+  Professor/Benchmark Example (Use this as the gold standard for depth/nuance):
+  {professor_example}
+  
+  AI Generated Ideal Answer (For structural comparison):
+  {ideal_answer}
+  
+  Context/Outline: 
+  {rag_context}
+  
+  --- RUBRIC CRITERIA ---
+  {grading_criteria}
+  
+  --- FORMATTING INSTRUCTIONS ---
+  {breakdown_format_instruction}
+  
+  --- TASK ---
+  1. Assign a Score (0-100). If the Student Answer matches the reasoning/depth of the Professor Example, score highly. If they deviate from the Professor's specific reasoning, penalize them.
   2. Generate Overview.
   3. Generate Breakdown (Specific analysis per rubric section).
   4. Identify Strengths.

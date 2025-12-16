@@ -79,3 +79,36 @@ feedback_prompt: |
   # Structure & Style
   
   # Exam Day Suggestions
+
+
+---
+
+# Step 3: Grading & Granular Feedback (Updated with CRITICAL instructions)
+grading_feedback_prompt: |
+  You are grading a student's answer against a specific Rubric and, if available, a Professor's Model Answer.
+  
+  --- CONTEXT ---
+  Question: {question}
+  # ... (other context) ...
+
+  --- TASK ---
+  1. Assign a Score (0-100). If the Student Answer matches the depth of the Professor Example, score highly.
+  2. Generate Overview.
+  3. Generate Breakdown (Specific analysis per rubric section).
+  4. Identify Strengths.
+  5. Identify Weaknesses/Improvements.
+  
+  --- OUTPUT FORMAT ---
+  **CRITICAL INSTRUCTIONS:**
+  **1. Return ONLY the JSON object.**
+  **2. DO NOT include any surrounding text, markdown wrappers (e.g., ```json or ```), or triple quotes.**
+  **3. All keys and values must conform to valid JSON standards (e.g., all strings must be properly escaped).**
+  
+  Return ONLY valid JSON with these keys:
+  {{
+    "exam_grade_percentage": (integer),
+    "feedback_overview": (markdown string),
+    "feedback_breakdown": (markdown string matching the requested headers),
+    "feedback_strength": (markdown string),
+    "feedback_weakness": (markdown string)
+  }}
