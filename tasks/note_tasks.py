@@ -494,7 +494,7 @@ class AsyncNoteManager:
         if not yaml_file:
             raise ValueError(f"Unknown note_type: {note_type}")
         
-        logger.info(f"📋 Loading prompt for note type: {note_type}")
+        logger.info(f"📋 Loading prompt YAML for NOTE TYPE: {note_type}")
         
         # Run in thread pool to avoid blocking
         loop = asyncio.get_event_loop()
@@ -588,80 +588,72 @@ class AsyncNoteManager:
         return chunks
 
     def _build_note_context(
-            self, 
-            prompt_yaml: Dict,
-            relevant_chunks: List[Dict], 
-            note_type: str, 
-            addtl_params: Dict
-        ) -> str:
-            """
-            Build context for note generation with smart parameter 
-            handling (organized by page numbers)
-            """
-            # Build page number dictionary (for note citations etc...)
-            pages_dict = {}
-            for chunk in relevant_chunks:
-                page_num = chunk.get('page_number') or 'Unknown'
-                if page_num not in pages_dict:
-                    pages_dict[page_num] = []
-                pages_dict[page_num].append(chunk)
-            
-            page_contexts = []
-            for page_num in sorted(pages_dict.keys(), key=lambda x: x if isinstance(x, int) else float('inf')):
-                chunks_on_page = pages_dict[page_num]
-                page_content = "\n".join(chunk["content"] for chunk in chunks_on_page)
-                page_contexts.append(
-                    f"=== Page {page_num} ===\n"
-                    f"Source: {chunks_on_page[0].get('title', 'Unknown Document')}\n"
-                    f"{page_content}\n"
-                )
-            chunk_context = "\n".join(page_contexts)
+        self, 
+        prompt_yaml: Dict,
+        relevant_chunks: List[Dict], 
+        note_type: str, 
+        addtl_params: Dict
+    ) -> str:
+        """
+        Build context for note generation with smart parameter 
+        handling (organized by page numbers)
+        """
+        # 1. Build Page Context (Standard for all)
+        pages_dict = {}
+        for chunk in relevant_chunks:
+            page_num = chunk.get('page_number') or 'Unknown'
+            if page_num not in pages_dict:
+                pages_dict[page_num] = []
+            pages_dict[page_num].append(chunk)
         
-            # Format yaml prompt dictionary
-            # We now fetch the system_prompt, (NOT the old base_prompt)
-            system_prompt = prompt_yaml.get("system_prompt", "")  # Use system_prompt
-            prompt_template = build_prompt_template_from_yaml(prompt_yaml)
-            
-            # Handle note-type specific YAML parameters
-            if note_type == "exam_questions":
-                example = prompt_yaml.get("example_issue_spotter", "")
-                num_questions = addtl_params.get("num_questions", 10)
-                
-                final_request = prompt_template.format(
-                    context=chunk_context, 
-                    n_questions=num_questions
-                )
-                # Assemble with the special example
-                # USE system_prompt
-                context = f"{system_prompt}\n\n## GOLD-STANDARD EXAMPLE\n{example}\n\n## YOUR TASK\n{final_request}"
+        page_contexts = []
+        for page_num in sorted(pages_dict.keys(), key=lambda x: x if isinstance(x, int) else float('inf')):
+            chunks_on_page = pages_dict[page_num]
+            page_content = "\n".join(chunk["content"] for chunk in chunks_on_page)
+            page_contexts.append(
+                f"=== Page {page_num} ===\n"
+                f"Source: {chunks_on_page[0].get('title', 'Unknown Document')}\n"
+                f"{page_content}\n"
+            )
+        chunk_context = "\n".join(page_contexts)
+    
+        # 2. Extract Standard Keys
+        # NOW STANDARDIZED: Every YAML must have system_prompt and template
+        system_prompt = prompt_yaml.get("system_prompt", "You are a helpful AI research assistant.")
+        prompt_template = build_prompt_template_from_yaml(prompt_yaml)
+        
+        # 3. Handle Variable Injection (Custom Logic only where vars differ)
+        if note_type == "exam_questions":
+            # Special Case: Exam questions needs example injection
+            example = prompt_yaml.get("example_issue_spotter", "")
+            num_questions = addtl_params.get("num_questions", 10)
+            formatted_template = prompt_template.format(
+                context=chunk_context, 
+                n_questions=num_questions
+            )
+            # Inject example between system and template
+            final_context = f"{system_prompt}\n\n## GOLD-STANDARD EXAMPLE\n{example}\n\n## YOUR TASK\n{formatted_template}"
 
-            elif note_type in ["flashcards", "cold_call"]:
-                num_cards = addtl_params.get("num_cards", 10)
-                
-                formatted_template = prompt_template.format(
-                    context=chunk_context, 
-                    num_cards=num_cards
-                )
-                # USE system_prompt
-                context = f"{system_prompt}\n\n{formatted_template}"
-
-            elif note_type == "quiz":
-                num_questions = addtl_params.get("num_questions", 10)
-                
-                formatted_template = prompt_template.format(
-                    context=chunk_context, 
-                    num_questions=num_questions
-                )
-                # USE system_prompt
-                context = f"{system_prompt}\n\n{formatted_template}"
-            else:
-                # For other note types
-                formatted_template = prompt_template.format(context=chunk_context)
-                # USE system_prompt
-                context = f"{system_prompt}\n\n{formatted_template}"
+        elif note_type in ["flashcards", "cold_call", "quiz"]:
+            # Special Case: Numeric parameters
+            count_param = "num_questions" if note_type == "quiz" else "num_cards"
+            count_val = addtl_params.get(count_param, 10)
             
-            logger.info(f"📝 Built context: {len(context)} characters")
-            return context
+            # Dynamic kwarg unpacking for format
+            fmt_args = {"context": chunk_context}
+            fmt_args[count_param] = count_val
+            
+            formatted_template = prompt_template.format(**fmt_args)
+            final_context = f"{system_prompt}\n\n{formatted_template}"
+
+        else:
+            # Standard Case (Attack Outline, Case Brief, Outline, Summary)
+            # Relies purely on standardized YAML keys
+            formatted_template = prompt_template.format(context=chunk_context)
+            final_context = f"{system_prompt}\n\n{formatted_template}"
+        
+        logger.info(f"📝 Built context: {len(final_context)} characters")
+        return final_context
 
     async def _generate_note_content_async(
         self, llm_client, context: str, provider: str
