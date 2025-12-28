@@ -35,6 +35,9 @@ MAIN_PROMPT_FILE = "exam-feedback.yaml"
 # The loader already assumes we are in the 'prompts' directory
 RUBRIC_DIR = "rubrics/"
 
+# Standard limit for JSON tasks (Rubric, Feedback)
+DEFAULT_MAX_TOKENS = 4096 
+
 class ExamGradingStatus(Enum):
     INITIALIZED = "INITIALIZED"
     PROCESSING_OUTLINE = "PROCESSING_OUTLINE"
@@ -59,6 +62,24 @@ class AsyncExamGradingManager:
             await init_async_pools()
             self._initialized = True
 
+    def _get_dynamic_max_tokens(self, model_name: str) -> int:
+        """
+        Determines the safe amx output token limit based on model capabilities.
+        e.g. gemini-3-pro=32k, gpt-4o=16k
+        """
+        name = model_name.lower()
+        
+        if "gpt-5" in name:
+            return 128000
+        if "gemini-3" in name: # Pro and Flash Previews
+            return 32000
+        if "gpt-4o" in name:
+            return 16384
+        if "claude" in name and "sonnet" in name:
+            return 8192 # Standard API max for Sonnet 3.5
+        
+        return 8192 # Safe high default for other models
+    
     async def run_grading_workflow(
         self,
         user_id: str,
@@ -268,7 +289,8 @@ class AsyncExamGradingManager:
             provider=model_provider, 
             model_name=model_name, 
             temperature=0.2, 
-            streaming=False
+            streaming=False,
+            max_output_tokens=DEFAULT_MAX_TOKENS
         )
         prompt = f"{prompts['system_prompt']}\n\n{prompts['rubric_generation_prompt']}".format(
             question=question
@@ -284,12 +306,18 @@ class AsyncExamGradingManager:
         model_provider: str,  
         prompts: str, 
     ) -> str:
+        
+        # Determine max tokens based on the specific model
+        dynamic_max = self._get_dynamic_max_tokens(model_name)
+        logger.info(f"⚖️ Using limit of {dynamic_max} tokens for Ideal Answer generation ({model_name})")
+
         """Step 6: Generate Model 'Legalnote' Answer"""
         llm = LLMFactory.get_client_for(
             provider=model_provider, 
             model_name=model_name, 
             temperature=0.3, 
-            streaming=False
+            streaming=False,
+            max_output_tokens=dynamic_max
         )
         prompt = prompts['ideal_answer_prompt'].format(
             question=question,
@@ -309,7 +337,8 @@ class AsyncExamGradingManager:
             provider=model_provider, 
             model_name=model_name, 
             temperature=0.2, 
-            streaming=False
+            streaming=False,
+            max_output_tokens=DEFAULT_MAX_TOKENS
         )
         
         if professor_example:

@@ -12,13 +12,21 @@ if not ANTHROPIC_API_KEY:
 
 
 class AnthropicClient:
-    def __init__(self, model_name: str = "claude-3-5-sonnet-20240620", temperature: float = 0.7, max_tokens: int = 4096, streaming: bool = False, callback_manager=None, **kwargs):
+    def __init__(
+            self, 
+            model_name: str = "claude-3-5-sonnet-20240620", 
+            temperature: float = 0.7, 
+            max_output_tokens: int = 4096, 
+            streaming: bool = False, 
+            callback_manager=None, 
+            **kwargs
+    ):
         # Use both sync and async clients for flexibility
         self._client = Anthropic(api_key=ANTHROPIC_API_KEY)
         self._async_client = AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
         self.model_name = model_name
         self.temperature = temperature
-        self.max_tokens = max_tokens
+        self.max_tokens = max_output_tokens
         self.streaming = streaming
         self.callback_manager = callback_manager
 

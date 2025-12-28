@@ -15,12 +15,13 @@ https://docs.claude.com/en/docs/about-claude/models/overview
 
 [
 {"order":1,"proTier":false,"provider":"openai","icon_name":"","model_name":"gpt-4o","description":"Fastest and most efficient version of GPT","display_name":"GPT-4o"},
-{"order":2,"proTier":false,"provider":"deepseek","icon_name":"","model_name":"deepseek-chat","description":"The lastest model from Deepseek","display_name":"DeepSeek V3"},
-{"order":3,"proTier":false,"provider":"gemini","icon_name":"","model_name":"gemini-2.5-flash","description":"Google's best model for balancing reasoning and speed","display_name":"Gemini 2.5 Flash"},
-{"order":4,"proTier":false,"provider":"anthropic","icon_name":"","model_name":"claude-3-5-haiku-latest","description":"Intelligence at blazing speeds","display_name":"Claude Haiku 3.5"},
-{"order":5,"proTier":true,"provider":"openai","icon_name":"","model_name":"gpt-5","description":"OpenAI's premiere reasoning model","display_name":"GPT-5 Thinking"},
-{"order":6,"proTier":true,"provider":"gemini","icon_name":"","model_name":"gemini-2.5-pro","description":"Google's most advanced reasoning model","display_name":"Gemini 2.5 Pro"},
-{"order":7,"proTier":true,"provider":"anthropic","icon_name":"","model_name":"claude-sonnet-4-5","description":"Anthropic's flagship intelligence model","display_name":"Claude Sonnet 4.5"}
+{"order":2,"proTier":false,"provider":"deepseek","icon_name":"","model_name":"deepseek-chat","description":"The lastest model from Deepseek","display_name":"DeepSeek V3.2"},
+{"order":3,"proTier":false,"provider":"deepseek","icon_name":"","model_name":"deepseek-reasoner","description":"The flagship reasoning model from Deepseek","display_name":"DeepSeek V3.2 Speciale"},
+{"order":4,"proTier":false,"provider":"gemini","icon_name":"","model_name":"gemini-2.5-flash","description":"Google's best model for balancing reasoning and speed","display_name":"Gemini 2.5 Flash"},
+{"order":5,"proTier":false,"provider":"anthropic","icon_name":"","model_name":"claude-3-5-haiku-latest","description":"Intelligence at blazing speeds","display_name":"Claude Haiku 3.5"},
+{"order":6,"proTier":true,"provider":"openai","icon_name":"","model_name":"gpt-5","description":"OpenAI's premiere reasoning model","display_name":"GPT-5 Thinking"},
+{"order":7,"proTier":true,"provider":"gemini","icon_name":"","model_name":"gemini-2.5-pro","description":"Google's most advanced reasoning model","display_name":"Gemini 2.5 Pro"},
+{"order":8,"proTier":true,"provider":"anthropic","icon_name":"","model_name":"claude-sonnet-4-5","description":"Anthropic's flagship intelligence model","display_name":"Claude Sonnet 4.5"}
 ]
 
 

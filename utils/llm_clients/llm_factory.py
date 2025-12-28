@@ -37,6 +37,7 @@ class LLMFactory:
         model_name: str, 
         temperature: float = 0.7, 
         streaming: bool = True,
+        max_output_tokens: int = 4056,
         **kwargs
     ) -> Any:
         """
@@ -64,6 +65,7 @@ class LLMFactory:
                     model_name=model_name,
                     temperature=temperature,
                     streaming=streaming,
+                    max_output_tokens=max_output_tokens,
                     **kwargs
                 )
             
@@ -73,6 +75,7 @@ class LLMFactory:
                     model_name=model_name,
                     temperature=temperature,
                     streaming=streaming,
+                    max_output_tokens=max_output_tokens,
                     **kwargs
                 )
             
@@ -82,6 +85,7 @@ class LLMFactory:
                     model_name=model_name,
                     temperature=temperature,
                     streaming=streaming,
+                    max_output_tokens=max_output_tokens,
                     **kwargs
                 )
             
@@ -91,6 +95,7 @@ class LLMFactory:
                     model_name=model_name,
                     temperature=temperature,
                     streaming=streaming,
+                    max_output_tokens=max_output_tokens,
                     **kwargs
                 )
             

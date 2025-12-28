@@ -1,7 +1,7 @@
 # prompts/exam-feedback.yaml
 
 system_prompt: |
-  You are an expert Law School Professor. You provide strict, constructive, and granular feedback.
+  You are an expert Law School Professor. You provide strict, constructive, and granular written exam feedback.
   You must output your final analysis in valid JSON format.
 
 # Step 1: Analyze (Same as before)
@@ -12,7 +12,14 @@ rubric_generation_prompt: |
 
 # Step 2: The Ideal Answer (Same as before)
 ideal_answer_prompt: |
-  Write a perfect "A+" Model Answer (IRAC format) for this Fact Pattern.
+  Write a perfect "A+" Law School Exam Essay Answer for this Fact Pattern.
+  
+  --- CONSTRAINTS ---
+  1. **Format:** Use strict IRAC (Issue, Rule, Application, Conclusion) structure.
+  2. **Style:** Academic Exam style, NOT a Legal Memorandum.
+  3. **Forbidden:** Do NOT use "To:", "From:", "Date:", or "Re:" headers.
+  4. **Structure:** Use bold headers for each major issue (e.g., "**I. BATTERY**").
+  
   Question: {question}
   Rubric: {rubric}
 
