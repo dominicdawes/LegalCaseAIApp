@@ -25,9 +25,17 @@ from lightrag.llm.openai import (
     gpt_4o_mini_complete,
     openai_embed
 )
-# DGraph integration
-import pydgraph
-from pydgraph import DgraphClient, DgraphClientStub
+# DGraph integration — imported lazily to avoid crashing Celery if protobuf is misconfigured
+try:
+    import pydgraph
+    from pydgraph import DgraphClient, DgraphClientStub
+    _pydgraph_available = True
+except ImportError as e:
+    pydgraph = None
+    DgraphClient = None
+    DgraphClientStub = None
+    _pydgraph_available = False
+    logging.getLogger(__name__).warning(f"pydgraph unavailable, DGraph features disabled: {e}")
 
 
 # Your existing imports
@@ -85,7 +93,10 @@ class DGraphManager:
         """Initialize DGraph client connection"""
         if self._initialized:
             return
-            
+
+        if not _pydgraph_available:
+            raise RuntimeError("pydgraph is not available — install protobuf>=4.25.0 and pydgraph")
+
         try:
             # Create DGraph client
             client_stub = DgraphClientStub(DGRAPH_ALPHA)
