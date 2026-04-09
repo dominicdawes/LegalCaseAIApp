@@ -125,22 +125,3 @@ class LLMFactory:
         return provider.lower().strip() in LLMFactory.get_available_providers()
     
 
-# class LLMFactory:
-#     """
-#     Given a provider name + model + temperature, return an object with .chat(prompt) -> str
-#     """
-#     @staticmethod
-#     def get_client(provider: str, model_name: str, temperature: float = 0.7, streaming: bool = False, callback_manager: Any = None):
-#         provider = provider.lower()
-#         if provider == "openai":
-#             return OpenAIClient(model_name=model_name, temperature=temperature, streaming=streaming, callback_manager=callback_manager)
-#         elif provider == "deepseek":
-#             return DeepSeekClient(model_name=model_name, temperature=temperature, streaming=streaming, callback_manager=callback_manager)
-#         elif provider == "anthropic":
-#             return AnthropicClient(model_name=model_name, temperature=temperature)
-#         elif provider == "gemini":
-#             return GeminiClient(model_name=model_name, temperature=temperature)
-#         elif provider == "qwen":
-#             return QWENClient(model_name=model_name, temperature=temperature)
-#         else:
-#             raise ValueError(f"Unknown provider '{provider}'. Valid options: openai, deepseek, anthropic, gemini, sonnet, qwen.")

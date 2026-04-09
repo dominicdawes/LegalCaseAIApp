@@ -63,16 +63,12 @@ redis_pub = aioredis.from_url(REDIS_LABS_URL, decode_responses=True)
 # celery_app = Celery('tasks', broker='redis://localhost:6379/0')
 
 origins = [
-    "https://app.weweb.io",  # Replace with the actual WeWeb domain if different
-    "https://editor.weweb.io",
-    "https://www.legalnote.io",  # Add your new domain
-    "https://legalnote.io",      # Also add without www in case
-    # Add other domains as needed
+    "https://www.legalnote.io",
+    "https://legalnote.io",
 ]
 
-# Using a regex to allow any subdomain of weweb-preview.io
-# The .* matches any characters (the subdomain)
-origins_regex = r"https://.*\.weweb-preview\.io$"
+# Allow any subdomain of weweb.io (covers app, editor, editor-cdn, etc.) and weweb-preview.io
+origins_regex = r"https://([a-zA-Z0-9-]+\.)?weweb(-preview)?\.io$"
 
 app.add_middleware(
     CORSMiddleware,
