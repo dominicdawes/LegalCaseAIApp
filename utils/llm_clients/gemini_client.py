@@ -45,10 +45,10 @@ class GeminiClient:
     """
     
     def __init__(
-        self, 
+        self,
         model_name: str = "gemini-2.5-flash",
         temperature: float = 0.7,
-        max_output_tokens: int = 4096,
+        max_output_tokens: int = 65536,
         top_p: float = 0.95,
         top_k: int = 40,
         streaming: bool = False,

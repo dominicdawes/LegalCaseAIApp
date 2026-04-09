@@ -198,8 +198,11 @@ class AsyncNoteManager:
             embedding_task = asyncio.create_task(
                 self._get_embedding_async(note_type)
             )
+            # Quiz JSON is large: ~1000 tokens per question + 500 buffer
+            num_questions = (addtl_params or {}).get('num_questions', 10)
+            quiz_token_budget = (num_questions * 1000 + 500) if note_type == "quiz" else 4056
             llm_task = asyncio.create_task(
-                self._setup_llm_client_async(provider, model_name, temperature)
+                self._setup_llm_client_async(provider, model_name, temperature, max_output_tokens=quiz_token_budget)
             )
             
             # Wait for all parallel tasks
@@ -551,15 +554,14 @@ class AsyncNoteManager:
         )
         return embedder.embed_query(query)
 
-    async def _setup_llm_client_async(self, provider: str, model_name: str, temperature: float):
+    async def _setup_llm_client_async(self, provider: str, model_name: str, temperature: float, max_output_tokens: int = 4056):
         """🆕 Async LLM client setup"""
         loop = asyncio.get_event_loop()
         client = await loop.run_in_executor(
-            None, 
-            LLMFactory.get_client_for,
-            provider, model_name, temperature, False  # streaming=False for notes
+            None,
+            lambda: LLMFactory.get_client_for(provider, model_name, temperature, False, max_output_tokens=max_output_tokens)
         )
-        logger.info(f"🤖 LLM client setup: {provider}/{model_name}")
+        logger.info(f"🤖 LLM client setup: {provider}/{model_name} (max_output_tokens={max_output_tokens})")
         return client
 
     async def _fetch_relevant_chunks_async(

@@ -34,9 +34,21 @@ class QuizProcessor:
         parses them individually, and coerces them into a valid format.
         This is robust against malformed JSON, duplicates, and truncation.
         """
+        # 1. Try clean full-JSON parse first (fastest path for well-formed output)
+        stripped = llm_output.strip().lstrip("```json").lstrip("```").rstrip("```").strip()
+        try:
+            data = json.loads(stripped)
+            questions = data.get("questions", [])
+            if questions:
+                logger.info(f"Clean JSON parse succeeded: {len(questions)} questions found.")
+                valid_questions = [q for q in (self._coerce_question(q, i) for i, q in enumerate(questions)) if q]
+                return {"questions": valid_questions}
+        except (json.JSONDecodeError, AttributeError):
+            pass  # Fall through to regex salvage
+
         valid_questions = []
-        
-        # 1. 🆕 Find all potential question strings using the regex
+
+        # 2. Regex salvage for truncated/malformed output
         potential_question_strings = QUESTION_REGEX.findall(llm_output)
         
         if not potential_question_strings:
@@ -44,19 +56,16 @@ class QuizProcessor:
             return {"questions": []}
 
         logger.info(f"Found {len(potential_question_strings)} potential question objects to parse.")
-        
+
         seen_questions = set()  # To prevent duplicates from the LLM
 
         for i, q_str in enumerate(potential_question_strings):
             try:
-                # 2. 🆕 Try to parse the individual string
                 q_data = json.loads(q_str)
-                
-                # 3. 🆕 Coerce and validate the single object
                 coerced_q = self._coerce_question(q_data, i)
-                
+
                 if coerced_q:
-                    # 4. 🆕 Add if valid and not a duplicate
+                    # Add if valid and not a duplicate
                     # 🆕 UPDATED: Key is now 'question_text'
                     q_text = coerced_q['question_text'].lower().strip()
                     if q_text not in seen_questions:
