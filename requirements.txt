@@ -23,7 +23,7 @@ mimetype
 # PyPDF2==3.0.1
 
 # AI dependencies
-openai==1.35.13 # openai
+openai>=1.54.0 # openai — 1.54+ required for max_completion_tokens on gpt-5/o-series
 tiktoken==0.7.0 # tiktoken
 anthropic==0.29.0 # anthropic
 google-cloud-aiplatform==1.56.0 #  google-cloud-aiplatform
