@@ -56,7 +56,8 @@ from utils.supabase_utils import (
     supabase_client,
     log_llm_error,
 )
-from utils.lightrag.lightrag_utils import lightrag_integration
+# LightRAG disabled — import lazily inside lightrag_note_generation_async when re-enabled
+# from utils.lightrag.lightrag_utils import lightrag_integration
 from utils.llm_clients.llm_factory import LLMFactory
 from utils.llm_clients.performance_monitor import PerformanceMonitor
 from utils.note_processing.flashcard_processor import FlashcardProcessor
@@ -321,87 +322,9 @@ class AsyncNoteManager:
                 pass
             gc.collect()
 
-    async def lightrag_note_generation_async(
-        self,
-        user_id: str,
-        note_type: str,
-        project_id: str,
-        note_title: str,
-        provider: str,
-        model_name: str,
-        temperature: float = 0.7,
-        addtl_params: Optional[Dict] = None,
-    ) -> str:
-        """
-        Enhanced version of your note generation that uses LightRAG
-        
-        This would supplement your existing generate_note_async function in note_tasks.py
-        """
-        
-        if addtl_params is None:
-            addtl_params = {}
-        
-        try:
-            logger.info(f"🎯 Starting enhanced note generation: {note_type} for project {project_id}")
-            
-            # ——— 1. Load Prompt (Your Existing Logic) ————————————————————————————————
-            from note_tasks import NOTE_TYPE_YAML_MAP, load_yaml_prompt, build_prompt_template_from_yaml
-            
-            yaml_file = NOTE_TYPE_YAML_MAP.get(note_type)
-            yaml_dict = load_yaml_prompt(yaml_file)
-            base_query = yaml_dict.get("base_prompt")
-            prompt_template = build_prompt_template_from_yaml(yaml_dict)
-            
-            # ——— 2. Enhanced Retrieval with LightRAG ——————————————————————————————————
-            logger.info("🔍 Using enhanced LightRAG retrieval...")
-            
-            try:
-                # Try LightRAG first
-                enhanced_context = await lightrag_integration.enhance_note_generation(
-                    query=base_query,
-                    project_id=project_id,
-                    note_type=note_type,
-                    retrieval_mode="hybrid"  # Use hybrid mode for best results
-                )
-                
-                logger.info(f"✅ LightRAG retrieval successful - context: {len(enhanced_context)} chars")
-                
-            except Exception as e:
-                logger.warning(f"⚠️ LightRAG retrieval failed, falling back to vector search: {e}")
-                
-                # Fallback to your existing vector search
-                from note_tasks import _fetch_relevant_chunks_async, _get_embedding_async
-                
-                embedding = await _get_embedding_async(note_type)
-                relevant_chunks = await _fetch_relevant_chunks_async(embedding, project_id)
-                
-                # Build context the traditional way
-                chunk_context = "\n\n".join(chunk["content"] for chunk in relevant_chunks)
-                enhanced_context = f"=== Retrieved Context ===\n{chunk_context}"
-            
-            # ——— 3. Build Final Context ——————————————————————————————————————————————
-            context = self._build_note_context(
-                prompt_template, 
-                enhanced_context, 
-                note_type, 
-                addtl_params
-            )
-            
-            # ——— 4. Generate Note (Your Existing Logic) ———————————————————————————————
-            from utils.llm_clients.llm_factory import LLMFactory
-            
-            llm_client = LLMFactory.get_client_for(provider, model_name, temperature, False)
-            note_content = await asyncio.get_event_loop().run_in_executor(
-                None, llm_client.chat, context
-            )
-            
-            logger.info(f"✅ Enhanced note generation completed: {len(note_content)} chars")
-            
-            return note_content
-            
-        except Exception as e:
-            logger.error(f"❌ Enhanced note generation failed: {e}")
-            raise
+    # LightRAG disabled — re-enable by uncommenting this method and restoring
+    # the lightrag_integration import at the top of the file.
+    # async def lightrag_note_generation_async(self, ...): ...
 
     async def cleanup_note_async(
         self,

@@ -56,11 +56,11 @@ langchain-community==0.2.5 # langchain-community
 langchain-openai==0.1.8 # langchain-openai
 promptic
 
-# LightRAG and dependencies
-lightrag-hku
-nano-vectordb>=0.0.4.3
-pydgraph>=21.12.0
-protobuf>=4.25.0  # pydgraph requires runtime_version which was added in 4.25.0
+# LightRAG and dependencies — disabled to reduce startup memory (OOM on 512MB Render instance)
+# lightrag-hku
+# nano-vectordb>=0.0.4.3
+# pydgraph>=21.12.0
+# protobuf>=4.25.0
 
 # Fuzzy logic
 fuzzywuzzy==0.18.0
