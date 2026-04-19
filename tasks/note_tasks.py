@@ -1008,7 +1008,6 @@ note_manager = AsyncNoteManager()
 )
 def rag_note_task(
     self,
-    note_id: str,
     user_id: str,
     note_type: str,
     project_id: str,
@@ -1018,6 +1017,7 @@ def rag_note_task(
     num_sources: int = 1,
     temperature: float = 0.7,
     addtl_params: Optional[Dict] = None,
+    note_id: Optional[str] = None,   # trailing optional — backward-compatible with old dispatches
 ):
     """
     🚀 Enhanced RAG note generation task with async event loop
@@ -1038,6 +1038,12 @@ def rag_note_task(
     - Same error handling patterns
     """
     
+    # Backward-compatibility: old dispatches (pre-observability) won't include note_id.
+    # Generate one so the pipeline has a consistent ID even without a stub row.
+    if note_id is None:
+        note_id = str(uuid.uuid4())
+        logger.warning(f"⚠️ note_id not provided — generated fallback {note_id[:8]}… (stub row not created)")
+
     try:
         # Set explicit start time metadata
         task_id = self.request.id
