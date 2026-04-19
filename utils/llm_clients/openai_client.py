@@ -40,11 +40,14 @@ class OpenAIClient:
             tokens_key: max_output_tokens,
         }
 
-        # If temperature is supported, clamp it
+        # If temperature is supported, clamp it; otherwise pass None to suppress
+        # ChatOpenAI's own default of 0.7 which would be rejected by these models
         if info.get("supports_temperature", True):
             lo, hi = info.get("min", 0.0), info.get("max", 2.0)
             safe_temp = max(lo, min(temperature, hi))
             llm_kwargs["temperature"] = safe_temp
+        else:
+            llm_kwargs["temperature"] = None
 
         if streaming and callback_manager:
             llm_kwargs["callback_manager"] = callback_manager
@@ -58,18 +61,20 @@ class OpenAIClient:
     def _streaming_client_kwargs(self) -> dict:
         """Build kwargs for a streaming ChatOpenAI client, using the correct token param."""
         cfg = {
-            "o4-mini": {"use_max_completion_tokens": True},
-            "gpt-5":   {"use_max_completion_tokens": True},
+            "o4-mini":      {"supports_temperature": False, "use_max_completion_tokens": True},
+            "gpt-4o-mini":  {"supports_temperature": False},
+            "gpt-4.1-nano": {"supports_temperature": True},
+            "gpt-5":        {"supports_temperature": False, "use_max_completion_tokens": True},
         }
-        tokens_key = "max_completion_tokens" if cfg.get(self.model_name, {}).get("use_max_completion_tokens") else "max_tokens"
+        info = cfg.get(self.model_name, {"supports_temperature": True})
+        tokens_key = "max_completion_tokens" if info.get("use_max_completion_tokens") else "max_tokens"
         kwargs = {
             "api_key": OPENAI_API_KEY,
             "model": self.model_name,
             "streaming": True,
             tokens_key: self.max_output_tokens,
+            "temperature": getattr(self, '_temperature', 0.7) if info.get("supports_temperature", True) else None,
         }
-        if not cfg.get(self.model_name, {}).get("use_max_completion_tokens"):
-            kwargs["temperature"] = getattr(self, '_temperature', 0.7)
         return kwargs
 
     async def stream_chat(self, prompt: str, system_prompt: str = None):
