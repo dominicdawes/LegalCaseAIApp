@@ -158,6 +158,7 @@ class AsyncNoteManager:
 
     async def generate_note_async(
         self,
+        note_id: str,
         user_id: str,
         note_type: str,
         project_id: str,
@@ -170,7 +171,7 @@ class AsyncNoteManager:
     ) -> str:
         """
         🚀 Main async note generation workflow with parallel processing
-        
+
         Key improvements:
         - Parallel execution of embedding and prompt loading
         - Async chunk retrieval with connection pooling
@@ -184,7 +185,6 @@ class AsyncNoteManager:
             addtl_params = {}
 
         start_time = time.time()
-        note_id = str(uuid.uuid4())
         
         try:
             logger.info(f"🎯 Starting async note generation: {note_type} for project {project_id}")
@@ -212,7 +212,9 @@ class AsyncNoteManager:
             
             setup_time = time.time() - start_time
             logger.info(f"📊 Parallel setup completed in {setup_time*1000:.0f}ms")
-            
+
+            await self._update_note_progress_async(note_id, "PROCESSING")
+
             # Async chunk retrieval (Naive RAG)
             retrieval_start = time.time()
             relevant_chunks = await self._fetch_relevant_chunks_async(
@@ -238,9 +240,10 @@ class AsyncNoteManager:
             
             # 🆕 Async note persistence: Nomal Notes (one block) vs Flashcards, Cold Calls (discrete-blocks)
             save_start = time.time()
-            if note_type == "flashcards"  or note_type == "cold_call":  
+            if note_type == "flashcards"  or note_type == "cold_call":
                 # Special flashcard processing and storage
                 deck_id, num_cards = await self._save_flashcard_deck_and_cards_async(
+                    note_id=note_id,
                     project_id=project_id,
                     user_id=user_id,
                     deck_name=note_title,
@@ -261,9 +264,8 @@ class AsyncNoteManager:
                 num_questions_requested = (addtl_params or {}).get('num_questions', 10)
                 
                 quiz_note_id, num_questions_saved = await self._save_quiz_and_questions_async(
-                    project_id=project_id,
+                    note_id=note_id,
                     user_id=user_id,
-                    quiz_title=note_title,
                     llm_output=note_content,
                     num_questions_requested=num_questions_requested,
                     is_essential=(addtl_params or {}).get('is_essential', False),
@@ -277,11 +279,9 @@ class AsyncNoteManager:
             else:
                 # Regular note types - save to notes table
                 await self._save_note_async(
-                    project_id, 
-                    user_id, 
-                    note_type, 
-                    note_title, 
-                    note_content,
+                    note_id=note_id,
+                    note_type=note_type,
+                    content=note_content,
                     is_essential=(addtl_params or {}).get('is_essential', False),
                     num_sources=1
                 )
@@ -311,7 +311,7 @@ class AsyncNoteManager:
             
         except Exception as e:
             logger.error(f"❌ Async note generation failed: {e}", exc_info=True)
-            await self._handle_note_error(project_id, user_id, note_type, str(e))
+            await self._handle_note_error(project_id, user_id, note_type, str(e), note_id=note_id)
             raise
         finally:
             # Clean up large objects
@@ -674,38 +674,40 @@ class AsyncNoteManager:
         return content
 
     async def _save_note_async(
-        self, 
-        project_id: str, 
-        user_id: str, 
-        note_type: str, 
-        note_title: str, 
+        self,
+        note_id: str,
+        note_type: str,
         content: str,
         is_essential: bool,
         num_sources: int,
     ):
-        """🆕 Async note persistence with connection pooling"""
-        
+        """Async note persistence — updates the stub row created at request time."""
+
         logger.info(f"💾 Saving {note_type} note to database")
-        
+
         async with get_db_connection() as conn:
             await conn.execute(
                 """
-                INSERT INTO notes (
-                    id, user_id, project_id, title, content_markdown, 
-                    note_type, is_generated, is_shareable, created_at, is_essential, num_sources_based_on
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                UPDATE notes SET
+                    content_markdown        = $1,
+                    is_generated            = $2,
+                    is_shareable            = $3,
+                    is_essential            = $4,
+                    num_sources_based_on    = $5,
+                    note_progress_status    = 'COMPLETE'
+                WHERE id = $6
                 """,
-                str(uuid.uuid4()), user_id, project_id, note_title, content,
-                note_type, True, False, datetime.now(timezone.utc), is_essential, num_sources
+                content, True, False, is_essential, num_sources, note_id
             )
-        
+
         logger.info(f"✅ Note saved successfully")
 
     async def _save_flashcard_deck_and_cards_async(
-        self, 
-        project_id: str, 
-        user_id: str, 
-        deck_name: str, 
+        self,
+        note_id: str,
+        project_id: str,
+        user_id: str,
+        deck_name: str,
         llm_output: str,
         is_essential: bool,
         num_sources: int,
@@ -748,25 +750,25 @@ class AsyncNoteManager:
             async with get_db_connection() as conn:
                 # Start transaction
                 async with conn.transaction():
-                    # Insert deck record first
-                    deck_id = await conn.fetchval(
+                    # Update the stub note row created at request time
+                    await conn.execute(
                         """
-                        INSERT INTO notes (
-                            id, user_id, project_id, title, note_type, description, 
-                            num_cards, created_at, is_active, is_essential, num_sources_based_on
-                        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-                        RETURNING id
+                        UPDATE notes SET
+                            description          = $1,
+                            num_cards            = $2,
+                            is_active            = $3,
+                            is_essential         = $4,
+                            num_sources_based_on = $5,
+                            note_progress_status = 'COMPLETE'
+                        WHERE id = $6
                         """,
-                        str(uuid.uuid4()), user_id, project_id, 
-                        deck_data['deck_name'], "flashcards", deck_data['description'],
-                        deck_data['num_cards'], deck_data['created_at'],
-                        deck_data.get('is_active', True), is_essential, num_sources
+                        deck_data['description'], deck_data['num_cards'],
+                        deck_data.get('is_active', True), is_essential, num_sources,
+                        note_id
                     )
-                    
-                    if not deck_id:
-                        raise Exception("Failed to insert flashcard deck")
-                    
-                    logger.info(f"✅ Inserted flashcard deck with ID: {deck_id}")
+                    deck_id = note_id
+
+                    logger.info(f"✅ Updated flashcard deck stub with ID: {deck_id}")
                     
                     # Prepare individual cards for batch insert
                     if cards_list:
@@ -817,9 +819,8 @@ class AsyncNoteManager:
     
     async def _save_quiz_and_questions_async(
         self,
-        project_id: str,
+        note_id: str,
         user_id: str,
-        quiz_title: str,
         llm_output: str,
         num_questions_requested: int,
         is_essential: bool,
@@ -843,7 +844,7 @@ class AsyncNoteManager:
             Tuple of (quiz_note_id, num_questions_saved)
         """
         try:
-            logger.info(f"🧠 Processing quiz: {quiz_title}")
+            logger.info(f"🧠 Processing quiz note {note_id[:8]}…")
 
             # 1. Initialize processor and parse/validate content
             # This part is synchronous but fast (no I/O)
@@ -866,31 +867,29 @@ class AsyncNoteManager:
             if num_questions_saved == 0:
                 raise ValueError("No questions found in parsed quiz data.")
 
-            logger.info(f"💾 Saving {num_questions_saved} quiz questions to DB for: {quiz_title}")
+            logger.info(f"💾 Saving {num_questions_saved} quiz questions to DB")
 
             # 2. Use async database connection for all DB operations
             async with get_db_connection() as conn:
                 # Start a single transaction for all inserts
                 async with conn.transaction():
                     
-                    # 3. Insert the main 'notes' record (type 'quiz')
-                    quiz_note_id = await conn.fetchval(
+                    # 3. Update the stub notes row created at request time
+                    await conn.execute(
                         """
-                        INSERT INTO notes (
-                            id, user_id, project_id, title, note_type,
-                            num_questions, created_at, is_generated, is_essential, num_sources_based_on
-                        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-                        RETURNING id
+                        UPDATE notes SET
+                            num_questions        = $1,
+                            is_generated         = $2,
+                            is_essential         = $3,
+                            num_sources_based_on = $4,
+                            note_progress_status = 'COMPLETE'
+                        WHERE id = $5
                         """,
-                        str(uuid.uuid4()), user_id, project_id,
-                        quiz_title, "quiz", num_questions_saved,
-                        datetime.now(timezone.utc), True, is_essential, num_sources
+                        num_questions_saved, True, is_essential, num_sources, note_id
                     )
+                    quiz_note_id = note_id
 
-                    if not quiz_note_id:
-                        raise Exception("Failed to insert quiz 'notes' record.")
-
-                    logger.info(f"✅ Inserted quiz note record with ID: {quiz_note_id}")
+                    logger.info(f"✅ Updated quiz note stub with ID: {quiz_note_id}")
 
                     # 4. Loop and insert all questions and their answers
                     for question_data in questions_list:
@@ -958,9 +957,25 @@ class AsyncNoteManager:
         except Exception as e:
             logger.warning(f"⚠️ Metrics logging failed: {e}")
 
+    async def _update_note_progress_async(self, note_id: str, status: str):
+        """Update note_progress_status for realtime frontend observability."""
+        try:
+            async with get_db_connection() as conn:
+                await conn.execute(
+                    "UPDATE notes SET note_progress_status = $1 WHERE id = $2",
+                    status, note_id
+                )
+            logger.info(f"📡 Note {note_id[:8]}… progress → {status}")
+        except Exception as e:
+            logger.warning(f"⚠️ Failed to update note progress [{status}] for {note_id}: {e}")
+
     async def _handle_note_error(
-        self, project_id: str, user_id: str, note_type: str, error_message: str
+        self, project_id: str, user_id: str, note_type: str, error_message: str,
+        note_id: Optional[str] = None,
     ):
+        # Mark the stub row as errored so the frontend listener is notified
+        if note_id:
+            await self._update_note_progress_async(note_id, "ERROR")
         try:
             loop = asyncio.get_event_loop()
             await loop.run_in_executor(
@@ -993,13 +1008,14 @@ note_manager = AsyncNoteManager()
 )
 def rag_note_task(
     self,
+    note_id: str,
     user_id: str,
     note_type: str,
     project_id: str,
     note_title: str,
     provider: str,
     model_name: str,
-    num_sources: int = 1,  # <-- 1 source is the default value
+    num_sources: int = 1,
     temperature: float = 0.7,
     addtl_params: Optional[Dict] = None,
 ):
@@ -1035,6 +1051,7 @@ def rag_note_task(
         # 🔥 CRITICAL: Execute async workflow in persistent event loop
         result = run_async_in_worker(
             note_manager.generate_note_async(
+                note_id=note_id,
                 user_id=user_id,
                 note_type=note_type,
                 project_id=project_id,

@@ -154,6 +154,10 @@ class PDFResponse(BaseModel):
 class GenericTaskResponse(BaseModel):
     task_id: str
 
+class NoteGenerationResponse(BaseModel):
+    task_id: str
+    note_id: str
+
 # <---- Models for new RAG pipeline kickoff  ----> #
 class NewRagPipelineRequest(BaseModel):
     ''' 
@@ -920,9 +924,9 @@ async def get_task_status(task_id: str):
 #          RAG GENERATIVE NOTES ENDPOINTS
 # ================================================ #
 
-@app.post("/generate-note/", response_model=GenericTaskResponse)
+@app.post("/generate-note/", response_model=NoteGenerationResponse)
 async def generate_note(
-    request: NewGeneratedNoteRequest, 
+    request: NewGeneratedNoteRequest,
     background_tasks: BackgroundTasks
 ):
     '''LIVE (08-20-2025)
@@ -930,7 +934,7 @@ async def generate_note(
         - rag_note_task():
             input: request.metadata
             returns: None
-        
+
     Request contains:
         request.metadata (json): {
             project_id:,
@@ -941,22 +945,37 @@ async def generate_note(
         }
     '''
     try:
-        # Apply async job to generate ai notes (grounded w/ RAG)
-        job = rag_note_task.apply_async(    
+        # Pre-generate note_id here so the frontend can immediately subscribe
+        # to the realtime listener on public.notes before the Celery task starts
+        note_id = str(uuid.uuid4())
+
+        # Create stub note row — frontend realtime listener fires on this INSERT
+        supabase_client.table("notes").insert({
+            "id":                   note_id,
+            "user_id":              request.metadata["user_id"],
+            "project_id":           request.metadata["project_id"],
+            "title":                request.metadata["note_title"],
+            "note_type":            request.metadata["note_type"],
+            "note_progress_status": "INITIALIZED",
+            "created_at":           datetime.now(timezone.utc).isoformat(),
+        }).execute()
+
+        # Dispatch Celery task, passing the pre-created note_id
+        job = rag_note_task.apply_async(
             kwargs={
-                "user_id":       request.metadata["user_id"],       # ← maps to your user_id param
-                "note_type":     request.metadata["note_type"],     # ← maps to your note_type param
-                "project_id":    request.metadata["project_id"],    # ← maps to your project_id param  
-                "note_title":    request.metadata["note_title"],    # ← "project_name: question type"
+                "note_id":       note_id,
+                "user_id":       request.metadata["user_id"],
+                "note_type":     request.metadata["note_type"],
+                "project_id":    request.metadata["project_id"],
+                "note_title":    request.metadata["note_title"],
                 "provider":      request.metadata["provider"],
-                "model_name":    request.metadata["model_name"],    # ← maps to your model_name param
-                "temperature":   request.metadata["temperature"],   
-                "num_sources":   request.metadata["num_sources"],   # this is new to capture selected source use
-                "addtl_params":  request.metadata["addtl_params"]   # ← Dict passed in by WeWeb/postman (num_questions, num_cards, num_sources)
+                "model_name":    request.metadata["model_name"],
+                "temperature":   request.metadata["temperature"],
+                "num_sources":   request.metadata["num_sources"],
+                "addtl_params":  request.metadata["addtl_params"],
             }
         )
-        # Poll in postman: "my_domain.com/task-status/{task_id}"
-        return {"task_id": job.id}
+        return {"task_id": job.id, "note_id": note_id}
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
