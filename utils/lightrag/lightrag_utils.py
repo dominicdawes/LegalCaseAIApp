@@ -15,16 +15,11 @@ from typing import List, Dict, Any, Optional, Tuple
 from datetime import datetime, timezone
 from dataclasses import dataclass
 
-# LightRAG core
-from lightrag import LightRAG, QueryParam
-from lightrag.kg.neo4j_impl import Neo4JStorage
-
-# LLM and embedding functions
-from lightrag.utils import EmbeddingFunc
-from lightrag.llm.openai import (
-    gpt_4o_mini_complete,
-    openai_embed
-)
+# LightRAG disabled — uncomment when re-enabling
+# from lightrag import LightRAG, QueryParam
+# from lightrag.kg.neo4j_impl import Neo4JStorage
+# from lightrag.utils import EmbeddingFunc
+# from lightrag.llm.openai import gpt_4o_mini_complete, openai_embed
 # DGraph integration — imported lazily to avoid crashing Celery if protobuf is misconfigured
 try:
     import pydgraph

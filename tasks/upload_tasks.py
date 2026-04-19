@@ -77,7 +77,7 @@ import psutil
 # ===== PROJECT MODULES =====
 from tasks.celery_app import celery_app
 from tasks.note_tasks import rag_note_task
-from utils.lightrag.lightrag_utils import lightrag_client, lightrag_integration
+# from utils.lightrag.lightrag_utils import lightrag_client, lightrag_integration  # LightRAG disabled
 from utils.s3_utils import upload_to_s3, s3_client
 from utils.cloudfront_utils import get_cloudfront_url
 from utils.supabase_utils import supabase_client
@@ -1979,38 +1979,33 @@ async def _lightrag_document_processing_async(
         chunks = parse_result['chunks']
         chunks_metadata = parse_result.get('metadatas', [])
         
-        # ——— 2. Parallel Processing: Traditional Embeddings + LightRAG ——————————————
-        logger.info(f"⚡ [DOC-{short_id}] Running parallel: embeddings + LightRAG")
-        
-        # Start both processes concurrently
+        # ——— 2. Embeddings Processing ————————————————————————————————————————————
+        logger.info(f"⚡ [DOC-{short_id}] Running embeddings processing")
+
         from upload_tasks import _process_embeddings_async
-        
+
         embedding_task = asyncio.create_task(
             _process_embeddings_async(doc_id, project_id, chunks, chunks_metadata)
         )
-        
-        lightrag_task = asyncio.create_task(
-            lightrag_integration.enhance_document_processing(
-                doc_id, chunks, chunks_metadata, project_id
-            )
-        )
-        
-        # Wait for both to complete
-        embedding_result, lightrag_result = await asyncio.gather(
-            embedding_task, lightrag_task, return_exceptions=True
-        )
-        
+
+        # LightRAG disabled — uncomment when re-enabling
+        # lightrag_task = asyncio.create_task(
+        #     lightrag_integration.enhance_document_processing(
+        #         doc_id, chunks, chunks_metadata, project_id
+        #     )
+        # )
+
+        # Wait for embedding to complete (LightRAG disabled)
+        embedding_result = await embedding_task
+        lightrag_result = {'success': False, 'entities_count': 0, 'relationships_count': 0}
+
         # ——— 3. Analyze Results ———————————————————————————————————————————————————
         final_status = 'COMPLETE'
-        
+
         # Check embedding results
         if isinstance(embedding_result, Exception) or not embedding_result.get('success'):
             final_status = 'PARTIAL'
             logger.warning(f"⚠️ [DOC-{short_id}] Embedding processing failed")
-        
-        # Check LightRAG results (non-critical)
-        if isinstance(lightrag_result, Exception) or not lightrag_result.get('success'):
-            logger.warning(f"⚠️ [DOC-{short_id}] LightRAG processing failed (non-critical)")
         
         # ——— 4. Return Enhanced Results ————————————————————————————————————————————
         return {
