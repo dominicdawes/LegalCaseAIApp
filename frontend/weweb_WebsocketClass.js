@@ -411,11 +411,14 @@ function connect() {
       case 'stream_cancelled':
         console.log('🛑 Stream was cancelled');
         variables['e70e3b39-8cd4-4696-ba05-49843187f822'] = '🛑 Stream cancelled by user';
-        // Reset streaming state
-        isNew = true;
-        // Optional: Add cancellation notice to content
+        // Stop the stall timer so it doesn't fire a spurious reconnect
+        clearTimeout(stallTimer);
+        // Append notice to visible content before finalising
         streaming += '\n\n[Response cancelled by user]';
         variables[WS_VAR_ID] = streaming;
+        // Call complete() to reset isNew and mark streaming_complete on the
+        // last chat-history entry — same cleanup path as a normal stream_complete.
+        complete(data.message_id);
         break;
 
       case 'error':

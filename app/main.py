@@ -571,24 +571,31 @@ async def cancel_rag_chat(task_id: str):
     logger.info(f"🛑 CANCEL REQUEST received for task: {task_id}")
 
     try:
-        # Step 1: Write a cancellation key to Redis with a 60-second expiry
-        # This is the "cancellation notice" for the worker.
         cancel_key = f"cancel-task:{task_id}"
-        await redis_pub.set(cancel_key, "1", ex=60) # ex=60 sets a 60-second TTL
+
+        # SET NX (set-if-not-exists) makes this idempotent: rapid double-clicks
+        # or duplicate network requests are silently absorbed — only the first
+        # caller actually sets the flag.
+        was_set = await redis_pub.set(cancel_key, "1", ex=60, nx=True)
+
+        if not was_set:
+            logger.info(f"ℹ️ Cancellation already in progress for task: {task_id}")
+            return {
+                "status": "already_cancelling",
+                "task_id": task_id,
+                "message": "Cancellation already requested for this task.",
+            }
+
         logger.info(f"✅ Cancellation notice posted to Redis for key: {cancel_key}")
 
-        # Step 2: Revoke the task from Celery (in case it hasn't started yet)
-        celery_app.control.revoke(task_id)
-
-        # Step 3: We don't know the session_id here anymore, so we can't send a
-        # targeted WebSocket message. The client should react to the task
-        # stopping or you can implement a more advanced notification system.
-        # For now, the client will see the stream stop.
+        # Revoke from Celery.  terminate=True sends SIGTERM to a *running* worker
+        # process so it is actually interrupted, not just blocked from future starts.
+        celery_app.control.revoke(task_id, terminate=True, signal="SIGTERM")
 
         return {
             "status": "cancellation_requested",
             "task_id": task_id,
-            "message": "Cancellation signal sent. The stream will stop shortly."
+            "message": "Cancellation signal sent. The stream will stop shortly.",
         }
 
     except Exception as e:

@@ -52,6 +52,11 @@ import threading
 import asyncio
 import socket
 
+
+class TaskCancelledError(Exception):
+    """Raised when a streaming task is cancelled via the Redis cancel-key mechanism."""
+    pass
+
 # ===== LLM & LANGCHAIN =====
 import tiktoken
 from langchain_openai import OpenAIEmbeddings
@@ -344,6 +349,7 @@ class StreamingChatManager:
         # 🔑 Use the Celery Task ID as the key for unambiguous lookups
         self._active_tasks: Dict[str, Dict[str, Any]] = {}
         self.task_id = None
+        self._last_cancel_check: float = 0.0  # monotonic time of last Redis cancel poll
         
     async def initialize(self):
         """
@@ -461,18 +467,26 @@ class StreamingChatManager:
             
             # Stream response with real-time updates
             llm_start = time.time()
-            streaming_response = await self._stream_rag_response(
-                assistant_message_id=assistant_message_id,
-                chat_session_id=chat_session_id,
-                query=query,
-                relevant_chunks=relevant_chunks,
-                chat_history=chat_history,
-                llm_client=llm_client,
-                provider=provider_name
-                # task_key=task_id
-            )
+            try:
+                streaming_response = await self._stream_rag_response(
+                    assistant_message_id=assistant_message_id,
+                    chat_session_id=chat_session_id,
+                    query=query,
+                    relevant_chunks=relevant_chunks,
+                    chat_history=chat_history,
+                    llm_client=llm_client,
+                    provider=provider_name
+                    # task_key=task_id
+                )
+            except TaskCancelledError:
+                # Cancellation was already handled inside _stream_rag_response
+                # (DB updated, stream_cancelled broadcast sent). Return without
+                # calling _finalize_streaming_message so we don't overwrite the
+                # 'cancelled' DB state with 'complete'.
+                logger.info(f"🛑 Streaming cancelled for task {task_id}, skipping finalize.")
+                return assistant_message_id
             llm_time = time.time() - llm_start
-            
+
             # 🆕 Finalize with rich content
             await self._finalize_streaming_message(
                 project_id, assistant_message_id, streaming_response, user_id, chat_session_id
@@ -683,11 +697,11 @@ class StreamingChatManager:
             
             # 🔀 Process each token from LLM with intelligent buffering
             async for raw_chunk in llm_client.stream_chat(context):
-                # Check for stream cancellation
+                # Check for stream cancellation (throttled to ~100ms to reduce Redis load)
                 if await self._is_cancelled():
                     logger.info(f"🛑 Task cancelled via Redis signal: {self.task_id}")
                     await self._handle_cancellation(assistant_message_id, chat_session_id)
-                    break
+                    raise TaskCancelledError("Task cancelled by user")
                 
                 # Normalize chunk
                 chunk_text = self.normalizer.extract_text(raw_chunk, provider)
@@ -1365,21 +1379,32 @@ class StreamingChatManager:
                 )
 
     async def _is_cancelled(self) -> bool:
-        """ 🆕 Checks Redis for a cancellation key for the current task. """
+        """Checks Redis for a cancellation key for the current task.
+
+        Throttled to at most one Redis call every 100 ms so the polling loop
+        doesn't hammer the connection pool at 40+ calls/second.
+        After detecting the flag the key is deleted so a future retry or
+        restart of the same task_id doesn't pick up a stale signal.
+        """
         if not self.task_id:
             return False
-        
+
+        now = time.monotonic()
+        if now - self._last_cancel_check < 0.1:  # 100 ms throttle
+            return False
+        self._last_cancel_check = now
+
         try:
             cancel_key = f"cancel-task:{self.task_id}"
             async with get_redis_connection() as r:
-                # The exists command is very fast. It returns 1 if the key exists, 0 otherwise.
-                exists = await r.exists(cancel_key)
-                if exists:
-                    logger.info(f"🛑 Cancellation notice found in Redis for task: {self.task_id}")
+                # getdel: atomic GET + DELETE so the key is consumed on detection
+                value = await r.getdel(cancel_key)
+                if value is not None:
+                    logger.info(f"🛑 Cancellation notice found and consumed for task: {self.task_id}")
                     return True
         except Exception as e:
             logger.warning(f"⚠️ Redis check for cancellation failed: {e}")
-            
+
         return False
 
     # def cancel_task(self, task_id: str) -> Optional[str]:
@@ -1396,11 +1421,11 @@ class StreamingChatManager:
     #     return None
 
     async def _handle_cancellation(self, message_id: str, chat_session_id: str):
-        """Handle task cancellation - Update Supabase DB of cancellation"""
+        """Handle task cancellation - Update Supabase DB and notify WebSocket clients."""
         async with get_db_connection() as conn:
             await conn.execute(
                 """
-                UPDATE messages 
+                UPDATE messages
                 SET status = 'cancelled',
                     query_response_status = 'cancelled',
                     content = COALESCE(content, '') || '\n\n[Response cancelled by user]',
@@ -1413,6 +1438,19 @@ class StreamingChatManager:
                 message_id
             )
             logger.info(f"🚫 Task {message_id} handled cancellation gracefully.")
+
+        # Broadcast stream_cancelled to WebSocket clients so the UI resets properly.
+        # Without this the frontend never leaves its streaming/loading state.
+        try:
+            async with get_redis_connection() as r:
+                await r.publish(f"chat:{chat_session_id}", json.dumps({
+                    "type": "stream_cancelled",
+                    "message_id": message_id,
+                    "timestamp": datetime.utcnow().isoformat()
+                }))
+            logger.info(f"📡 stream_cancelled broadcast sent for session {chat_session_id}")
+        except Exception as e:
+            logger.warning(f"⚠️ stream_cancelled broadcast failed: {e}")
 
     async def _handle_streaming_error(self, message_id: str, error_message: str):
         """🆕 Handle streaming errors gracefully"""
