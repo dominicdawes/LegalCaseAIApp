@@ -391,9 +391,26 @@ class CitationProcessor:
                             logger.debug(f"  Comparing with Chunk Index: {chunk_idx}, Chunk ID: {chunk_id}")
 
                             # Safely get chunk page number and metadata
+                            # page_number is a top-level DB column; fall back to metadata['page']
+                            # for older chunks uploaded before the column was added.
                             chunk_page = chunk.get('page_number')
                             metadata = self._parse_metadata(chunk.get('metadata', {}))
-                            chunk_doc_name = metadata.get('title') or metadata.get('filename', '')
+                            if chunk_page is None:
+                                chunk_page = metadata.get('page') or metadata.get('estimated_page')
+                                if chunk_page is not None:
+                                    try:
+                                        chunk_page = int(chunk_page)
+                                    except (ValueError, TypeError):
+                                        chunk_page = None
+
+                            # title is a top-level column returned by the HNSW JOIN query;
+                            # metadata blob doesn't carry it, so check top-level first.
+                            chunk_doc_name = (
+                                chunk.get('title')
+                                or metadata.get('title')
+                                or metadata.get('filename')
+                                or ''
+                            )
                             source_id = chunk.get('source_id') # Get source_id for URL generation
 
                             # --- 🐞 DEBUG: Log comparison details ---
