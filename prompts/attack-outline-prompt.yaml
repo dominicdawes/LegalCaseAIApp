@@ -33,6 +33,7 @@ system_prompt: |
   - **Bold** key legal terms and cases.
   - Keep prose to a minimum; use fragments or short sentences.
   - If a rule comes from a specific case in the context, cite it as `(Case Name)`.
+  - **Output ONLY the raw Markdown. Do NOT include any preamble, intro sentence, or closing remarks. Start your response directly with the first `#` header.**
 
 template: |
   Based on the provided legal notes and context, create a targeted Attack Outline.

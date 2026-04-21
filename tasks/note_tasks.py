@@ -234,8 +234,11 @@ class AsyncNoteManager:
             )
             
             # Generate note content
+            # Strip preamble for markdown note types (LLMs sometimes prefix with intro prose)
+            _markdown_note_types = {"attack_outline", "case_brief", "outline", "compare_contrast", "exam_questions"}
             note_content = await self._generate_note_content_async(
-                llm_client, context, provider
+                llm_client, context, provider,
+                strip_preamble=(note_type in _markdown_note_types),
             )
             generation_time = time.time() - generation_start
             
@@ -580,19 +583,39 @@ class AsyncNoteManager:
         logger.info(f"📝 Built context: {len(final_context)} characters")
         return final_context
 
+    @staticmethod
+    def _strip_llm_preamble(content: str) -> str:
+        """Strip any intro prose before the first Markdown header.
+
+        LLMs sometimes prefix responses with 'Here is your outline...' etc.
+        This finds the first line starting with '#' and discards everything before it.
+        """
+        lines = content.splitlines()
+        for i, line in enumerate(lines):
+            if line.lstrip().startswith("#"):
+                stripped = "\n".join(lines[i:]).strip()
+                if i > 0:
+                    logger.debug(f"🧹 Stripped {i} preamble line(s) from LLM response.")
+                return stripped
+        # No header found — return as-is (e.g. plain-text note types)
+        return content.strip()
+
     async def _generate_note_content_async(
-        self, llm_client, context: str, provider: str
+        self, llm_client, context: str, provider: str, strip_preamble: bool = False
     ) -> str:
         """🆕 Async note content generation"""
-        
+
         logger.info(f"🧠 Generating note content with {provider}")
-        
+
         # Run LLM generation in thread pool
         loop = asyncio.get_event_loop()
         content = await loop.run_in_executor(
             None, llm_client.chat, context
         )
-        
+
+        if strip_preamble:
+            content = self._strip_llm_preamble(content)
+
         logger.info(f"✅ Generated {len(content)} characters of content")
         return content
 
