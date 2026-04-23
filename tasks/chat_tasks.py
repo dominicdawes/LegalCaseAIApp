@@ -445,7 +445,16 @@ class StreamingChatManager:
             
             embedding_time = time.time() - start_time
             logger.info(f"📊 Parallel setup completed in {embedding_time*1000:.0f}ms")
-            
+
+            # ⏳ Speculative-upload barrier: wait for any drag-dropped files to
+            # finish embedding before RAG retrieval so they're included in context.
+            all_ready = await self._wait_for_speculative_uploads(chat_session_id)
+            if not all_ready:
+                query = (
+                    "[Note: Some recently uploaded documents are still processing "
+                    "and may not be reflected in the context below.]\n\n" + query
+                )
+
             # 🆕 Fetch relevant chunks with project isolation
             retrieval_start = time.time()
             relevant_chunks = await self._fetch_relevant_chunks_async(
@@ -568,6 +577,88 @@ class StreamingChatManager:
         logger.info(f"📚 Fetched {len(history)} history messages")
         return history
 
+
+    async def _wait_for_speculative_uploads(
+        self,
+        chat_session_id: str,
+        timeout_s: float = 12.0,
+        poll_interval_s: float = 0.3,
+    ) -> bool:
+        """
+        Barrier: wait for any in-flight speculative uploads to finish
+        embedding before running RAG retrieval.
+
+        Returns True if all uploads completed, False if timed out.
+        """
+        gate_key = f"pending_uploads:{chat_session_id}"
+
+        async with get_redis_connection() as r:
+            pending = await r.hlen(gate_key)
+
+        if pending == 0:
+            return True
+
+        logger.info(f"⏳ Waiting for {pending} speculative upload(s) to finish embedding...")
+        deadline = time.monotonic() + timeout_s
+
+        while time.monotonic() < deadline:
+            await asyncio.sleep(poll_interval_s)
+
+            if await self._is_cancelled():
+                raise TaskCancelledError("Cancelled while waiting for speculative uploads")
+
+            async with get_redis_connection() as r:
+                remaining = await r.hlen(gate_key)
+
+            if remaining == 0:
+                logger.info("✅ All speculative uploads ready — proceeding with RAG")
+                return True
+            logger.info(f"⏳ Still waiting on {remaining} upload(s)...")
+
+        async with get_redis_connection() as r:
+            stragglers = await r.hkeys(gate_key)
+        logger.warning(
+            f"⚠️ Timed out waiting for speculative uploads: "
+            f"{[s.decode() if isinstance(s, bytes) else s for s in stragglers]}. "
+            f"Proceeding with partial context."
+        )
+        return False
+
+    async def fetch_chat_timeline(self, chat_session_id: str, limit: int = 50) -> List[Dict]:
+        """
+        Unified timeline query that returns both text messages and file_upload
+        anchor messages in chronological order, with document metadata
+        hydrated for file_upload rows.
+        """
+        async with get_db_connection() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT
+                    m.id, m.role, m.content, m.message_type,
+                    m.status, m.created_at, m.citations, m.highlights,
+                    m.streaming_complete, m.loader_visible,
+                    CASE WHEN m.message_type = 'file_upload' THEN (
+                        SELECT json_agg(json_build_object(
+                            'id',                  ds.id,
+                            'filename',            ds.filename,
+                            'file_extension',      ds.file_extension,
+                            'file_size_bytes',     ds.file_size_bytes,
+                            'cdn_url',             ds.cdn_url,
+                            'vector_embed_status', ds.vector_embed_status
+                        ))
+                        FROM document_sources ds
+                        WHERE ds.id = ANY(m.inline_document_ids)
+                    ) ELSE NULL END AS documents
+                FROM messages m
+                WHERE m.chat_session_id = $1
+                  AND m.status IN ('complete', 'streaming')
+                ORDER BY m.created_at ASC
+                LIMIT $2
+                """,
+                chat_session_id,
+                limit,
+            )
+        return [dict(row) for row in rows]
 
     async def _setup_llm_client(self, provider: str, model_name: str, temperature: float):
         """🎯 ONE LINE: Factory handles the routing complexity"""

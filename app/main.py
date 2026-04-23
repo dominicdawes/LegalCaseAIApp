@@ -1048,6 +1048,84 @@ async def pdf_to_dialogue_transcript(request: PDFRequest, background_tasks: Back
 
 
 # ================================================ #
+#         SPECULATIVE UPLOAD ENDPOINTS
+# ================================================ #
+
+class SpeculativeUploadRequest(BaseModel):
+    """Register a drag-dropped file in the Redis gate before its Celery task finishes."""
+    chat_session_id: str
+    doc_id: str
+    celery_task_id: str
+
+
+class CancelSpeculativeUploadRequest(BaseModel):
+    """Cancel a speculative upload — revoke task, purge DB rows and S3 object."""
+    chat_session_id: str
+    doc_id: str
+    project_id: str
+
+
+class InlineUploadMessageRequest(BaseModel):
+    """Persist a file_upload anchor message into the chat timeline."""
+    user_id: str
+    chat_session_id: str
+    document_ids: List[str]
+
+
+@app.post("/speculative-upload/register/")
+async def register_speculative_upload_endpoint(request: SpeculativeUploadRequest):
+    """
+    Called immediately after a drag-drop triggers document ingestion.
+    Writes {doc_id → celery_task_id} into the Redis gate so the chat
+    barrier knows to wait before running RAG retrieval.
+    """
+    try:
+        from utils.speculative_upload import register_speculative_upload
+        await register_speculative_upload(
+            request.chat_session_id, request.doc_id, request.celery_task_id
+        )
+        return {"status": "registered", "doc_id": request.doc_id}
+    except Exception as e:
+        logger.error(f"Error registering speculative upload: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/speculative-upload/cancel/")
+async def cancel_speculative_upload_endpoint(request: CancelSpeculativeUploadRequest):
+    """
+    Called when the user clicks the 'x' on a file card before sending their query.
+    Revokes the Celery ingestion task, deletes any partial DB rows and S3 object,
+    and removes the entry from the Redis gate.
+    """
+    try:
+        from utils.speculative_upload import cancel_speculative_upload
+        await cancel_speculative_upload(
+            request.chat_session_id, request.doc_id, request.project_id
+        )
+        return {"status": "cancelled", "doc_id": request.doc_id}
+    except Exception as e:
+        logger.error(f"Error cancelling speculative upload: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/speculative-upload/persist-message/")
+async def persist_inline_upload_message_endpoint(request: InlineUploadMessageRequest):
+    """
+    Called when the user hits Send to anchor the uploaded files as a
+    file_upload message in the conversation timeline.
+    """
+    try:
+        from utils.speculative_upload import persist_inline_upload
+        message_id = persist_inline_upload(
+            request.user_id, request.chat_session_id, request.document_ids
+        )
+        return {"status": "ok", "message_id": message_id}
+    except Exception as e:
+        logger.error(f"Error persisting inline upload message: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ================================================ #
 #              DEV-TOOLS ENDPOINTS
 # ================================================ #
 

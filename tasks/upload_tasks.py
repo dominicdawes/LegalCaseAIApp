@@ -1787,7 +1787,14 @@ def process_new_document_wrapper(
         
         # Update document status (sync call, like your pattern)
         _update_document_status_sync(doc_id, ProcessingStatus.COMPLETE, stats=result)
-        
+
+        # Clear the speculative-upload Redis gate for this doc (if the call
+        # came from a drag-drop chat flow that included chat_session_id).
+        chat_session_id = workflow_metadata.get('chat_session_id')
+        if chat_session_id:
+            from utils.speculative_upload import clear_speculative_upload
+            run_async_in_worker(clear_speculative_upload(chat_session_id, doc_id))
+
         logger.info(f"✅ [DOC-{short_id}] Document processing completed successfully")
         return result
         

@@ -432,7 +432,10 @@ class CitationProcessor:
                             # logger.info(f"    Page match: {page_match}, Doc match: {doc_match}")
                             
                             # === Perform matching (FUZZY LOGIC -- LLM Practical) =============
-                            page_match = chunk_page == page_num
+                            # If chunk_page is None (old chunks without page tracking),
+                            # treat the page constraint as satisfied — doc name match alone is
+                            # sufficient. The inline page number from the LLM is used for the URL.
+                            page_match = (chunk_page is None) or (chunk_page == page_num)
                             doc_match = False
                             similarity_threshold = 85 # Adjust as needed (e.g., 85%)
 
@@ -448,7 +451,8 @@ class CitationProcessor:
                                 else:
                                     logger.info(f"    Fuzzy Match Failed: ratio={ratio}, partial={partial_ratio} (Threshold={similarity_threshold})")
 
-                            logger.info(f"    Page match: {page_match}, Doc match (Fuzzy): {doc_match}")
+                            page_match_detail = "exact" if chunk_page == page_num else ("no-page-data" if chunk_page is None else "mismatch")
+                            logger.info(f"    Page match: {page_match} ({page_match_detail}), Doc match (Fuzzy): {doc_match}")
 
                             # If match found, create Citation object
                             if page_match and doc_match:
