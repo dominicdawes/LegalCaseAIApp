@@ -1760,7 +1760,9 @@ def process_new_document_wrapper(
         - project_id (str): project uuid
         - workflow_metadata: Dict[str, Any]
     """
-    doc_id = str(uuid.uuid4())  # create a new uuid
+    # Use the pre-generated UUID from speculative ingest if provided,
+    # otherwise mint a fresh one (standard non-speculative path).
+    doc_id = workflow_metadata.get('speculative_doc_id') or str(uuid.uuid4())
     doc_data['id'] = doc_id
     short_id = doc_id[:8]
     
@@ -1855,26 +1857,34 @@ async def _process_document_async_workflow(
                     essential_section = workflow_metadata.get('essential_section')
                     
                     cur.execute(
-                        '''INSERT INTO document_sources 
-                        (id, essential_course, essential_section, is_essential, cdn_url, content_hash, project_id, content_tags, uploaded_by, 
+                        '''INSERT INTO document_sources
+                        (id, essential_course, essential_section, is_essential, cdn_url, content_hash, project_id, content_tags, uploaded_by,
                         vector_embed_status, filename, file_size_bytes, file_extension, created_at, processing_metadata)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)''',
-                        (doc_id, essential_course, essential_section, is_essential, doc_data['cdn_url'], doc_data['content_hash'], 
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (id) DO UPDATE SET
+                            content_hash = EXCLUDED.content_hash,
+                            vector_embed_status = EXCLUDED.vector_embed_status,
+                            processing_metadata = EXCLUDED.processing_metadata''',
+                        (doc_id, essential_course, essential_section, is_essential, doc_data['cdn_url'], doc_data['content_hash'],
                         project_id, doc_data.get('content_tags', []), workflow_metadata['user_id'],
-                        ProcessingStatus.PENDING.value, doc_data['filename'], 
+                        ProcessingStatus.PENDING.value, doc_data['filename'],
                         doc_data['file_size_bytes'], os.path.splitext(doc_data['filename'])[1].lower(),
                         datetime.now(timezone.utc), Json(workflow_metadata))
                     )
                 else:
                     # Non-essential document - use standard insert
                     cur.execute(
-                        '''INSERT INTO document_sources 
-                        (id, cdn_url, content_hash, project_id, content_tags, uploaded_by, 
+                        '''INSERT INTO document_sources
+                        (id, cdn_url, content_hash, project_id, content_tags, uploaded_by,
                         vector_embed_status, filename, file_size_bytes, file_extension, created_at, processing_metadata)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)''',
-                        (doc_id, doc_data['cdn_url'], doc_data['content_hash'], 
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (id) DO UPDATE SET
+                            content_hash = EXCLUDED.content_hash,
+                            vector_embed_status = EXCLUDED.vector_embed_status,
+                            processing_metadata = EXCLUDED.processing_metadata''',
+                        (doc_id, doc_data['cdn_url'], doc_data['content_hash'],
                         project_id, doc_data.get('content_tags', []), workflow_metadata['user_id'],
-                        ProcessingStatus.PENDING.value, doc_data['filename'], 
+                        ProcessingStatus.PENDING.value, doc_data['filename'],
                         doc_data['file_size_bytes'], os.path.splitext(doc_data['filename'])[1].lower(),
                         datetime.now(timezone.utc), Json(workflow_metadata))
                     )

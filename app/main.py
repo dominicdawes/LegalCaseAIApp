@@ -1051,11 +1051,18 @@ async def pdf_to_dialogue_transcript(request: PDFRequest, background_tasks: Back
 #         SPECULATIVE UPLOAD ENDPOINTS
 # ================================================ #
 
-class SpeculativeUploadRequest(BaseModel):
-    """Register a drag-dropped file in the Redis gate before its Celery task finishes."""
+class SpeculativeIngestRequest(BaseModel):
+    """
+    Payload sent by WeWeb on drag-drop, AFTER the file has been uploaded to S3/CDN.
+    The backend creates the document_sources row, kicks off ingestion, and registers
+    the Redis gate — all in one round-trip.
+    """
+    cdn_url: str
+    filename: str
+    file_size_bytes: int
+    project_id: str
+    user_id: str
     chat_session_id: str
-    doc_id: str
-    celery_task_id: str
 
 
 class CancelSpeculativeUploadRequest(BaseModel):
@@ -1072,21 +1079,73 @@ class InlineUploadMessageRequest(BaseModel):
     document_ids: List[str]
 
 
-@app.post("/speculative-upload/register/")
-async def register_speculative_upload_endpoint(request: SpeculativeUploadRequest):
+@app.post("/speculative-ingest/")
+async def speculative_ingest(request: SpeculativeIngestRequest):
     """
-    Called immediately after a drag-drop triggers document ingestion.
-    Writes {doc_id → celery_task_id} into the Redis gate so the chat
-    barrier knows to wait before running RAG retrieval.
+    Single round-trip endpoint called by WeWeb on drag-drop (after S3 upload).
+
+    1. Pre-creates a document_sources row (PENDING) so the UI can show a file
+       card immediately via Supabase Realtime.
+    2. Kicks off process_document_batch_workflow with chat_session_id injected
+       into workflow_metadata so the barrier in chat_tasks can be registered.
+    3. Registers the Redis gate entry (doc_id → celery_task_id).
+    4. Returns {doc_id, celery_task_id} to WeWeb.
     """
+    import hashlib
+    import os as _os
+
     try:
-        from utils.speculative_upload import register_speculative_upload
-        await register_speculative_upload(
-            request.chat_session_id, request.doc_id, request.celery_task_id
+        doc_id = str(uuid.uuid4())
+        file_extension = _os.path.splitext(request.filename)[1].lower()
+
+        # ── 1. Pre-create document_sources row (PENDING) ──────────────────────
+        # content_hash is a stable placeholder derived from the CDN URL; the
+        # Celery worker will overwrite it with the real file hash via ON CONFLICT.
+        placeholder_hash = hashlib.sha256(request.cdn_url.encode()).hexdigest()
+
+        supabase_client.table("document_sources").insert(
+            {
+                "id": doc_id,
+                "cdn_url": request.cdn_url,
+                "content_hash": placeholder_hash,
+                "project_id": request.project_id,
+                "uploaded_by": request.user_id,
+                "vector_embed_status": "PENDING",
+                "filename": request.filename,
+                "file_size_bytes": request.file_size_bytes,
+                "file_extension": file_extension,
+                "content_tags": [],
+            }
+        ).execute()
+
+        logger.info(f"📄 Pre-created document_sources row {doc_id[:8]} (PENDING)")
+
+        # ── 2. Kick off ingestion workflow ────────────────────────────────────
+        metadata = {
+            "project_id": request.project_id,
+            "user_id": request.user_id,
+            "chat_session_id": request.chat_session_id,
+            "speculative_doc_id": doc_id,   # ← worker will use this UUID
+        }
+        job = process_document_batch_workflow.apply_async(
+            args=[[request.cdn_url], metadata],
+            kwargs={"create_note": False},
         )
-        return {"status": "registered", "doc_id": request.doc_id}
+
+        # ── 3. Register Redis gate ─────────────────────────────────────────────
+        from utils.speculative_upload import register_speculative_upload
+        await register_speculative_upload(request.chat_session_id, doc_id, job.id)
+
+        logger.info(
+            f"🚀 Speculative ingest started: doc={doc_id[:8]} task={job.id[:8]} "
+            f"session={request.chat_session_id[:8]}"
+        )
+
+        # ── 4. Return identifiers to WeWeb ────────────────────────────────────
+        return {"doc_id": doc_id, "celery_task_id": job.id}
+
     except Exception as e:
-        logger.error(f"Error registering speculative upload: {e}", exc_info=True)
+        logger.error(f"Error starting speculative ingest: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 
