@@ -13,6 +13,20 @@ Workflow:
   2. After embed   → clear_speculative_upload()   (called from upload_tasks.py)
   3. User clicks x → cancel_speculative_upload()
   4. User hits Send → persist_inline_upload()
+
+**IN THE UI**
+
+Drag-drop
+    └─ POST /speculative-ingest/         ← Goal 2 (backend)
+        returns { doc_id, document: {...} }
+
+Send button
+    ├─ Append file cards to chatHistory   ← Goal 1 (WeWeb variable)
+    ├─ Supabase INSERT into messages      ← Goal 1 (WeWeb direct)
+    │    with inline_documents = jsonb
+    ├─ Append query to chatHistory        ← existing
+    └─ POST /rag-chat/                    ← existing + Goal 2 barrier
+
 """
 
 import asyncio

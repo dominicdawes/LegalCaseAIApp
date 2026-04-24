@@ -1680,7 +1680,20 @@ def finalize_batch_and_create_note(
     logger.info(f"   ❌ Failed: {failure_count}")
     logger.info(f"   📄 Total chunks: {total_chunks:,}")
     logger.info(f"   🔄 Status: {batch_status}")
-    
+
+    # ——— 🚦 Clear Speculative-Upload Redis Gate ———————————————————————————————————
+    # Covers both the new-doc path (process_new_document_wrapper also clears, but
+    # that's a no-op) and the reused-doc path which has no per-task clearing.
+    chat_session_id = workflow_metadata.get('chat_session_id')
+    if chat_session_id and batch_status in ('COMPLETE', 'PARTIAL'):
+        from utils.speculative_upload import clear_speculative_upload
+        for doc_result in successful_docs:
+            doc_id_to_clear = doc_result.get('doc_id')
+            if doc_id_to_clear:
+                run_async_in_worker(
+                    clear_speculative_upload(chat_session_id, doc_id_to_clear)
+                )
+
     # ——— 📝 Trigger Note Generation (Based on Resilience Rules) ——————————————————————
     if workflow_metadata.get('create_note') and batch_status in ['COMPLETE', 'PARTIAL']:
         # Enhance metadata with batch context for note generation
@@ -2109,14 +2122,16 @@ def process_reused_document_task(
     - Much faster than full processing pipeline
     - Returns processing results for workflow coordination
     """
-    new_doc_id = str(uuid.uuid4())
-    
+    # Use the pre-generated UUID from speculative ingest if present so the
+    # pre-created PENDING row is updated in place rather than creating an orphan.
+    new_doc_id = workflow_metadata.get('speculative_doc_id') or str(uuid.uuid4())
+
     try:
         # ——— Create New Document Entry + Copy Embeddings ——————————————————————————
         # Use global pool instead of local pool
         pool = get_global_sync_db_pool()
         conn = pool.getconn()
-        
+
         try:
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
                 # FIND source document info for copying
@@ -2125,25 +2140,32 @@ def process_reused_document_task(
                     (existing_doc_id,)
                 )
                 source_info = cur.fetchone()
-                
+
                 if not source_info:
                     raise Exception(f"Source document {existing_doc_id} not found")
-                
-                # INSERT new document record with completed status
+
+                # UPSERT: if this is a speculative doc the row already exists with
+                # a placeholder content_hash and PENDING status — overwrite those fields.
                 cur.execute(
-                    '''INSERT INTO document_sources 
-                    (id, cdn_url, content_hash, project_id, content_tags, uploaded_by, 
-                    vector_embed_status, filename, file_size_bytes, file_extension, 
+                    '''INSERT INTO document_sources
+                    (id, cdn_url, content_hash, project_id, content_tags, uploaded_by,
+                    vector_embed_status, filename, file_size_bytes, file_extension,
                     total_chunks, total_batches, created_at, processing_metadata)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)''', # <-- FIXED HERE: unsupported format character ')' (0x29)
-                    (new_doc_id, doc_data['cdn_url'], doc_data['content_hash'], 
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (id) DO UPDATE SET
+                        content_hash       = EXCLUDED.content_hash,
+                        vector_embed_status = EXCLUDED.vector_embed_status,
+                        total_chunks       = EXCLUDED.total_chunks,
+                        total_batches      = EXCLUDED.total_batches,
+                        processing_metadata = EXCLUDED.processing_metadata''',
+                    (new_doc_id, doc_data['cdn_url'], doc_data['content_hash'],
                     project_id, doc_data.get('content_tags', []), workflow_metadata['user_id'],
-                    ProcessingStatus.COMPLETE.value, doc_data['filename'], 
+                    ProcessingStatus.COMPLETE.value, doc_data['filename'],
                     doc_data['file_size_bytes'], os.path.splitext(doc_data['filename'])[1].lower(),
                     source_info['total_chunks'], source_info['total_batches'],
                     datetime.now(timezone.utc), Json(workflow_metadata))
                 )
-                conn.commit() # Commit the insert of the new document source
+                conn.commit()
         finally:
             pool.putconn(conn)
         
