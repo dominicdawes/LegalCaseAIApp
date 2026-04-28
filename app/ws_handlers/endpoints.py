@@ -47,22 +47,28 @@ def setup_websocket_routes(app: FastAPI, redis_pub):
             receive_task = asyncio.create_task(
                 receive_websocket_messages(websocket, session_id, user_id)
             )
-            
+
+            # Register the listen task so the next reconnect for this session
+            # cancels this subscriber before creating a new one.  This is the fix
+            # for the N× message delivery bug caused by stale pubsub listeners.
+            manager.register_listen_task(session_id, listen_task)
+
             # Wait for either task to complete (usually due to disconnect)
             done, pending = await asyncio.wait(
                 [listen_task, receive_task],
                 return_when=asyncio.FIRST_COMPLETED
             )
-            
+
             # Cancel remaining tasks
             for task in pending:
                 task.cancel()
-                
+
         except WebSocketDisconnect:
             logger.info(f"🔌 WebSocket disconnected for session {session_id}")
         except Exception as e:
             logger.error(f"❌ WebSocket error for session {session_id}: {e}")
         finally:
+            manager.deregister_listen_task(session_id)
             await pubsub.unsubscribe(f"chat:{session_id}")
             await pubsub.close()
             await manager.disconnect(websocket, session_id, user_id)

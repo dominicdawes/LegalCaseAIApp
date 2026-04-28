@@ -14,27 +14,47 @@ logger.propagate = False
 
 class ConnectionManager:
     """Manages WebSocket connections for real-time streaming"""
-    
+
     def __init__(self):
         self.active_connections: Dict[str, Set[WebSocket]] = {}
         self.user_sessions: Dict[str, Set[str]] = {}  # user_id -> session_ids
-        self._lock = asyncio.Lock()  # Add lock for thread safety
-        
+        self._lock = asyncio.Lock()
+        # Track the Redis listen task per session so we can cancel stale ones on reconnect.
+        # Without this, each reconnect adds a new pubsub subscriber while the old ones
+        # keep running, causing every message to be delivered N times (once per subscriber).
+        self._listen_tasks: Dict[str, asyncio.Task] = {}
+
+    def register_listen_task(self, session_id: str, task: asyncio.Task):
+        """Register the Redis listen task for a session.
+
+        Call this immediately after creating the listen_task in the endpoint so that
+        the next connection for the same session can cancel the old subscriber.
+        """
+        old_task = self._listen_tasks.get(session_id)
+        if old_task and not old_task.done():
+            old_task.cancel()
+            logger.info(f"🔇 Cancelled stale Redis listener for session {session_id}")
+        self._listen_tasks[session_id] = task
+
+    def deregister_listen_task(self, session_id: str):
+        """Remove the task entry when a session closes cleanly."""
+        self._listen_tasks.pop(session_id, None)
+
     async def connect(self, websocket: WebSocket, session_id: str, user_id: str = None):
         """Connect a WebSocket to a chat session"""
         await websocket.accept()
-        
+
         # Add to session connections
         if session_id not in self.active_connections:
             self.active_connections[session_id] = set()
         self.active_connections[session_id].add(websocket)
-        
+
         # Track user sessions
         if user_id:
             if user_id not in self.user_sessions:
                 self.user_sessions[user_id] = set()
             self.user_sessions[user_id].add(session_id)
-        
+
         logger.info(f"✅ WebSocket connected to session {session_id} (user: {user_id})")
         
     async def disconnect(self, websocket: WebSocket, session_id: str, user_id: str = None):

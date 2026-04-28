@@ -13,3 +13,6 @@ docs/*
 prompt_engineering/*
 
 utils/available_models.txt
+
+# Frontend reference files (WeWeb JS — not deployed from this repo)
+frontend/
