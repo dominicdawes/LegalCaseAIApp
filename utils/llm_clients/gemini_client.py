@@ -178,27 +178,57 @@ class GeminiClient:
 
     #  Labeled as 'FIX 1'
     async def stream_chat(self, prompt: str, system_prompt: str = None):
-        """Stream chat response with optional system prompt. Now an async generator."""
-        try:
-            full_prompt = f"{system_prompt}\n\n{prompt}" if system_prompt else prompt
-            
-            kwargs = {
-                "generation_config": self.generation_config,
-                "stream": True
-            }
-            if self.safety_settings:
-                kwargs["safety_settings"] = self.safety_settings
-            
-            response_stream = self._model.generate_content(full_prompt, **kwargs)
-            
-            for chunk in response_stream:
-                if chunk.text:
-                    yield chunk.text
-                # Yield control to the event loop to prevent blocking
-                await asyncio.sleep(0)
-                    
-        except Exception as e:
-            raise RuntimeError(f"Gemini streaming error: {e}")
+        """Stream chat response without blocking the async event loop.
+
+        The Vertex AI SDK's streaming iterator is synchronous — each next() call
+        blocks until the next network chunk arrives.  Running it in a thread and
+        bridging via asyncio.Queue lets the event loop stay free to handle Redis
+        publishes and WebSocket sends between chunks.
+
+        Large Gemini chunks (Gemini returns paragraph-sized pieces, not tokens)
+        are sub-split into ~15-char pieces with a small sleep so the frontend
+        receives many small content_delta events and can render progressively.
+        """
+        import threading
+
+        full_prompt = f"{system_prompt}\n\n{prompt}" if system_prompt else prompt
+
+        kwargs = {"generation_config": self.generation_config, "stream": True}
+        if self.safety_settings:
+            kwargs["safety_settings"] = self.safety_settings
+
+        loop = asyncio.get_event_loop()
+        queue: asyncio.Queue = asyncio.Queue()
+
+        def _run_sync() -> None:
+            try:
+                response_stream = self._model.generate_content(full_prompt, **kwargs)
+                for chunk in response_stream:
+                    if chunk.text:
+                        loop.call_soon_threadsafe(queue.put_nowait, chunk.text)
+            except Exception as exc:
+                loop.call_soon_threadsafe(queue.put_nowait, exc)
+            finally:
+                loop.call_soon_threadsafe(queue.put_nowait, None)  # sentinel
+
+        thread = threading.Thread(target=_run_sync, daemon=True)
+        thread.start()
+
+        # Sub-chunk size: small enough to feel like token streaming (~15 chars).
+        # Adjust upward if you want fewer, larger broadcasts.
+        SUB_CHUNK_SIZE = 15
+        SUB_CHUNK_DELAY = 0.02  # 20ms between sub-chunks
+
+        while True:
+            item = await queue.get()
+            if item is None:
+                break
+            if isinstance(item, Exception):
+                raise RuntimeError(f"Gemini streaming error: {item}")
+            # Split large API chunks so the frontend gets many small deltas
+            for i in range(0, len(item), SUB_CHUNK_SIZE):
+                yield item[i : i + SUB_CHUNK_SIZE]
+                await asyncio.sleep(SUB_CHUNK_DELAY)
 
     def chat_with_retry(self, prompt: str, max_retries: int = 3, system_prompt: str = None) -> str:
         """Chat with automatic retry on provider outage"""
