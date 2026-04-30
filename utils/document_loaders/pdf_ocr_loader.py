@@ -15,6 +15,9 @@ class PDFOCRLoader(BaseDocumentLoader):
     """
     ### MODIFIED: Forces OCR on a PDF stream from memory.
     """
+    def __init__(self):
+        self.name = "PDFOCRLoader"
+
     def stream_documents(self, source: Union[str, io.BytesIO]) -> Iterator[Document]:
         # ### CHANGE: Opens the PDF from a stream for OCR.
         pdf = fitz.open(stream=source, filetype="pdf") if isinstance(source, io.BytesIO) else fitz.open(source)

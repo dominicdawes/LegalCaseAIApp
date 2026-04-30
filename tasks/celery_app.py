@@ -212,6 +212,8 @@ def register_tasks():
     import tasks.note_tasks
     import tasks.note_conversion_tasks
     import tasks.sample_tasks
+    import tasks.exam_grading_tasks
+    import tasks.conversions
     
     # Import and initialize scheduled tasks for Celery Beat
     from tasks.system_tasks import initialize_production_pipeline

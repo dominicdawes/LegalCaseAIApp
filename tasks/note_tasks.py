@@ -15,6 +15,7 @@ Note genereation (with RAG) is done without token streaming `llm_client.chat` re
 
 # ===== STANDARD LIBRARY IMPORTS =====
 import gc
+import re
 import logging
 import os
 import time
@@ -55,10 +56,12 @@ from utils.supabase_utils import (
     supabase_client,
     log_llm_error,
 )
-from utils.lightrag.lightrag_utils import lightrag_integration
+# LightRAG disabled — import lazily inside lightrag_note_generation_async when re-enabled
+# from utils.lightrag.lightrag_utils import lightrag_integration
 from utils.llm_clients.llm_factory import LLMFactory
 from utils.llm_clients.performance_monitor import PerformanceMonitor
 from utils.note_processing.flashcard_processor import FlashcardProcessor
+from utils.note_processing.quiz_processor import QuizProcessor
 
 # ——— Logging & Env Load ———————————————————————————————————————————————————————————
 logger = get_task_logger(__name__)
@@ -94,6 +97,8 @@ NOTE_TYPE_YAML_MAP = {
     "compare_contrast": "compare-contrast-prompt.yaml",
     "flashcards": "flashcards-prompt.yaml",
     "cold_call": "cold-call-prompt.yaml",
+    "quiz": "quiz-prompt.yaml",
+    "attack_outline": "attack-outline-prompt.yaml",
 }
 
 # ——— Enhanced Base Task Class ————————————————————————————————————————————————————
@@ -154,18 +159,20 @@ class AsyncNoteManager:
 
     async def generate_note_async(
         self,
+        note_id: str,
         user_id: str,
         note_type: str,
         project_id: str,
         note_title: str,
         provider: str,
         model_name: str,
+        num_sources: int,
         temperature: float = 0.7,
         addtl_params: Optional[Dict] = None,
     ) -> str:
         """
         🚀 Main async note generation workflow with parallel processing
-        
+
         Key improvements:
         - Parallel execution of embedding and prompt loading
         - Async chunk retrieval with connection pooling
@@ -179,7 +186,6 @@ class AsyncNoteManager:
             addtl_params = {}
 
         start_time = time.time()
-        note_id = str(uuid.uuid4())
         
         try:
             logger.info(f"🎯 Starting async note generation: {note_type} for project {project_id}")
@@ -193,8 +199,11 @@ class AsyncNoteManager:
             embedding_task = asyncio.create_task(
                 self._get_embedding_async(note_type)
             )
+            # Quiz JSON is large: ~1000 tokens per question + 500 buffer
+            num_questions = (addtl_params or {}).get('num_questions', 10)
+            quiz_token_budget = (num_questions * 1000 + 500) if note_type == "quiz" else 4056
             llm_task = asyncio.create_task(
-                self._setup_llm_client_async(provider, model_name, temperature)
+                self._setup_llm_client_async(provider, model_name, temperature, max_output_tokens=quiz_token_budget)
             )
             
             # Wait for all parallel tasks
@@ -204,8 +213,10 @@ class AsyncNoteManager:
             
             setup_time = time.time() - start_time
             logger.info(f"📊 Parallel setup completed in {setup_time*1000:.0f}ms")
-            
-            # 🆕 Async chunk retrieval (Naive RAG)
+
+            await self._update_note_progress_async(note_id, "PROCESSING")
+
+            # Async chunk retrieval (Naive RAG)
             retrieval_start = time.time()
             relevant_chunks = await self._fetch_relevant_chunks_async(
                 embedding, project_id
@@ -213,7 +224,7 @@ class AsyncNoteManager:
             retrieval_time = time.time() - retrieval_start
             logger.info(f"🔍 Retrieved {len(relevant_chunks)} chunks in {retrieval_time*1000:.0f}ms")
             
-            # 🆕 Build context and generate note
+            # Build context and generate note (typicaly BASE_PROMPT + TEMPLATE + CHUNKS)
             generation_start = time.time()
             context = self._build_note_context(
                 prompt_yaml, 
@@ -223,21 +234,26 @@ class AsyncNoteManager:
             )
             
             # Generate note content
+            # Strip preamble for markdown note types (LLMs sometimes prefix with intro prose)
+            _markdown_note_types = {"attack_outline", "case_brief", "outline", "compare_contrast", "exam_questions"}
             note_content = await self._generate_note_content_async(
-                llm_client, context, provider
+                llm_client, context, provider,
+                strip_preamble=(note_type in _markdown_note_types),
             )
             generation_time = time.time() - generation_start
             
             # 🆕 Async note persistence: Nomal Notes (one block) vs Flashcards, Cold Calls (discrete-blocks)
             save_start = time.time()
-            if note_type == "flashcards"  or note_type == "cold_call":  
+            if note_type == "flashcards"  or note_type == "cold_call":
                 # Special flashcard processing and storage
                 deck_id, num_cards = await self._save_flashcard_deck_and_cards_async(
+                    note_id=note_id,
                     project_id=project_id,
                     user_id=user_id,
                     deck_name=note_title,
                     llm_output=note_content,
                     is_essential=(addtl_params or {}).get('is_essential', False),
+                    num_sources=num_sources,
                 )
                 logger.info(f"🃏 Created flashcard deck {deck_id} with {num_cards} cards")
                 
@@ -247,15 +263,31 @@ class AsyncNoteManager:
                     "num_cards": num_cards,
                     "storage_type": "flashcards"
                 }
+            elif note_type=="quiz":
+                # Special quiz processing and storage
+                num_questions_requested = (addtl_params or {}).get('num_questions', 10)
+                
+                quiz_note_id, num_questions_saved = await self._save_quiz_and_questions_async(
+                    note_id=note_id,
+                    user_id=user_id,
+                    llm_output=note_content,
+                    num_questions_requested=num_questions_requested,
+                    is_essential=(addtl_params or {}).get('is_essential', False),
+                    num_sources=num_sources,
+                )
+                save_metrics = {
+                    "quiz_note_id": str(quiz_note_id),
+                    "num_questions": num_questions_saved,
+                    "storage_type": "quiz"
+                }
             else:
                 # Regular note types - save to notes table
                 await self._save_note_async(
-                    project_id, 
-                    user_id, 
-                    note_type, 
-                    note_title, 
-                    note_content,
+                    note_id=note_id,
+                    note_type=note_type,
+                    content=note_content,
                     is_essential=(addtl_params or {}).get('is_essential', False),
+                    num_sources=1
                 )
                 save_metrics = {"storage_type": "regular_note"}
             
@@ -283,7 +315,7 @@ class AsyncNoteManager:
             
         except Exception as e:
             logger.error(f"❌ Async note generation failed: {e}", exc_info=True)
-            await self._handle_note_error(project_id, user_id, note_type, str(e))
+            await self._handle_note_error(project_id, user_id, note_type, str(e), note_id=note_id)
             raise
         finally:
             # Clean up large objects
@@ -293,88 +325,97 @@ class AsyncNoteManager:
                 pass
             gc.collect()
 
-    async def lightrag_note_generation_async(
+    # LightRAG disabled — re-enable by uncommenting this method and restoring
+    # the lightrag_integration import at the top of the file.
+    # async def lightrag_note_generation_async(self, ...): ...
+
+    async def cleanup_note_async(
         self,
+        note_id: str,
         user_id: str,
-        note_type: str,
-        project_id: str,
-        note_title: str,
         provider: str,
         model_name: str,
-        temperature: float = 0.7,
-        addtl_params: Optional[Dict] = None,
+        temperature: float = 0.5
     ) -> str:
         """
-        Enhanced version of your note generation that uses LightRAG
-        
-        This would supplement your existing generate_note_async function in note_tasks.py
+        Fetches a user's note, enhances it using an LLM, and updates it in the database.
         """
-        
-        if addtl_params is None:
-            addtl_params = {}
-        
-        try:
-            logger.info(f"🎯 Starting enhanced note generation: {note_type} for project {project_id}")
-            
-            # ——— 1. Load Prompt (Your Existing Logic) ————————————————————————————————
-            from note_tasks import NOTE_TYPE_YAML_MAP, load_yaml_prompt, build_prompt_template_from_yaml
-            
-            yaml_file = NOTE_TYPE_YAML_MAP.get(note_type)
-            yaml_dict = load_yaml_prompt(yaml_file)
-            base_query = yaml_dict.get("base_prompt")
-            prompt_template = build_prompt_template_from_yaml(yaml_dict)
-            
-            # ——— 2. Enhanced Retrieval with LightRAG ——————————————————————————————————
-            logger.info("🔍 Using enhanced LightRAG retrieval...")
-            
-            try:
-                # Try LightRAG first
-                enhanced_context = await lightrag_integration.enhance_note_generation(
-                    query=base_query,
-                    project_id=project_id,
-                    note_type=note_type,
-                    retrieval_mode="hybrid"  # Use hybrid mode for best results
-                )
-                
-                logger.info(f"✅ LightRAG retrieval successful - context: {len(enhanced_context)} chars")
-                
-            except Exception as e:
-                logger.warning(f"⚠️ LightRAG retrieval failed, falling back to vector search: {e}")
-                
-                # Fallback to your existing vector search
-                from note_tasks import _fetch_relevant_chunks_async, _get_embedding_async
-                
-                embedding = await _get_embedding_async(note_type)
-                relevant_chunks = await _fetch_relevant_chunks_async(embedding, project_id)
-                
-                # Build context the traditional way
-                chunk_context = "\n\n".join(chunk["content"] for chunk in relevant_chunks)
-                enhanced_context = f"=== Retrieved Context ===\n{chunk_context}"
-            
-            # ——— 3. Build Final Context ——————————————————————————————————————————————
-            context = self._build_note_context(
-                prompt_template, 
-                enhanced_context, 
-                note_type, 
-                addtl_params
-            )
-            
-            # ——— 4. Generate Note (Your Existing Logic) ———————————————————————————————
-            from utils.llm_clients.llm_factory import LLMFactory
-            
-            llm_client = LLMFactory.get_client_for(provider, model_name, temperature, False)
-            note_content = await asyncio.get_event_loop().run_in_executor(
-                None, llm_client.chat, context
-            )
-            
-            logger.info(f"✅ Enhanced note generation completed: {len(note_content)} chars")
-            
-            return note_content
-            
-        except Exception as e:
-            logger.error(f"❌ Enhanced note generation failed: {e}")
-            raise
+        if not self._initialized:
+            await self.initialize()
 
+        start_time = time.time()
+        logger.info(f"✨ Starting note cleanup for note_id: {note_id}")
+
+        try:
+            original_content = ""
+            # 1. Fetch the existing note content using the async pool
+            async with get_db_connection() as conn:
+                record = await conn.fetchrow(
+                    "SELECT content_markdown FROM notes WHERE id = $1 AND user_id = $2",
+                    uuid.UUID(note_id), uuid.UUID(user_id)
+                )
+                if not record or not record['content_markdown']:
+                    logger.warning(f"⚠️ Note {note_id} not found or is empty. Aborting cleanup.")
+                    return "Note not found or empty."
+                
+                original_content = record['content_markdown']
+
+            # 2. Build the prompt for the LLM
+            prompt = f"""
+            You are an expert editor. Review the following user-written note and enhance it.
+            Your tasks are to:
+            - Correct any spelling, grammar, and punctuation errors.
+            - Improve sentence structure for better clarity and flow.
+            - Format the entire note using clean and readable Markdown.
+            - Do not add any new information or change the original meaning of the note.
+            - Retain the user's original intent and tone.
+            
+            Here is the note to clean up:
+            ---
+            {original_content}
+            ---
+            
+            output_format: markdown
+            
+            important formatting: no triple tick wrapping (e.g. ``` ```) or explict language identifier (e.g. ```markdown ```)
+            """
+            # 3. Get LLM client and generate the cleaned content
+            llm_client = await self._setup_llm_client_async(provider, model_name, temperature)
+            cleaned_content = await self._generate_note_content_async(llm_client, prompt, provider)
+
+            # NEW: Add this block to remove wrapping markdown code fences
+            # This pattern finds a string that starts with ```, optionally followed by a language name,
+            # captures everything in between (.+?), and ends with ```. It then replaces the
+            # entire match with just the captured group. The re.DOTALL flag is crucial
+            # to ensure that the '.' special character matches newlines.
+            pattern = r"^\s*```[a-zA-Z]*\s*\n?(.*?)\n?\s*```\s*$"
+            match = re.search(pattern, cleaned_content, re.DOTALL)
+            if match:
+                # If the pattern matches, extract the content from the capture group
+                cleaned_content = match.group(1).strip()
+            # END NEW BLOCK
+
+            # 4. Update the note in the database within a transaction
+            async with get_db_connection() as conn:
+                async with conn.transaction():
+                    await conn.execute(
+                        """
+                        UPDATE notes 
+                        SET suggested_cleanup = $1, updated_at = NOW()
+                        WHERE id = $2 AND user_id = $3
+                        """,
+                        cleaned_content, uuid.UUID(note_id), uuid.UUID(user_id)
+                    )
+            
+            total_time = time.time() - start_time
+            logger.info(f"✅ Note cleanup for {note_id} completed in {total_time:.2f}s.")
+            return cleaned_content
+
+        except Exception as e:
+            logger.error(f"❌ Note cleanup failed for {note_id}: {e}", exc_info=True)
+            # You could potentially log this error to the 'notes' table as well
+            raise
+            
     async def _load_prompt_async(self, note_type: str) -> tuple:
         """Returns the full yaml dict and all keys"""
         
@@ -382,7 +423,7 @@ class AsyncNoteManager:
         if not yaml_file:
             raise ValueError(f"Unknown note_type: {note_type}")
         
-        logger.info(f"📋 Loading prompt for note type: {note_type}")
+        logger.info(f"📋 Loading prompt YAML for NOTE TYPE: {note_type}")
         
         # Run in thread pool to avoid blocking
         loop = asyncio.get_event_loop()
@@ -395,9 +436,13 @@ class AsyncNoteManager:
         return yaml_dict
 
     async def _get_embedding_async(self, note_type: str) -> List[float]:
-        """🆕 Async 'note prompt' embedding generation with caching"""
+        """Async 'note prompt' embedding generation with caching
+        Description:
+            Converts baseline prompts to vector representation. Note embeddings are not seen by the LLM only vector-similarity lookup.
+            Base prompts should be instructive/SEO based to to match with the most relevant chunk vectors. 
+            i.e. packed with domain specific search terms: "core legal concepts, black letter law, claim, olding, etc..."
+        """
         
-        # Use note_type as cache key (embeddings are similar for same note types)
         if note_type in self._embedding_cache:
             logger.info(f"🎯 Cache HIT for {note_type} embedding")
             return self._embedding_cache[note_type]
@@ -405,17 +450,21 @@ class AsyncNoteManager:
         # Load prompt to get base query
         yaml_file = NOTE_TYPE_YAML_MAP.get(note_type)
         yaml_dict = load_yaml_prompt(yaml_file)
-        base_query = yaml_dict.get("base_prompt")
         
+        # Look for the new key. Fallback to base_prompt for older files.
+        retrieval_query = yaml_dict.get("retrieval_prompt", yaml_dict.get("base_prompt"))
+
+        if not retrieval_query:
+            logger.error(f"No retrieval_prompt or base_prompt found in {yaml_file}")
+            raise ValueError(f"Missing prompt for embedding in {note_type}")
+
         logger.info(f"🤖 Generating embedding for {note_type}")
         
-        # Generate embedding in thread pool
         loop = asyncio.get_event_loop()
         embedding = await loop.run_in_executor(
-            None, self._generate_embedding_sync, base_query
+            None, self._generate_embedding_sync, retrieval_query
         )
         
-        # Cache for future use
         self._embedding_cache[note_type] = embedding
         logger.info(f"💾 Cached embedding for {note_type}")
         
@@ -431,21 +480,27 @@ class AsyncNoteManager:
         )
         return embedder.embed_query(query)
 
-    async def _setup_llm_client_async(self, provider: str, model_name: str, temperature: float):
+    async def _setup_llm_client_async(self, provider: str, model_name: str, temperature: float, max_output_tokens: int = 4056):
         """🆕 Async LLM client setup"""
         loop = asyncio.get_event_loop()
         client = await loop.run_in_executor(
-            None, 
-            LLMFactory.get_client_for,
-            provider, model_name, temperature, False  # streaming=False for notes
+            None,
+            lambda: LLMFactory.get_client_for(provider, model_name, temperature, False, max_output_tokens=max_output_tokens)
         )
-        logger.info(f"🤖 LLM client setup: {provider}/{model_name}")
+        logger.info(f"🤖 LLM client setup: {provider}/{model_name} (max_output_tokens={max_output_tokens})")
         return client
 
     async def _fetch_relevant_chunks_async(
-        self, embedding: List[float], project_id: str, k: int = 10
+        self, 
+        embedding: List[float], 
+        project_id: str, 
+        k: int = 10
     ) -> List[Dict]:
-        """🆕 Async chunk retrieval with connection pooling"""
+        """🆕 Async chunk retrieval with connection pooling
+        Args:
+        - embedding (List): vectorized question prompt
+        - k (int): Top k relevant chunks, (default is 10)
+        """
         
         # Convert to pgvector format
         vector_str = '[' + ','.join(map(str, embedding)) + ']'
@@ -461,123 +516,147 @@ class AsyncNoteManager:
         return chunks
 
     def _build_note_context(
-            self, 
-            prompt_yaml: Dict,
-            relevant_chunks: List[Dict], 
-            note_type: str, 
-            addtl_params: Dict
-        ) -> str:
-            """
-            Build context for note generation with smart parameter 
-            handling (organized by page numbers)
-            """
-            # Build page number dictionary (for note citations etc...)
-            pages_dict = {}
-            for chunk in relevant_chunks:
-                page_num = chunk.get('page_number') or 'Unknown'
-                if page_num not in pages_dict:
-                    pages_dict[page_num] = []
-                pages_dict[page_num].append(chunk)
-            
-            page_contexts = []
-            for page_num in sorted(pages_dict.keys(), key=lambda x: x if isinstance(x, int) else float('inf')):
-                chunks_on_page = pages_dict[page_num]
-                page_content = "\n".join(chunk["content"] for chunk in chunks_on_page)
-                page_contexts.append(
-                    f"=== Page {page_num} ===\n"
-                    f"Source: {chunks_on_page[0].get('title', 'Unknown Document')}\n"
-                    f"{page_content}\n"
-                )
-            chunk_context = "\n".join(page_contexts)
-            
+        self, 
+        prompt_yaml: Dict,
+        relevant_chunks: List[Dict], 
+        note_type: str, 
+        addtl_params: Dict
+    ) -> str:
+        """
+        Build context for note generation with smart parameter 
+        handling (organized by page numbers)
+        """
+        # 1. Build Page Context (Standard for all)
+        pages_dict = {}
+        for chunk in relevant_chunks:
+            page_num = chunk.get('page_number') or 'Unknown'
+            if page_num not in pages_dict:
+                pages_dict[page_num] = []
+            pages_dict[page_num].append(chunk)
+        
+        page_contexts = []
+        for page_num in sorted(pages_dict.keys(), key=lambda x: x if isinstance(x, int) else float('inf')):
+            chunks_on_page = pages_dict[page_num]
+            page_content = "\n".join(chunk["content"] for chunk in chunks_on_page)
+            page_contexts.append(
+                f"=== Page {page_num} ===\n"
+                f"Source: {chunks_on_page[0].get('title', 'Unknown Document')}\n"
+                f"{page_content}\n"
+            )
+        chunk_context = "\n".join(page_contexts)
+    
+        # 2. Extract Standard Keys
+        # NOW STANDARDIZED: Every YAML must have system_prompt and template
+        system_prompt = prompt_yaml.get("system_prompt", "You are a helpful AI research assistant.")
+        prompt_template = build_prompt_template_from_yaml(prompt_yaml)
+        
+        # 3. Handle Variable Injection (Custom Logic only where vars differ)
+        if note_type == "exam_questions":
+            # Special Case: Exam questions needs example injection
+            example = prompt_yaml.get("example_issue_spotter", "")
+            num_questions = addtl_params.get("num_questions", 10)
+            formatted_template = prompt_template.format(
+                context=chunk_context, 
+                n_questions=num_questions
+            )
+            # Inject example between system and template
+            final_context = f"{system_prompt}\n\n## GOLD-STANDARD EXAMPLE\n{example}\n\n## YOUR TASK\n{formatted_template}"
 
-            # Format yaml prompt dictionary
-            base_prompt = prompt_yaml.get("base_prompt", "")        # directly accesses the yaml dict
-            prompt_template = build_prompt_template_from_yaml(prompt_yaml)      # fetched the full dict (so unique keys are included "example_issue_spotter"...)
+        elif note_type in ["flashcards", "cold_call", "quiz"]:
+            # Special Case: Numeric parameters
+            count_param = "num_questions" if note_type == "quiz" else "num_cards"
+            count_val = addtl_params.get(count_param, 10)
             
-            # Handle note-type specific YAML parameters
-            if note_type == "exam_questions":
-                example = prompt_yaml.get("example_issue_spotter", "")
-                num_questions = addtl_params.get("num_questions", 15)
-                
-                final_request = prompt_template.format(
-                    context=chunk_context, 
-                    n_questions=num_questions
-                )
-                # Assemble with the special example
-                context = f"{base_prompt}\n\n## GOLD-STANDARD EXAMPLE\n{example}\n\n## YOUR TASK\n{final_request}"
+            # Dynamic kwarg unpacking for format
+            fmt_args = {"context": chunk_context}
+            fmt_args[count_param] = count_val
+            
+            formatted_template = prompt_template.format(**fmt_args)
+            final_context = f"{system_prompt}\n\n{formatted_template}"
 
-            elif note_type in ["flashcards", "cold_call"]:
-                # Use "num_cards" as the consistent parameter key
-                num_cards = addtl_params.get("num_cards", 10)
-                
-                # Curly brace "filling in" vars
-                formatted_template = prompt_template.format(
-                    context=chunk_context, 
-                    num_cards=num_cards
-                )
-                # CORRECTLY assemble the prompt using the base_prompt
-                context = f"{base_prompt}\n\n{formatted_template}"
-                
-            else:
-                # For other note types, still combine base_prompt and template
-                # Curly brace "filling in" vars
-                formatted_template = prompt_template.format(context=chunk_context)
-                context = f"{base_prompt}\n\n{formatted_template}"
-            
-            logger.info(f"📝 Built context: {len(context)} characters")
-            return context
+        else:
+            # Standard Case (Attack Outline, Case Brief, Outline, Summary)
+            # Relies purely on standardized YAML keys
+            formatted_template = prompt_template.format(context=chunk_context)
+            final_context = f"{system_prompt}\n\n{formatted_template}"
+        
+        logger.info(f"📝 Built context: {len(final_context)} characters")
+        return final_context
+
+    @staticmethod
+    def _strip_llm_preamble(content: str) -> str:
+        """Strip any intro prose before the first Markdown header.
+
+        LLMs sometimes prefix responses with 'Here is your outline...' etc.
+        This finds the first line starting with '#' and discards everything before it.
+        """
+        lines = content.splitlines()
+        for i, line in enumerate(lines):
+            if line.lstrip().startswith("#"):
+                stripped = "\n".join(lines[i:]).strip()
+                if i > 0:
+                    logger.debug(f"🧹 Stripped {i} preamble line(s) from LLM response.")
+                return stripped
+        # No header found — return as-is (e.g. plain-text note types)
+        return content.strip()
 
     async def _generate_note_content_async(
-        self, llm_client, context: str, provider: str
+        self, llm_client, context: str, provider: str, strip_preamble: bool = False
     ) -> str:
         """🆕 Async note content generation"""
-        
+
         logger.info(f"🧠 Generating note content with {provider}")
-        
+
         # Run LLM generation in thread pool
         loop = asyncio.get_event_loop()
         content = await loop.run_in_executor(
             None, llm_client.chat, context
         )
-        
+
+        if strip_preamble:
+            content = self._strip_llm_preamble(content)
+
         logger.info(f"✅ Generated {len(content)} characters of content")
         return content
 
     async def _save_note_async(
-        self, 
-        project_id: str, 
-        user_id: str, 
-        note_type: str, 
-        note_title: str, 
+        self,
+        note_id: str,
+        note_type: str,
         content: str,
-        is_essential: bool
+        is_essential: bool,
+        num_sources: int,
     ):
-        """🆕 Async note persistence with connection pooling"""
-        
+        """Async note persistence — updates the stub row created at request time."""
+
         logger.info(f"💾 Saving {note_type} note to database")
-        
+
         async with get_db_connection() as conn:
             await conn.execute(
                 """
-                INSERT INTO notes (
-                    id, user_id, project_id, title, content_markdown, 
-                    note_type, is_generated, is_shareable, created_at, is_essential
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                UPDATE notes SET
+                    content_markdown        = $1,
+                    is_generated            = $2,
+                    is_shareable            = $3,
+                    is_essential            = $4,
+                    num_sources_based_on    = $5,
+                    note_progress_status    = 'COMPLETE'
+                WHERE id = $6
                 """,
-                str(uuid.uuid4()), user_id, project_id, note_title, content,
-                note_type, True, False, datetime.now(timezone.utc), is_essential
+                content, True, False, is_essential, num_sources, note_id
             )
-        
+
         logger.info(f"✅ Note saved successfully")
 
     async def _save_flashcard_deck_and_cards_async(
-        self, 
-        project_id: str, 
-        user_id: str, 
-        deck_name: str, 
+        self,
+        note_id: str,
+        project_id: str,
+        user_id: str,
+        deck_name: str,
         llm_output: str,
-        is_essential: bool
+        is_essential: bool,
+        num_sources: int,
     ) -> tuple:
         """
         🆕 Async flashcard processing and database insertion
@@ -617,25 +696,25 @@ class AsyncNoteManager:
             async with get_db_connection() as conn:
                 # Start transaction
                 async with conn.transaction():
-                    # Insert deck record first
-                    deck_id = await conn.fetchval(
+                    # Update the stub note row created at request time
+                    await conn.execute(
                         """
-                        INSERT INTO notes (
-                            id, user_id, project_id, title, note_type, description, 
-                            num_cards, created_at, is_active, is_essential
-                        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-                        RETURNING id
+                        UPDATE notes SET
+                            description          = $1,
+                            num_cards            = $2,
+                            is_active            = $3,
+                            is_essential         = $4,
+                            num_sources_based_on = $5,
+                            note_progress_status = 'COMPLETE'
+                        WHERE id = $6
                         """,
-                        str(uuid.uuid4()), user_id, project_id, 
-                        deck_data['deck_name'], "flashcards", deck_data['description'],
-                        deck_data['num_cards'], deck_data['created_at'],
-                        deck_data.get('is_active', True), is_essential
+                        deck_data['description'], deck_data['num_cards'],
+                        deck_data.get('is_active', True), is_essential, num_sources,
+                        note_id
                     )
-                    
-                    if not deck_id:
-                        raise Exception("Failed to insert flashcard deck")
-                    
-                    logger.info(f"✅ Inserted flashcard deck with ID: {deck_id}")
+                    deck_id = note_id
+
+                    logger.info(f"✅ Updated flashcard deck stub with ID: {deck_id}")
                     
                     # Prepare individual cards for batch insert
                     if cards_list:
@@ -683,73 +762,128 @@ class AsyncNoteManager:
         except Exception as e:
             logger.error(f"❌ Error saving flashcard deck and cards: {e}", exc_info=True)
             raise
+    
+    async def _save_quiz_and_questions_async(
+        self,
+        note_id: str,
+        user_id: str,
+        llm_output: str,
+        num_questions_requested: int,
+        is_essential: bool,
+        num_sources: int,
+    ) -> tuple:
+        """
+        🆕 Async quiz processing and database insertion.
 
-    # def save_flashcard_deck_and_cards_sync(self, project_id, user_id, deck_name, llm_output):
-    #     """
-    #     🔄 SUNSET: NOW PLACING FLASHCARDS DIRECT INTO NOTES TABLE
-    #     synchronous wrapper for flashcard processing
-    #     Maintained for backward compatibility with existing code
-    #     """
-    #     logger.warning("⚠️ Using legacy sync flashcard processing - consider upgrading to async")
-        
-    #     try:
-    #         # Initialize processor
-    #         processor = FlashcardProcessor()
-            
-    #         # Parse the LLM output
-    #         deck_data, cards_list = processor.parse_flashcard_content(llm_output, deck_name)
-            
-    #         # Validate the parsed data
-    #         if not processor.validate_flashcard_data(deck_data, cards_list):
-    #             raise ValueError("Invalid flashcard data structure")
-            
-    #         logger.info(f"💾 Parsed {len(cards_list)} flashcards for deck: {deck_name}")
-            
-    #         # Insert deck record first using Supabase client
-    #         deck_response = supabase_client.table('flashcard_decks').insert({
-    #             'user_id': user_id,
-    #             'project_id': project_id,
-    #             'deck_name': deck_data['deck_name'],
-    #             'description': deck_data['description'],
-    #             'num_cards': deck_data['num_cards'],
-    #             'created_at': deck_data['created_at'],
-    #             'is_active': deck_data.get('is_active', True)
-    #         }).execute()
-            
-    #         if not deck_response.data:
-    #             raise Exception("Failed to insert flashcard deck")
-            
-    #         deck_id = deck_response.data[0]['id']
-    #         logger.info(f"✅ Inserted flashcard deck with ID: {deck_id}")
-            
-    #         # Prepare individual cards for batch insert
-    #         cards_to_insert = []
-    #         for card in cards_list:
-    #             cards_to_insert.append({
-    #                 'deck_id': deck_id,
-    #                 'user_id': user_id,
-    #                 'project_id': project_id,
-    #                 'front_content': card['front_content'],
-    #                 'back_content': card['back_content'],
-    #                 'card_order': card['card_order'],
-    #                 'created_at': card['created_at'],
-    #                 'is_active': card.get('is_active', True)
-    #             })
-            
-    #         # Batch insert individual cards
-    #         if cards_to_insert:
-    #             cards_response = supabase_client.table('individual_cards').insert(cards_to_insert).execute()
-                
-    #             if not cards_response.data:
-    #                 raise Exception("Failed to insert flashcards")
-                
-    #             logger.info(f"✅ Inserted {len(cards_response.data)} individual flashcards")
-            
-    #         return deck_id, len(cards_list)
-            
-    #     except Exception as e:
-    #         logger.error(f"Error saving flashcard deck and cards: {e}", exc_info=True)
-    #         raise
+        Parses LLM JSON output and saves data to `notes`, `quiz_questions`,
+        and `quiz_answers` tables within a single transaction.
+
+        Args:
+            project_id: The project ID
+            user_id: The user ID
+            quiz_title: Name for the quiz (saved to notes.title)
+            llm_output: Raw LLM JSON response string
+            num_questions_requested: The number of questions asked for
+            is_essential: Flag for essential notes
+
+        Returns:
+            Tuple of (quiz_note_id, num_questions_saved)
+        """
+        try:
+            logger.info(f"🧠 Processing quiz note {note_id[:8]}…")
+
+            # 1. Initialize processor and parse/validate content
+            # This part is synchronous but fast (no I/O)
+            processor = QuizProcessor()
+
+            # 🆕 DEBUG PRINT: Log the first 2000 chars of the output
+            logger.info(f"Raw LLM Output ({len(llm_output)} chars) received for quiz:\n{llm_output[:2000]}...")
+
+            # 🆕 Use the new "Aggressive Coercion" method
+            # This one method replaces both parse_quiz_content and validate_quiz_data
+            quiz_data = processor.parse_and_salvage_quiz(llm_output)
+            # 🛑 REMOVED: processor.validate_quiz_data(quiz_data)
+
+            questions_list = quiz_data.get("questions", [])
+            num_questions_saved = len(questions_list)
+
+            # 💡 OPTIONAL: Add this log for comparison
+            logger.info(f"Successfully salvaged {num_questions_saved} out of {num_questions_requested} requested questions.")
+
+            if num_questions_saved == 0:
+                raise ValueError("No questions found in parsed quiz data.")
+
+            logger.info(f"💾 Saving {num_questions_saved} quiz questions to DB")
+
+            # 2. Use async database connection for all DB operations
+            async with get_db_connection() as conn:
+                # Start a single transaction for all inserts
+                async with conn.transaction():
+                    
+                    # 3. Update the stub notes row created at request time
+                    await conn.execute(
+                        """
+                        UPDATE notes SET
+                            num_questions        = $1,
+                            is_generated         = $2,
+                            is_essential         = $3,
+                            num_sources_based_on = $4,
+                            note_progress_status = 'COMPLETE'
+                        WHERE id = $5
+                        """,
+                        num_questions_saved, True, is_essential, num_sources, note_id
+                    )
+                    quiz_note_id = note_id
+
+                    logger.info(f"✅ Updated quiz note stub with ID: {quiz_note_id}")
+
+                    # 4. Loop and insert all questions and their answers
+                    for question_data in questions_list:
+                        # Insert quiz_questions record
+                        question_db_id = await conn.fetchval(
+                            """
+                            INSERT INTO quiz_questions (
+                                id, quiz_id, user_id, question_text, hint, created_at
+                            ) VALUES ($1, $2, $3, $4, $5, $6)
+                            RETURNING id
+                            """,
+                            str(uuid.uuid4()), quiz_note_id, user_id,
+                            question_data['question_text'], question_data['hint'],
+                            datetime.now(timezone.utc)
+                        )
+
+                        if not question_db_id:
+                            raise Exception(f"Failed to insert question: {question_data['question_text']}")
+
+                        # 5. Prepare and batch insert answers for this question
+                        answers_data = question_data.get("answers", [])
+                        if answers_data:
+                            answer_records = [
+                                (
+                                    str(uuid.uuid4()),  # id
+                                    question_db_id,     # question_id
+                                    ans['answer_choice_text'], # answer_choice_text
+                                    ans['is_correct'],  # is_correct
+                                    ans['feedback'],    # feedback
+                                    datetime.now(timezone.utc) # created_at
+                                ) for ans in answers_data
+                            ]
+                            
+                            await conn.copy_records_to_table(
+                                'quiz_answers',
+                                records=answer_records,
+                                columns=('id', 'question_id', 'answer_choice_text', 'is_correct', 'feedback', 'created_at')
+                            )
+
+                    logger.info(f"✅ Successfully inserted {num_questions_saved} questions and all their answers.")
+                    return quiz_note_id, num_questions_saved
+
+        except Exception as e:
+            logger.error(f"❌ Error saving quiz and questions: {e}", exc_info=True)
+            # 🆕 DEBUG PRINT: On error, log the *full* problematic output
+            if "llm_output" in locals():
+                logger.error(f"--- FULL FAILED LLM OUTPUT ---\n{llm_output}\n--- END FAILED LLM OUTPUT ---")
+            raise
 
     async def _log_performance_metrics(self, metrics: Dict):
         """🆕 Log performance metrics for monitoring"""
@@ -769,9 +903,25 @@ class AsyncNoteManager:
         except Exception as e:
             logger.warning(f"⚠️ Metrics logging failed: {e}")
 
+    async def _update_note_progress_async(self, note_id: str, status: str):
+        """Update note_progress_status for realtime frontend observability."""
+        try:
+            async with get_db_connection() as conn:
+                await conn.execute(
+                    "UPDATE notes SET note_progress_status = $1 WHERE id = $2",
+                    status, note_id
+                )
+            logger.info(f"📡 Note {note_id[:8]}… progress → {status}")
+        except Exception as e:
+            logger.warning(f"⚠️ Failed to update note progress [{status}] for {note_id}: {e}")
+
     async def _handle_note_error(
-        self, project_id: str, user_id: str, note_type: str, error_message: str
+        self, project_id: str, user_id: str, note_type: str, error_message: str,
+        note_id: Optional[str] = None,
     ):
+        # Mark the stub row as errored so the frontend listener is notified
+        if note_id:
+            await self._update_note_progress_async(note_id, "ERROR")
         try:
             loop = asyncio.get_event_loop()
             await loop.run_in_executor(
@@ -810,8 +960,10 @@ def rag_note_task(
     note_title: str,
     provider: str,
     model_name: str,
+    num_sources: int = 1,
     temperature: float = 0.7,
     addtl_params: Optional[Dict] = None,
+    note_id: Optional[str] = None,   # trailing optional — backward-compatible with old dispatches
 ):
     """
     🚀 Enhanced RAG note generation task with async event loop
@@ -832,6 +984,12 @@ def rag_note_task(
     - Same error handling patterns
     """
     
+    # Backward-compatibility: old dispatches (pre-observability) won't include note_id.
+    # Generate one so the pipeline has a consistent ID even without a stub row.
+    if note_id is None:
+        note_id = str(uuid.uuid4())
+        logger.warning(f"⚠️ note_id not provided — generated fallback {note_id[:8]}… (stub row not created)")
+
     try:
         # Set explicit start time metadata
         task_id = self.request.id
@@ -845,12 +1003,14 @@ def rag_note_task(
         # 🔥 CRITICAL: Execute async workflow in persistent event loop
         result = run_async_in_worker(
             note_manager.generate_note_async(
+                note_id=note_id,
                 user_id=user_id,
                 note_type=note_type,
                 project_id=project_id,
                 note_title=note_title,
                 provider=provider,
                 model_name=model_name,
+                num_sources=num_sources,
                 temperature=temperature,
                 addtl_params=addtl_params,
             )
@@ -860,7 +1020,7 @@ def rag_note_task(
         return "RAG Note Task success"
 
     except Exception as e:
-        logger.error(f"❌ Note task failed: {e}", exc_info=True)
+        logger.error(f"❌ Note task for {note_type} failed: {e}", exc_info=True)
         
         # Log error synchronously
         log_llm_error(
@@ -870,6 +1030,7 @@ def rag_note_task(
             error_message=str(e),
             project_id=project_id,
             user_id=user_id,
+            note_type=note_type, # 🆕 FIX: Add missing note_type for error logging
         )
         
         try:
@@ -882,6 +1043,55 @@ def rag_note_task(
     finally:
         # Clean up
         gc.collect()
+
+@celery_app.task(
+    bind=True,
+    base=BaseTaskWithRetry,
+    queue='notes', # Or a different queue if you prefer
+    acks_late=True,
+    rate_limit=RATE_LIMIT # Adjust as needed
+)
+def cleanup_note_task(
+    self,
+    note_id: str,
+    user_id: str,
+    provider: str,
+    model_name: str,
+    temperature: float = 0.5,
+):
+    """
+    Celery task to clean up and enhance a user's existing note.
+    """
+    try:
+        task_id = self.request.id
+        logger.info(f"🚀 Starting cleanup_note_task {task_id} for note: {note_id}")
+        self.update_state(
+            state="STARTED",
+            meta={"start_time": datetime.now(timezone.utc).isoformat()}
+        )
+
+        # Execute the async workflow in the worker's persistent event loop
+        result = run_async_in_worker(
+            note_manager.cleanup_note_async(
+                note_id=note_id,
+                user_id=user_id,
+                provider=provider,
+                model_name=model_name,
+                temperature=temperature,
+            )
+        )
+        
+        logger.info(f"✅ Cleanup task {task_id} completed successfully.")
+        return "Note cleanup successful."
+
+    except Exception as e:
+        logger.error(f"❌ Cleanup task for note {note_id} failed: {e}", exc_info=True)
+        try:
+            raise self.retry(exc=e)
+        except MaxRetriesExceededError:
+            raise RuntimeError(
+                f"Note cleanup failed permanently for note {note_id} after {self.max_retries} retries: {e}"
+            ) from e
 
 # ——— Legacy Support Functions (For Backward Compatibility) ——————————————————————
 
@@ -918,6 +1128,7 @@ def save_note(project_id, user_id, note_type, note_title, content):
         is_generated=True,
         is_shareable=False,
         created_at=datetime.now(timezone.utc).isoformat(),
+        num_sources=1,
     )
 
 def trim_context_length(full_context, query, relevant_chunks, model_name, max_tokens):

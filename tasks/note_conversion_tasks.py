@@ -302,6 +302,7 @@ def rag_note_conversion_task(
             note_type=note_type,
             note_title=note_title,
             content=full_answer,  # full rag reponse
+            num_sources=1
         )
 
         # Garbage collect cleanup and return success (proactively release large in-memory buffers)
@@ -351,7 +352,7 @@ def fetch_relevant_chunks(query_embedding, project_id, match_count=10):
         raise
 
 
-def save_note(project_id, user_id, note_type, note_title, content):
+def save_note(project_id, user_id, note_type, note_title, content, num_sources):
     """
     Persists generated summary note into Supabase public.notes table.
     """
@@ -367,6 +368,7 @@ def save_note(project_id, user_id, note_type, note_title, content):
         is_generated=True,
         is_shareable=False,
         created_at=datetime.now(timezone.utc).isoformat(),
+        num_sources=num_sources
     )
 
 

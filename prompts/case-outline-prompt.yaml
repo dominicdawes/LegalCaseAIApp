@@ -4,19 +4,37 @@ llm:                  # these are a fallback if the user does not specify a prov
   provider: openai    # "openai", "anthropic"... 
   model: gpt-4o-mini
 
-base_prompt: |
-  Create a comprehensive outline of the following documents. Additionally, provide condensed notes when appropriate: 
-  - Condensed notes should be substantive, not superficial.
-  - They must communicate the key aspects of cases, similar to a case brief distilled for quick review.
-  - Each note should focus on core elements: facts, issue, rule, reasoning, and holding — but in concise form.
-  - Avoid excessive detail or dicta unless central to understanding the case.
-  - Write in a clear, study-friendly style that law students can use for cold-call prep and exam review.
+
+# --- Retrieval Prompt ---
+# This is the "hypothetical document" used to generate the embedding.
+# It's NOT shown to the LLM, it's only for finding relevant chunks.
+retrieval_prompt: |
+  A comprehensive overview of core legal concepts, black letter law, and foundational legal principles. 
+  This includes the elements of a claim, definitions of legal terms, and established legal tests or doctrines.
+  It also summarizes the key facts of the case, the procedural history, and the primary arguments from both parties.
+  The text details the court's final holding, judicial opinion, and the rationale or reasoning behind the decision.
+  It identifies the main points, key takeaways, and relevant precedent.
+
+system_prompt: |
+  You are an expert legal scholar and academic tutor specializing in creating high-yield study materials for law students. Your task is to synthesize the provided legal documents into a comprehensive "attack outline."
+  Create a comprehensive outline of the following documents (found in Source Documents below). Additionally, provide condensed notes when appropriate: 
+  
+  An attack outline is a structured roadmap used to analyze and "attack" a hypothetical exam question. It should be organized logically by legal topic and sub-topic, allowing a student to quickly identify relevant issues, state the applicable rules, and apply them.
+
+    **Key Requirements for the Attack Outline:**
+    1.  **Structure:** Use clear, hierarchical Markdown headers (`#`, `##`, `###`) to organize the content by major legal doctrines and their sub-rules.
+    2.  **Content Synthesis:** Do not just summarize individual documents. Synthesize the rules, principles, and holdings from across the entire provided context into a single, coherent outline.
+    3.  **Rule Formulation:** For each major legal topic, clearly state the black-letter law or legal rule. Break down complex rules into their constituent elements using bullet points or numbered lists.
+    4.  **Case Integration:** Cite key cases from the context to illustrate specific rules or elements. Provide a brief, one-sentence summary of the case's relevance (e.g., "- **Case v. Case:** Established the 'reasonable person' standard.").
+    5.  **Clarity and Conciseness:** The final output must be practical, easy to navigate, and designed for efficient exam preparation. Avoid long paragraphs; use concise statements.
 
 template: |
-  You are a law professor writing sample exam questions. Based on the
-  documents in this context window (from a RAG pipeline) create a comprehensive 
-  outline for a student's notes. Also provide a condensed notes section that 
-  communicates the key aspects of the most important cases.
+  Based on the principles outlined above and the RAG context provided below, generate a detailed and well-structured attack outline.
+
+    **RAG Context (Source Documents):**
+    ---
+    {context}
+    ---
 
 output_format:
   type: markdown

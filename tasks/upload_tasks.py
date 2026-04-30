@@ -77,7 +77,7 @@ import psutil
 # ===== PROJECT MODULES =====
 from tasks.celery_app import celery_app
 from tasks.note_tasks import rag_note_task
-from utils.lightrag.lightrag_utils import lightrag_client, lightrag_integration
+# from utils.lightrag.lightrag_utils import lightrag_client, lightrag_integration  # LightRAG disabled
 from utils.s3_utils import upload_to_s3, s3_client
 from utils.cloudfront_utils import get_cloudfront_url
 from utils.supabase_utils import supabase_client
@@ -283,68 +283,110 @@ def _update_document_status_sync(doc_id: str, status: ProcessingStatus, error_me
     """
     logger.info(f"📋 Doc {doc_id[:8]}... → {status.value}")
     pool = get_global_sync_db_pool()
-    conn = pool.getconn()
-    try:
-        with conn.cursor() as cur:
-            # If the process is complete and we have stats, perform a full update
-            if status == ProcessingStatus.COMPLETE and stats:
-                cur.execute(
-                    """
-                    UPDATE document_sources
-                    SET 
-                        vector_embed_status = %s, 
-                        error_message = %s, 
-                        updated_at = NOW(),
-                        total_chunks = %s,
-                        total_tokens = %s
-                    WHERE id = %s
-                    """,
-                    (
-                        status.value, 
-                        error_message, 
-                        stats.get('chunks_created', 0), 
-                        stats.get('total_tokens', 0), 
-                        doc_id
+    retries = 3
+
+    for attempt in range(retries):
+        conn = None
+        try:
+            conn = pool.getconn()
+            with conn.cursor() as cur:
+                if status == ProcessingStatus.COMPLETE and stats:
+                    cur.execute(
+                        """
+                        UPDATE document_sources
+                        SET 
+                            vector_embed_status = %s, 
+                            error_message = %s, 
+                            updated_at = NOW(),
+                            total_chunks = %s,
+                            total_tokens = %s
+                        WHERE id = %s
+                        """,
+                        (
+                            status.value, 
+                            error_message, 
+                            stats.get('chunks_created', 0), 
+                            stats.get('total_tokens', 0), 
+                            doc_id
+                        )
                     )
-                )
-            else:
-                # Original query for simple status updates or failures
-                cur.execute(
-                    """
-                    UPDATE document_sources
-                    SET vector_embed_status = %s, error_message = %s, updated_at = NOW()
-                    WHERE id = %s
-                    """,
-                    (status.value, error_message, doc_id)
-                )
+                else:
+                    cur.execute(
+                        """
+                        UPDATE document_sources
+                        SET vector_embed_status = %s, error_message = %s, updated_at = NOW()
+                        WHERE id = %s
+                        """,
+                        (status.value, error_message, doc_id)
+                    )
             conn.commit()
-    finally:
-        pool.putconn(conn)
+            return # Success
+
+        except (psycopg2.OperationalError, psycopg2.DatabaseError) as e:
+            logger.warning(f"⚠️ DB Connection failed in doc update (attempt {attempt+1}/{retries}): {e}")
+            if conn:
+                try:
+                    pool.putconn(conn, close=True)
+                except Exception:
+                    pass
+                conn = None
+            
+            if attempt == retries - 1:
+                raise e
+            time.sleep(0.5)
+            
+        finally:
+            if conn:
+                pool.putconn(conn)
 
 def _update_batch_progress_sync(batch_id: str, project_id: str, status: BatchProgressStatus):
     """
     [PER BATCH] Update batch_progress for all documents in a batch
-    Fast bulk update - better than individual document updates
+    Includes retry logic for stale connections.
     """
     pool = get_global_sync_db_pool()
-    conn = pool.getconn()
-    try:
-        with conn.cursor() as cur:
-            # Use batch_id from processing_metadata to identify batch documents
-            cur.execute(
-                """
-                UPDATE document_sources 
-                SET batch_progress = %s, updated_at = NOW()
-                WHERE project_id = %s 
-                AND processing_metadata->>'batch_id' = %s
-                """,
-                (status.value, project_id, batch_id)
-            )
-            rows_updated = cur.rowcount
+    retries = 3
+    
+    for attempt in range(retries):
+        conn = None
+        try:
+            conn = pool.getconn()
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE document_sources 
+                    SET batch_progress = %s, updated_at = NOW()
+                    WHERE project_id = %s 
+                    AND processing_metadata->>'batch_id' = %s
+                    """,
+                    (status.value, project_id, batch_id)
+                )
+                rows_updated = cur.rowcount
             conn.commit()
             logger.info(f"📊 [BATCH-{batch_id[:8]}] Progress → {status.value} ({rows_updated} docs)")
-    finally:
-        pool.putconn(conn)
+            return # Success, exit loop
+
+        except (psycopg2.OperationalError, psycopg2.DatabaseError) as e:
+            logger.warning(f"⚠️ DB Connection failed in batch update (attempt {attempt+1}/{retries}): {e}")
+            if conn:
+                # CRITICAL: Return the bad connection to the pool with close=True
+                # This forces the pool to discard it and create a new one next time
+                try:
+                    pool.putconn(conn, close=True)
+                except Exception:
+                    pass
+                conn = None
+            
+            if attempt == retries - 1:
+                logger.error(f"❌ Failed to update batch progress after {retries} attempts")
+                raise e
+            
+            # Small backoff before retry
+            time.sleep(0.5)
+
+        finally:
+            if conn:
+                pool.putconn(conn)
 
 def create_http_session() -> requests.Session:
     """Helper to create a requests session with retry strategy"""
@@ -740,6 +782,7 @@ def copy_embeddings_for_project_sync(existing_source_id: str, new_source_id: str
             records_to_insert = []
             total_tokens = 0
             
+            # Parse fetched embeddings
             for embedding_row in existing_embeddings:
                 records_to_insert.append((
                     str(uuid.uuid4()),
@@ -895,8 +938,19 @@ async def _call_openai_embeddings_async(texts: List[str]) -> List[List[float]]:
     
 # ——— Async Helper Functions ——————————————————————————————————————————————————————
 
-async def _parse_document_async(source_id: str, cdn_url: str, project_id: str) -> Dict[str, Any]:
-    """Parse document asynchronously - FIXED for proper async operation"""
+async def _parse_document_async(source_id: str, source_filename: str, cdn_url: str, project_id: str) -> Dict[str, Any]:
+    """
+    Parse single document (or any type) asynchronously.
+    Uses the DocumentLoader class to parse documents
+
+    Returns:
+        Dict: parse results dict including (
+            'success': True,
+            'chunks': all_chunks,
+            'metadatas': all_metadatas,  # Include metadata for embedding
+            'total_pages': processing_summary['total_pages'],
+            'performance_metrics': perf_summary)
+    """
     _update_document_status_sync(source_id, ProcessingStatus.PARSING)
 
     short_id = source_id[:8]
@@ -975,11 +1029,25 @@ async def _parse_document_async(source_id: str, cdn_url: str, project_id: str) -
                 logger.info(f"🔄 [PARSE-{short_id}] Starting streaming processing...")
                 
                 # Process document stream into chunks
+                logger.info(f"USING {loader.name} loader to process documents...")
+
+                # Returns a tuple (text, meta). `meta` has keys {paragraph_index, page, estmated_page...}
                 document_stream = loader.stream_documents(file_buffer)
-                text_stream = processor.process_documents_streaming(document_stream, source_id)
+
+                text_stream = processor.process_documents_streaming(
+                    source_filename=source_filename,
+                    documents=document_stream, 
+                    source_id=source_id,
+                    source_url=cdn_url
+                )
 
                 # ✅ FIXED: Add async yields for long-running CPU work
                 for chunk_text, chunk_metadata in text_stream:
+
+                    if isinstance(chunk_metadata, dict): # Check if metadata is a dict
+                        chunk_metadata['filename'] = source_filename
+                        chunk_metadata['title'] = source_filename # Use filename as title for now
+                    
                     all_chunks.append(chunk_text)
                     all_metadatas.append(chunk_metadata)
                     
@@ -1021,9 +1089,13 @@ async def _parse_document_async(source_id: str, cdn_url: str, project_id: str) -
                 'error': str(e)
             }
 
-async def _embed_batch_async(doc_id: str, project_id: str, batch_info: List[str]) -> Dict[str, Any]:
+async def _embed_batch_async(
+        doc_id: str, 
+        project_id: str, 
+        batch_info: List[str],
+) -> Dict[str, Any]:
     """
-    Process a SIMGLE embedding batch - combines your legacy robustness with async benefits
+    Process a SINGLE embedding batch - combines your legacy robustness with async benefits
     
     This replaces _embed_batch_gevent but keeps all the good parts:
     - Same error handling and retry logic
@@ -1060,9 +1132,10 @@ async def _embed_batch_async(doc_id: str, project_id: str, batch_info: List[str]
             token_count = len(tokenizer.encode(text))
             total_tokens += token_count
             
-            # Extract page number from metadata
-            page_number = meta.get('page') if isinstance(meta, dict) else None
+            # Extract page number from metadata 'page' from PDFs first, but fall back to 'estimated_page' from DOCX.
+            page_number = meta.get('page', meta.get('estimated_page')) if isinstance(meta, dict) else None
             chunk_index = meta.get('chunk_index') if isinstance(meta, dict) else None
+            source_url = meta.get('source_id', None)
             
             records_to_insert.append((
                 str(uuid.uuid4()), 
@@ -1074,6 +1147,7 @@ async def _embed_batch_async(doc_id: str, project_id: str, batch_info: List[str]
                 token_count,
                 page_number,  # Add page number
                 chunk_index,  # Add chunk index for ordering
+                source_url,
                 datetime.now(timezone.utc)
             ))
 
@@ -1091,8 +1165,8 @@ async def _embed_batch_async(doc_id: str, project_id: str, batch_info: List[str]
             with conn.cursor() as cur:
                 cur.executemany(
                     '''INSERT INTO document_vector_store 
-                    (id, source_id, project_id, content, metadata, embedding, num_tokens, page_number, chunk_index, created_at)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)''',
+                    (id, source_id, project_id, content, metadata, embedding, num_tokens, page_number, chunk_index, cdn_url, created_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)''',
                     records_to_insert
                 )
                 conn.commit()
@@ -1439,8 +1513,8 @@ async def _execute_batch_workflow(batch_id: str, file_urls: List[str], metadata:
         for doc_info in new_documents:
             # Single task per document - handles everything internally
             task_sig = process_new_document_wrapper.s(
-                doc_data=doc_info['doc_data'], 
-                project_id=doc_info['project_id'], 
+                doc_data=doc_info['doc_data'],
+                project_id=doc_info['project_id'],
                 workflow_metadata={**metadata, 'batch_id': batch_id}
             )
             document_tasks.append(task_sig)     # ← Add NEW docs to chord signature
@@ -1606,7 +1680,20 @@ def finalize_batch_and_create_note(
     logger.info(f"   ❌ Failed: {failure_count}")
     logger.info(f"   📄 Total chunks: {total_chunks:,}")
     logger.info(f"   🔄 Status: {batch_status}")
-    
+
+    # ——— 🚦 Clear Speculative-Upload Redis Gate ———————————————————————————————————
+    # Covers both the new-doc path (process_new_document_wrapper also clears, but
+    # that's a no-op) and the reused-doc path which has no per-task clearing.
+    chat_session_id = workflow_metadata.get('chat_session_id')
+    if chat_session_id and batch_status in ('COMPLETE', 'PARTIAL'):
+        from utils.speculative_upload import clear_speculative_upload
+        for doc_result in successful_docs:
+            doc_id_to_clear = doc_result.get('doc_id')
+            if doc_id_to_clear:
+                run_async_in_worker(
+                    clear_speculative_upload(chat_session_id, doc_id_to_clear)
+                )
+
     # ——— 📝 Trigger Note Generation (Based on Resilience Rules) ——————————————————————
     if workflow_metadata.get('create_note') and batch_status in ['COMPLETE', 'PARTIAL']:
         # Enhance metadata with batch context for note generation
@@ -1686,7 +1773,9 @@ def process_new_document_wrapper(
         - project_id (str): project uuid
         - workflow_metadata: Dict[str, Any]
     """
-    doc_id = str(uuid.uuid4())  # create a new uuid
+    # Use the pre-generated UUID from speculative ingest if provided,
+    # otherwise mint a fresh one (standard non-speculative path).
+    doc_id = workflow_metadata.get('speculative_doc_id') or str(uuid.uuid4())
     doc_data['id'] = doc_id
     short_id = doc_id[:8]
     
@@ -1713,7 +1802,14 @@ def process_new_document_wrapper(
         
         # Update document status (sync call, like your pattern)
         _update_document_status_sync(doc_id, ProcessingStatus.COMPLETE, stats=result)
-        
+
+        # Clear the speculative-upload Redis gate for this doc (if the call
+        # came from a drag-drop chat flow that included chat_session_id).
+        chat_session_id = workflow_metadata.get('chat_session_id')
+        if chat_session_id:
+            from utils.speculative_upload import clear_speculative_upload
+            run_async_in_worker(clear_speculative_upload(chat_session_id, doc_id))
+
         logger.info(f"✅ [DOC-{short_id}] Document processing completed successfully")
         return result
         
@@ -1741,7 +1837,7 @@ async def _process_document_async_workflow(
     workflow_metadata: Dict[str, Any]
 ) -> Dict[str, Any]:
     """
-    Asynchronous processing for a NEW document that handles the complete workflow: 
+    Asynchronous processing for a NEW document (one file) that handles the complete workflow: 
     1. INSERT document into Supaabse
     2. PARSE document into semantic chunks
     3. EMBED chunks using 'smart batching' using OpenAI embeddings
@@ -1774,26 +1870,34 @@ async def _process_document_async_workflow(
                     essential_section = workflow_metadata.get('essential_section')
                     
                     cur.execute(
-                        '''INSERT INTO document_sources 
-                        (id, essential_course, essential_section, is_essential, cdn_url, content_hash, project_id, content_tags, uploaded_by, 
+                        '''INSERT INTO document_sources
+                        (id, essential_course, essential_section, is_essential, cdn_url, content_hash, project_id, content_tags, uploaded_by,
                         vector_embed_status, filename, file_size_bytes, file_extension, created_at, processing_metadata)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)''',
-                        (doc_id, essential_course, essential_section, is_essential, doc_data['cdn_url'], doc_data['content_hash'], 
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (id) DO UPDATE SET
+                            content_hash = EXCLUDED.content_hash,
+                            vector_embed_status = EXCLUDED.vector_embed_status,
+                            processing_metadata = EXCLUDED.processing_metadata''',
+                        (doc_id, essential_course, essential_section, is_essential, doc_data['cdn_url'], doc_data['content_hash'],
                         project_id, doc_data.get('content_tags', []), workflow_metadata['user_id'],
-                        ProcessingStatus.PENDING.value, doc_data['filename'], 
+                        ProcessingStatus.PENDING.value, doc_data['filename'],
                         doc_data['file_size_bytes'], os.path.splitext(doc_data['filename'])[1].lower(),
                         datetime.now(timezone.utc), Json(workflow_metadata))
                     )
                 else:
                     # Non-essential document - use standard insert
                     cur.execute(
-                        '''INSERT INTO document_sources 
-                        (id, cdn_url, content_hash, project_id, content_tags, uploaded_by, 
+                        '''INSERT INTO document_sources
+                        (id, cdn_url, content_hash, project_id, content_tags, uploaded_by,
                         vector_embed_status, filename, file_size_bytes, file_extension, created_at, processing_metadata)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)''',
-                        (doc_id, doc_data['cdn_url'], doc_data['content_hash'], 
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (id) DO UPDATE SET
+                            content_hash = EXCLUDED.content_hash,
+                            vector_embed_status = EXCLUDED.vector_embed_status,
+                            processing_metadata = EXCLUDED.processing_metadata''',
+                        (doc_id, doc_data['cdn_url'], doc_data['content_hash'],
                         project_id, doc_data.get('content_tags', []), workflow_metadata['user_id'],
-                        ProcessingStatus.PENDING.value, doc_data['filename'], 
+                        ProcessingStatus.PENDING.value, doc_data['filename'],
                         doc_data['file_size_bytes'], os.path.splitext(doc_data['filename'])[1].lower(),
                         datetime.now(timezone.utc), Json(workflow_metadata))
                     )
@@ -1805,7 +1909,12 @@ async def _process_document_async_workflow(
         logger.info(f"📋 [DOC-{short_id}] → PARSING")
 
         # Parsing contains these subtasks: select optimal loader → in-memory streaming → clean/chunk text
-        parse_result = await _parse_document_async(doc_id, doc_data['cdn_url'], project_id)
+        parse_result = await _parse_document_async(
+            doc_id, 
+            doc_data['filename'],
+            doc_data['cdn_url'], 
+            project_id,
+            )
         
         if not parse_result.get('success'):
             return {
@@ -1886,7 +1995,7 @@ async def _lightrag_document_processing_async(
         # ——— 1. Your Existing Document Processing ————————————————————————————————
         # Keep your existing parsing logic
         from upload_tasks import _parse_document_async
-        parse_result = await _parse_document_async(doc_id, doc_data['cdn_url'], project_id)
+        parse_result = await _parse_document_async(doc_id, doc_data['filename'], doc_data['cdn_url'], project_id)
         
         if not parse_result.get('success'):
             return {
@@ -1900,38 +2009,33 @@ async def _lightrag_document_processing_async(
         chunks = parse_result['chunks']
         chunks_metadata = parse_result.get('metadatas', [])
         
-        # ——— 2. Parallel Processing: Traditional Embeddings + LightRAG ——————————————
-        logger.info(f"⚡ [DOC-{short_id}] Running parallel: embeddings + LightRAG")
-        
-        # Start both processes concurrently
+        # ——— 2. Embeddings Processing ————————————————————————————————————————————
+        logger.info(f"⚡ [DOC-{short_id}] Running embeddings processing")
+
         from upload_tasks import _process_embeddings_async
-        
+
         embedding_task = asyncio.create_task(
             _process_embeddings_async(doc_id, project_id, chunks, chunks_metadata)
         )
-        
-        lightrag_task = asyncio.create_task(
-            lightrag_integration.enhance_document_processing(
-                doc_id, chunks, chunks_metadata, project_id
-            )
-        )
-        
-        # Wait for both to complete
-        embedding_result, lightrag_result = await asyncio.gather(
-            embedding_task, lightrag_task, return_exceptions=True
-        )
-        
+
+        # LightRAG disabled — uncomment when re-enabling
+        # lightrag_task = asyncio.create_task(
+        #     lightrag_integration.enhance_document_processing(
+        #         doc_id, chunks, chunks_metadata, project_id
+        #     )
+        # )
+
+        # Wait for embedding to complete (LightRAG disabled)
+        embedding_result = await embedding_task
+        lightrag_result = {'success': False, 'entities_count': 0, 'relationships_count': 0}
+
         # ——— 3. Analyze Results ———————————————————————————————————————————————————
         final_status = 'COMPLETE'
-        
+
         # Check embedding results
         if isinstance(embedding_result, Exception) or not embedding_result.get('success'):
             final_status = 'PARTIAL'
             logger.warning(f"⚠️ [DOC-{short_id}] Embedding processing failed")
-        
-        # Check LightRAG results (non-critical)
-        if isinstance(lightrag_result, Exception) or not lightrag_result.get('success'):
-            logger.warning(f"⚠️ [DOC-{short_id}] LightRAG processing failed (non-critical)")
         
         # ——— 4. Return Enhanced Results ————————————————————————————————————————————
         return {
@@ -2018,14 +2122,16 @@ def process_reused_document_task(
     - Much faster than full processing pipeline
     - Returns processing results for workflow coordination
     """
-    new_doc_id = str(uuid.uuid4())
-    
+    # Use the pre-generated UUID from speculative ingest if present so the
+    # pre-created PENDING row is updated in place rather than creating an orphan.
+    new_doc_id = workflow_metadata.get('speculative_doc_id') or str(uuid.uuid4())
+
     try:
         # ——— Create New Document Entry + Copy Embeddings ——————————————————————————
         # Use global pool instead of local pool
         pool = get_global_sync_db_pool()
         conn = pool.getconn()
-        
+
         try:
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
                 # FIND source document info for copying
@@ -2034,25 +2140,32 @@ def process_reused_document_task(
                     (existing_doc_id,)
                 )
                 source_info = cur.fetchone()
-                
+
                 if not source_info:
                     raise Exception(f"Source document {existing_doc_id} not found")
-                
-                # INSERT new document record with completed status
+
+                # UPSERT: if this is a speculative doc the row already exists with
+                # a placeholder content_hash and PENDING status — overwrite those fields.
                 cur.execute(
-                    '''INSERT INTO document_sources 
-                    (id, cdn_url, content_hash, project_id, content_tags, uploaded_by, 
-                    vector_embed_status, filename, file_size_bytes, file_extension, 
+                    '''INSERT INTO document_sources
+                    (id, cdn_url, content_hash, project_id, content_tags, uploaded_by,
+                    vector_embed_status, filename, file_size_bytes, file_extension,
                     total_chunks, total_batches, created_at, processing_metadata)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)''', # <-- FIXED HERE: unsupported format character ')' (0x29)
-                    (new_doc_id, doc_data['cdn_url'], doc_data['content_hash'], 
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (id) DO UPDATE SET
+                        content_hash       = EXCLUDED.content_hash,
+                        vector_embed_status = EXCLUDED.vector_embed_status,
+                        total_chunks       = EXCLUDED.total_chunks,
+                        total_batches      = EXCLUDED.total_batches,
+                        processing_metadata = EXCLUDED.processing_metadata''',
+                    (new_doc_id, doc_data['cdn_url'], doc_data['content_hash'],
                     project_id, doc_data.get('content_tags', []), workflow_metadata['user_id'],
-                    ProcessingStatus.COMPLETE.value, doc_data['filename'], 
+                    ProcessingStatus.COMPLETE.value, doc_data['filename'],
                     doc_data['file_size_bytes'], os.path.splitext(doc_data['filename'])[1].lower(),
                     source_info['total_chunks'], source_info['total_batches'],
                     datetime.now(timezone.utc), Json(workflow_metadata))
                 )
-                conn.commit() # Commit the insert of the new document source
+                conn.commit()
         finally:
             pool.putconn(conn)
         

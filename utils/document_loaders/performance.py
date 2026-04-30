@@ -21,6 +21,8 @@ class ProcessingMetrics:
     cleaning_time_ms: float = 0
     chunking_time_ms: float = 0
     token_counting_time_ms: float = 0
+    # This will track the actual highest page number from the document metadata
+    highest_page_seen: int = 0
     
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -37,7 +39,9 @@ class ProcessingMetrics:
         }
 
 class OptimizedTextCleaner:
-    """High-performance text cleaning with compiled regex patterns"""
+    """A utility class for cleaning raw text using pre-compiled regular expressions (regex)
+    for high efficiency. It can operate in a 'fast' mode for basic cleanup or a
+    'thorough' mode for more intensive normalization."""
     
     def __init__(self):
         # Compile regex patterns once for better performance
@@ -86,7 +90,10 @@ class OptimizedTextCleaner:
 
 class StreamingTextProcessor:
     """
-    High-performance streaming text processor with metrics
+    Orchestrates the entire text processing pipeline. It takes a stream of
+    Document objects (representing pages or paragraphs), cleans their content,
+    splits them into semantic chunks, and yields the final chunks with enriched
+    metadata while tracking performance metrics.
     """
     
     def __init__(self, 
@@ -123,20 +130,35 @@ class StreamingTextProcessor:
         self.metrics = ProcessingMetrics()
     
     def process_documents_streaming(self, 
+                                    source_filename: str,
                                     documents: Iterator[Document],
-                                    source_id: str = None) -> Iterator[Tuple[str, Dict[str, Any]]]:
+                                    source_id: str = None,
+                                    source_url: str = None) -> Iterator[Tuple[str, Dict[str, Any]]]:
         """
-        Process documents in streaming fashion with performance tracking
+        Takes a stream of Document objects from a loader, processes them, and
+        yields a stream of cleaned, chunked text along with their metadata.
+
+        This function correctly determines the total page count by inspecting the
+        'page' or 'estimated_page' metadata from the incoming documents.
+
+        Args:
+            documents: An iterator of Document objects from a document loader.
+            source_id: The unique identifier for the source document.
         
         Yields:
-            Tuple of (cleaned_text, metadata)
+            A tuple containing the chunked text (str) and its associated
+            metadata (dict).
         """
         start_time = time.time()
         
         try:
-            for page_num, document in enumerate(documents):
-                # Track page processing
-                self.metrics.total_pages += 1
+            # We no longer use enumerate for page counting.
+            for document in documents:
+                # Track page processing by reading the metadata from the loader
+                current_page_num = document.metadata.get('page') or document.metadata.get('estimated_page') or 0
+                if current_page_num > self.metrics.highest_page_seen:
+                    self.metrics.highest_page_seen = current_page_num
+                
                 page_start_time = time.time()
                 
                 # Clean text
@@ -145,7 +167,7 @@ class StreamingTextProcessor:
                 self.metrics.cleaning_time_ms += (time.time() - clean_start) * 1000
                 
                 if len(cleaned_content) < self.min_chunk_length:
-                    logger.debug(f"Skipping short page {page_num + 1}: {len(cleaned_content)} chars")
+                    logger.debug(f"Skipping short content from page {current_page_num}: {len(cleaned_content)} chars")
                     continue
                 
                 self.metrics.total_characters += len(cleaned_content)
@@ -169,17 +191,19 @@ class StreamingTextProcessor:
                         # Enhanced metadata
                         chunk_metadata = {
                             **chunk.metadata,
+                            "title": source_filename,
                             "chunk_index": chunk_idx,
                             "chunk_length": len(chunk.page_content),
-                            "source_id": source_id
+                            "source_id": source_id,
+                            "source_url": source_url,
                         }
                         
                         yield chunk.page_content, chunk_metadata
                 
-                # Log progress periodically (every 20 pages)
-                if (page_num + 1) % 20 == 0:
+                # Log progress periodically (every 20 pages that have passed)
+                if self.metrics.highest_page_seen > 0 and (self.metrics.highest_page_seen) % 20 == 0:
                     elapsed_ms = (time.time() - start_time) * 1000
-                    logger.info(f"Processed {page_num + 1} pages, "
+                    logger.info(f"Processed up to page {self.metrics.highest_page_seen}, "
                                 f"{self.metrics.total_chunks} chunks, "
                                 f"{elapsed_ms:.1f}ms elapsed")
         

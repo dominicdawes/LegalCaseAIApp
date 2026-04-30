@@ -52,6 +52,11 @@ import threading
 import asyncio
 import socket
 
+
+class TaskCancelledError(Exception):
+    """Raised when a streaming task is cancelled via the Redis cancel-key mechanism."""
+    pass
+
 # ===== LLM & LANGCHAIN =====
 import tiktoken
 from langchain_openai import OpenAIEmbeddings
@@ -82,7 +87,7 @@ from utils.supabase_utils import (
 )
 
 from tasks.celery_app import run_async_in_worker
-from tasks.database import get_db_connection, get_redis_connection, get_global_async_db_pool, get_global_redis_pool, init_async_pools, check_db_pool_health
+from tasks.database import get_db_connection, get_redis_connection, get_global_async_db_pool, get_global_redis_pool, init_async_pools, check_db_pool_health, check_redis_pool_health
 from utils.prompt_utils import load_yaml_prompt, build_chat_messages_from_yaml
 
 # ——— Logging & Env Load ———————————————————————————————————————————————————————————
@@ -307,7 +312,16 @@ class EmbeddingCache:
                 logger.info(f"💾 Cached embedding for future use")
         except Exception as e:
             logger.warning(f"⚠️ Cache storage failed: {e}")
-
+            
+class UUIDEncoder(json.JSONEncoder):
+    """Custom JSON encoder that handles UUIDs and datetime objects"""
+    def default(self, obj):
+        if isinstance(obj, uuid.UUID):
+            return str(obj)
+        if isinstance(obj, datetime):
+            return obj.isoformat()
+        return super().default(obj)
+        
 # ——— Streaming Chat Manager (Core New Component) ——————————————————————————————————
 
 class StreamingChatManager:
@@ -335,6 +349,7 @@ class StreamingChatManager:
         # 🔑 Use the Celery Task ID as the key for unambiguous lookups
         self._active_tasks: Dict[str, Dict[str, Any]] = {}
         self.task_id = None
+        self._last_cancel_check: float = 0.0  # monotonic time of last Redis cancel poll
         
     async def initialize(self):
         """
@@ -430,7 +445,16 @@ class StreamingChatManager:
             
             embedding_time = time.time() - start_time
             logger.info(f"📊 Parallel setup completed in {embedding_time*1000:.0f}ms")
-            
+
+            # ⏳ Speculative-upload barrier: wait for any drag-dropped files to
+            # finish embedding before RAG retrieval so they're included in context.
+            all_ready = await self._wait_for_speculative_uploads(chat_session_id)
+            if not all_ready:
+                query = (
+                    "[Note: Some recently uploaded documents are still processing "
+                    "and may not be reflected in the context below.]\n\n" + query
+                )
+
             # 🆕 Fetch relevant chunks with project isolation
             retrieval_start = time.time()
             relevant_chunks = await self._fetch_relevant_chunks_async(
@@ -452,21 +476,29 @@ class StreamingChatManager:
             
             # Stream response with real-time updates
             llm_start = time.time()
-            streaming_response = await self._stream_rag_response(
-                assistant_message_id=assistant_message_id,
-                chat_session_id=chat_session_id,
-                query=query,
-                relevant_chunks=relevant_chunks,
-                chat_history=chat_history,
-                llm_client=llm_client,
-                provider=provider_name
-                # task_key=task_id
-            )
+            try:
+                streaming_response = await self._stream_rag_response(
+                    assistant_message_id=assistant_message_id,
+                    chat_session_id=chat_session_id,
+                    query=query,
+                    relevant_chunks=relevant_chunks,
+                    chat_history=chat_history,
+                    llm_client=llm_client,
+                    provider=provider_name
+                    # task_key=task_id
+                )
+            except TaskCancelledError:
+                # Cancellation was already handled inside _stream_rag_response
+                # (DB updated, stream_cancelled broadcast sent). Return without
+                # calling _finalize_streaming_message so we don't overwrite the
+                # 'cancelled' DB state with 'complete'.
+                logger.info(f"🛑 Streaming cancelled for task {task_id}, skipping finalize.")
+                return assistant_message_id
             llm_time = time.time() - llm_start
-            
+
             # 🆕 Finalize with rich content
             await self._finalize_streaming_message(
-                assistant_message_id, streaming_response, user_id, chat_session_id
+                project_id, assistant_message_id, streaming_response, user_id, chat_session_id
             )
             
             # 🆕 Performance tracking
@@ -546,6 +578,88 @@ class StreamingChatManager:
         return history
 
 
+    async def _wait_for_speculative_uploads(
+        self,
+        chat_session_id: str,
+        timeout_s: float = 12.0,
+        poll_interval_s: float = 0.3,
+    ) -> bool:
+        """
+        Barrier: wait for any in-flight speculative uploads to finish
+        embedding before running RAG retrieval.
+
+        Returns True if all uploads completed, False if timed out.
+        """
+        gate_key = f"pending_uploads:{chat_session_id}"
+
+        async with get_redis_connection() as r:
+            pending = await r.hlen(gate_key)
+
+        if pending == 0:
+            return True
+
+        logger.info(f"⏳ Waiting for {pending} speculative upload(s) to finish embedding...")
+        deadline = time.monotonic() + timeout_s
+
+        while time.monotonic() < deadline:
+            await asyncio.sleep(poll_interval_s)
+
+            if await self._is_cancelled():
+                raise TaskCancelledError("Cancelled while waiting for speculative uploads")
+
+            async with get_redis_connection() as r:
+                remaining = await r.hlen(gate_key)
+
+            if remaining == 0:
+                logger.info("✅ All speculative uploads ready — proceeding with RAG")
+                return True
+            logger.info(f"⏳ Still waiting on {remaining} upload(s)...")
+
+        async with get_redis_connection() as r:
+            stragglers = await r.hkeys(gate_key)
+        logger.warning(
+            f"⚠️ Timed out waiting for speculative uploads: "
+            f"{[s.decode() if isinstance(s, bytes) else s for s in stragglers]}. "
+            f"Proceeding with partial context."
+        )
+        return False
+
+    async def fetch_chat_timeline(self, chat_session_id: str, limit: int = 50) -> List[Dict]:
+        """
+        Unified timeline query that returns both text messages and file_upload
+        anchor messages in chronological order, with document metadata
+        hydrated for file_upload rows.
+        """
+        async with get_db_connection() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT
+                    m.id, m.role, m.content, m.message_type,
+                    m.status, m.created_at, m.citations, m.highlights,
+                    m.streaming_complete, m.loader_visible,
+                    CASE WHEN m.message_type = 'file_upload' THEN (
+                        SELECT json_agg(json_build_object(
+                            'id',                  ds.id,
+                            'filename',            ds.filename,
+                            'file_extension',      ds.file_extension,
+                            'file_size_bytes',     ds.file_size_bytes,
+                            'cdn_url',             ds.cdn_url,
+                            'vector_embed_status', ds.vector_embed_status
+                        ))
+                        FROM document_sources ds
+                        WHERE ds.id = ANY(m.inline_document_ids)
+                    ) ELSE NULL END AS documents
+                FROM messages m
+                WHERE m.chat_session_id = $1
+                  AND m.status IN ('complete', 'streaming')
+                ORDER BY m.created_at ASC
+                LIMIT $2
+                """,
+                chat_session_id,
+                limit,
+            )
+        return [dict(row) for row in rows]
+
     async def _setup_llm_client(self, provider: str, model_name: str, temperature: float):
         """🎯 ONE LINE: Factory handles the routing complexity"""
         client = LLMFactory.get_client_for(provider, model_name, temperature, streaming=True)
@@ -609,6 +723,7 @@ class StreamingChatManager:
         """
         Description:
             Core streaming response generator with professional-grade smart buffering
+            with real-time citation extraction during streaming loop
             
             Uses intelligent chunking strategy similar to Claude/ChatGPT:
             - Buffers tokens until word/sentence boundaries
@@ -632,6 +747,10 @@ class StreamingChatManager:
         highlights = []
         last_db_update = time.time()
         content_buffer = ""
+
+        # 🆕 Citation tracking
+        seen_citation_ids = set()
+        last_citation_check = ""  # Track last checked content
         
         # 🚀 SMART BUFFERING STATE (Professional streaming)
         streaming_buffer = ""
@@ -669,13 +788,13 @@ class StreamingChatManager:
             
             # 🔀 Process each token from LLM with intelligent buffering
             async for raw_chunk in llm_client.stream_chat(context):
-                # 👈 MODIFIED: The check is now an awaitable async call
+                # Check for stream cancellation (throttled to ~100ms to reduce Redis load)
                 if await self._is_cancelled():
                     logger.info(f"🛑 Task cancelled via Redis signal: {self.task_id}")
                     await self._handle_cancellation(assistant_message_id, chat_session_id)
-                    break
+                    raise TaskCancelledError("Task cancelled by user")
                 
-                # 🎯 NORMALIZE: Convert provider-specific format to text
+                # Normalize chunk
                 chunk_text = self.normalizer.extract_text(raw_chunk, provider)
                 
                 # Skip empty chunks
@@ -691,8 +810,28 @@ class StreamingChatManager:
                 # Accumulate content for final response
                 accumulated_content += chunk_text
                 content_buffer += chunk_text
-                
-                # 🧠 SMART BUFFERING LOGIC (Claude/ChatGPT style)
+
+                # 🆕 REAL-TIME CITATION DETECTION: Only check for citations when we have new content
+                if len(accumulated_content) > len(last_citation_check):
+                    new_citations = await self._extract_citations_from_accumulated_text(
+                        accumulated_content=accumulated_content,
+                        relevant_chunks=relevant_chunks,
+                        seen_citation_ids=seen_citation_ids
+                    )
+                    
+                    if len(new_citations)>0:
+                        logger.info(f"🧙‍♂️ Wizard has found {len(new_citations)} new citations...")
+                        citations.extend(new_citations)
+                        seen_citation_ids.update(c.id for c in new_citations)
+                        
+                        # 🚀 BROADCAST CITATIONS IMMEDIATELY
+                        await self._broadcast_citations(chat_session_id, new_citations)
+                        logger.info(f"📎 Detected {len(new_citations)} new citations during streaming")
+                        logger.info(f"📎 [DEBUG] citation content:\n{new_citations}")
+
+                    last_citation_check = accumulated_content
+
+                # 🧠 Smart buffering logic
                 streaming_buffer += chunk_text
                 time_since_last = (time.time() - last_broadcast) * 1000  # Convert to ms
                 
@@ -725,16 +864,7 @@ class StreamingChatManager:
                     logger.info(f"📡 Broadcasting reason: {send_reason} (after {time_since_last:.1f}ms)")
                     await smart_broadcast_chunk()
                 
-                # 1) --- Extract citations using your existing processor
-                doc_citations, seen_citations = self.citation_processor.extract_document_citations_from_chunks(
-                    accumulated_content, relevant_chunks, getattr(self, '_seen_citations', set())
-                )
-                if doc_citations:
-                    citations.extend(doc_citations)
-                    self._seen_citations = seen_citations
-                    await self._broadcast_citations(chat_session_id, doc_citations)
-                
-                # 2) --- Extract highlights (your existing method)
+                # 2) --- Extract highlights (unchanged)
                 new_highlights = self._extract_highlights_from_chunk(chunk_text)
                 if new_highlights:
                     highlights.extend(new_highlights)
@@ -761,7 +891,7 @@ class StreamingChatManager:
             
             logger.info(f"🏁 Final content: {len(accumulated_content)} chars")
             logger.info(f"📊 Smart streaming: {chunk_count} broadcasts, avg {(len(accumulated_content)/chunk_count):.1f} chars/chunk")
-            logger.info(f"📊 Complete: {len(enriched_citations)} citations, {len(highlights)} highlights")
+            logger.info(f"📊 Streaming complete: parsed {len(enriched_citations)} citations, and created {len(highlights)} highlights")
             
             return StreamingResponse(
                 content=accumulated_content,
@@ -774,6 +904,7 @@ class StreamingChatManager:
                     "total_tokens": len(accumulated_content.split()),
                     "broadcast_count": chunk_count,
                     "avg_chars_per_chunk": len(accumulated_content) / max(chunk_count, 1)
+                    # ❌ Remove: "relevant_chunks": relevant_chunks
                 },
                 is_complete=True
             )
@@ -784,14 +915,35 @@ class StreamingChatManager:
             raise
 
     async def _build_enhanced_context(
-        self, query: str, chunks: List[Dict], history: List[Dict]
+        self, 
+        query: str, 
+        chunks: List[Dict], 
+        history: List[Dict]
     ) -> str:
         """
         Build enhanced context with RAG retrieval and system instructions
         - Load system instructions from YAML 
         - Format chat history
         - 🧠 SMART chunk context trimming
-        
+
+        Args:
+            query (str): User chat query
+            chunks (List[Dict]): relevant chunks from RAG retrieval
+            history (List[Dict]): prior chat history
+
+        Returns:
+            [SYSTEM INSTRUCTIONS] 
+            \n
+            Source 1:
+            Chunks formatted as content... (page 1)
+            ---
+            Source 2:
+            Chunks formatted as content... (page 1)
+            Chunks formatted as content... (page 4)
+            ---
+            Source n:
+            Chunks formatted as content... (page 2)
+            Chunks formatted as content... (page 5)
         """
         
         # Load system instructions from YAML
@@ -823,6 +975,7 @@ class StreamingChatManager:
             max_tokens=120_000  # Leave buffer for response
         )
         
+        # logger.info(f"_build_enhanced_context() result:\n{SYSTEM_INSTRUCTIONS}\n\n{trimmed_user_context}")
         return f"{SYSTEM_INSTRUCTIONS}\n\n{trimmed_user_context}"
 
     def _trim_context_smart(
@@ -836,6 +989,13 @@ class StreamingChatManager:
         """
         Smart context trimming that preserves highest-quality chunks and
         Creates proper page citations out of the chunks relevant chunks of data
+
+        Return:
+        'Relevant Context:
+            source 1
+            content from text (page 1)
+            content from text (pare 12)
+            source 2 
         """
         
         # Get tokenizer
@@ -912,8 +1072,10 @@ class StreamingChatManager:
         numbered_contexts = []
         source_index = 1
         for doc_title, chunks_in_doc in grouped_chunks.items():
+
             # Each document gets a single, stable "Source" number
-            header = f"Source {source_index}: [Document: {doc_title}]"
+            # header = f"Source {source_index}: [Document: {doc_title}]"      # LLM Gets the header `Source 1: [Document: IRB_-_Hadley_v_Baxendale_1854_.pdf]` so it knows what to cite in citation_processor regex
+            header = f"Source {source_index}: {doc_title}"  
             numbered_contexts.append(header)
             
             # Add content from each chunk with its specific page number
@@ -932,7 +1094,7 @@ class StreamingChatManager:
         chunk_context = "\n".join(numbered_contexts)
 
         final_context = f"{user_context}\n\nRelevant Context:\n{chunk_context}"
-        
+        # logger.info(f"_trim_context_smart() result:\n{final_context}, {final_chunks}")    # <----- Debug to see source [Doc, pg] formatting
         return final_context, final_chunks
 
     def _build_page_context(self, page_num, chunks):
@@ -951,7 +1113,10 @@ class StreamingChatManager:
         ).strip()
 
     def _extract_highlights_from_chunk(self, chunk: str) -> List[Highlight]:
-        """🆕 Extract highlights like metrics and key facts"""
+        """
+        [May be Deprecated] This has been replaced with `_extract_citations_from_accumulated_text` a new method from Claude 4.5
+        Extract highlights like metrics and key facts
+        """
         highlights = []
         
         # Patterns for different highlight types
@@ -971,7 +1136,55 @@ class StreamingChatManager:
                 ))
         
         return highlights
+    
+    async def _extract_citations_from_accumulated_text(
+        self,
+        accumulated_content: str,
+        relevant_chunks: List[Dict],
+        seen_citation_ids: set
+    ) -> List[Citation]:
+        """
+        Extract NEW citations from accumulated text during streaming 📡
+        
+        This checks the current accumulated text for citation patterns
+        and only returns citations we haven't seen before.
 
+        Content: "...authored by Justice Alito [WMNS_Dobbs.pdf, p"  
+        → Check for citations: None yet (incomplete)         
+        
+        Content: "...[WMNS_Dobbs.pdf, p. 1]."                      
+        → Extract citation ✓   
+
+        """
+        try:
+            logger.info(f"🧙‍♂️ Wizard is filtering for new citations...")
+
+            # Extract inline citations that look like: [Doc.pdf, p. X]
+            inline_citations = self.citation_processor.extract_inline_citations_from_content(
+                accumulated_content
+            )
+            
+            if not inline_citations:
+                return []
+            
+            # Match to chunks
+            citation_map = self.citation_processor.match_inline_citations_to_chunks(
+                inline_citations,
+                relevant_chunks
+            )
+            
+            # Filter out already-seen citations
+            new_citations = [
+                citation for citation_id, citation in citation_map.items()
+                if citation.id not in seen_citation_ids
+            ]
+            
+            return new_citations
+            
+        except Exception as e:
+            logger.warning(f"⚠️ Citation extraction during streaming failed: {e}")
+            return []
+    
     async def _broadcast_content_chunk(
         self, session_id: str, message_id: str, chunk: str
     ):
@@ -992,7 +1205,11 @@ class StreamingChatManager:
             logger.warning(f"⚠️ Broadcast failed: {e}")
 
     async def _broadcast_citations(self, session_id: str, citations: List[Citation]):
-        """🆕 Broadcast new citations"""       
+        """
+        Broadcast new citations
+        Function publishes a JSON object to Redis with {"type": "citations_found", "citations": [...]}.
+
+        """       
         try:
             async with get_redis_connection() as r:
                 await r.publish(f"chat:{session_id}", json.dumps({
@@ -1003,10 +1220,15 @@ class StreamingChatManager:
                             "text": c.text,
                             "url": c.url,
                             "title": c.title,
-                            "confidence": c.confidence
+                            "confidence": c.confidence,
+                            "document_title": c.document_title,
+                            "source_id": str(c.source_id) if c.source_id else None, # Convert UUID to string
+                            "relevant_excerpt": c.relevant_excerpt,
+                            "page_number": c.page_number
                         } for c in citations
                     ]
-                }))
+                }, cls=UUIDEncoder))
+            logger.info(f"🛰️ New Citation broadcast success quantity-{len(citations)}")
         except Exception as e:
             logger.warning(f"⚠️ Citation broadcast failed: {e}")
 
@@ -1042,7 +1264,9 @@ class StreamingChatManager:
     async def _enrich_citations_with_previews(
         self, citations: List[Citation]
     ) -> List[Citation]:
-        """🆕 Enrich citations with link previews using CitationProcessor"""
+        """
+        Enrich Citation object with (internal/external) url link previews using CitationProcessor
+        """
         if not citations:
             return citations
         
@@ -1057,10 +1281,10 @@ class StreamingChatManager:
                 citations, use_cache=True
             )
             
-            # Validate citations
+            # Validate citations url syntax
             validated_citations = self.citation_processor.validate_citations(enriched_citations)
             
-            logger.info(f"🔗 Enriched {len(validated_citations)}/{len(citations)} citations")
+            logger.info(f"🔗 Enriched {len(validated_citations)}/{len(citations)} citations 📚")
             return validated_citations
             
         except Exception as e:
@@ -1069,75 +1293,133 @@ class StreamingChatManager:
 
     async def _finalize_streaming_message(
         self,
+        project_id: str,
         message_id: str,
         response: StreamingResponse,
         user_id: str,
         chat_session_id: str
     ):
         """
-        Finalize message with rich content
+        Finalize message with rich content and citations already extracted during streaming
         - Provides status updates to DB and to websocket stream
+        - Convert inline citations to markdown links
+        - Persis to database (supabase tables: messages, message_citations, message_highlights)
         - Records RAG chat api usage (robust and has Idempotency fallbacks)
         """
-        
-        # Add this line to escape dollar amounts before saving (stops wierd .md mathjax)
-        final_content = re.sub(r'(?<!\\)\$(\d)', r'\\$\1', response.content)
+        try:
+            # 1️⃣ Get citation map from streaming response
+            citation_map = {
+                citation.text: citation  # Map original text to Citation object
+                for citation in response.citations
+            }
+            
+            # 2️⃣ Convert to markdown links: [Doc, p. X] → [Doc, p. X](#cite-id)
+            enhanced_content = self.citation_processor.convert_inline_citations_to_markdown_links(
+                response.content,
+                citation_map
+            )
 
-        async with get_db_connection() as conn:
-            async with conn.transaction():
-                # Update main message
-                await conn.execute(
-                    """
-                    UPDATE messages 
-                    SET content = $1, status = 'complete', 
-                        streaming_complete = true, completed_at = NOW(),
-                        metadata = $2
-                    WHERE id = $3
-                    """,
-                    response.content, json.dumps(response.metadata), message_id
-                )
-                
-                # Insert citations
-                for citation in response.citations:
+            # Add this line to escape dollar amounts before saving (stops wierd .md mathjax $-sign formatting)
+            # final_content = re.sub(r'(?<!\\)\$(\d)', r'\\$\1', response.content)
+            final_content = re.sub(r'(?<!\\)\$(\d)', r'\\$\1', enhanced_content)
+
+            async with get_db_connection() as conn:
+                async with conn.transaction():
+                    # Final pdate to main message row
                     await conn.execute(
                         """
-                        INSERT INTO message_citations 
-                        (message_id, citation_id, url, title, description, 
-                        source_type, confidence, relevant_excerpt)
-                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                        UPDATE messages 
+                        SET content = $1, 
+                            status = 'complete', 
+                            query_response_status = 'query_complete',
+                            streaming_complete = true, 
+                            completed_at = NOW(),
+                            metadata = $2
+                        WHERE id = $3
                         """,
-                        message_id, citation.id, citation.url, citation.title,
-                        citation.description, citation.source_type, 
-                        citation.confidence, citation.relevant_excerpt
+                        final_content,
+                        # json.dumps({
+                        #     **response.metadata,
+                        #     'citation_count': len(response.citations),
+                        #     'citations_extracted_during_streaming': True
+                        # }),
+                        json.dumps({
+                            **response.metadata,
+                            'citation_count': len(response.citations),
+                            'citations_extracted_during_streaming': True
+                        }, cls=UUIDEncoder), # <-- ADD THIS
+                        message_id
                     )
-                
-                # Insert highlights
-                for highlight in response.highlights:
+                    
+                    # Persist citations to public.message_citations
+                    for citation in response.citations:
+                        logger.info(f"ABOUT TO INSERT CITATION: {citation}")
+
+                        await conn.execute(
+                            """
+                            INSERT INTO message_citations
+                            (message_id, citation_id, citation_key, title, url,
+                            page_number, document_title, relevant_excerpt,
+                            source_type, confidence, metadata, source_id, chat_session_id, user_id) -- Added source_id column
+                            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) -- Increased value count
+                            ON CONFLICT (message_id, citation_id) DO NOTHING
+                            """,
+                            message_id,                 # $1
+                            citation.id,                # $2
+                            citation.id,                # $3 citation_key
+                            citation.title,             # $4 title (Changed from document_title)
+                            citation.url,               # $5 <-- ADDED citation.url HERE
+                            citation.page_number,       # $6
+                            citation.document_title,    # $7
+                            citation.relevant_excerpt,  # $8
+                            citation.source_type,       # $9
+                            citation.confidence,        # $10
+                            json.dumps(citation.metadata, cls=UUIDEncoder), # $11
+                            citation.source_id,         # $12
+                            chat_session_id,            # $13
+                            user_id,                    # $14
+                        )
+                    
+                    # Insert highlights
+                    for highlight in response.highlights:
+                        await conn.execute(
+                            """
+                            INSERT INTO message_highlights 
+                            (message_id, text, highlight_type, confidence)
+                            VALUES ($1, $2, $3, $4)
+                            """,
+                            message_id, highlight.text, highlight.highlight_type,
+                            highlight.confidence
+                        )
+
+                    # 4. Increment user usage atomically (specific to user_id)
                     await conn.execute(
                         """
-                        INSERT INTO message_highlights 
-                        (message_id, text, highlight_type, confidence)
-                        VALUES ($1, $2, $3, $4)
+                        INSERT INTO public.usage (user_id, day_rag_queries)
+                        VALUES ($1, 1)
+                        ON CONFLICT (user_id) DO UPDATE 
+                        SET day_rag_queries = usage.day_rag_queries + 1,
+                            last_active_at = NOW();
                         """,
-                        message_id, highlight.text, highlight.highlight_type,
-                        highlight.confidence
+                        user_id
                     )
 
-                # 4. Increment user usage atomically (specific to user_id)
-                await conn.execute(
-                    """
-                    INSERT INTO public.usage (user_id, day_rag_queries)
-                    VALUES ($1, 1)
-                    ON CONFLICT (user_id) DO UPDATE 
-                    SET day_rag_queries = usage.day_rag_queries + 1,
-                        last_active_at = NOW();
-                    """,
-                    user_id
-                )
+            # Final broadcast
+            await self._broadcast_completion(chat_session_id, message_id)
+            logger.info(f"✅ Message finalized (persist to db) with {len(response.citations)} citations, and {len(response.highlights)} highlights")
 
-        # Final broadcast
-        await self._broadcast_completion(chat_session_id, message_id)
-        logger.info(f"✅ Message finalized with {len(response.citations)} citations, {len(response.highlights)} highlights")
+        except Exception as e:
+            logger.error(f"❌ Assistant citations persistence failed: {e}", exc_info=True)
+            log_llm_error(
+                client=supabase_client,
+                table_name="messages",
+                task_name="persist_response_citations",
+                error_message=str(e),
+                project_id=project_id,
+                chat_session_id=chat_session_id,
+                user_id=user_id,
+            )
+            raise # self.retry(exc=e)  # <-- CORRECTED
 
     async def _broadcast_completion(self, session_id: str, message_id: str):
         """🆕 Broadcast stream completion"""
@@ -1188,21 +1470,32 @@ class StreamingChatManager:
                 )
 
     async def _is_cancelled(self) -> bool:
-        """ 🆕 Checks Redis for a cancellation key for the current task. """
+        """Checks Redis for a cancellation key for the current task.
+
+        Throttled to at most one Redis call every 100 ms so the polling loop
+        doesn't hammer the connection pool at 40+ calls/second.
+        After detecting the flag the key is deleted so a future retry or
+        restart of the same task_id doesn't pick up a stale signal.
+        """
         if not self.task_id:
             return False
-        
+
+        now = time.monotonic()
+        if now - self._last_cancel_check < 0.1:  # 100 ms throttle
+            return False
+        self._last_cancel_check = now
+
         try:
             cancel_key = f"cancel-task:{self.task_id}"
             async with get_redis_connection() as r:
-                # The exists command is very fast. It returns 1 if the key exists, 0 otherwise.
-                exists = await r.exists(cancel_key)
-                if exists:
-                    logger.info(f"🛑 Cancellation notice found in Redis for task: {self.task_id}")
+                # getdel: atomic GET + DELETE so the key is consumed on detection
+                value = await r.getdel(cancel_key)
+                if value is not None:
+                    logger.info(f"🛑 Cancellation notice found and consumed for task: {self.task_id}")
                     return True
         except Exception as e:
             logger.warning(f"⚠️ Redis check for cancellation failed: {e}")
-            
+
         return False
 
     # def cancel_task(self, task_id: str) -> Optional[str]:
@@ -1219,11 +1512,11 @@ class StreamingChatManager:
     #     return None
 
     async def _handle_cancellation(self, message_id: str, chat_session_id: str):
-        """Handle task cancellation - Update Supabase DB of cancellation"""
+        """Handle task cancellation - Update Supabase DB and notify WebSocket clients."""
         async with get_db_connection() as conn:
             await conn.execute(
                 """
-                UPDATE messages 
+                UPDATE messages
                 SET status = 'cancelled',
                     query_response_status = 'cancelled',
                     content = COALESCE(content, '') || '\n\n[Response cancelled by user]',
@@ -1236,6 +1529,19 @@ class StreamingChatManager:
                 message_id
             )
             logger.info(f"🚫 Task {message_id} handled cancellation gracefully.")
+
+        # Broadcast stream_cancelled to WebSocket clients so the UI resets properly.
+        # Without this the frontend never leaves its streaming/loading state.
+        try:
+            async with get_redis_connection() as r:
+                await r.publish(f"chat:{chat_session_id}", json.dumps({
+                    "type": "stream_cancelled",
+                    "message_id": message_id,
+                    "timestamp": datetime.utcnow().isoformat()
+                }))
+            logger.info(f"📡 stream_cancelled broadcast sent for session {chat_session_id}")
+        except Exception as e:
+            logger.warning(f"⚠️ stream_cancelled broadcast failed: {e}")
 
     async def _handle_streaming_error(self, message_id: str, error_message: str):
         """🆕 Handle streaming errors gracefully"""
@@ -1400,10 +1706,10 @@ def rag_chat_task(
                 )
             )
         
-        # Update message status (sync call)
-        supabase_client.table("messages").update({
-            "query_response_status": "complete"
-        }).eq("id", message_id).execute()
+        # # Update message status (sync call)
+        # supabase_client.table("messages").update({
+        #     "query_response_status": "complete"
+        # }).eq("id", message_id).execute()
         
         mode = "streaming" if use_streaming else "legacy"
         logger.info(f"✅ RAG task completed successfully ({mode} mode)")

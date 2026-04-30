@@ -23,7 +23,7 @@ mimetype
 # PyPDF2==3.0.1
 
 # AI dependencies
-openai==1.35.13 # openai
+openai>=1.54.0 # openai — 1.54+ required for max_completion_tokens on gpt-5/o-series
 tiktoken==0.7.0 # tiktoken
 anthropic==0.29.0 # anthropic
 google-cloud-aiplatform==1.56.0 #  google-cloud-aiplatform
@@ -56,10 +56,16 @@ langchain-community==0.2.5 # langchain-community
 langchain-openai==0.1.8 # langchain-openai
 promptic
 
-# LightRAG and dependencies
-lightrag-hku
-nano-vectordb>=0.0.4.3
-pydgraph>=21.12.0
+# LightRAG and dependencies — disabled to reduce startup memory (OOM on 512MB Render instance)
+# lightrag-hku
+# nano-vectordb>=0.0.4.3
+# pydgraph>=21.12.0
+# protobuf>=4.25.0
+
+# Fuzzy logic
+fuzzywuzzy==0.18.0
+python-Levenshtein>=0.20.9
+json_repair
 
 # Optional: LightRAG server features
 # lightrag-hku[api]==1.3.7

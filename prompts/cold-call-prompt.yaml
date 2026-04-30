@@ -4,9 +4,19 @@ llm:                  # these are a fallback if the user does not specify a prov
   provider: openai    # "openai", "anthropic"... 
   model: gpt-4o-mini
 
-base_prompt: |
+# --- Retrieval Prompt ---
+# This is the "hypothetical document" used to generate the embedding.
+# It's NOT shown to the LLM, it's only for finding relevant chunks.
+retrieval_prompt: |
+  A comprehensive overview of core legal concepts, black letter law, and foundational legal principles. 
+  This includes the elements of a claim, definitions of legal terms, and established legal tests or doctrines.
+  It also summarizes the key facts of the case, the procedural history, and the primary arguments from both parties.
+  The text details the court's final holding, judicial opinion, and the rationale or reasoning behind the decision.
+  It identifies the main points, key takeaways, and relevant precedent.
+
+system_prompt: |
   Based on the documents (appended as rag context) create a list of flashcards covering core legal concepts.
-  
+
 template: |
   You are a law professor creating cold call questions for Law Students. Based on the
   following legal context, please create exactly {num_cards} cold=call-style flashcards covering

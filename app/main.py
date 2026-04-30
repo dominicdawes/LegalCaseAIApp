@@ -6,10 +6,11 @@ Main FastAPI script, this is the heart of the web service
 
 import os
 import re       # regex
+from uuid import UUID
 from dotenv import load_dotenv
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from datetime import datetime, timezone
-from typing import List, Dict, Any, Literal
+from typing import List, Dict, Any, Literal, Optional
 import uuid
 from fastapi import FastAPI, HTTPException, Query
 import logging
@@ -35,11 +36,14 @@ from app.ws_handlers import setup_websocket_routes, manager     # from ws_handle
 # `Task/` module imports
 from tasks.profile_tasks import upload_profile_picture_task
 from tasks.podcast_generate_tasks import validate_and_generate_audio_task, generate_dialogue_only_task
+from tasks.exam_grading_tasks import grade_exam_question_workflow
+from tasks.conversions import convert_chat_to_note_task
 from tasks.upload_tasks import process_document_batch_workflow
 from tasks.chat_tasks import streaming_manager
 # from tasks.upload_tasks import append_document_task  <-- need to revive this later
 from tasks.sample_tasks import addition_task
 from tasks.chat_tasks import rag_chat_task, persist_user_query
+from tasks.note_tasks import cleanup_note_task
 from tasks.note_tasks import rag_note_task 
 from tasks.celery_app import celery_app  # Import the Celery app instance (see celery_app.py for LocalHost config)
 
@@ -59,16 +63,12 @@ redis_pub = aioredis.from_url(REDIS_LABS_URL, decode_responses=True)
 # celery_app = Celery('tasks', broker='redis://localhost:6379/0')
 
 origins = [
-    "https://app.weweb.io",  # Replace with the actual WeWeb domain if different
-    "https://editor.weweb.io",
-    "https://www.legalnote.io",  # Add your new domain
-    "https://legalnote.io",      # Also add without www in case
-    # Add other domains as needed
+    "https://www.legalnote.io",
+    "https://legalnote.io",
 ]
 
-# Using a regex to allow any subdomain of weweb-preview.io
-# The .* matches any characters (the subdomain)
-origins_regex = r"https://.*\.weweb-preview\.io$"
+# Allow any subdomain of weweb.io (covers app, editor, editor-cdn, etc.) and weweb-preview.io
+origins_regex = r"https://([a-zA-Z0-9-]+\.)?weweb(-preview)?\.io$"
 
 app.add_middleware(
     CORSMiddleware,
@@ -154,6 +154,10 @@ class PDFResponse(BaseModel):
 class GenericTaskResponse(BaseModel):
     task_id: str
 
+class NoteGenerationResponse(BaseModel):
+    task_id: str
+    note_id: str
+
 # <---- Models for new RAG pipeline kickoff  ----> #
 class NewRagPipelineRequest(BaseModel):
     ''' 
@@ -190,6 +194,13 @@ class RagPipelineNewDocumentsResponse(BaseModel):
     }
     '''
     embedding_task_id: str      # from vector embedding task
+
+class CleanNoteRequest(BaseModel):
+    note_id: str
+    user_id: str
+    provider: str = "openai"
+    model_name: str = "gpt-4o"
+    temperature: float = 0.5
 
 # <---- Models for new RAG pipeline nested Celery task staus checking ----> #
 class EmbeddingStatusRequest(BaseModel):
@@ -274,7 +285,25 @@ class NewGeneratedNoteRequest(BaseModel):
     # files: List[str]  # List of URLs or file paths of the PDFs
     metadata: Dict[str, Any]  # A dictionary for any metadata information
 
+class ChatToNoteRequest(BaseModel):
+    '''
+    Request model for converting chat content to a persistent note
+    '''
+    note_content: str = Field(..., description="The markdown text from the chat")
+    user_id: str
+    project_id: str
+    note_type: str = "chat"
 
+class ExamGradingRequest(BaseModel):
+    user_id: UUID
+    project_id: Optional[UUID] = None  # Change str to UUID here
+    question: str
+    user_answer: str
+    question_type: str = "fact_pattern"         # Default rubric
+    professor_example: Optional[str] = None     # Optional professor example
+    outline_url: Optional[str] = None           # Optional CDN link to PDF/Doc
+    model_name: str = "gpt-4o"
+    model_provider: str = "openai"
 # ================================================ #
 #               TEST ENDPOINTS
 # ================================================ #
@@ -321,7 +350,7 @@ async def upload_profile_picture(request: ProfilePictureRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 # ================================================ #
-#                RAG CHAT ENDPOINTS
+#                RAG CHAT ENDPOINTS (ONLY)
 # ================================================ #
 
 @app.post("/new-rag-project/", response_model=NewRagPipelineResponse)
@@ -419,7 +448,6 @@ async def append_sources_to_project(request: RagPipelineNewDocumentsRequest, bac
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-
 @app.post("/rag-chat/")
 async def rag_chat(request: RagQueryRequest):
     """
@@ -467,14 +495,13 @@ async def rag_chat(request: RagQueryRequest):
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-
 @app.post("/rag-chat/reset/")
 async def rag_chat_reset(request: RagQueryRequest):
     """
     Endpoint for the rag query responses (token streaming not enabled)
     Uses Celery chain to perform persist → rag back-to-back
     
-    **FYI NOT CURRENTLY IN USE
+    **FYI NOT CURRENTLY IN USE (i have a WeWeb Workflow in use instead)
 
     Raw json:
     ----------
@@ -510,7 +537,7 @@ async def rag_chat_reset(request: RagQueryRequest):
 # async def rag_chat_regenerate(request: RagRegenerateRequest):
 #     """
 #     Endpoint for regenerating a "FAILED" RAG query (token streaming not ENABLED)
-    
+
 #     Raw json:
 #     ----------
 #     {
@@ -544,70 +571,136 @@ async def cancel_rag_chat(task_id: str):
     logger.info(f"🛑 CANCEL REQUEST received for task: {task_id}")
 
     try:
-        # Step 1: Write a cancellation key to Redis with a 60-second expiry
-        # This is the "cancellation notice" for the worker.
         cancel_key = f"cancel-task:{task_id}"
-        await redis_pub.set(cancel_key, "1", ex=60) # ex=60 sets a 60-second TTL
+
+        # SET NX (set-if-not-exists) makes this idempotent: rapid double-clicks
+        # or duplicate network requests are silently absorbed — only the first
+        # caller actually sets the flag.
+        was_set = await redis_pub.set(cancel_key, "1", ex=60, nx=True)
+
+        if not was_set:
+            logger.info(f"ℹ️ Cancellation already in progress for task: {task_id}")
+            return {
+                "status": "already_cancelling",
+                "task_id": task_id,
+                "message": "Cancellation already requested for this task.",
+            }
+
         logger.info(f"✅ Cancellation notice posted to Redis for key: {cancel_key}")
 
-        # Step 2: Revoke the task from Celery (in case it hasn't started yet)
-        celery_app.control.revoke(task_id)
-
-        # Step 3: We don't know the session_id here anymore, so we can't send a
-        # targeted WebSocket message. The client should react to the task
-        # stopping or you can implement a more advanced notification system.
-        # For now, the client will see the stream stop.
+        # Revoke from Celery.  terminate=True sends SIGTERM to a *running* worker
+        # process so it is actually interrupted, not just blocked from future starts.
+        celery_app.control.revoke(task_id, terminate=True, signal="SIGTERM")
 
         return {
             "status": "cancellation_requested",
             "task_id": task_id,
-            "message": "Cancellation signal sent. The stream will stop shortly."
+            "message": "Cancellation signal sent. The stream will stop shortly.",
         }
 
     except Exception as e:
         logger.error(f"❌ Cancel request failed for task {task_id}: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Failed to cancel task: {str(e)}")
-    # """
-    # Gracefully cancels a streaming RAG chat task.
-    
-    # This flow performs two actions:
-    # 1.  Sets an internal flag in the StreamingChatManager to stop the asyncio stream.
-    # 2.  Revokes the Celery task to prevent it from running if it's still in the queue.
-    # """
-    # logger.info(f"🛑 CANCEL REQUEST received for task: {task_id}")
 
-    # try:
-    #     # Step 1: Cooperatively cancel the running stream (see... chat_task.StreamingManager.cancel_task() )
-    #     session_id_to_notify = streaming_manager.cancel_task(task_id)
 
-    #     # Step 2: Revoke the task from Celery.
-    #     # This prevents the task from running if it hasn't started yet.
-    #     celery_app.control.revoke(task_id)
+# ================================================ #
+#                CHAT / STUDY FEATURES ENDPOINTS
+# ================================================ #
+
+@app.post("/grade-exam-question/", response_model=GenericTaskResponse)
+async def grade_exam_question(request: ExamGradingRequest):
+    """
+    Ingests a law exam answer, optionally ingests a course outline,
+    and runs a multi-stage grading and feedback pipeline.
+    """
+    try:
+        # ——— DELETE THIS BLOCK ———
+        # Pydantic already validated user_id. 
+        # Also, checking project_id here would crash if it is None.
+        # try:
+        #     uuid.UUID(request.user_id)
+        #     uuid.UUID(request.project_id)
+        # except ValueError:
+        #     raise HTTPException(status_code=400, detail="Invalid user_id or project_id UUID format")
+        # —————————————————————————
+
+        # Note: You might need to cast user_id back to str for Celery 
+        # if your Celery serializer is JSON (which doesn't support UUID objects natively)
         
-    #     message = "Task cancellation requested."
+        job = grade_exam_question_workflow.apply_async(
+            kwargs={
+                "user_id": str(request.user_id),          # Cast to string for Celery
+                "project_id": request.project_id,         # Already optional str
+                "question": request.question,
+                "user_answer": request.user_answer,
+                "professor_example": request.professor_example,
+                "outline_url": request.outline_url,
+                "model_name": request.model_name,
+                "model_provider": request.model_provider
+            }
+        )
         
-    #     # Step 3: Notify the client immediately via WebSocket
-    #     if session_id_to_notify:
-    #         logger.info(f"📡 Sending cancellation notice to session: {session_id_to_notify}")
-    #         await websocket_manager.send_to_session(session_id_to_notify, {
-    #             "type": "stream_cancelled",
-    #             "task_id": task_id,
-    #             "message": "Stream cancelled by user 🚫.",
-    #             "timestamp": datetime.now(timezone.utc).isoformat()
-    #         })
-    #         message = f"Cancellation signal sent to running task in session {session_id_to_notify}."
-    #     else:
-    #         logger.info(f"Task {task_id} was not actively streaming, but was revoked from the queue.")
+        logger.info(f"🎓 Queued Exam Grading Task {job.id} for User {request.user_id}")
+        return {"task_id": job.id}
 
-    #     return {
-    #         "status": "cancellation_requested",
-    #         "task_id": task_id,
-    #         "message": message
-    #     }
+    except Exception as e:
+        logger.error(f"Failed to queue exam grading: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
 
-    # except Exception as e:
-    #     logger.error(f"❌ Cancel request failed for task {task_id}: {e}", exc_info=True)
-    #     raise HTTPException(status_code=500, detail=f"Failed to cancel task: {str(e)}")
+
+@app.post("/clean-notes/", response_model=GenericTaskResponse)
+async def clean_note(request: CleanNoteRequest):
+    """
+    Triggers a background task to clean up and enhance an existing note's content.
+    """
+    try:
+        if not request.note_id or not request.user_id:
+            raise HTTPException(status_code=400, detail="note_id and user_id are required.")
+
+        job = cleanup_note_task.apply_async(
+            kwargs={
+                "note_id": request.note_id,
+                "user_id": request.user_id,
+                "provider": request.provider,
+                "model_name": request.model_name,
+                "temperature": request.temperature,
+            }
+        )
+        
+        logger.info(f"Queued note cleanup task {job.id} for note {request.note_id}")
+        return {"task_id": job.id}
+
+    except Exception as e:
+        logger.error(f"Failed to queue note cleanup task: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/convert-chat-to-note/", response_model=GenericTaskResponse)
+async def convert_chat_to_note(request: ChatToNoteRequest):
+    """
+    Endpoint to take chat content and persist it as a note in public.notes.
+    Handled asynchronously via conversions.py.
+    """
+    try:
+        # Validate inputs roughly before queuing
+        if not request.note_content:
+            raise HTTPException(status_code=400, detail="note_content cannot be empty")
+
+        job = convert_chat_to_note_task.apply_async(
+            kwargs={
+                "user_id": request.user_id,
+                "project_id": request.project_id,
+                "content": request.note_content,
+                "note_type": request.note_type,
+            }
+        )
+        
+        logger.info(f"Queued chat conversion task {job.id} for user {request.user_id}")
+        return {"task_id": job.id}
+
+    except Exception as e:
+        logger.error(f"Failed to queue chat conversion: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 
 # ================================================ #
@@ -677,6 +770,7 @@ async def get_pdf_upload_status(task_id: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Status check error: {e}")
 
+
 @app.post("/embedding-pipeline-task-status", response_model=EmbeddingStatusResponse, summary="Check embedding status for a batch of documents")
 async def embedding_pipeline_task_status(
     req: EmbeddingStatusRequest
@@ -726,6 +820,7 @@ async def embedding_pipeline_task_status(
             detail=f"Could not fetch embedding statuses: {e}"
         )
 
+
 @app.get("/rag-chat-status/{task_id}")
 async def get_rag_chat_status(task_id: str):
     """
@@ -767,6 +862,7 @@ async def get_rag_chat_status(task_id: str):
         return {"task_id": task_id, "status": "FAILURE", "error": str(result.result)}
     else:
         return {"task_id": task_id, "status": result.state}
+
 
 # Combined endpoint to check the status of any Celery task
 @app.get("/task-status/{task_id}")
@@ -830,13 +926,14 @@ async def get_task_status(task_id: str):
         # Handle any unexpected exceptions
         raise HTTPException(status_code=500, detail=f"Error retrieving task status: {str(e)}")
 
+
 # ================================================ #
 #          RAG GENERATIVE NOTES ENDPOINTS
 # ================================================ #
 
-@app.post("/generate-note/", response_model=GenericTaskResponse)
+@app.post("/generate-note/", response_model=NoteGenerationResponse)
 async def generate_note(
-    request: NewGeneratedNoteRequest, 
+    request: NewGeneratedNoteRequest,
     background_tasks: BackgroundTasks
 ):
     '''LIVE (08-20-2025)
@@ -844,7 +941,7 @@ async def generate_note(
         - rag_note_task():
             input: request.metadata
             returns: None
-        
+
     Request contains:
         request.metadata (json): {
             project_id:,
@@ -855,21 +952,37 @@ async def generate_note(
         }
     '''
     try:
-        # Apply async job to generate ai notes (grounded w/ RAG)
-        job = rag_note_task.apply_async(    
+        # Pre-generate note_id here so the frontend can immediately subscribe
+        # to the realtime listener on public.notes before the Celery task starts
+        note_id = str(uuid.uuid4())
+
+        # Create stub note row — frontend realtime listener fires on this INSERT
+        supabase_client.table("notes").insert({
+            "id":                   note_id,
+            "user_id":              request.metadata["user_id"],
+            "project_id":           request.metadata["project_id"],
+            "title":                request.metadata["note_title"],
+            "note_type":            request.metadata["note_type"],
+            "note_progress_status": "INITIALIZED",
+            "created_at":           datetime.now(timezone.utc).isoformat(),
+        }).execute()
+
+        # Dispatch Celery task, passing the pre-created note_id
+        job = rag_note_task.apply_async(
             kwargs={
-                "user_id":       request.metadata["user_id"],       # ← maps to your user_id param
-                "note_type":     request.metadata["note_type"],     # ← maps to your note_type param
-                "project_id":    request.metadata["project_id"],    # ← maps to your project_id param  
-                "note_title":    request.metadata["note_title"],    # ← "project_name: question type"
+                "note_id":       note_id,
+                "user_id":       request.metadata["user_id"],
+                "note_type":     request.metadata["note_type"],
+                "project_id":    request.metadata["project_id"],
+                "note_title":    request.metadata["note_title"],
                 "provider":      request.metadata["provider"],
-                "model_name":    request.metadata["model_name"],    # ← maps to your model_name param
+                "model_name":    request.metadata["model_name"],
                 "temperature":   request.metadata["temperature"],
-                "addtl_params":  request.metadata["addtl_params"]       # ← Dict passed in by WeWeb/postman 
+                "num_sources":   request.metadata["num_sources"],
+                "addtl_params":  request.metadata["addtl_params"],
             }
         )
-        # Poll in postman: "my_domain.com/task-status/{task_id}"
-        return {"task_id": job.id}
+        return {"task_id": job.id, "note_id": note_id}
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -916,7 +1029,8 @@ async def pdf_to_dialogue(request: PDFRequest, background_tasks: BackgroundTasks
         }
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
-    
+
+
 # Endpoint to process PDFs and generate dialogue transcript
 @app.post("/pdf-to-dialogue-transcript/", response_model=PDFResponse)
 async def pdf_to_dialogue_transcript(request: PDFRequest, background_tasks: BackgroundTasks):
@@ -931,6 +1045,144 @@ async def pdf_to_dialogue_transcript(request: PDFRequest, background_tasks: Back
         return {"task_id": task.id}
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+
+# ================================================ #
+#         SPECULATIVE UPLOAD ENDPOINTS
+# ================================================ #
+
+class SpeculativeIngestRequest(BaseModel):
+    """
+    Payload sent by WeWeb on drag-drop, AFTER the file has been uploaded to S3/CDN.
+    The backend creates the document_sources row, kicks off ingestion, and registers
+    the Redis gate — all in one round-trip.
+    """
+    cdn_url: str
+    filename: str
+    file_size_bytes: int
+    project_id: str
+    user_id: str
+    chat_session_id: str
+
+
+class CancelSpeculativeUploadRequest(BaseModel):
+    """Cancel a speculative upload — revoke task, purge DB rows and S3 object."""
+    chat_session_id: str
+    doc_id: str
+    project_id: str
+
+
+class InlineUploadMessageRequest(BaseModel):
+    """Persist a file_upload anchor message into the chat timeline."""
+    user_id: str
+    chat_session_id: str
+    document_ids: List[str]
+
+
+@app.post("/speculative-ingest/")
+async def speculative_ingest(request: SpeculativeIngestRequest):
+    """
+    Single round-trip endpoint called by WeWeb on drag-drop (after S3 upload).
+
+    1. Pre-creates a document_sources row (PENDING) so the UI can show a file
+       card immediately via Supabase Realtime.
+    2. Kicks off process_document_batch_workflow with chat_session_id injected
+       into workflow_metadata so the barrier in chat_tasks can be registered.
+    3. Registers the Redis gate entry (doc_id → celery_task_id).
+    4. Returns {doc_id, celery_task_id} to WeWeb.
+    """
+    import hashlib
+    import os as _os
+
+    try:
+        doc_id = str(uuid.uuid4())
+        file_extension = _os.path.splitext(request.filename)[1].lower()
+
+        # ── 1. Pre-create document_sources row (PENDING) ──────────────────────
+        # content_hash is a stable placeholder derived from the CDN URL; the
+        # Celery worker will overwrite it with the real file hash via ON CONFLICT.
+        placeholder_hash = hashlib.sha256(request.cdn_url.encode()).hexdigest()
+
+        supabase_client.table("document_sources").insert(
+            {
+                "id": doc_id,
+                "cdn_url": request.cdn_url,
+                "content_hash": placeholder_hash,
+                "project_id": request.project_id,
+                "uploaded_by": request.user_id,
+                "vector_embed_status": "PENDING",
+                "filename": request.filename,
+                "file_size_bytes": request.file_size_bytes,
+                "file_extension": file_extension,
+                "content_tags": [],
+            }
+        ).execute()
+
+        logger.info(f"📄 Pre-created document_sources row {doc_id[:8]} (PENDING)")
+
+        # ── 2. Kick off ingestion workflow ────────────────────────────────────
+        metadata = {
+            "project_id": request.project_id,
+            "user_id": request.user_id,
+            "chat_session_id": request.chat_session_id,
+            "speculative_doc_id": doc_id,   # ← worker will use this UUID
+        }
+        job = process_document_batch_workflow.apply_async(
+            args=[[request.cdn_url], metadata],
+            kwargs={"create_note": False},
+        )
+
+        # ── 3. Register Redis gate ─────────────────────────────────────────────
+        from utils.speculative_upload import register_speculative_upload
+        await register_speculative_upload(request.chat_session_id, doc_id, job.id)
+
+        logger.info(
+            f"🚀 Speculative ingest started: doc={doc_id[:8]} task={job.id[:8]} "
+            f"session={request.chat_session_id[:8]}"
+        )
+
+        # ── 4. Return identifiers to WeWeb ────────────────────────────────────
+        return {"doc_id": doc_id, "celery_task_id": job.id}
+
+    except Exception as e:
+        logger.error(f"Error starting speculative ingest: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/speculative-upload/cancel/")
+async def cancel_speculative_upload_endpoint(request: CancelSpeculativeUploadRequest):
+    """
+    Called when the user clicks the 'x' on a file card before sending their query.
+    Revokes the Celery ingestion task, deletes any partial DB rows and S3 object,
+    and removes the entry from the Redis gate.
+    """
+    try:
+        from utils.speculative_upload import cancel_speculative_upload
+        await cancel_speculative_upload(
+            request.chat_session_id, request.doc_id, request.project_id
+        )
+        return {"status": "cancelled", "doc_id": request.doc_id}
+    except Exception as e:
+        logger.error(f"Error cancelling speculative upload: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/speculative-upload/persist-message/")
+async def persist_inline_upload_message_endpoint(request: InlineUploadMessageRequest):
+    """
+    Called when the user hits Send to anchor the uploaded files as a
+    file_upload message in the conversation timeline.
+    """
+    try:
+        from utils.speculative_upload import persist_inline_upload
+        message_id = persist_inline_upload(
+            request.user_id, request.chat_session_id, request.document_ids
+        )
+        return {"status": "ok", "message_id": message_id}
+    except Exception as e:
+        logger.error(f"Error persisting inline upload message: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 # ================================================ #
 #              DEV-TOOLS ENDPOINTS
