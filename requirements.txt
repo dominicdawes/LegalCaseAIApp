@@ -24,6 +24,7 @@ python-Levenshtein>=0.20.9
 
 # PDF utils (used directly by app/main.py → utils/pdf_utils.py)
 PyPDF2
+requests
 
 # Database / storage
 supabase==2.5.0
