@@ -1,0 +1,35 @@
+# Celery worker dependencies (Render worker instance — 4GB)
+-r requirements.txt
+
+# Document parsing
+textract
+pytesseract
+python-docx
+docx2txt
+pypdf
+pymupdf
+PyPDF2
+pillow
+ebooklib
+beautifulsoup4
+mimetype
+
+# AI / LLM clients
+openai>=1.54.0
+tiktoken==0.7.0
+anthropic==0.29.0
+google-cloud-aiplatform==1.56.0
+
+# LangChain / LangGraph
+langchain==0.2.5
+langchain-community==0.2.5
+langchain-openai==0.1.8
+langchain-anthropic>=0.1.0
+langgraph>=0.2.0
+langsmith>=0.1.0
+promptic
+
+# Hierarchical RAG ingest + retrieval
+docling>=2.5.0
+voyageai>=0.3.0
+cohere>=5.0.0
