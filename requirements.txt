@@ -22,6 +22,9 @@ typing_extensions>=4.0
 fuzzywuzzy==0.18.0
 python-Levenshtein>=0.20.9
 
+# PDF utils (used directly by app/main.py → utils/pdf_utils.py)
+PyPDF2
+
 # Database / storage
 supabase==2.5.0
 psycopg2-binary==2.9.9
