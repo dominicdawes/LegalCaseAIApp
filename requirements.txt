@@ -21,9 +21,11 @@ json_repair
 typing_extensions>=4.0
 fuzzywuzzy==0.18.0
 python-Levenshtein>=0.20.9
+pyyaml
 
 # PDF utils (used directly by app/main.py → utils/pdf_utils.py)
 PyPDF2
+pypdf
 requests
 
 # Database / storage
@@ -35,3 +37,15 @@ botocore
 
 # Auth
 google-auth
+
+# AI / LLM clients (imported transitively by chat_tasks, note_tasks, llm_clients/)
+openai>=1.54.0
+anthropic==0.29.0
+tiktoken==0.7.0
+google-cloud-aiplatform==1.56.0
+
+# LangChain (imported by chat_tasks, note_tasks, prompt_utils)
+langchain==0.2.5
+langchain-community==0.2.5
+langchain-openai==0.1.8
+promptic
