@@ -112,6 +112,13 @@ load_dotenv()
 # ——— Configuration & Constants ————————————————————————————————————————————————————
 USE_LIGHTRAG_INTEGRATION = False
 
+# ── Phase 1 hierarchical ingest feature flags ────────────────────────────────
+# Set USE_HIERARCHICAL_INGEST=true to activate Docling + Voyage + contextual-blurb pipeline.
+# Set USE_VOYAGE_EMBEDDINGS=true to switch the embedding model to voyage-law-2 (1024-dim).
+# Both can be toggled independently; turning off either falls back to the legacy path.
+USE_HIERARCHICAL_INGEST = os.getenv("USE_HIERARCHICAL_INGEST", "false").lower() == "true"
+USE_VOYAGE_EMBEDDINGS   = os.getenv("USE_VOYAGE_EMBEDDINGS",   "false").lower() == "true"
+
 # Queue configuration
 INGEST_QUEUE = 'ingest'
 PARSE_QUEUE = 'parsing'
@@ -127,7 +134,8 @@ RATE_LIMIT = '150/m' # Tuned for a 2-CPU / 4GB RAM instance instead of 1000/m
 # OpenAI configuration
 OPENAI_EMBEDDING_MODEL = "text-embedding-ada-002"
 OPENAI_MAX_TOKENS_PER_BATCH = 8190 # Safety margin below the 8192 limit
-EXPECTED_EMBEDDING_LEN = 1536
+# Dimension changes with embedding model: voyage-law-2 → 1024, ada-002 → 1536
+EXPECTED_EMBEDDING_LEN = 1024 if USE_VOYAGE_EMBEDDINGS else 1536
 MAX_CONCURRENT_DOWNLOADS = 3 # A modest limit instead of 10
 CHUNK_SIZE = 1000
 CHUNK_OVERLAP = 200
@@ -765,9 +773,9 @@ def copy_embeddings_for_project_sync(existing_source_id: str, new_source_id: str
             # Get vector embeddings from the existing document
             cur.execute(
                 '''
-                SELECT content, metadata, embedding, num_tokens, page_number, chunk_index
-                FROM document_vector_store 
-                WHERE source_id = %s AND embedding IS NOT NULL
+                SELECT content, metadata, embedding_ada_legacy, num_tokens, page_number, chunk_index
+                FROM document_vector_store
+                WHERE source_id = %s AND embedding_ada_legacy IS NOT NULL
                 ORDER BY page_number, chunk_index
                 ''',
                 (existing_source_id,)
@@ -790,7 +798,7 @@ def copy_embeddings_for_project_sync(existing_source_id: str, new_source_id: str
                     project_id,
                     embedding_row['content'],
                     Json(embedding_row['metadata']), # <-- FIXED HERE: Serialize dict back to JSON
-                    embedding_row['embedding'],
+                    embedding_row['embedding_ada_legacy'],
                     embedding_row['num_tokens'],
                     embedding_row['page_number'],
                     embedding_row['chunk_index'],
@@ -801,8 +809,8 @@ def copy_embeddings_for_project_sync(existing_source_id: str, new_source_id: str
             
             # Bulk insert the copied embeddings
             cur.executemany(
-                '''INSERT INTO document_vector_store 
-                (id, source_id, project_id, content, metadata, embedding, num_tokens, page_number, chunk_index, user_id, created_at)
+                '''INSERT INTO document_vector_store
+                (id, source_id, project_id, content, metadata, embedding_ada_legacy, num_tokens, page_number, chunk_index, user_id, created_at)
                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)''',
                 records_to_insert
             )
@@ -900,17 +908,28 @@ def _create_smart_embedding_batches(chunks: List[str], metadatas: List[Dict]) ->
     
     return batches
 
+async def _call_voyage_embeddings_async(texts: List[str]) -> List[List[float]]:
+    """Voyage AI embeddings via voyage-law-2 (1024-dim). Called when USE_VOYAGE_EMBEDDINGS=true."""
+    from utils.llm_clients.voyage_client import VoyageEmbeddingsClient
+    loop = asyncio.get_event_loop()
+    voyage = VoyageEmbeddingsClient()
+    try:
+        return await loop.run_in_executor(None, voyage.embed_documents, texts)
+    except Exception as e:
+        logger.error(f"Voyage API call failed: {e}")
+        return []
+
+
 async def _call_openai_embeddings_async(texts: List[str]) -> List[List[float]]:
     """
-    Call OpenAI embeddings API asynchronously
-    
-    Options:
-    1. Use httpx for direct API calls (more control)
-    2. Use async OpenAI client (cleaner)
-    3. Fall back to sync client in thread pool (hybrid)
+    Call the active embedding API asynchronously.
+    Routes to Voyage (voyage-law-2) when USE_VOYAGE_EMBEDDINGS=true,
+    otherwise calls OpenAI text-embedding-ada-002.
     """
-    
-    # Option 1: Direct httpx call (matches your pattern)
+    if USE_VOYAGE_EMBEDDINGS:
+        return await _call_voyage_embeddings_async(texts)
+
+    # ── Legacy: OpenAI ada-002 ────────────────────────────────────────────────
     try:
         async with httpx.AsyncClient(timeout=60.0) as client:
             response = await client.post(
@@ -925,17 +944,194 @@ async def _call_openai_embeddings_async(texts: List[str]) -> List[List[float]]:
                 }
             )
             response.raise_for_status()
-            
             data = response.json()
-            
-            # Extract embeddings in correct order
-            embeddings = [item['embedding'] for item in data['data']]
-            return embeddings
-            
+            return [item['embedding'] for item in data['data']]
+
     except Exception as e:
         logger.error(f"OpenAI API call failed: {e}")
         return []
     
+# ——— Hierarchical Ingest Helpers (Phase 1) ———————————————————————————————————
+
+
+async def _parse_and_chunk_docling_async(
+    source_id: str,
+    source_filename: str,
+    cdn_url: str,
+    project_id: str,
+) -> Dict[str, Any]:
+    """
+    Hierarchical ingest PDF path: download → DoclingPDFLoader (HybridChunker).
+    Returns the same dict contract as _parse_document_async so the caller is
+    unaware of which path ran.
+
+    Extra key 'raw_doc' carries the DoclingDocument for TOC extraction and
+    blurb generation; it is popped before the result is returned upstream.
+    """
+    _update_document_status_sync(source_id, ProcessingStatus.PARSING)
+    short_id = source_id[:8]
+    file_buffer = io.BytesIO()
+
+    try:
+        # ── Download ─────────────────────────────────────────────────────────
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            async with client.stream("GET", cdn_url, headers=DEFAULT_HEADERS) as response:
+                response.raise_for_status()
+                async for raw_bytes in response.aiter_bytes(chunk_size=8_192):
+                    if raw_bytes:
+                        file_buffer.write(raw_bytes)
+        file_buffer.seek(0)
+        logger.info(f"📥 [DOCLING-{short_id}] Downloaded {file_buffer.tell()} bytes")
+
+        # ── Docling parse + HybridChunker (CPU-bound → executor) ─────────────
+        from utils.document_loaders.docling_loader import DoclingPDFLoader
+        loader = DoclingPDFLoader()
+        loop = asyncio.get_event_loop()
+        texts, metadatas, raw_doc = await loop.run_in_executor(
+            None,
+            lambda: loader.load_document(file_buffer, source_id, source_filename, cdn_url),
+        )
+
+        for meta in metadatas:
+            meta.setdefault('filename', source_filename)
+            meta.setdefault('title', source_filename)
+
+        pages = {m.get('page') for m in metadatas if m.get('page') is not None}
+        total_pages = max(pages, default=0)
+
+        logger.info(
+            f"✅ [DOCLING-{short_id}] {len(texts)} chunks, ~{total_pages} pages"
+        )
+        return {
+            'success': True,
+            'chunks': texts,
+            'metadatas': metadatas,
+            'total_pages': total_pages,
+            'raw_doc': raw_doc,
+            'performance_metrics': {},
+        }
+
+    except Exception as e:
+        logger.error(f"💥 [DOCLING-{short_id}] Parsing failed: {e}", exc_info=True)
+        _update_document_status_sync(source_id, ProcessingStatus.FAILED_PARSING, str(e))
+        return {'success': False, 'error': str(e)}
+
+
+async def _generate_chunk_blurbs_async(
+    chunks: List[str],
+    metadatas: List[Dict],
+    doc_id: str,
+) -> List[Dict]:
+    """
+    Contextual retrieval: generate a 1-2 line situating blurb for every chunk
+    using Haiku 4.5 with prompt-caching on the full document text.
+
+    For table chunks the blurb is a longer LLM-written summary that will be
+    used as the embed_text (we embed the summary, not the raw markdown).
+    For prose/heading/list chunks the blurb is prepended to the content to
+    form embed_text.
+
+    Populates two keys in each metadata dict:
+      chunk_summary — stored in document_vector_store.chunk_summary
+      embed_text    — the text actually passed to the embedding model
+                      (replaces raw content for embedding purposes only)
+
+    Returns the updated metadatas list.
+    """
+    ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "").strip()
+    if not ANTHROPIC_API_KEY:
+        logger.warning("⚠️ ANTHROPIC_API_KEY not set — skipping blurb generation")
+        return metadatas
+
+    short_id = doc_id[:8]
+
+    # Build the cached system context from the first ~50k chars of the document
+    full_doc_text = "\n\n".join(chunks)[:50_000]
+
+    # Semaphore caps concurrent Haiku calls (prompt cache keeps these cheap)
+    semaphore = asyncio.Semaphore(10)
+
+    async def _blurb_one(idx: int, text: str, meta: Dict) -> tuple:
+        chunk_type = meta.get('chunk_type', 'prose')
+        truncated = text[:2_000] if chunk_type == 'table' else text[:1_000]
+
+        if chunk_type == 'table':
+            user_msg = (
+                "Write 2-4 sentences summarising the following table from a legal "
+                "document.  Identify what it shows, any key legal concepts or "
+                "statutes, and what a law student would learn from it.  "
+                "Output only the sentences, no preamble.\n\n"
+                f"<table>\n{truncated}\n</table>"
+            )
+        else:
+            user_msg = (
+                "Write exactly 1-2 sentences that situate the following passage "
+                "in the context of the document above, mentioning the relevant "
+                "legal concept, rule, or case name.  "
+                "Output only the 1-2 sentences, no preamble.\n\n"
+                f"<chunk>\n{truncated}\n</chunk>"
+            )
+
+        async with semaphore:
+            try:
+                async with httpx.AsyncClient(timeout=45.0) as client:
+                    resp = await client.post(
+                        "https://api.anthropic.com/v1/messages",
+                        headers={
+                            "x-api-key": ANTHROPIC_API_KEY,
+                            "anthropic-version": "2023-06-01",
+                            "anthropic-beta": "prompt-caching-2024-07-31",
+                            "content-type": "application/json",
+                        },
+                        json={
+                            "model": "claude-haiku-4-5-20251001",
+                            "max_tokens": 200,
+                            "system": [
+                                {
+                                    "type": "text",
+                                    "text": (
+                                        "You are a legal-document analyst helping to build "
+                                        "a retrieval index.\n\n"
+                                        f"<document>\n{full_doc_text}\n</document>"
+                                    ),
+                                    "cache_control": {"type": "ephemeral"},
+                                }
+                            ],
+                            "messages": [{"role": "user", "content": user_msg}],
+                        },
+                    )
+                    resp.raise_for_status()
+                    blurb = resp.json()["content"][0]["text"].strip()
+            except Exception as e:
+                logger.debug(f"Blurb gen failed for chunk {idx}: {e}")
+                blurb = ""
+
+        updated_meta = dict(meta)
+        updated_meta['chunk_summary'] = blurb
+
+        if chunk_type == 'table':
+            # Embed the LLM summary, not the raw markdown
+            updated_meta['embed_text'] = blurb if blurb else text
+        else:
+            # Prepend blurb for contextual retrieval
+            updated_meta['embed_text'] = f"{blurb}\n\n{text}" if blurb else text
+
+        return idx, updated_meta
+
+    tasks = [_blurb_one(i, c, m) for i, (c, m) in enumerate(zip(chunks, metadatas))]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    updated = list(metadatas)
+    for r in results:
+        if isinstance(r, tuple):
+            idx, meta = r
+            updated[idx] = meta
+
+    n_ok = sum(1 for r in results if isinstance(r, tuple) and r[1].get('chunk_summary'))
+    logger.info(f"📝 [BLURB-{short_id}] {n_ok}/{len(chunks)} blurbs generated")
+    return updated
+
+
 # ——— Async Helper Functions ——————————————————————————————————————————————————————
 
 async def _parse_document_async(source_id: str, source_filename: str, cdn_url: str, project_id: str) -> Dict[str, Any]:
@@ -1110,45 +1306,66 @@ async def _embed_batch_async(
     try:
         logger.info(f"🤖 [BATCH-{short_id}] Processing {len(texts)} texts")
         
-        # ——— 1. Generate Embeddings (ASYNC HTTP) ————————————————————————————————
-        embeddings = await _call_openai_embeddings_async(texts)
-        
+        # ——— 1. Generate Embeddings ——————————————————————————————————————————————
+        # When USE_HIERARCHICAL_INGEST=true, metadatas carry an 'embed_text' key
+        # set by _generate_chunk_blurbs_async.  We embed that instead of the raw
+        # content (blurb+content for prose, LLM summary for tables).
+        embed_inputs = [
+            (m.get('embed_text') or t) if isinstance(m, dict) else t
+            for t, m in zip(texts, metadatas)
+        ]
+        embeddings = await _call_openai_embeddings_async(embed_inputs)
+
         if not embeddings:
             return {
                 'success': False,
                 'error': 'Failed to generate embeddings'
             }
-        
-        # ——— 2. Prepare Data (Same as legacy) ———————————————————————————————————
+
+        # ——— 2. Prepare Data ————————————————————————————————————————————————————
         records_to_insert = []
         total_tokens = 0
-        
+
         for text, meta, vec in zip(texts, metadatas, embeddings):
             if len(vec) != EXPECTED_EMBEDDING_LEN:
-                logger.warning(f"⚠️ [BATCH-{short_id}] Skipping malformed embedding")
+                logger.warning(f"⚠️ [BATCH-{short_id}] Skipping malformed embedding (len={len(vec)})")
                 continue
-            
-            # Use your existing tokenizer (same as legacy)
+
             token_count = len(tokenizer.encode(text))
             total_tokens += token_count
-            
-            # Extract page number from metadata 'page' from PDFs first, but fall back to 'estimated_page' from DOCX.
+
             page_number = meta.get('page', meta.get('estimated_page')) if isinstance(meta, dict) else None
             chunk_index = meta.get('chunk_index') if isinstance(meta, dict) else None
-            source_url = meta.get('source_id', None)
-            
+            source_url  = meta.get('source_id', None)
+
+            # New hierarchical columns (NULL when USE_HIERARCHICAL_INGEST=false)
+            chunk_summary    = meta.get('chunk_summary')    if isinstance(meta, dict) else None
+            section_path     = meta.get('section_path')     if isinstance(meta, dict) else None
+            chunk_type       = meta.get('chunk_type')       if isinstance(meta, dict) else None
+            parent_chunk_id  = meta.get('parent_chunk_id')  if isinstance(meta, dict) else None
+
+            # Strip internal-only keys before persisting to the metadata JSONB column
+            meta_clean = {
+                k: v for k, v in (meta or {}).items()
+                if k not in ('embed_text',)
+            }
+
             records_to_insert.append((
-                str(uuid.uuid4()), 
-                str(uuid.UUID(doc_id)), 
-                str(uuid.UUID(project_id)), 
-                text, 
-                json.dumps(meta), 
-                vec, 
+                str(uuid.uuid4()),
+                str(uuid.UUID(doc_id)),
+                str(uuid.UUID(project_id)),
+                text,
+                json.dumps(meta_clean),
+                vec,
                 token_count,
-                page_number,  # Add page number
-                chunk_index,  # Add chunk index for ordering
+                page_number,
+                chunk_index,
                 source_url,
-                datetime.now(timezone.utc)
+                chunk_summary,
+                section_path,
+                chunk_type,
+                parent_chunk_id,
+                datetime.now(timezone.utc),
             ))
 
         if not records_to_insert:
@@ -1157,16 +1374,24 @@ async def _embed_batch_async(
                 'error': 'No valid embeddings to insert'
             }
 
-        # ——— 3. Database Insert (Keep your sync pool - it works!) ———————————————
-        # Use global pool instead of local pool
+        # ——— 3. Database Insert ——————————————————————————————————————————————————
+        # Route embedding vector to the correct column:
+        #   USE_VOYAGE_EMBEDDINGS=true  → embedding_voyage_2   (vector(1024), voyage-law-2)
+        #   USE_VOYAGE_EMBEDDINGS=false → embedding_ada_legacy (vector(1536), ada-002)
+        embedding_col = "embedding_voyage_2" if USE_VOYAGE_EMBEDDINGS else "embedding_ada_legacy"
+
         pool = get_global_sync_db_pool()
         conn = pool.getconn()
         try:
             with conn.cursor() as cur:
                 cur.executemany(
-                    '''INSERT INTO document_vector_store 
-                    (id, source_id, project_id, content, metadata, embedding, num_tokens, page_number, chunk_index, cdn_url, created_at)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)''',
+                    f'''INSERT INTO document_vector_store
+                    (id, source_id, project_id, content, metadata, {embedding_col},
+                     num_tokens, page_number, chunk_index, cdn_url,
+                     chunk_summary, section_path, chunk_type, parent_chunk_id,
+                     created_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                            %s, %s, %s, %s, %s)''',
                     records_to_insert
                 )
                 conn.commit()
@@ -1906,16 +2131,23 @@ async def _process_document_async_workflow(
             pool.putconn(conn)
         
         # ——— 2. PARSE Document ———————————————————————————————————————————————————
-        logger.info(f"📋 [DOC-{short_id}] → PARSING")
+        logger.info(f"📋 [DOC-{short_id}] → PARSING ({'Docling' if USE_HIERARCHICAL_INGEST else 'legacy'})")
 
-        # Parsing contains these subtasks: select optimal loader → in-memory streaming → clean/chunk text
-        parse_result = await _parse_document_async(
-            doc_id, 
-            doc_data['filename'],
-            doc_data['cdn_url'], 
-            project_id,
+        if USE_HIERARCHICAL_INGEST:
+            parse_result = await _parse_and_chunk_docling_async(
+                doc_id,
+                doc_data['filename'],
+                doc_data['cdn_url'],
+                project_id,
             )
-        
+        else:
+            parse_result = await _parse_document_async(
+                doc_id,
+                doc_data['filename'],
+                doc_data['cdn_url'],
+                project_id,
+            )
+
         if not parse_result.get('success'):
             return {
                 'doc_id': doc_id,
@@ -1924,37 +2156,68 @@ async def _process_document_async_workflow(
                 'error': parse_result.get('error', 'Parsing failed'),
                 'chunks_created': 0
             }
-        
+
         chunks = parse_result['chunks']
-        chunks_metadata = parse_result.get('metadatas', [])  # ← Extract metadatas
+        chunks_metadata = parse_result.get('metadatas', [])
         logger.info(f"✅ [DOC-{short_id}] Parsed {len(chunks)} chunks")
 
-        # --- INTEGRATION ⚙️: This could also be where we can kick off ainsert() with LightRag -------------
-        # You can also add document UUIDs here so that LightRAG can use them in its pipeline for consistency
-        # LightRAG only accepts full parsed documents so I'll need to concatenate the chunks back into a single document
-        
-        # @TODO: ADD IN A SWITCH FOR LIGHTRAG INTEGRATION
+        # LightRAG hook (disabled)
         if USE_LIGHTRAG_INTEGRATION:
-            lightrag_client.insert_document_into_kg(
-                doc_id=doc_id,
-                chunks=chunks,
+            lightrag_client.insert_document_into_kg(doc_id=doc_id, chunks=chunks)
+
+        # ——— 2b. CONTEXTUAL BLURBS (hierarchical path only) ——————————————————
+        # Must run before embedding: table chunks embed their LLM summary, not raw markdown.
+        if USE_HIERARCHICAL_INGEST:
+            logger.info(f"📝 [DOC-{short_id}] → BLURB GENERATION")
+            chunks_metadata = await _generate_chunk_blurbs_async(
+                chunks, chunks_metadata, doc_id
             )
 
         # ——— 3. EMBEDDING Process, async with concurrency control ————————————————
         logger.info(f"📋 [DOC-{short_id}] → EMBEDDING")
         embedding_result = await _process_embeddings_async(doc_id, project_id, chunks, chunks_metadata)
-        
+
         if not embedding_result.get('success'):
             return {
                 'doc_id': doc_id,
-                'processing_type': 'NEW', 
+                'processing_type': 'NEW',
                 'status': 'FAILED',
                 'error': embedding_result.get('error', 'Embedding failed'),
                 'chunks_created': len(chunks)
             }
-        
+
         logger.info(f"✅ [DOC-{short_id}] Embedded {embedding_result['chunks_embedded']} chunks")
-        
+
+        # ——— 3b. POST-EMBED SUB-TASKS (hierarchical path only) ———————————————
+        # Fired as fire-and-forget Celery tasks; never blocks note generation.
+        if USE_HIERARCHICAL_INGEST:
+            from tasks.hierarchical_ingest_tasks import (
+                extract_doc_summary,
+                extract_doc_concepts,
+                build_section_summaries,
+            )
+            doc_sample = "\n\n".join(chunks[:15])[:8_000]
+            extract_doc_summary.delay(doc_id, doc_sample)
+            extract_doc_concepts.delay(doc_id, doc_sample)
+            build_section_summaries.delay(doc_id, project_id)
+            logger.info(f"🚀 [DOC-{short_id}] Post-embed sub-tasks dispatched")
+
+            # Persist TOC extracted by Docling (best-effort)
+            raw_doc = parse_result.get('raw_doc')
+            if raw_doc is not None:
+                try:
+                    from utils.document_loaders.docling_loader import extract_toc_from_docling_doc
+                    toc = extract_toc_from_docling_doc(raw_doc)
+                    if toc:
+                        async with get_db_connection() as conn:
+                            await conn.execute(
+                                "UPDATE document_sources SET toc = $1 WHERE id = $2",
+                                json.dumps(toc), doc_id,
+                            )
+                        logger.info(f"📑 [DOC-{short_id}] TOC saved ({len(toc)} entries)")
+                except Exception as toc_err:
+                    logger.warning(f"⚠️ TOC save failed: {toc_err}")
+
         # ——— Return Success Result ———————————————————————————————————————————————
         return {
             'doc_id': doc_id,

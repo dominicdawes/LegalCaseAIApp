@@ -70,6 +70,8 @@ load_dotenv()
 
 # ——— Configuration & Constants ————————————————————————————————————————————————————
 USE_LIGHTRAG_INTEGRATION = False
+USE_LANGGRAPH_AGENT = os.getenv("USE_LANGGRAPH_AGENT", "false").lower() == "true"
+USE_VOYAGE_EMBEDDINGS = os.getenv("USE_VOYAGE_EMBEDDINGS", "false").lower() == "true"
 
 # Queue configuration
 NOTES_QUEUE = 'notes'
@@ -189,7 +191,17 @@ class AsyncNoteManager:
         
         try:
             logger.info(f"🎯 Starting async note generation: {note_type} for project {project_id}")
-            
+
+            # ── LangGraph agentic path ──────────────────────────────────────────────
+            if note_type == "exam_questions" and USE_LANGGRAPH_AGENT:
+                return await self._generate_exam_questions_agent(
+                    note_id=note_id,
+                    user_id=user_id,
+                    project_id=project_id,
+                    note_title=note_title,
+                    addtl_params=addtl_params or {},
+                )
+
             # 🆕 PARALLEL EXECUTION - Load prompt and generate embedding concurrently
             logger.info("⚡ Executing parallel tasks: prompt loading + embedding generation")
             
@@ -914,6 +926,78 @@ class AsyncNoteManager:
             logger.info(f"📡 Note {note_id[:8]}… progress → {status}")
         except Exception as e:
             logger.warning(f"⚠️ Failed to update note progress [{status}] for {note_id}: {e}")
+
+    async def _generate_exam_questions_agent(
+        self,
+        note_id: str,
+        user_id: str,
+        project_id: str,
+        note_title: str,
+        addtl_params: Dict,
+    ) -> str:
+        """
+        Route exam_questions to the LangGraph agentic pipeline when
+        USE_LANGGRAPH_AGENT=true.  Falls back to the standard RAG path
+        on import error so a missing langgraph install never breaks prod.
+        """
+        try:
+            from agents.exam_questions.graph import run_exam_agent
+        except ImportError:
+            logger.warning("langgraph not installed — falling back to standard RAG path")
+            return await self.generate_note_async(
+                note_id=note_id,
+                user_id=user_id,
+                note_type="exam_questions",
+                project_id=project_id,
+                note_title=note_title,
+                provider="anthropic",
+                model_name="claude-opus-4-7",
+                num_sources=10,
+                addtl_params=addtl_params,
+            )
+
+        n_questions = int(addtl_params.get("num_questions", 3))
+        source_ids = addtl_params.get("source_ids") or []
+
+        # If no explicit source_ids, fetch all for the project
+        if not source_ids:
+            from utils.db.connection_manager import get_async_pool
+            pool = await get_async_pool()
+            async with pool.acquire() as conn:
+                rows = await conn.fetch(
+                    "SELECT id FROM document_sources WHERE project_id = $1",
+                    project_id,
+                )
+            source_ids = [str(r["id"]) for r in rows]
+
+        await self._update_note_progress_async(note_id, "PROCESSING")
+
+        try:
+            final_state = await run_exam_agent(
+                request=note_title,
+                project_id=project_id,
+                source_ids=source_ids,
+                n_questions=n_questions,
+                use_voyage=USE_VOYAGE_EMBEDDINGS,
+                thread_id=note_id,
+            )
+            markdown = final_state.get("final_output") or ""
+        except Exception as e:
+            logger.error(f"LangGraph agent failed: {e}", exc_info=True)
+            raise
+
+        await self._save_note_async(
+            note_id=note_id,
+            user_id=user_id,
+            project_id=project_id,
+            note_type="exam_questions",
+            note_title=note_title,
+            note_content=markdown,
+            provider="anthropic",
+            model_name="claude-opus-4-7",
+        )
+        await self._update_note_progress_async(note_id, "COMPLETE")
+        return markdown
 
     async def _handle_note_error(
         self, project_id: str, user_id: str, note_type: str, error_message: str,

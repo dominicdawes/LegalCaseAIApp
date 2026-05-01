@@ -12,6 +12,10 @@ from .epub_loader import EpubLoader
 
 logger = logging.getLogger(__name__)
 
+# When true, PDFs are routed through DoclingPDFLoader (HybridChunker + Voyage).
+# Non-PDF formats use existing loaders unchanged.
+USE_HIERARCHICAL_INGEST = os.getenv("USE_HIERARCHICAL_INGEST", "false").lower() == "true"
+
 # Map extension→loader class remains the same.
 _LOADER_MAP: dict[str, Type[BaseDocumentLoader]] = {
     ".pdf": PDFLoader,
@@ -149,13 +153,17 @@ def is_pdf_text_based(file_stream: io.BytesIO, min_char_threshold: int = 100) ->
         pdf.close()
         file_stream.seek(0)
 
-def get_loader_for(filename: str, 
-                    file_like_object: io.BytesIO, 
+def get_loader_for(filename: str,
+                    file_like_object: io.BytesIO,
                     performance_mode: str = "auto",
                     analyze_first: bool = True) -> BaseDocumentLoader:
     """
-    Enhanced loader factory with performance optimization
-    
+    Enhanced loader factory with performance optimization.
+
+    When USE_HIERARCHICAL_INGEST=true, PDF files are routed to DoclingPDFLoader
+    which handles both parsing and chunking in a single step (HybridChunker).
+    All non-PDF formats always use their existing loaders regardless of the flag.
+
     Args:
         filename: Original filename for extension detection
         file_like_object: In-memory file content
@@ -163,12 +171,18 @@ def get_loader_for(filename: str,
         analyze_first: Whether to analyze document before choosing loader
     """
     ext = os.path.splitext(filename.lower())[1]
-    
+
     if ext not in _LOADER_MAP:
         raise ValueError(
             f"Unsupported document type '{ext}'. Supported: {list(_LOADER_MAP.keys())}"
         )
-    
+
+    # ── Hierarchical ingest: Docling replaces the legacy PDF path ────────────
+    if ext == ".pdf" and USE_HIERARCHICAL_INGEST:
+        from .docling_loader import DoclingPDFLoader
+        logger.info("🔬 [USE_HIERARCHICAL_INGEST] Using DoclingPDFLoader")
+        return DoclingPDFLoader()
+
     # PDF-specific logic with performance optimization
     if ext == ".pdf":
         file_like_object.seek(0)

@@ -1,0 +1,52 @@
+# prompts/chunk-blurb-prompt.yaml
+#
+# Used by _generate_chunk_blurbs_async in tasks/upload_tasks.py.
+# The cheap model (Haiku 4.5) is called once per chunk with the full document
+# text as a prompt-cached system message.
+#
+# Two task variants:
+#   blurb  — 1-2 sentence contextual situating blurb for prose/heading/list chunks
+#   table  — 2-4 sentence summary of a table chunk (this is what gets embedded)
+
+model: claude-haiku-4-5-20251001
+provider: anthropic
+max_tokens: 200
+temperature: 0.1
+
+# ── System prompt (cached against the full document text) ──────────────────
+# The literal placeholder {document_text} is replaced at call-time with the
+# first ~50 k chars of the parsed document.  This block is sent with
+# cache_control: ephemeral so all chunks in the same document share one cache hit.
+system_prompt: |
+  You are a legal-document analyst helping to build a retrieval index.
+  Below is the full text of the document being indexed:
+
+  <document>
+  {document_text}
+  </document>
+
+  Your task is to write a short description for individual passages from
+  this document so that they can be retrieved accurately by a semantic
+  search engine.  Follow the instructions for each chunk type below.
+
+# ── User prompt for prose / heading / list chunks ──────────────────────────
+blurb_prompt: |
+  Write exactly 1-2 sentences that situate the following passage within the
+  document above.  Mention the relevant legal concept, rule, or case name it
+  discusses so that a student searching for that topic will find it.
+  Do NOT copy the passage verbatim.  Output only the 1-2 sentences, no preamble.
+
+  <chunk>
+  {chunk_text}
+  </chunk>
+
+# ── User prompt for table chunks ───────────────────────────────────────────
+table_summary_prompt: |
+  Write 2-4 sentences summarising the following table from the legal document
+  above.  Identify: (1) what the table shows, (2) any key legal concepts,
+  statutes, or cases it references, and (3) what a law student would learn
+  from it.  Output only the summary sentences, no preamble or labels.
+
+  <table>
+  {chunk_text}
+  </table>

@@ -115,6 +115,26 @@ class LLMFactory:
             raise ValueError(f"Failed to create {provider} client: {str(e)}") from e
     
     @staticmethod
+    def get_langchain_model(tier: str = "mid"):
+        """
+        Return a LangChain BaseChatModel for LangGraph nodes.
+
+        tier options:
+            "cheap"    → claude-haiku-4-5-20251001  (fast, low-cost; grounding, routing)
+            "mid"      → claude-sonnet-4-6           (default; most nodes)
+            "flagship" → claude-opus-4-7             (drafting + answer-key nodes)
+        """
+        from langchain_anthropic import ChatAnthropic
+
+        model_map = {
+            "cheap": "claude-haiku-4-5-20251001",
+            "mid": "claude-sonnet-4-6",
+            "flagship": "claude-opus-4-7",
+        }
+        model_name = model_map.get(tier, "claude-sonnet-4-6")
+        return ChatAnthropic(model=model_name, max_tokens=4096)
+
+    @staticmethod
     def get_available_providers() -> list[str]:
         """Get list of supported providers"""
         return ["anthropic", "openai", "deepseek", "gemini"]
