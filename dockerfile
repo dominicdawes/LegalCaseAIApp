@@ -14,7 +14,9 @@ RUN apt-get update && \
         libreoffice-common \
         libreoffice-writer \
         tesseract-ocr \
-        redis-tools && \
+        redis-tools \
+        libmagic1 \
+        poppler-utils && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
@@ -23,13 +25,15 @@ ENV VIRTUAL_ENV=/opt/venv
 RUN python3 -m venv $VIRTUAL_ENV
 ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 
-# 4) Copy your requirements.txt and install Python packages
-COPY requirements.txt /app/requirements.txt
+# 4) Copy requirements files and install Python packages
+#    requirements.txt      — lean web-service deps (also used by Render web instance)
+#    requirements-worker.txt — heavy worker deps; inherits requirements.txt via -r
+COPY requirements.txt requirements-worker.txt /app/
 WORKDIR /app
 
 # Downgrade pip to <24.1 so that it doesn’t reject textract’s metadata
 RUN pip install pip==24.0 \
-    && pip install -r requirements.txt
+    && pip install -r requirements-worker.txt
 
 # 5) Copy in your application code
 COPY . /app
