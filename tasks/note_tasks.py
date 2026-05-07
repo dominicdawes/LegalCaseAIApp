@@ -1074,6 +1074,16 @@ def rag_note_task(
         note_id = str(uuid.uuid4())
         logger.warning(f"⚠️ note_id not provided — generated fallback {note_id[:8]}… (stub row not created)")
 
+    # Reset status to PROCESSING on each attempt so the frontend doesn't
+    # flash ERROR while the task is waiting between retries.
+    if self.request.retries > 0:
+        try:
+            supabase_client.table("notes").update(
+                {"note_progress_status": "PROCESSING"}
+            ).eq("id", note_id).execute()
+        except Exception:
+            pass
+
     try:
         # Set explicit start time metadata
         task_id = self.request.id
@@ -1120,6 +1130,12 @@ def rag_note_task(
         try:
             raise self.retry(exc=e)
         except MaxRetriesExceededError:
+            # Delete the stub row so it doesn't linger in the user's project view.
+            try:
+                supabase_client.table("notes").delete().eq("id", note_id).execute()
+                logger.info(f"🗑️ Deleted failed note stub {note_id[:8]} after max retries")
+            except Exception as del_err:
+                logger.warning(f"⚠️ Could not delete failed note stub {note_id[:8]}: {del_err}")
             raise RuntimeError(
                 f"Note creation failed permanently after {self.max_retries} retries: {e}"
             ) from e
