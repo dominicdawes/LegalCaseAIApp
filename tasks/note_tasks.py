@@ -54,7 +54,6 @@ from utils.prompt_utils import load_yaml_prompt, build_prompt_template_from_yaml
 from utils.supabase_utils import (
     insert_note_supabase_record,
     supabase_client,
-    log_llm_error,
 )
 # LightRAG disabled — import lazily inside lightrag_note_generation_async when re-enabled
 # from utils.lightrag.lightrag_utils import lightrag_integration
@@ -327,7 +326,7 @@ class AsyncNoteManager:
             
         except Exception as e:
             logger.error(f"❌ Async note generation failed: {e}", exc_info=True)
-            await self._handle_note_error(project_id, user_id, note_type, str(e), note_id=note_id)
+            await self._handle_note_error(str(e), note_id=note_id)
             raise
         finally:
             # Clean up large objects
@@ -915,14 +914,20 @@ class AsyncNoteManager:
         except Exception as e:
             logger.warning(f"⚠️ Metrics logging failed: {e}")
 
-    async def _update_note_progress_async(self, note_id: str, status: str):
-        """Update note_progress_status for realtime frontend observability."""
+    async def _update_note_progress_async(self, note_id: str, status: str, error_message: str = None):
+        """Update note_progress_status (and optionally error_message) on the existing stub row."""
         try:
             async with get_db_connection() as conn:
-                await conn.execute(
-                    "UPDATE notes SET note_progress_status = $1 WHERE id = $2",
-                    status, note_id
-                )
+                if error_message:
+                    await conn.execute(
+                        "UPDATE notes SET note_progress_status = $1, error_message = $2 WHERE id = $3",
+                        status, error_message[:2000], note_id
+                    )
+                else:
+                    await conn.execute(
+                        "UPDATE notes SET note_progress_status = $1 WHERE id = $2",
+                        status, note_id
+                    )
             logger.info(f"📡 Note {note_id[:8]}… progress → {status}")
         except Exception as e:
             logger.warning(f"⚠️ Failed to update note progress [{status}] for {note_id}: {e}")
@@ -1000,28 +1005,13 @@ class AsyncNoteManager:
         return markdown
 
     async def _handle_note_error(
-        self, project_id: str, user_id: str, note_type: str, error_message: str,
-        note_id: Optional[str] = None,
+        self, error_message: str, note_id: Optional[str] = None,
     ):
-        # Mark the stub row as errored so the frontend listener is notified
+        # Update the existing stub row — never INSERT a new one
         if note_id:
-            await self._update_note_progress_async(note_id, "ERROR")
-        try:
-            loop = asyncio.get_event_loop()
-            await loop.run_in_executor(
-                None,
-                lambda: log_llm_error(
-                    supabase_client,
-                    table_name="notes",
-                    task_name="async_note_generation",
-                    error_message=error_message,
-                    project_id=project_id,
-                    user_id=user_id,
-                    note_type=note_type,
-                ),
-            )
-        except Exception as e:
-            logger.warning(f"⚠️ Error logging failed: {e}")
+            await self._update_note_progress_async(note_id, "ERROR", error_message=error_message)
+        else:
+            logger.warning(f"⚠️ _handle_note_error called without note_id — error not persisted: {error_message[:200]}")
 
 # ——— Global Manager Instance ————————————————————————————————————————————————————
 
@@ -1116,26 +1106,12 @@ def rag_note_task(
     except Exception as e:
         logger.error(f"❌ Note task for {note_type} failed: {e}", exc_info=True)
         
-        # Log error synchronously
-        log_llm_error(
-            client=supabase_client,
-            table_name="notes",
-            task_name="rag_note_task",
-            error_message=str(e),
-            project_id=project_id,
-            user_id=user_id,
-            note_type=note_type, # 🆕 FIX: Add missing note_type for error logging
-        )
-        
         try:
             raise self.retry(exc=e)
         except MaxRetriesExceededError:
-            # Delete the stub row so it doesn't linger in the user's project view.
-            try:
-                supabase_client.table("notes").delete().eq("id", note_id).execute()
-                logger.info(f"🗑️ Deleted failed note stub {note_id[:8]} after max retries")
-            except Exception as del_err:
-                logger.warning(f"⚠️ Could not delete failed note stub {note_id[:8]}: {del_err}")
+            # Stub row already has ERROR + error_message from _handle_note_error in the
+            # inner async function. Leave it so the frontend can show an error card.
+            logger.error(f"💀 Note {note_id[:8]} failed permanently after {self.max_retries} retries: {e}")
             raise RuntimeError(
                 f"Note creation failed permanently after {self.max_retries} retries: {e}"
             ) from e
