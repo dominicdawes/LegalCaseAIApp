@@ -3,12 +3,8 @@
 import os
 import io
 import logging
-from typing import Type, Union, Optional, Dict, Any
+from typing import Union, Optional, Dict, Any
 from .base import BaseDocumentLoader
-from .pdf_loader import PDFLoader, HighPerformancePDFLoader
-from .pdf_ocr_loader import PDFOCRLoader
-from .docx_loader import DocxLoader, LegacyDocLoader
-from .epub_loader import EpubLoader
 
 logger = logging.getLogger(__name__)
 
@@ -16,21 +12,6 @@ logger = logging.getLogger(__name__)
 # Non-PDF formats use existing loaders unchanged.
 USE_HIERARCHICAL_INGEST = os.getenv("USE_HIERARCHICAL_INGEST", "false").lower() == "true"
 
-# Map extension→loader class remains the same.
-_LOADER_MAP: dict[str, Type[BaseDocumentLoader]] = {
-    ".pdf": PDFLoader,
-    ".docx": DocxLoader,
-    ".doc": LegacyDocLoader,
-    ".epub": EpubLoader,
-    # you could add ".txt": TxtLoader, etc.
-    # you could add ".md": MarkdownLoader, etc.
-}
-
-# Performance-optimized loaders for specific use cases
-_HIGH_PERFORMANCE_MAP: Dict[str, Type[BaseDocumentLoader]] = {
-    ".pdf": HighPerformancePDFLoader,
-    # Add more high-performance variants
-}
 
 # ——— DocumentAnalyzer Class ————————————————————————————————
 
@@ -170,11 +151,23 @@ def get_loader_for(filename: str,
         performance_mode: "auto", "standard", "high_performance", "ocr"
         analyze_first: Whether to analyze document before choosing loader
     """
+    from .pdf_loader import PDFLoader, HighPerformancePDFLoader
+    from .pdf_ocr_loader import PDFOCRLoader
+    from .docx_loader import DocxLoader, LegacyDocLoader
+    from .epub_loader import EpubLoader
+
+    loader_map = {
+        ".pdf": PDFLoader,
+        ".docx": DocxLoader,
+        ".doc": LegacyDocLoader,
+        ".epub": EpubLoader,
+    }
+
     ext = os.path.splitext(filename.lower())[1]
 
-    if ext not in _LOADER_MAP:
+    if ext not in loader_map:
         raise ValueError(
-            f"Unsupported document type '{ext}'. Supported: {list(_LOADER_MAP.keys())}"
+            f"Unsupported document type '{ext}'. Supported: {list(loader_map.keys())}"
         )
 
     # ── Hierarchical ingest: Docling replaces the legacy PDF path ────────────
@@ -186,45 +179,40 @@ def get_loader_for(filename: str,
     # PDF-specific logic with performance optimization
     if ext == ".pdf":
         file_like_object.seek(0)
-        
+
         # Analyze document if requested
         if analyze_first and performance_mode == "auto":
             analysis = DocumentAnalyzer.analyze_pdf_performance(file_like_object)
-            
+
             logger.info(f"PDF Analysis: {analysis['file_size_mb']:.1f}MB, "
                         f"{analysis['estimated_pages']} pages, "
                         f"complexity: {analysis['complexity_score']}/10, "
                         f"recommended: {analysis['recommended_loader']}")
-            
+
             performance_mode = analysis["recommended_loader"]
-        
+
         # Choose appropriate loader based on analysis or explicit mode
         if performance_mode == "high_performance":
             loader = HighPerformancePDFLoader(
-                batch_pages=20,  # Larger batches for big docs
+                batch_pages=20,
                 skip_images=True,
                 fast_text_only=True
             )
         elif performance_mode == "ocr":
             loader = PDFOCRLoader()
         elif performance_mode == "auto" or performance_mode == "standard":
-            # Fallback to text-based detection
             if is_pdf_text_based(file_like_object):
-                loader = PDFLoader(
-                    min_page_length=50,
-                    extract_images=False
-                )
+                loader = PDFLoader(min_page_length=50, extract_images=False)
             else:
                 loader = PDFOCRLoader()
         else:
-            # Default standard loader
             loader = PDFLoader()
-        
+
         file_like_object.seek(0)
         return loader
-    
+
     # For non-PDF files, use standard loaders
-    LoaderCls = _LOADER_MAP[ext]
+    LoaderCls = loader_map[ext]
     return LoaderCls()
 
 def get_high_performance_loader(filename: str, file_like_object: io.BytesIO) -> BaseDocumentLoader:
