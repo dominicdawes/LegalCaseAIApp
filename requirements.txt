@@ -27,6 +27,7 @@ pyyaml
 PyPDF2
 pypdf
 requests
+PyMuPDF==1.24.10
 
 # Database / storage
 supabase==2.5.0
