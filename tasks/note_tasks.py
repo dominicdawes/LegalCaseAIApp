@@ -35,6 +35,11 @@ from contextlib import asynccontextmanager
 from celery import Task
 from celery.exceptions import MaxRetriesExceededError
 from celery.utils.log import get_task_logger
+try:
+    from anthropic import NotFoundError as AnthropicNotFoundError, AuthenticationError as AnthropicAuthError
+    _PERMANENT_LLM_ERRORS = (AnthropicNotFoundError, AnthropicAuthError)
+except ImportError:
+    _PERMANENT_LLM_ERRORS = ()
 
 # ===== MACHINE LEARNING & TEXT PROCESSING =====  
 import tiktoken
@@ -1105,7 +1110,12 @@ def rag_note_task(
 
     except Exception as e:
         logger.error(f"❌ Note task for {note_type} failed: {e}", exc_info=True)
-        
+
+        # Permanent errors (bad model name, invalid API key, etc.) — never worth retrying.
+        if _PERMANENT_LLM_ERRORS and isinstance(e, _PERMANENT_LLM_ERRORS):
+            logger.error(f"💀 Permanent LLM error for note {note_id[:8]}, skipping retries: {e}")
+            raise RuntimeError(str(e)) from e
+
         try:
             raise self.retry(exc=e)
         except MaxRetriesExceededError:

@@ -1934,13 +1934,27 @@ def finalize_batch_and_create_note(
         
         logger.info(f"🎯 [BATCH-{batch_id[:8]}] Triggering RAG note generation...")
         try:
+            # Pre-create stub row so the frontend realtime listener fires and
+            # _save_note_async has a row to UPDATE (same pattern as the API path).
+            note_id = str(uuid.uuid4())
+            supabase_client.table("notes").insert({
+                "id":                   note_id,
+                "user_id":              note_metadata["user_id"],
+                "project_id":           note_metadata["project_id"],
+                "title":                note_metadata["note_title"],
+                "note_type":            note_metadata["note_type"],
+                "note_progress_status": "INITIALIZED",
+                "created_at":           datetime.now(timezone.utc).isoformat(),
+            }).execute()
+
             rag_note_task.apply_async(kwargs={
-                "user_id": note_metadata["user_id"],
-                "note_type": note_metadata["note_type"], 
+                "note_id":    note_id,
+                "user_id":    note_metadata["user_id"],
+                "note_type":  note_metadata["note_type"],
                 "project_id": note_metadata["project_id"],
                 "note_title": note_metadata["note_title"],
-                "provider": note_metadata.get("provider"),
-                "model_name": note_metadata.get("model_name"), 
+                "provider":   note_metadata.get("provider"),
+                "model_name": note_metadata.get("model_name"),
                 "temperature": note_metadata.get("temperature"),
                 "addtl_params": {
                     **note_metadata.get("addtl_params", {}),
@@ -1952,7 +1966,7 @@ def finalize_batch_and_create_note(
                     }
                 }
             })
-            logger.info(f"✅ [BATCH-{batch_id[:8]}] RAG note generation triggered")
+            logger.info(f"✅ [BATCH-{batch_id[:8]}] RAG note generation triggered (note_id={note_id[:8]})")
             
         except Exception as e:
             logger.error(f"❌ [BATCH-{batch_id[:8]}] Failed to trigger note generation: {e}")
@@ -2343,13 +2357,24 @@ async def _handle_duplicate_only_batch(batch_id: str, project_id: str, workflow_
         }
         
         logger.info(f"🎯 [BATCH-{batch_id[:8]}] Triggering note generation for duplicate-only batch")
+        note_id = str(uuid.uuid4())
+        supabase_client.table("notes").insert({
+            "id":                   note_id,
+            "user_id":              note_metadata["user_id"],
+            "project_id":           note_metadata["project_id"],
+            "title":                note_metadata["note_title"],
+            "note_type":            note_metadata["note_type"],
+            "note_progress_status": "INITIALIZED",
+            "created_at":           datetime.now(timezone.utc).isoformat(),
+        }).execute()
         rag_note_task.apply_async(kwargs={
-            "user_id": note_metadata["user_id"],
-            "note_type": note_metadata["note_type"], 
+            "note_id":    note_id,
+            "user_id":    note_metadata["user_id"],
+            "note_type":  note_metadata["note_type"],
             "project_id": note_metadata["project_id"],
             "note_title": note_metadata["note_title"],
-            "provider": note_metadata.get("provider"),
-            "model_name": note_metadata.get("model_name"), 
+            "provider":   note_metadata.get("provider"),
+            "model_name": note_metadata.get("model_name"),
             "temperature": note_metadata.get("temperature"),
             "addtl_params": {
                 **note_metadata.get("addtl_params", {}),
