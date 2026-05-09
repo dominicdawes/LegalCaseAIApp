@@ -37,9 +37,9 @@ from celery.exceptions import MaxRetriesExceededError
 from celery.utils.log import get_task_logger
 try:
     from anthropic import NotFoundError as AnthropicNotFoundError, AuthenticationError as AnthropicAuthError
-    _PERMANENT_LLM_ERRORS = (AnthropicNotFoundError, AnthropicAuthError)
+    _PERMANENT_LLM_ERRORS = (AnthropicNotFoundError, AnthropicAuthError, ModuleNotFoundError, ImportError)
 except ImportError:
-    _PERMANENT_LLM_ERRORS = ()
+    _PERMANENT_LLM_ERRORS = (ModuleNotFoundError, ImportError)
 
 # ===== MACHINE LEARNING & TEXT PROCESSING =====  
 import tiktoken
@@ -971,12 +971,10 @@ class AsyncNoteManager:
 
         # If no explicit source_ids, fetch all for the project
         if not source_ids:
-            from utils.db.connection_manager import get_async_pool
-            pool = await get_async_pool()
-            async with pool.acquire() as conn:
+            async with get_db_connection() as conn:
                 rows = await conn.fetch(
                     "SELECT id FROM document_sources WHERE project_id = $1",
-                    project_id,
+                    uuid.UUID(project_id),
                 )
             source_ids = [str(r["id"]) for r in rows]
 
