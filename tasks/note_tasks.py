@@ -996,13 +996,10 @@ class AsyncNoteManager:
 
         await self._save_note_async(
             note_id=note_id,
-            user_id=user_id,
-            project_id=project_id,
             note_type="exam_questions",
-            note_title=note_title,
-            note_content=markdown,
-            provider="anthropic",
-            model_name="claude-opus-4-7",
+            content=markdown,
+            is_essential=False,
+            num_sources=len(source_ids),
         )
         await self._update_note_progress_async(note_id, "COMPLETE")
         return markdown
