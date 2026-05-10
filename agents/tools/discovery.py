@@ -30,7 +30,7 @@ def build_discovery_tools(ctx: ToolContext) -> list:
         doc_summary) for each source.  Use get_doc_outline or
         find_docs_about for deeper exploration.
 
-        Returns JSON array: [{id, filename, total_chunks, file_type}]
+        Returns JSON array: [{id, filename, total_chunks, doc_summary}]
         """
         from tasks.database import get_global_async_db_pool, init_async_pools
         await init_async_pools()
@@ -38,8 +38,7 @@ def build_discovery_tools(ctx: ToolContext) -> list:
         async with pool.acquire() as conn:
             rows = await conn.fetch(
                 """
-                SELECT id, filename, total_chunks,
-                       vector_embed_status, file_extension
+                SELECT id, filename, total_chunks, doc_summary
                 FROM document_sources
                 WHERE project_id = $1
                   AND vector_embed_status = 'COMPLETE'
@@ -52,7 +51,7 @@ def build_discovery_tools(ctx: ToolContext) -> list:
                 "id": str(r["id"]),
                 "filename": r["filename"] or "",
                 "total_chunks": r["total_chunks"] or 0,
-                "file_type": r["file_extension"] or "",
+                "doc_summary": (r["doc_summary"] or "")[:200],
             }
             for r in rows
         ])
@@ -78,8 +77,7 @@ def build_discovery_tools(ctx: ToolContext) -> list:
         async with pool.acquire() as conn:
             row = await conn.fetchrow(
                 """
-                SELECT filename, total_chunks, file_extension,
-                       vector_embed_status
+                SELECT filename, total_chunks, doc_summary, toc, doc_concepts
                 FROM document_sources
                 WHERE id = $1 AND project_id = $2
                 """,
@@ -89,12 +87,27 @@ def build_discovery_tools(ctx: ToolContext) -> list:
         if not row:
             return json.dumps({"error": "document not found"})
 
+        toc = row["toc"] or []
+        if isinstance(toc, str):
+            try:
+                toc = json.loads(toc)
+            except Exception:
+                toc = []
+
+        concepts = row["doc_concepts"] or []
+        if isinstance(concepts, str):
+            try:
+                concepts = json.loads(concepts)
+            except Exception:
+                concepts = []
+
         return json.dumps({
             "source_id": source_id,
             "filename": row["filename"] or "",
             "total_chunks": row["total_chunks"] or 0,
-            "file_type": row["file_extension"] or "",
-            "status": row["vector_embed_status"] or "",
+            "doc_summary": row["doc_summary"] or "",
+            "toc": toc[:50],
+            "doc_concepts": concepts[:30],
         })
 
     @tool
