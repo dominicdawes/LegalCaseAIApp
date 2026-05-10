@@ -1114,12 +1114,20 @@ def rag_note_task(
         try:
             raise self.retry(exc=e)
         except MaxRetriesExceededError:
-            # Stub row already has ERROR + error_message from _handle_note_error in the
-            # inner async function. Leave it so the frontend can show an error card.
-            logger.error(f"💀 Note {note_id[:8]} failed permanently after {self.max_retries} retries: {e}")
-            raise RuntimeError(
-                f"Note creation failed permanently after {self.max_retries} retries: {e}"
-            ) from e
+            error_msg = (
+                f"Note generation timed out and failed after {self.max_retries} retries. "
+                f"The task repeatedly encountered errors and could not complete. "
+                f"Last error: {str(e)[:300]}"
+            )
+            logger.error(f"💀 Note {note_id[:8]} exhausted {self.max_retries} retries: {e}")
+            try:
+                supabase_client.table("notes").update({
+                    "note_progress_status": "MAX_RETRY_ERROR",
+                    "error_message": error_msg[:2000],
+                }).eq("id", note_id).execute()
+            except Exception as upd_err:
+                logger.warning(f"⚠️ Could not update note to MAX_RETRY_ERROR: {upd_err}")
+            raise RuntimeError(error_msg) from e
     
     finally:
         # Clean up

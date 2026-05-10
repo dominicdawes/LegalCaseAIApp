@@ -36,7 +36,7 @@ def build_housekeeping_tools(ctx: ToolContext) -> list:
         async with pool.acquire() as conn:
             row = await conn.fetchrow(
                 """
-                SELECT id, source_filename, cdn_url, total_pages,
+                SELECT id, filename, cdn_url, total_chunks,
                        doc_summary, doc_concepts, toc, created_at,
                        file_type, file_size
                 FROM document_sources
@@ -65,9 +65,9 @@ def build_housekeeping_tools(ctx: ToolContext) -> list:
 
         return json.dumps({
             "id": str(row["id"]),
-            "filename": row["source_filename"],
+            "filename": row["filename"],
             "cdn_url": row["cdn_url"],
-            "total_pages": row["total_pages"],
+            "total_chunks": row["total_chunks"],
             "file_type": row.get("file_type"),
             "file_size": row.get("file_size"),
             "doc_summary": row["doc_summary"],

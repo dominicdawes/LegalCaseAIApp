@@ -197,7 +197,7 @@ def build_verification_tools(ctx: ToolContext) -> list:
             rows = await conn.fetch(
                 """
                 SELECT dvs.id, dvs.source_id, dvs.page_number, dvs.section_path,
-                       ds.source_filename
+                       ds.filename
                 FROM document_vector_store dvs
                 JOIN document_sources ds ON ds.id = dvs.source_id
                 WHERE dvs.id = ANY($1::uuid[])
@@ -209,7 +209,7 @@ def build_verification_tools(ctx: ToolContext) -> list:
 
         results = []
         for r in rows:
-            fname = r["source_filename"] or "Unknown"
+            fname = r["filename"] or "Unknown"
             page = r["page_number"]
             sec = r["section_path"] or ""
             parts = [fname]
