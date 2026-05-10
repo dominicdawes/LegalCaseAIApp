@@ -37,9 +37,9 @@ from celery.exceptions import MaxRetriesExceededError
 from celery.utils.log import get_task_logger
 try:
     from anthropic import NotFoundError as AnthropicNotFoundError, AuthenticationError as AnthropicAuthError
-    _PERMANENT_LLM_ERRORS = (AnthropicNotFoundError, AnthropicAuthError, ModuleNotFoundError, ImportError)
+    _PERMANENT_LLM_ERRORS = (AnthropicNotFoundError, AnthropicAuthError, ModuleNotFoundError, ImportError, SyntaxError)
 except ImportError:
-    _PERMANENT_LLM_ERRORS = (ModuleNotFoundError, ImportError)
+    _PERMANENT_LLM_ERRORS = (ModuleNotFoundError, ImportError, SyntaxError)
 
 # ===== MACHINE LEARNING & TEXT PROCESSING =====  
 import tiktoken

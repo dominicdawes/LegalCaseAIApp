@@ -64,7 +64,7 @@ def build_crossdoc_tools(ctx: ToolContext) -> list:
             doc_ids = ctx.source_ids
         else:
             await init_async_pools()
-        pool = get_global_async_db_pool()
+            pool = get_global_async_db_pool()
             async with pool.acquire() as conn:
                 rows = await conn.fetch(
                     "SELECT id FROM document_sources WHERE project_id = $1",
