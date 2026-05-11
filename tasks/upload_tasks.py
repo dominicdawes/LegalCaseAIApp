@@ -1975,7 +1975,24 @@ def finalize_batch_and_create_note(
             batch_status = 'NOTE_GENERATION_FAILED'
             
     elif batch_status == 'FAILED':
-        logger.info(f"⚠️ [BATCH-{batch_id[:8]}] Skipping note generation - all documents failed")
+        logger.info(f"⚠️ [BATCH-{batch_id[:8]}] All documents failed — persisting PARSE_ERROR note stub")
+        if workflow_metadata.get('create_note'):
+            first_error = (failed_docs[0].get('error', 'Document parsing failed') if failed_docs else 'All documents failed to process')
+            parse_error_note_id = str(uuid.uuid4())
+            try:
+                supabase_client.table("notes").insert({
+                    "id":                   parse_error_note_id,
+                    "user_id":              workflow_metadata["user_id"],
+                    "project_id":           workflow_metadata["project_id"],
+                    "title":                workflow_metadata.get("note_title", "Failed Note"),
+                    "note_type":            workflow_metadata.get("note_type", "unknown"),
+                    "note_progress_status": "PARSE_ERROR",
+                    "error_message":        first_error[:500],
+                    "created_at":           datetime.now(timezone.utc).isoformat(),
+                }).execute()
+                logger.info(f"📋 [BATCH-{batch_id[:8]}] PARSE_ERROR note persisted (note_id={parse_error_note_id[:8]})")
+            except Exception as pe:
+                logger.warning(f"⚠️ [BATCH-{batch_id[:8]}] Could not persist PARSE_ERROR note: {pe}")
         
     else:
         logger.info(f"ℹ️ [BATCH-{batch_id[:8]}] Note generation not requested")
