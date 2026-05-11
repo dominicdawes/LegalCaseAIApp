@@ -126,9 +126,7 @@ class DoclingPDFLoader(BaseDocumentLoader):
             return
 
         try:
-            from docling.document_converter import DocumentConverter, PdfFormatOption
-            from docling.datamodel.pipeline_options import PdfPipelineOptions
-            from docling.datamodel.base_models import InputFormat
+            from docling.document_converter import DocumentConverter
             from docling.chunking import HybridChunker
         except ImportError as exc:
             raise ImportError(
@@ -136,14 +134,7 @@ class DoclingPDFLoader(BaseDocumentLoader):
                 "Run: pip install docling"
             ) from exc
 
-        # Disable TableFormer (table structure recognition) to avoid the
-        # docling-ibm-models → cv2 → libGL.so.1 dependency on headless servers.
-        # Tables are still extracted as prose; structure detection is skipped.
-        _pipeline_opts = PdfPipelineOptions()
-        _pipeline_opts.do_table_structure = False
-        self._converter = DocumentConverter(
-            format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=_pipeline_opts)}
-        )
+        self._converter = DocumentConverter()
 
         # HybridChunker: use the default tokenizer with our max_tokens cap.
         # The spec calls for a voyage-law-2–compatible tokenizer; since that

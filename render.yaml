@@ -10,6 +10,6 @@ services:
     type: worker
     env: python
     runtime: python3
-    buildCommand: "pip install -r requirements-worker.txt"
+    buildCommand: "pip install -r requirements-worker.txt && pip uninstall -y opencv-python opencv-python-headless && pip install --no-cache-dir opencv-python-headless"
     startCommand: "celery -A tasks.celery_app worker --loglevel=info --concurrency=2"
     pythonVersion: 3.9.12

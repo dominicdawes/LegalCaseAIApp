@@ -207,13 +207,15 @@ def register_tasks():
     This function is now the single entry point for final setup.
     """
     import tasks.chat_tasks
-    import tasks.upload_tasks  
+    import tasks.upload_tasks
     import tasks.profile_tasks
     import tasks.note_tasks
     import tasks.note_conversion_tasks
     import tasks.sample_tasks
     import tasks.exam_grading_tasks
     import tasks.conversions
+    import tasks.hierarchical_ingest_tasks
+    # import tasks.podcast_generate_tasks
     
     # Import and initialize scheduled tasks for Celery Beat
     from tasks.system_tasks import initialize_production_pipeline

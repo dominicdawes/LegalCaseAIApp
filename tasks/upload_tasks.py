@@ -980,8 +980,9 @@ async def _parse_and_chunk_docling_async(
                 async for raw_bytes in response.aiter_bytes(chunk_size=8_192):
                     if raw_bytes:
                         file_buffer.write(raw_bytes)
+        downloaded_bytes = file_buffer.tell()
         file_buffer.seek(0)
-        logger.info(f"📥 [DOCLING-{short_id}] Downloaded {file_buffer.tell()} bytes")
+        logger.info(f"📥 [DOCLING-{short_id}] Downloaded {downloaded_bytes:,} bytes")
 
         # ── Docling parse + HybridChunker (CPU-bound → executor) ─────────────
         file_ext = source_filename.rsplit(".", 1)[-1].upper() if "." in source_filename else "PDF"
