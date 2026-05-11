@@ -984,6 +984,8 @@ async def _parse_and_chunk_docling_async(
         logger.info(f"📥 [DOCLING-{short_id}] Downloaded {file_buffer.tell()} bytes")
 
         # ── Docling parse + HybridChunker (CPU-bound → executor) ─────────────
+        file_ext = source_filename.rsplit(".", 1)[-1].upper() if "." in source_filename else "PDF"
+        logger.info(f"🦆 Parsing {file_ext} with Docling 🪿")
         from utils.document_loaders.docling_loader import DoclingPDFLoader
         loader = DoclingPDFLoader()
         loop = asyncio.get_event_loop()
