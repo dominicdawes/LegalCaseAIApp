@@ -16,7 +16,9 @@ RUN apt-get update && \
         tesseract-ocr \
         redis-tools \
         libmagic1 \
-        poppler-utils && \
+        poppler-utils \
+        libgl1 \
+        libglib2.0-0 && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
