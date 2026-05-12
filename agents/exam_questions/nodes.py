@@ -18,6 +18,7 @@ Node responsibilities:
 import asyncio
 import json
 import logging
+import re
 import os
 from typing import Any, Dict, List
 
@@ -274,7 +275,7 @@ async def question_drafter(state: Dict) -> Dict:
     idx: int = state["bundle_index"]
 
     context = "\n\n---\n\n".join(
-        f"[{c.get('source_id','?')} p.{c.get('page_number','?')}]\n{c.get('content','')}"
+        f"[chunk_id:{c.get('id','?')} p.{c.get('page_number','?')}]\n{c.get('content','')}"
         for c in bundle["chunks"][:15]
     )
 
@@ -286,7 +287,8 @@ async def question_drafter(state: Dict) -> Dict:
         "- End with a clear 'Call of the Question' in bold\n"
         "- Be based ONLY on the provided legal context\n"
         "Return JSON with keys: fact_pattern (str), call_of_question (str), "
-        "chunk_ids_used (list of chunk id strings)"
+        "chunk_ids_used (list of chunk_id UUID strings from the [chunk_id:...] markers above — "
+        "copy only the UUID, not the page number)"
     )
 
     prompt = (
@@ -426,8 +428,11 @@ async def grounder(state: Dict) -> Dict:
         overall = "warn"
         notes = "Some claims have insufficient evidence."
 
-    # Build citations
-    chunk_ids = draft.get("chunk_ids_used") or []
+    # Build citations — sanitize chunk_ids to bare UUIDs in case the LLM
+    # copied the full "[chunk_id:uuid p.N]" reference format from the context.
+    _UUID_RE = re.compile(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', re.I)
+    raw_chunk_ids = draft.get("chunk_ids_used") or []
+    chunk_ids = [m.group() for raw in raw_chunk_ids if (m := _UUID_RE.search(str(raw)))]
     if chunk_ids:
         cites_json = await cite_tool.ainvoke({"chunk_ids": chunk_ids[:10]})
         citations = json.loads(cites_json)

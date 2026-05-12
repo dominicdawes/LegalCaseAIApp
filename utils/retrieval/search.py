@@ -159,6 +159,27 @@ async def bm25_search(
         await init_async_pools()
 
     async with get_db_connection() as conn:
+        # Debug: confirm rows exist with bm25_tsvector populated for this project
+        debug_row = await conn.fetchrow(
+            """
+            SELECT
+                COUNT(*) FILTER (WHERE bm25_tsvector IS NOT NULL) AS populated,
+                COUNT(*) FILTER (WHERE bm25_tsvector IS NULL)     AS nulls,
+                COUNT(*)                                           AS total,
+                websearch_to_tsquery('english', $2)::text          AS tsquery_text
+            FROM document_vector_store
+            WHERE project_id = $1::uuid
+            """,
+            project_id,
+            query_text,
+        )
+        logger.info(
+            f"🔍 [BM25-DEBUG] project={project_id[:8]} "
+            f"query={repr(query_text)[:80]} "
+            f"tsquery={debug_row['tsquery_text']!r} "
+            f"rows={debug_row['total']} populated={debug_row['populated']} nulls={debug_row['nulls']}"
+        )
+
         rows = await conn.fetch(
             """
             SELECT
