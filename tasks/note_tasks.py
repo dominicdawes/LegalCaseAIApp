@@ -656,7 +656,8 @@ class AsyncNoteManager:
                     is_shareable            = $3,
                     is_essential            = $4,
                     num_sources_based_on    = $5,
-                    note_progress_status    = 'COMPLETE'
+                    note_progress_status    = 'COMPLETE',
+                    error_message           = NULL
                 WHERE id = $6
                 """,
                 content, True, False, is_essential, num_sources, note_id
@@ -1068,9 +1069,10 @@ def rag_note_task(
     # flash ERROR while the task is waiting between retries.
     if self.request.retries > 0:
         try:
-            supabase_client.table("notes").update(
-                {"note_progress_status": "PROCESSING"}
-            ).eq("id", note_id).execute()
+            supabase_client.table("notes").update({
+                "note_progress_status": "PROCESSING",
+                "error_message": None,  # clear stale error from previous attempt
+            }).eq("id", note_id).execute()
         except Exception:
             pass
 
