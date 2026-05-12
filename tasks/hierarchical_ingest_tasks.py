@@ -301,7 +301,7 @@ async def _build_section_summaries_async(source_id: str, project_id: str) -> Dic
             project_id,
             section["section_path"],
             section["section_summary"],
-            vec,
+            str(vec),  # asyncpg executemany needs str for pgvector, not List[float]
             section["start_chunk_idx"],
             section["end_chunk_idx"],
             now,
