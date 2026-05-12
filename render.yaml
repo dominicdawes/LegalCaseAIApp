@@ -13,3 +13,4 @@ services:
     buildCommand: "pip install -r requirements-worker.txt"
     startCommand: "celery -A tasks.celery_app worker --loglevel=info --concurrency=2"
     pythonVersion: 3.9.12
+    terminationGracePeriodSeconds: 300
