@@ -28,6 +28,10 @@ langchain-anthropic>=0.1.0
 langgraph>=0.2.0
 langsmith>=0.1.0
 promptic
+# Durable LangGraph checkpointing (psycopg3 driver — coexists with asyncpg)
+langgraph-checkpoint-postgres>=2.0.0
+psycopg[binary]>=3.1.0
+psycopg-pool>=3.1.0
 
 # Hierarchical RAG ingest + retrieval
 docling>=2.5.0

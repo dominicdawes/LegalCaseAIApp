@@ -1,26 +1,27 @@
 # agents/exam_questions/nodes.py
 """
-All 10 nodes for the exam-questions LangGraph agent.
+All 12 nodes for the exam-questions LangGraph agent.
 
 Node responsibilities:
-  1. Planner          — read source outlines, write retrieval strategy
-  2. SourceProfiler   — per-doc profile (parallel Send from Planner)
-  3. IssueClusterer   — cluster profiles into exam issues
-  4. Retriever        — per-issue evidence bundle (parallel Send)
-  5. QuestionDrafter  — per-issue fact-pattern (parallel Send, flagship)
-  6. AnswerKeyBuilder — per-question answer key (parallel Send, flagship)
-  7. Grounder         — per-question claim verification (parallel Send, cheap)
-  8. Critic           — whole-exam critique (cheap)
-  9. Reviser          — targeted revision of failing questions (conditional)
-  10. Assembler        — deterministic final Markdown assembly
+  1.  Planner            — read source outlines, write retrieval strategy
+  2.  SourceProfiler     — per-doc profile (parallel Send from Planner)
+  3.  ConceptSynthesizer — cross-doc throughlines after all profiles merge
+  4.  IssueClusterer     — cluster profiles + synthesis into exam issues
+  5.  Retriever          — per-issue evidence bundle (parallel Send)
+  6.  QuestionDrafter    — per-issue fact-pattern (parallel Send, orchestrator)
+  7.  AnswerKeyBuilder   — per-question answer key (parallel Send, orchestrator)
+  8.  Grounder           — per-question claim verification (parallel Send, worker_low)
+  9.  Critic             — whole-exam critique (worker_low)
+  10. Reviser            — targeted revision of failing questions (conditional, worker_mid)
+  11. FinalDrafter       — editorial polish and IRAC enforcement (orchestrator)
+  12. Assembler          — deterministic final Markdown assembly
 """
 
 import asyncio
 import json
 import logging
 import re
-import os
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from langgraph.types import Send
 
@@ -32,45 +33,59 @@ from .state import (
     SourceProfile,
     VerifiedQuestion,
 )
+from .worker_config import _fetch_worker_model, model_costs
 
 logger = logging.getLogger(__name__)
 
-_HAIKU = "claude-haiku-4-5-20251001"
-_SONNET = "claude-sonnet-4-6"
-_OPUS = "claude-opus-4-7"
+# ── IRAC style guide injected into FinalDrafter ──────────────────────────────
+_IRAC_STYLE_GUIDE = """
+IRAC Structure per issue:
+  Issue:       One sentence identifying the precise legal question.
+  Rule:        State the applicable rule/standard; cite source materials by name.
+  Application: Apply the rule to the facts; argue BOTH sides; address counterarguments.
+  Conclusion:  Clear, practical outcome. One sentence.
 
-ANTHROPIC_KEY = os.getenv("ANTHROPIC_API_KEY", "")
-
-
-async def _llm(model: str, prompt: str, system: str = "", max_tokens: int = 2048) -> str:
-    import httpx
-
-    messages = [{"role": "user", "content": prompt}]
-    body: Dict[str, Any] = {"model": model, "max_tokens": max_tokens, "messages": messages}
-    if system:
-        body["system"] = system
-
-    async with httpx.AsyncClient(timeout=120.0) as http:
-        resp = await http.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={
-                "x-api-key": ANTHROPIC_KEY,
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json",
-            },
-            json=body,
-        )
-        resp.raise_for_status()
-        return resp.json()["content"][0]["text"].strip()
+Style constraints:
+  - Plain legal English; define any technical term on first use.
+  - Consistent party names throughout (pick one label per party and keep it).
+  - One major IRAC block per paragraph; blank line between blocks.
+  - Fact patterns: multi-character narrative, chronological, no explicit legal labels.
+  - Answer keys: full IRAC per sub-issue; all raised defences addressed.
+  - Markdown: ## Question N / **Call of the Question** / ### Answer Key — Question N
+  - No duplicate sub-issues across questions in the same exam.
+"""
 
 
-def _add_budget(state: AgentState, model: str, in_tok: int, out_tok: int) -> Dict:
-    costs = {
-        _HAIKU: (0.25e-6, 1.25e-6),
-        _SONNET: (3e-6, 15e-6),
-        _OPUS: (15e-6, 75e-6),
-    }
-    in_cost, out_cost = costs.get(model, (3e-6, 15e-6))
+# ── LLM call via LLMFactory ───────────────────────────────────────────────────
+
+async def _llm(
+    worker_class: str,
+    prompt: str,
+    system: str = "",
+    max_tokens: int = 2048,
+    provider: Optional[str] = None,
+) -> str:
+    """
+    Route an LLM call through LLMFactory using the worker-class abstraction.
+    Falls back to draining stream_chat if the client has no achat() method.
+    """
+    from utils.llm_clients.llm_factory import LLMFactory
+    _provider, model_name = _fetch_worker_model(worker_class, provider)
+    client = LLMFactory.get_client_for(
+        _provider, model_name,
+        temperature=0.7, streaming=False, max_output_tokens=max_tokens,
+    )
+    if hasattr(client, "achat"):
+        return await client.achat(prompt, system_prompt=system or None)
+    # Fallback: collect tokens from the async streaming generator
+    chunks: List[str] = []
+    async for chunk in client.stream_chat(prompt, system_prompt=system or None):
+        chunks.append(chunk)
+    return "".join(chunks)
+
+
+def _add_budget(state: AgentState, model_name: str, in_tok: int, out_tok: int) -> Dict:
+    in_cost, out_cost = model_costs(model_name)
     delta = in_tok * in_cost + out_tok * out_cost
     budget = dict(state.get("budget") or {})
     budget["input_tokens"] = budget.get("input_tokens", 0) + in_tok
@@ -84,10 +99,7 @@ def _add_budget(state: AgentState, model: str, in_tok: int, out_tok: int) -> Dic
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def planner(state: AgentState) -> Dict:
-    """
-    Read the list of source documents and write a concise retrieval strategy.
-    Emits a Send per source_id to SourceProfiler.
-    """
+    """Read the list of source documents and write a concise retrieval strategy."""
     from agents.tools.base import make_tools
     from agents.tools.registry import PLANNER_TOOLS
 
@@ -108,13 +120,15 @@ async def planner(state: AgentState) -> Dict:
     ).format(n=state["n_questions"])
 
     plan = await _llm(
-        _SONNET,
+        "worker_mid",
         f"Documents available:\n{sources_json}\n\nUser request: {state['request']}",
         system=system,
         max_tokens=512,
     )
-
     return {"plan": plan}
+
+
+planner.default_worker_class = "worker_mid"
 
 
 def planner_to_profiler(state: AgentState) -> List[Send]:
@@ -130,10 +144,7 @@ def planner_to_profiler(state: AgentState) -> List[Send]:
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def source_profiler(state: Dict) -> Dict:
-    """
-    Build a profile for a single source document: concepts, toc, summary.
-    Receives an augmented state dict injected by Send.
-    """
+    """Build a profile for a single source document: concepts, toc, summary."""
     from agents.tools.base import make_tools
     from agents.tools.registry import PROFILER_TOOLS
 
@@ -157,55 +168,146 @@ async def source_profiler(state: Dict) -> Dict:
         "key_concepts": outline.get("doc_concepts", [])[:20],
         "toc": outline.get("toc", [])[:30],
     }
-
-    # Merge into shared list (LangGraph reduces parallel branch outputs)
     return {"source_profiles": [profile]}
 
 
+source_profiler.default_worker_class = "tool_only"
+
+
 # ─────────────────────────────────────────────────────────────────────────────
-# 3. IssueClusterer
+# 3. ConceptSynthesizer — cross-doc throughlines
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def concept_synthesizer(state: AgentState) -> Dict:
+    """
+    Identify conceptual throughlines that span multiple source documents.
+
+    Runs after all SourceProfiler branches merge. The synthesis JSON is stored
+    in state["concept_synthesis"] and passed as extra context to IssueClusterer,
+    helping it spot cross-cutting exam themes the per-doc profiler cannot see.
+    """
+    profiles = state.get("source_profiles") or []
+    if len(profiles) <= 1:
+        # Nothing to synthesise across a single document
+        return {"concept_synthesis": ""}
+
+    from agents.tools.base import make_tools
+    from agents.tools.registry import SYNTHESIZER_TOOLS
+    from collections import Counter
+
+    tools = make_tools(
+        state["project_id"],
+        source_ids=state["source_ids"],
+        use_voyage=state.get("use_voyage", False),
+        tool_names=SYNTHESIZER_TOOLS,
+    )
+    crossdoc_tool = next(t for t in tools if t.name == "find_concept_across_docs")
+
+    # Identify concepts shared across two or more documents
+    all_concepts: List[str] = []
+    for p in profiles:
+        all_concepts.extend(p.get("key_concepts", [])[:6])
+    counts = Counter(all_concepts)
+    shared = [c for c, n in counts.most_common(8) if n > 1]
+    if not shared:
+        # No exact overlap — take the most common unique concepts as candidates
+        shared = [c for c, _ in counts.most_common(6)]
+
+    # Pull cross-doc evidence for the top shared concepts
+    cross_results: List[Dict[str, Any]] = []
+    for concept in shared[:5]:
+        try:
+            result_json = await crossdoc_tool.ainvoke({"concept": concept, "k_per_doc": 2})
+            cross_results.append({"concept": concept, "hits": json.loads(result_json)})
+        except Exception:
+            pass
+
+    profiles_brief = [
+        {
+            "source_id": p["source_id"],
+            "filename":  p["filename"],
+            "concepts":  p.get("key_concepts", [])[:8],
+        }
+        for p in profiles
+    ]
+
+    prompt = (
+        f"You are a law professor identifying conceptual throughlines across "
+        f"{len(profiles)} legal documents.\n\n"
+        f"Document summaries:\n{json.dumps(profiles_brief, indent=2)}\n\n"
+        f"Cross-document concept evidence:\n{json.dumps(cross_results, indent=2)}\n\n"
+        f"Identify 3-5 conceptual throughlines: legal concepts, doctrines, or themes "
+        f"that span multiple documents and would make strong exam question material.\n\n"
+        f"For each throughline return:\n"
+        f'  "concept":    the concept or doctrine name\n'
+        f'  "summary":    2-3 sentences on how the documents relate to or develop it\n'
+        f'  "source_ids": list of document UUIDs where this concept appears\n\n'
+        f"Return a JSON array only. No extra text."
+    )
+
+    raw = await _llm("worker_mid", prompt, max_tokens=1024)
+    try:
+        throughlines = json.loads(raw)
+    except Exception:
+        throughlines = []
+
+    synthesis = json.dumps({"throughlines": throughlines, "shared_concepts": shared})
+    return {"concept_synthesis": synthesis}
+
+
+concept_synthesizer.default_worker_class = "worker_mid"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 4. IssueClusterer
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def issue_clusterer(state: AgentState) -> Dict:
-    """
-    Given all source profiles, identify and cluster N exam-worthy legal issues.
-    """
+    """Given all source profiles and the concept synthesis, cluster N exam-worthy issues."""
     profiles = state.get("source_profiles") or []
     n = state["n_questions"]
+    synthesis = state.get("concept_synthesis", "")
 
     profiles_text = json.dumps(profiles, indent=2)
+    synthesis_section = (
+        f"\nCross-document concept synthesis:\n{synthesis}\n"
+        if synthesis else ""
+    )
+
     prompt = (
         f"You are a law professor. Given the source document profiles below "
         f"and the exam request, identify exactly {n} high-quality legal issues "
         f"suitable for exam fact-patterns.\n\n"
+        f"Prioritise issues that appear in the cross-document synthesis where available.\n\n"
         f"For each issue output a JSON object with:\n"
-        f'  "issue_label": short label (e.g. "Negligence — proximate cause")\n'
-        f'  "source_ids": list of source UUIDs where material exists\n'
+        f'  "issue_label":   short label (e.g. "Negligence — proximate cause")\n'
+        f'  "source_ids":    list of source UUIDs where material exists\n'
         f'  "section_hints": list of section_path hints to retrieve\n'
-        f'  "priority": 1 (high) | 2 (medium) | 3 (low)\n\n'
+        f'  "priority":      1 (high) | 2 (medium) | 3 (low)\n\n'
         f"Return a JSON array of exactly {n} objects. No extra text.\n\n"
-        f"Source profiles:\n{profiles_text}\n\n"
+        f"Source profiles:\n{profiles_text}"
+        f"{synthesis_section}\n"
         f"User request: {state['request']}\n"
         f"Plan: {state.get('plan', '')}"
     )
 
-    raw = await _llm(_SONNET, prompt, max_tokens=1024)
-
+    raw = await _llm("worker_mid", prompt, max_tokens=1024)
     try:
         clusters: List[IssueCluster] = json.loads(raw)
     except Exception:
-        # Fallback: create one generic cluster per source
         clusters = [
             {
-                "issue_label": f"Legal issues from document {i+1}",
-                "source_ids": [p["source_id"]],
+                "issue_label":   f"Legal issues from document {i+1}",
+                "source_ids":    [p["source_id"]],
                 "section_hints": [],
-                "priority": 2,
+                "priority":      2,
             }
             for i, p in enumerate((profiles or [])[:n])
         ]
-
     return {"chosen_issues": clusters[:n]}
+
+
+issue_clusterer.default_worker_class = "worker_mid"
 
 
 def clusterer_to_retriever(state: AgentState) -> List[Send]:
@@ -217,13 +319,11 @@ def clusterer_to_retriever(state: AgentState) -> List[Send]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 4. Retriever (parallel leaf)
+# 5. Retriever (parallel leaf)
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def retriever(state: Dict) -> Dict:
-    """
-    Retrieve evidence passages for a single issue cluster.
-    """
+    """Retrieve evidence passages for a single issue cluster."""
     from agents.tools.base import make_tools
     from agents.tools.registry import RETRIEVER_TOOLS
 
@@ -248,10 +348,13 @@ async def retriever(state: Dict) -> Dict:
 
     bundle: RetrievalBundle = {
         "issue_label": issue["issue_label"],
-        "chunks": chunks[:20],
-        "table_ids": [t["chunk_id"] for t in tables],
+        "chunks":      chunks[:20],
+        "table_ids":   [t["chunk_id"] for t in tables],
     }
     return {"retrieval_bundles": [bundle]}
+
+
+retriever.default_worker_class = "tool_only"
 
 
 def retriever_to_drafter(state: AgentState) -> List[Send]:
@@ -264,13 +367,11 @@ def retriever_to_drafter(state: AgentState) -> List[Send]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 5. QuestionDrafter (parallel leaf, flagship model)
+# 6. QuestionDrafter (parallel leaf, orchestrator model)
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def question_drafter(state: Dict) -> Dict:
-    """
-    Draft a fact-pattern hypothetical for one issue bundle.
-    """
+    """Draft a fact-pattern hypothetical for one issue bundle."""
     bundle: RetrievalBundle = state["bundle"]
     idx: int = state["bundle_index"]
 
@@ -297,22 +398,28 @@ async def question_drafter(state: Dict) -> Dict:
         f"Draft the fact-pattern hypothetical."
     )
 
-    raw = await _llm(_OPUS, prompt, system=system, max_tokens=1500)
-
+    raw = await _llm("orchestrator", prompt, system=system, max_tokens=1500)
     try:
         data = json.loads(raw)
     except Exception:
-        data = {"fact_pattern": raw, "call_of_question": "Discuss the rights and liabilities of all parties.", "chunk_ids_used": []}
+        data = {
+            "fact_pattern":     raw,
+            "call_of_question": "Discuss the rights and liabilities of all parties.",
+            "chunk_ids_used":   [],
+        }
 
     draft: DraftQuestion = {
-        "question_index": idx,
-        "issue_label": bundle["issue_label"],
-        "fact_pattern": data.get("fact_pattern", raw),
+        "question_index":  idx,
+        "issue_label":     bundle["issue_label"],
+        "fact_pattern":    data.get("fact_pattern", raw),
         "call_of_question": data.get("call_of_question", ""),
-        "answer_key": "",
-        "chunk_ids_used": data.get("chunk_ids_used", [c.get("id","") for c in bundle["chunks"][:10]]),
+        "answer_key":      "",
+        "chunk_ids_used":  data.get("chunk_ids_used", [c.get("id", "") for c in bundle["chunks"][:10]]),
     }
     return {"draft_questions": [draft]}
+
+
+question_drafter.default_worker_class = "orchestrator"
 
 
 def drafter_to_answerkey(state: AgentState) -> List[Send]:
@@ -322,7 +429,7 @@ def drafter_to_answerkey(state: AgentState) -> List[Send]:
     bundle_map = {b["issue_label"]: b for b in bundles}
     return [
         Send("answer_key_builder", {
-            "draft": d,
+            "draft":  d,
             "bundle": bundle_map.get(d["issue_label"], {"chunks": [], "table_ids": []}),
             **state,
         })
@@ -331,13 +438,11 @@ def drafter_to_answerkey(state: AgentState) -> List[Send]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 6. AnswerKeyBuilder (parallel leaf, flagship model)
+# 7. AnswerKeyBuilder (parallel leaf, orchestrator model)
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def answer_key_builder(state: Dict) -> Dict:
-    """
-    Generate a full IRAC answer key for a drafted question.
-    """
+    """Generate a full IRAC answer key for a drafted question."""
     draft: DraftQuestion = state["draft"]
     bundle: RetrievalBundle = state["bundle"]
 
@@ -359,11 +464,14 @@ async def answer_key_builder(state: Dict) -> Dict:
         f"Write the detailed Answer Key & Analysis."
     )
 
-    answer_key = await _llm(_OPUS, prompt, system=system, max_tokens=2500)
+    answer_key = await _llm("orchestrator", prompt, system=system, max_tokens=2500)
 
     updated_draft = dict(draft)
     updated_draft["answer_key"] = answer_key
     return {"draft_questions": [updated_draft]}
+
+
+answer_key_builder.default_worker_class = "orchestrator"
 
 
 def answerkey_to_grounder(state: AgentState) -> List[Send]:
@@ -375,13 +483,11 @@ def answerkey_to_grounder(state: AgentState) -> List[Send]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 7. Grounder (parallel leaf, cheap model)
+# 8. Grounder (parallel leaf, worker_low / escalation: worker_mid)
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def grounder(state: Dict) -> Dict:
-    """
-    Extract 3-5 factual claims from the answer key and verify each against the docs.
-    """
+    """Extract 3-5 factual claims from the answer key and verify each against the docs."""
     from agents.tools.base import make_tools
     from agents.tools.registry import VERIFIER_TOOLS
 
@@ -394,15 +500,14 @@ async def grounder(state: Dict) -> Dict:
         tool_names=VERIFIER_TOOLS,
     )
     verify_tool = next(t for t in tools if t.name == "verify_claim")
-    cite_tool = next(t for t in tools if t.name == "get_citations_for")
+    cite_tool   = next(t for t in tools if t.name == "get_citations_for")
 
-    # Extract claims to verify
     extract_prompt = (
         f"Extract 3-5 specific legal claims from the answer key below as a JSON array of strings.\n\n"
         f"Answer key:\n{draft['answer_key'][:3000]}\n\n"
         "Return only the JSON array, no extra text."
     )
-    claims_raw = await _llm(_HAIKU, extract_prompt, max_tokens=512)
+    claims_raw = await _llm("worker_low", extract_prompt, max_tokens=512)
     try:
         claims = json.loads(claims_raw)
         if not isinstance(claims, list):
@@ -410,56 +515,56 @@ async def grounder(state: Dict) -> Dict:
     except Exception:
         claims = [draft["answer_key"][:300]]
 
-    # Verify each claim
     verdicts = []
     for claim in claims[:5]:
         result_json = await verify_tool.ainvoke({"claim": claim, "k": 8})
         verdicts.append(json.loads(result_json))
 
-    # Determine overall grounding verdict
     statuses = [v.get("verdict", "insufficient") for v in verdicts]
     if all(s == "supported" for s in statuses):
         overall = "pass"
-        notes = "All claims supported."
+        notes   = "All claims supported."
     elif any(s == "contradicted" for s in statuses):
         overall = "fail"
-        notes = "One or more claims contradicted by source material."
+        notes   = "One or more claims contradicted by source material."
     else:
         overall = "warn"
-        notes = "Some claims have insufficient evidence."
+        notes   = "Some claims have insufficient evidence."
 
-    # Build citations — sanitize chunk_ids to bare UUIDs in case the LLM
-    # copied the full "[chunk_id:uuid p.N]" reference format from the context.
-    _UUID_RE = re.compile(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', re.I)
+    _UUID_RE = re.compile(
+        r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', re.I
+    )
     raw_chunk_ids = draft.get("chunk_ids_used") or []
     chunk_ids = [m.group() for raw in raw_chunk_ids if (m := _UUID_RE.search(str(raw)))]
     if chunk_ids:
         cites_json = await cite_tool.ainvoke({"chunk_ids": chunk_ids[:10]})
-        citations = json.loads(cites_json)
+        citations  = json.loads(cites_json)
     else:
         citations = []
 
     vq: VerifiedQuestion = {
-        "question_index": draft["question_index"],
-        "fact_pattern": draft["fact_pattern"],
-        "call_of_question": draft["call_of_question"],
-        "answer_key": draft["answer_key"],
+        "question_index":    draft["question_index"],
+        "fact_pattern":      draft["fact_pattern"],
+        "call_of_question":  draft["call_of_question"],
+        "answer_key":        draft["answer_key"],
         "grounding_verdict": overall,
-        "grounding_notes": notes,
-        "citations": citations,
-        "revised": False,
+        "grounding_notes":   notes,
+        "citations":         citations,
+        "revised":           False,
     }
     return {"verified_questions": [vq]}
 
 
+grounder.default_worker_class    = "worker_low"
+grounder.escalation_worker_class = "worker_mid"
+
+
 # ─────────────────────────────────────────────────────────────────────────────
-# 8. Critic
+# 9. Critic (worker_low / escalation: worker_mid)
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def critic(state: AgentState) -> Dict:
-    """
-    Holistic critique of the full draft exam. Flags questions that need revision.
-    """
+    """Holistic critique of the full draft exam. Flags questions that need revision."""
     questions = state.get("verified_questions") or []
     n = state["n_questions"]
 
@@ -478,17 +583,16 @@ async def critic(state: AgentState) -> Dict:
         f"Return a JSON array of objects with:\n"
         f'  "question_index": int\n'
         f'  "needs_revision": bool\n'
-        f'  "critique": one-sentence note\n\n'
+        f'  "critique":       one-sentence note\n\n'
         f"Questions:\n{questions_text}\n\nReturn only JSON array, no extra text."
     )
 
-    raw = await _llm(_HAIKU, prompt, max_tokens=1024)
+    raw = await _llm("worker_low", prompt, max_tokens=1024)
     try:
         critiques = json.loads(raw)
     except Exception:
         critiques = []
 
-    # Mark questions for revision
     revision_map = {c["question_index"]: c for c in critiques if isinstance(c, dict)}
     updated = []
     for q in questions:
@@ -505,29 +609,31 @@ async def critic(state: AgentState) -> Dict:
     return {"verified_questions": updated}
 
 
+critic.default_worker_class    = "worker_low"
+critic.escalation_worker_class = "worker_mid"
+
+
 def should_revise(state: AgentState) -> str:
     """
-    Conditional edge: route to Reviser if any question failed and
-    we haven't hit the max revision count (2).
+    Route to Reviser if any question failed grounding and we haven't hit the
+    max revision count (2). Otherwise route to FinalDrafter.
     """
     count = state.get("revision_count") or 0
     if count >= 2:
-        return "assembler"
+        return "final_drafter"
     questions = state.get("verified_questions") or []
     if any(q["grounding_verdict"] == "fail" for q in questions):
         return "reviser"
-    return "assembler"
+    return "final_drafter"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 9. Reviser (conditional)
+# 10. Reviser (conditional, worker_mid / escalation: orchestrator)
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def reviser(state: AgentState) -> Dict:
-    """
-    Revise only the questions that failed grounding.  Max 2 passes.
-    """
-    questions = state.get("verified_questions") or []
+    """Revise only the questions that failed grounding. Max 2 passes."""
+    questions  = state.get("verified_questions") or []
     project_id = state["project_id"]
     use_voyage = state.get("use_voyage", False)
 
@@ -536,7 +642,6 @@ async def reviser(state: AgentState) -> Dict:
         if q["grounding_verdict"] != "fail":
             continue
 
-        # Pull fresh evidence
         from agents.tools.base import make_tools
         from agents.tools.registry import RETRIEVER_TOOLS
 
@@ -549,8 +654,7 @@ async def reviser(state: AgentState) -> Dict:
         search_tool = next(t for t in tools if t.name == "hybrid_search")
         evidence_json = await search_tool.ainvoke({"query": q["fact_pattern"][:200], "k": 15})
         evidence = json.loads(evidence_json)
-
-        context = "\n\n".join(c.get("content", "") for c in evidence[:10])
+        context  = "\n\n".join(c.get("content", "") for c in evidence[:10])
 
         prompt = (
             f"The following exam question failed grounding verification.\n"
@@ -562,11 +666,11 @@ async def reviser(state: AgentState) -> Dict:
             f"Return only the revised fact_pattern text."
         )
 
-        revised_fp = await _llm(_OPUS, prompt, max_tokens=1200)
-        updated_q = dict(q)
-        updated_q["fact_pattern"] = revised_fp
+        revised_fp = await _llm("worker_mid", prompt, max_tokens=1200)
+        updated_q  = dict(q)
+        updated_q["fact_pattern"]      = revised_fp
         updated_q["grounding_verdict"] = "warn"
-        updated_q["revised"] = True
+        updated_q["revised"]           = True
         revised[i] = updated_q
 
     return {
@@ -575,21 +679,104 @@ async def reviser(state: AgentState) -> Dict:
     }
 
 
+reviser.default_worker_class    = "worker_mid"
+reviser.escalation_worker_class = "orchestrator"
+
+
 # ─────────────────────────────────────────────────────────────────────────────
-# 10. Assembler
+# 11. FinalDrafter — editorial polish + IRAC enforcement (orchestrator)
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def final_drafter(state: AgentState) -> Dict:
+    """
+    Final editorial pass over all questions and answer keys.
+
+    Removes cross-question repetition, smooths prose, enforces consistent
+    party naming and IRAC structure, and tightens markdown formatting.
+    Runs once after the critic/reviser loop exits — always before Assembler.
+    """
+    questions = sorted(
+        state.get("verified_questions") or [],
+        key=lambda q: q["question_index"],
+    )
+    if not questions:
+        return {}
+
+    exam_input = json.dumps(
+        [
+            {
+                "question_index":  q["question_index"],
+                "fact_pattern":    q["fact_pattern"],
+                "call_of_question": q["call_of_question"],
+                "answer_key":      q["answer_key"],
+            }
+            for q in questions
+        ],
+        indent=2,
+    )
+
+    system = (
+        f"You are a senior legal examinations editor. "
+        f"Your task is to polish {len(questions)} law exam questions and answer keys "
+        f"as a final editorial review.\n\n"
+        f"Style guide:\n{_IRAC_STYLE_GUIDE}"
+    )
+
+    prompt = (
+        f"Review and polish the {len(questions)} exam questions and answer keys below.\n\n"
+        f"For each question:\n"
+        f"  - Remove any sub-issues duplicated across questions\n"
+        f"  - Ensure smooth, readable prose in fact patterns\n"
+        f"  - Enforce consistent party names and legal terminology\n"
+        f"  - Verify IRAC structure in answer keys; fill any missing elements\n"
+        f"  - Tighten wording without altering legal substance\n\n"
+        f"Return a JSON array with the SAME structure as input "
+        f"(question_index, fact_pattern, call_of_question, answer_key). "
+        f"No extra text.\n\n"
+        f"Questions:\n{exam_input}"
+    )
+
+    raw = await _llm("orchestrator", prompt, system=system, max_tokens=4000)
+    try:
+        polished = json.loads(raw)
+    except Exception:
+        logger.warning("final_drafter: JSON parse failed — returning questions unchanged")
+        return {}
+
+    polished_map = {p["question_index"]: p for p in polished if isinstance(p, dict)}
+    updated = []
+    for q in questions:
+        patch = polished_map.get(q["question_index"])
+        if patch:
+            updated_q = dict(q)
+            updated_q["fact_pattern"]     = patch.get("fact_pattern",    q["fact_pattern"])
+            updated_q["call_of_question"] = patch.get("call_of_question", q["call_of_question"])
+            updated_q["answer_key"]       = patch.get("answer_key",      q["answer_key"])
+            updated.append(updated_q)
+        else:
+            updated.append(q)
+
+    return {"verified_questions": updated}
+
+
+final_drafter.default_worker_class = "orchestrator"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 12. Assembler — deterministic Markdown formatter
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def assembler(state: AgentState) -> Dict:
     """
     Deterministic assembly of the final Markdown exam document.
-    No LLM call — just formatting.
+    No LLM call — questions arrive fully polished from FinalDrafter.
     """
     questions = sorted(
         state.get("verified_questions") or [],
         key=lambda q: q["question_index"],
     )
 
-    sections = []
+    sections    = []
     answer_keys = []
 
     for i, q in enumerate(questions, 1):
@@ -598,7 +785,7 @@ async def assembler(state: AgentState) -> Dict:
             f"{q['fact_pattern']}\n\n"
             f"**{q['call_of_question']}**"
         )
-        cites = q.get("citations") or []
+        cites    = q.get("citations") or []
         cite_str = ""
         if cites:
             cite_str = "\n\n*Sources: " + "; ".join(
@@ -610,10 +797,10 @@ async def assembler(state: AgentState) -> Dict:
             f"{q['answer_key']}{cite_str}"
         )
 
-    exam_body = "\n\n---\n\n".join(sections)
+    exam_body      = "\n\n---\n\n".join(sections)
     answer_section = "\n\n---\n\n".join(answer_keys)
 
-    budget = state.get("budget") or {}
+    budget     = state.get("budget") or {}
     budget_note = (
         f"\n\n<!-- tokens: {budget.get('input_tokens',0)} in / "
         f"{budget.get('output_tokens',0)} out | "
@@ -627,5 +814,7 @@ async def assembler(state: AgentState) -> Dict:
         f"{answer_section}"
         f"{budget_note}"
     )
-
     return {"final_output": final}
+
+
+assembler.default_worker_class = "tool_only"

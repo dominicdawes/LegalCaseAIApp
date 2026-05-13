@@ -3,10 +3,15 @@
 LangGraph StateGraph for the exam-questions agent.
 
 Graph topology:
-  planner → [Send → source_profiler] → issue_clusterer
+  planner → [Send → source_profiler] → concept_synthesizer → issue_clusterer
   issue_clusterer → [Send → retriever] → [Send → question_drafter]
   question_drafter → [Send → answer_key_builder] → [Send → grounder]
-  grounder → critic → (should_revise?) → reviser ↺ | assembler
+  grounder → critic → (should_revise?) → reviser ↺ | final_drafter → assembler
+
+Checkpointing:
+  Uses AsyncPostgresSaver (langgraph-checkpoint-postgres) for durable state
+  across worker restarts.  Falls back to MemorySaver if the package is not
+  installed, preserving the original in-process behaviour.
 
 Run with:
     result = await run_exam_agent(request, project_id, source_ids, n_questions)
@@ -15,6 +20,7 @@ Run with:
 
 import logging
 import os
+from contextlib import asynccontextmanager
 from typing import AsyncGenerator, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -22,25 +28,47 @@ logger = logging.getLogger(__name__)
 USE_LANGGRAPH_AGENT = os.getenv("USE_LANGGRAPH_AGENT", "false").lower() == "true"
 
 
-def create_exam_agent():
-    """
-    Build and compile the LangGraph exam-questions StateGraph.
+# ── Checkpointer factory ───────────────────────────────────────────────────────
 
-    Lazy import so that importing this module never fails even if
-    langgraph is not installed (returns None, checked by caller).
+@asynccontextmanager
+async def _checkpointer_ctx():
+    """
+    Async context manager that yields a configured LangGraph checkpointer.
+
+    Tries AsyncPostgresSaver first (durable, survives worker restarts).
+    Falls back to MemorySaver if langgraph-checkpoint-postgres or psycopg
+    is not installed — useful for local dev without the extra deps.
     """
     try:
-        from langgraph.graph import StateGraph, END
+        from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+        from tasks.database import DB_DSN
+        async with AsyncPostgresSaver.from_conn_string(DB_DSN) as saver:
+            await saver.setup()   # creates checkpoint tables if they don't exist
+            yield saver
+    except (ImportError, Exception) as exc:
+        if not isinstance(exc, ImportError):
+            logger.warning(
+                "AsyncPostgresSaver failed (%s) — falling back to MemorySaver", exc
+            )
         from langgraph.checkpoint.memory import MemorySaver
-    except ImportError:
-        logger.error("langgraph not installed — cannot create exam agent")
-        return None
+        yield MemorySaver()
+
+
+# ── Graph builder ──────────────────────────────────────────────────────────────
+
+def _build_graph(checkpointer):
+    """
+    Compile the StateGraph with the supplied checkpointer.
+    Separated from the async runner so the topology is easy to read.
+    """
+    from langgraph.graph import StateGraph, END
 
     from .state import AgentState
     from .nodes import (
         planner,
         planner_to_profiler,
         source_profiler,
+        concept_synthesizer,
         issue_clusterer,
         clusterer_to_retriever,
         retriever,
@@ -53,37 +81,43 @@ def create_exam_agent():
         critic,
         should_revise,
         reviser,
+        final_drafter,
         assembler,
     )
 
     builder = StateGraph(AgentState)
 
-    # ── add nodes ─────────────────────────────────────────────────────────────
-    builder.add_node("planner", planner)
-    builder.add_node("source_profiler", source_profiler)
-    builder.add_node("issue_clusterer", issue_clusterer)
-    builder.add_node("retriever", retriever)
-    builder.add_node("question_drafter", question_drafter)
+    # ── nodes ──────────────────────────────────────────────────────────────────
+    builder.add_node("planner",            planner)
+    builder.add_node("source_profiler",    source_profiler)
+    builder.add_node("concept_synthesizer", concept_synthesizer)
+    builder.add_node("issue_clusterer",    issue_clusterer)
+    builder.add_node("retriever",          retriever)
+    builder.add_node("question_drafter",   question_drafter)
     builder.add_node("answer_key_builder", answer_key_builder)
-    builder.add_node("grounder", grounder)
-    builder.add_node("critic", critic)
-    builder.add_node("reviser", reviser)
-    builder.add_node("assembler", assembler)
+    builder.add_node("grounder",           grounder)
+    builder.add_node("critic",             critic)
+    builder.add_node("reviser",            reviser)
+    builder.add_node("final_drafter",      final_drafter)
+    builder.add_node("assembler",          assembler)
 
     # ── entry ──────────────────────────────────────────────────────────────────
     builder.set_entry_point("planner")
 
-    # ── sequential / fan-out edges ────────────────────────────────────────────
+    # ── edges ──────────────────────────────────────────────────────────────────
     # planner → parallel source_profiler (one per doc)
     builder.add_conditional_edges("planner", planner_to_profiler)
 
-    # source_profiler (all branches) → issue_clusterer
-    builder.add_edge("source_profiler", "issue_clusterer")
+    # all source_profiler branches → concept_synthesizer (single sequential node)
+    builder.add_edge("source_profiler", "concept_synthesizer")
+
+    # concept_synthesizer → issue_clusterer
+    builder.add_edge("concept_synthesizer", "issue_clusterer")
 
     # issue_clusterer → parallel retriever (one per issue)
     builder.add_conditional_edges("issue_clusterer", clusterer_to_retriever)
 
-    # retriever (all branches) → parallel question_drafter
+    # retriever → parallel question_drafter (one per bundle)
     builder.add_conditional_edges("retriever", retriever_to_drafter)
 
     # question_drafter → parallel answer_key_builder
@@ -95,22 +129,24 @@ def create_exam_agent():
     # grounder (all branches) → critic
     builder.add_edge("grounder", "critic")
 
-    # critic → conditional: reviser or assembler
+    # critic → conditional: reviser or final_drafter
     builder.add_conditional_edges(
         "critic",
         should_revise,
-        {"reviser": "reviser", "assembler": "assembler"},
+        {"reviser": "reviser", "final_drafter": "final_drafter"},
     )
 
     # reviser loops back to critic for another grounding pass
     builder.add_edge("reviser", "critic")
 
-    # assembler → END
+    # final_drafter → assembler → END
+    builder.add_edge("final_drafter", "assembler")
     builder.add_edge("assembler", END)
 
-    checkpointer = MemorySaver()
     return builder.compile(checkpointer=checkpointer)
 
+
+# ── Public run functions ───────────────────────────────────────────────────────
 
 async def run_exam_agent(
     request: str,
@@ -119,7 +155,6 @@ async def run_exam_agent(
     n_questions: int = 3,
     use_voyage: bool = False,
     thread_id: Optional[str] = None,
-    stream_first: bool = False,
 ) -> Dict:
     """
     Run the exam-questions agent to completion and return the final state.
@@ -131,30 +166,24 @@ async def run_exam_agent(
         n_questions  — number of exam questions to generate
         use_voyage   — True if documents were ingested with voyage-law-2
         thread_id    — optional LangGraph checkpoint thread ID for resumption
-        stream_first — if True, yield partial state dicts as they arrive
-                       (caller must use run_exam_agent_stream instead)
 
     Returns:
         Final AgentState dict.  Key: state["final_output"] is the Markdown.
     """
-    graph = create_exam_agent()
-    if graph is None:
-        raise RuntimeError("langgraph not available — install langgraph>=0.2.0")
-
     initial_state = {
-        "request": request,
-        "project_id": project_id,
-        "source_ids": source_ids,
-        "n_questions": n_questions,
-        "use_voyage": use_voyage,
+        "request":        request,
+        "project_id":     project_id,
+        "source_ids":     source_ids,
+        "n_questions":    n_questions,
+        "use_voyage":     use_voyage,
         "revision_count": 0,
-        "budget": {"input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0},
+        "budget":         {"input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0},
     }
-
     config = {"configurable": {"thread_id": thread_id or "exam-agent"}}
 
-    final_state = await graph.ainvoke(initial_state, config=config)
-    return final_state
+    async with _checkpointer_ctx() as checkpointer:
+        graph = _build_graph(checkpointer)
+        return await graph.ainvoke(initial_state, config=config)
 
 
 async def run_exam_agent_stream(
@@ -178,21 +207,18 @@ async def run_exam_agent_stream(
                 print(state["final_output"])
                 break
     """
-    graph = create_exam_agent()
-    if graph is None:
-        raise RuntimeError("langgraph not available — install langgraph>=0.2.0")
-
     initial_state = {
-        "request": request,
-        "project_id": project_id,
-        "source_ids": source_ids,
-        "n_questions": n_questions,
-        "use_voyage": use_voyage,
+        "request":        request,
+        "project_id":     project_id,
+        "source_ids":     source_ids,
+        "n_questions":    n_questions,
+        "use_voyage":     use_voyage,
         "revision_count": 0,
-        "budget": {"input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0},
+        "budget":         {"input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0},
     }
-
     config = {"configurable": {"thread_id": thread_id or "exam-agent-stream"}}
 
-    async for event in graph.astream(initial_state, config=config, stream_mode="values"):
-        yield event
+    async with _checkpointer_ctx() as checkpointer:
+        graph = _build_graph(checkpointer)
+        async for event in graph.astream(initial_state, config=config, stream_mode="values"):
+            yield event

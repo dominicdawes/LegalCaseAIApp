@@ -132,7 +132,7 @@ DEFAULT_RETRY_DELAY = 5
 RATE_LIMIT = '150/m' # Tuned for a 2-CPU / 4GB RAM instance instead of 1000/m
 
 # OpenAI configuration
-OPENAI_EMBEDDING_MODEL = "text-embedding-ada-002"
+OPENAI_EMBEDDING_MODEL = "text-embedding-ada-002"  # XTREMELY OUTDATAE
 OPENAI_MAX_TOKENS_PER_BATCH = 8190 # Safety margin below the 8192 limit
 # Dimension changes with embedding model: voyage-law-2 → 1024, ada-002 → 1536
 EXPECTED_EMBEDDING_LEN = 1024 if USE_VOYAGE_EMBEDDINGS else 1536
@@ -1026,6 +1026,7 @@ async def _generate_chunk_blurbs_async(
     doc_id: str,
 ) -> List[Dict]:
     """
+    [AGENTIC INGEST]
     Contextual retrieval: generate a 1-2 line situating blurb for every chunk
     using Haiku 4.5 with prompt-caching on the full document text.
 

@@ -62,6 +62,9 @@ class AgentState(TypedDict):
     # ── planner output ───────────────────────────────────────────────────────────
     plan: NotRequired[str]                # planner's strategic note
 
+    # ── cross-document concept synthesis (ConceptSynthesizer output) ──────────
+    concept_synthesis: NotRequired[str]   # JSON: {throughlines, shared_concepts}
+
     # ── per-document profiles (populated by parallel SourceProfiler) ──────────
     source_profiles: NotRequired[List[SourceProfile]]
 

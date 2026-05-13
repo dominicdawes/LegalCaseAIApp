@@ -45,6 +45,12 @@ VERIFIER_TOOLS = [
     "search_passages",
 ]
 
+# Concept synthesizer maps shared concepts across all source documents
+SYNTHESIZER_TOOLS = [
+    "find_concept_across_docs",
+    "search_passages",
+]
+
 # Full set — only used when explicit node routing is unavailable
 ALL_TOOLS = [
     "list_sources",

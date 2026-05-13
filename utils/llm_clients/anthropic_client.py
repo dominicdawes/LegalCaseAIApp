@@ -89,6 +89,19 @@ class AnthropicClient:
         response = self._client.messages.create(**request_params)
         return response.content[0].text
 
+    async def achat(self, prompt: str, system_prompt: str = None) -> str:
+        """Non-streaming async single-turn call. Used by exam agent nodes."""
+        messages = [{"role": "user", "content": str(prompt)}]
+        params = {
+            "model": self.model_name,
+            "max_tokens": self.max_tokens,
+            "messages": messages,
+        }
+        if system_prompt:
+            params["system"] = system_prompt
+        resp = await self._async_client.messages.create(**params)
+        return resp.content[0].text
+
     async def stream_chat(self, prompt: str, system_prompt: str = None):
         """
         Asynchronously stream a chat response from Claude.
