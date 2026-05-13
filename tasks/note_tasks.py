@@ -981,6 +981,30 @@ class AsyncNoteManager:
 
         await self._update_note_progress_async(note_id, "PROCESSING")
 
+        # ── Ledger: initialise job + run ──────────────────────────────────────
+        from agents.ledger import AgentLedgerService
+        ledger = AgentLedgerService()
+        job_uuid = uuid.UUID(note_id)
+        run_meta = None
+        try:
+            await ledger.ensure_job(
+                job_id=job_uuid,
+                project_id=project_id,
+                source_ids=source_ids,
+                job_type="exam_questions",
+            )
+            run_meta = await ledger.initialize_run(
+                job_id=job_uuid,
+                graph_name="exam_questions",
+            )
+            agent_thread_id = run_meta.langgraph_thread_id
+            agent_run_id    = str(run_meta.run_id)
+        except Exception as ledger_exc:
+            logger.warning(f"Ledger init failed (non-fatal, running without persistence): {ledger_exc}")
+            agent_thread_id = note_id   # fall back to old behaviour
+            agent_run_id    = None
+
+        # ── Run the agent ─────────────────────────────────────────────────────
         try:
             final_state = await run_exam_agent(
                 request=note_title,
@@ -988,12 +1012,28 @@ class AsyncNoteManager:
                 source_ids=source_ids,
                 n_questions=n_questions,
                 use_voyage=USE_VOYAGE_EMBEDDINGS,
-                thread_id=note_id,
+                thread_id=agent_thread_id,
+                job_id=note_id,
+                run_id=agent_run_id,
             )
             markdown = final_state.get("final_output") or ""
         except Exception as e:
+            if run_meta:
+                try:
+                    await ledger.mark_run_failed(run_meta.run_id, e)
+                    await ledger.set_job_status(job_uuid, "failed")
+                except Exception:
+                    pass
             logger.error(f"LangGraph agent failed: {e}", exc_info=True)
             raise
+
+        # ── Ledger: mark success ──────────────────────────────────────────────
+        if run_meta:
+            try:
+                await ledger.complete_run(run_meta.run_id)
+                await ledger.set_job_status(job_uuid, "succeeded")
+            except Exception as ledger_exc:
+                logger.warning(f"Ledger completion update failed (non-fatal): {ledger_exc}")
 
         await self._save_note_async(
             note_id=note_id,

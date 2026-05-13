@@ -59,6 +59,10 @@ class AgentState(TypedDict):
     n_questions: int
     use_voyage: NotRequired[bool]
 
+    # ── ledger identifiers (injected at invocation, read by nodes) ──────────────
+    job_id: NotRequired[str]             # agent_jobs.id — used to save artifacts
+    run_id: NotRequired[str]             # agent_runs.id — used for progress tracking
+
     # ── planner output ───────────────────────────────────────────────────────────
     plan: NotRequired[str]                # planner's strategic note
 

@@ -84,6 +84,40 @@ async def _llm(
     return "".join(chunks)
 
 
+async def _try_save_artifact(
+    state: Dict,
+    artifact_key: str,
+    content: Dict[str, Any],
+    worker_class: str,
+    node_name: str,
+    artifact_type: str,
+    source_ids: Optional[List[str]] = None,
+) -> None:
+    """
+    Non-fatal ledger write — never raises.
+    Nodes call this after producing output; a ledger failure must never crash a node.
+    Silently skips if job_id is not present in state (e.g. during local testing).
+    """
+    job_id_str = (state.get("job_id") or "").strip()
+    if not job_id_str:
+        return
+    try:
+        from uuid import UUID as _UUID
+        from agents.ledger import AgentLedgerService
+        ledger = AgentLedgerService()
+        await ledger.save_artifact(
+            job_id=_UUID(job_id_str),
+            artifact_key=artifact_key,
+            content=content,
+            worker_class=worker_class,
+            node_name=node_name,
+            artifact_type=artifact_type,
+            source_ids=[_UUID(s) for s in (source_ids or []) if s],
+        )
+    except Exception as exc:
+        logger.warning("Ledger save '%s' failed (non-fatal): %s", artifact_key, exc)
+
+
 def _add_budget(state: AgentState, model_name: str, in_tok: int, out_tok: int) -> Dict:
     in_cost, out_cost = model_costs(model_name)
     delta = in_tok * in_cost + out_tok * out_cost
@@ -168,6 +202,15 @@ async def source_profiler(state: Dict) -> Dict:
         "key_concepts": outline.get("doc_concepts", [])[:20],
         "toc": outline.get("toc", [])[:30],
     }
+    await _try_save_artifact(
+        state,
+        artifact_key=f"source_profile:{source_id}",
+        content=profile,
+        worker_class="tool_only",
+        node_name="source_profiler",
+        artifact_type="source_profile",
+        source_ids=[source_id],
+    )
     return {"source_profiles": [profile]}
 
 
@@ -252,6 +295,15 @@ async def concept_synthesizer(state: AgentState) -> Dict:
         throughlines = []
 
     synthesis = json.dumps({"throughlines": throughlines, "shared_concepts": shared})
+    await _try_save_artifact(
+        state,
+        artifact_key="concept_synthesis",
+        content={"throughlines": throughlines, "shared_concepts": shared},
+        worker_class="worker_mid",
+        node_name="concept_synthesizer",
+        artifact_type="concept_synthesis",
+        source_ids=state.get("source_ids"),
+    )
     return {"concept_synthesis": synthesis}
 
 
@@ -552,6 +604,15 @@ async def grounder(state: Dict) -> Dict:
         "citations":         citations,
         "revised":           False,
     }
+    await _try_save_artifact(
+        state,
+        artifact_key=f"verification:{draft['question_index']}",
+        content=dict(vq),
+        worker_class="worker_low",
+        node_name="grounder",
+        artifact_type="verification_result",
+        source_ids=state.get("source_ids"),
+    )
     return {"verified_questions": [vq]}
 
 
@@ -756,6 +817,15 @@ async def final_drafter(state: AgentState) -> Dict:
         else:
             updated.append(q)
 
+    await _try_save_artifact(
+        state,
+        artifact_key="polished_questions",
+        content={"questions": [dict(q) for q in updated]},
+        worker_class="orchestrator",
+        node_name="final_drafter",
+        artifact_type="polished_questions",
+        source_ids=state.get("source_ids"),
+    )
     return {"verified_questions": updated}
 
 
@@ -813,6 +883,14 @@ async def assembler(state: AgentState) -> Dict:
         f"# Answer Key & Analysis\n\n"
         f"{answer_section}"
         f"{budget_note}"
+    )
+    await _try_save_artifact(
+        state,
+        artifact_key="final_output",
+        content={"markdown": final, "n_questions": len(questions)},
+        worker_class="tool_only",
+        node_name="assembler",
+        artifact_type="final_output",
     )
     return {"final_output": final}
 

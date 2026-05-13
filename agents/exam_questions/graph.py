@@ -155,6 +155,8 @@ async def run_exam_agent(
     n_questions: int = 3,
     use_voyage: bool = False,
     thread_id: Optional[str] = None,
+    job_id: Optional[str] = None,
+    run_id: Optional[str] = None,
 ) -> Dict:
     """
     Run the exam-questions agent to completion and return the final state.
@@ -165,7 +167,9 @@ async def run_exam_agent(
         source_ids   — list of document UUIDs to scope retrieval
         n_questions  — number of exam questions to generate
         use_voyage   — True if documents were ingested with voyage-law-2
-        thread_id    — optional LangGraph checkpoint thread ID for resumption
+        thread_id    — LangGraph checkpoint thread ID (from AgentLedgerService.initialize_run)
+        job_id       — agent_jobs.id for artifact persistence (optional)
+        run_id       — agent_runs.id for progress tracking (optional)
 
     Returns:
         Final AgentState dict.  Key: state["final_output"] is the Markdown.
@@ -178,6 +182,8 @@ async def run_exam_agent(
         "use_voyage":     use_voyage,
         "revision_count": 0,
         "budget":         {"input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0},
+        "job_id":         job_id or "",
+        "run_id":         run_id or "",
     }
     config = {"configurable": {"thread_id": thread_id or "exam-agent"}}
 
@@ -193,6 +199,8 @@ async def run_exam_agent_stream(
     n_questions: int = 3,
     use_voyage: bool = False,
     thread_id: Optional[str] = None,
+    job_id: Optional[str] = None,
+    run_id: Optional[str] = None,
 ) -> AsyncGenerator[Dict, None]:
     """
     Stream partial state updates from the exam agent.
@@ -215,6 +223,8 @@ async def run_exam_agent_stream(
         "use_voyage":     use_voyage,
         "revision_count": 0,
         "budget":         {"input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0},
+        "job_id":         job_id or "",
+        "run_id":         run_id or "",
     }
     config = {"configurable": {"thread_id": thread_id or "exam-agent-stream"}}
 
