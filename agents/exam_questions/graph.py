@@ -82,7 +82,8 @@ def _build_graph(checkpointer):
         should_revise,
         reviser,
         final_drafter,
-        assembler,
+        final_drafter_to_writer,
+        exam_card_writer,
     )
 
     builder = StateGraph(AgentState)
@@ -99,7 +100,7 @@ def _build_graph(checkpointer):
     builder.add_node("critic",             critic)
     builder.add_node("reviser",            reviser)
     builder.add_node("final_drafter",      final_drafter)
-    builder.add_node("assembler",          assembler)
+    builder.add_node("exam_card_writer",   exam_card_writer)
 
     # ── entry ──────────────────────────────────────────────────────────────────
     builder.set_entry_point("planner")
@@ -139,9 +140,12 @@ def _build_graph(checkpointer):
     # reviser loops back to critic for another grounding pass
     builder.add_edge("reviser", "critic")
 
-    # final_drafter → assembler → END
-    builder.add_edge("final_drafter", "assembler")
-    builder.add_edge("assembler", END)
+    # final_drafter → [Send → exam_card_writer ×N (parallel, one per question)] → END
+    # Each branch owns one DB write (exam_questions + exam_answers row).
+    # LangGraph waits for all N branches before returning to the caller.
+    # note_tasks._generate_exam_questions_agent then stamps notes COMPLETE.
+    builder.add_conditional_edges("final_drafter", final_drafter_to_writer)
+    builder.add_edge("exam_card_writer", END)
 
     return builder.compile(checkpointer=checkpointer)
 
@@ -152,11 +156,12 @@ async def run_exam_agent(
     request: str,
     project_id: str,
     source_ids: List[str],
-    n_questions: int = 3,
+    n_questions: int = 5,
     use_voyage: bool = False,
     thread_id: Optional[str] = None,
     job_id: Optional[str] = None,
     run_id: Optional[str] = None,
+    user_id: Optional[str] = None,
 ) -> Dict:
     """
     Run the exam-questions agent to completion and return the final state.
@@ -168,11 +173,13 @@ async def run_exam_agent(
         n_questions  — number of exam questions to generate
         use_voyage   — True if documents were ingested with voyage-law-2
         thread_id    — LangGraph checkpoint thread ID (from AgentLedgerService.initialize_run)
-        job_id       — agent_jobs.id for artifact persistence (optional)
+        job_id       — agent_jobs.id / notes.id for artifact + exam card persistence
         run_id       — agent_runs.id for progress tracking (optional)
+        user_id      — auth.users.id; required for exam_questions.user_id FK
 
     Returns:
-        Final AgentState dict.  Key: state["final_output"] is the Markdown.
+        Final AgentState dict.  Keys: state["final_output"] (Markdown),
+        state["persisted_question_ids"] (list of exam_questions UUIDs written).
     """
     initial_state = {
         "request":        request,
@@ -184,6 +191,7 @@ async def run_exam_agent(
         "budget":         {"input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0},
         "job_id":         job_id or "",
         "run_id":         run_id or "",
+        "user_id":        user_id or "",
     }
     config = {"configurable": {"thread_id": thread_id or "exam-agent"}}
 
@@ -196,11 +204,12 @@ async def run_exam_agent_stream(
     request: str,
     project_id: str,
     source_ids: List[str],
-    n_questions: int = 3,
+    n_questions: int = 5,
     use_voyage: bool = False,
     thread_id: Optional[str] = None,
     job_id: Optional[str] = None,
     run_id: Optional[str] = None,
+    user_id: Optional[str] = None,
 ) -> AsyncGenerator[Dict, None]:
     """
     Stream partial state updates from the exam agent.
@@ -225,6 +234,7 @@ async def run_exam_agent_stream(
         "budget":         {"input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0},
         "job_id":         job_id or "",
         "run_id":         run_id or "",
+        "user_id":        user_id or "",
     }
     config = {"configurable": {"thread_id": thread_id or "exam-agent-stream"}}
 

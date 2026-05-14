@@ -60,8 +60,9 @@ class AgentState(TypedDict):
     use_voyage: NotRequired[bool]
 
     # ── ledger identifiers (injected at invocation, read by nodes) ──────────────
-    job_id: NotRequired[str]             # agent_jobs.id — used to save artifacts
+    job_id: NotRequired[str]             # agent_jobs.id — used to save artifacts; doubles as notes.id for exam card persistence
     run_id: NotRequired[str]             # agent_runs.id — used for progress tracking
+    user_id: NotRequired[str]            # auth.users.id — required by exam_card_writer for DB inserts
 
     # ── planner output ───────────────────────────────────────────────────────────
     plan: NotRequired[str]                # planner's strategic note
@@ -83,6 +84,9 @@ class AgentState(TypedDict):
 
     # ── verified questions (Grounder + Critic + optional Reviser) ───────────
     verified_questions: NotRequired[List[VerifiedQuestion]]
+
+    # ── persisted exam card IDs (exam_card_writer parallel fan-out) ─────────
+    persisted_question_ids: NotRequired[List[str]]   # exam_questions.id rows written to DB
 
     # ── final assembled markdown ─────────────────────────────────────────────
     final_output: NotRequired[str]

@@ -235,7 +235,8 @@ class AsyncNoteManager:
             # Async chunk retrieval (Naive RAG)
             retrieval_start = time.time()
             relevant_chunks = await self._fetch_relevant_chunks_async(
-                embedding, project_id
+                embedding, project_id,
+                source_ids=addtl_params.get("subset_document_ids") or [],
             )
             retrieval_time = time.time() - retrieval_start
             logger.info(f"🔍 Retrieved {len(relevant_chunks)} chunks in {retrieval_time*1000:.0f}ms")
@@ -507,29 +508,36 @@ class AsyncNoteManager:
         return client
 
     async def _fetch_relevant_chunks_async(
-        self, 
-        embedding: List[float], 
-        project_id: str, 
-        k: int = 10
+        self,
+        embedding: List[float],
+        project_id: str,
+        k: int = 10,
+        source_ids: List[str] = None,
     ) -> List[Dict]:
         """🆕 Async chunk retrieval with connection pooling
         Args:
         - embedding (List): vectorized question prompt
         - k (int): Top k relevant chunks, (default is 10)
+        - source_ids (List[str]): optional subset of document_sources UUIDs to restrict retrieval
         """
-        
-        # Convert to pgvector format
         vector_str = '[' + ','.join(map(str, embedding)) + ']'
-        
+
         async with get_db_connection() as conn:
-            rows = await conn.fetch(
-                "SELECT * FROM match_document_chunks_hnsw($1, $2, $3)",
-                project_id, vector_str, k
-            )
-        
-        chunks = [dict(row) for row in rows]
-        logger.info(f"🎯 Retrieved {len(chunks)} relevant chunks")
-        return chunks
+            if source_ids:
+                uuid_list = [uuid.UUID(sid) for sid in source_ids]
+                rows = await conn.fetch(
+                    "SELECT * FROM match_document_chunks_hnsw($1, $2, $3, NULL, $4)",
+                    project_id, vector_str, k, uuid_list,
+                )
+                logger.info(f"🎯 Subset retrieval ({len(source_ids)} docs): {len(rows)} chunks")
+            else:
+                rows = await conn.fetch(
+                    "SELECT * FROM match_document_chunks_hnsw($1, $2, $3)",
+                    project_id, vector_str, k,
+                )
+                logger.info(f"🎯 Project-wide retrieval: {len(rows)} chunks")
+
+        return [dict(row) for row in rows]
 
     def _build_note_context(
         self, 
@@ -570,9 +578,9 @@ class AsyncNoteManager:
         if note_type == "exam_questions":
             # Special Case: Exam questions needs example injection
             example = prompt_yaml.get("example_issue_spotter", "")
-            num_questions = addtl_params.get("num_questions", 10)
+            num_questions = addtl_params.get("num_questions", 5)
             formatted_template = prompt_template.format(
-                context=chunk_context, 
+                context=chunk_context,
                 n_questions=num_questions
             )
             # Inject example between system and template
@@ -967,7 +975,7 @@ class AsyncNoteManager:
                 addtl_params=addtl_params,
             )
 
-        n_questions = int(addtl_params.get("num_questions", 3))
+        n_questions = int(addtl_params.get("num_questions", 5))
         source_ids = addtl_params.get("source_ids") or []
 
         # If no explicit source_ids, fetch all for the project
@@ -1015,6 +1023,7 @@ class AsyncNoteManager:
                 thread_id=agent_thread_id,
                 job_id=note_id,
                 run_id=agent_run_id,
+                user_id=user_id,
             )
             markdown = final_state.get("final_output") or ""
         except Exception as e:
@@ -1035,14 +1044,32 @@ class AsyncNoteManager:
             except Exception as ledger_exc:
                 logger.warning(f"Ledger completion update failed (non-fatal): {ledger_exc}")
 
-        await self._save_note_async(
-            note_id=note_id,
-            note_type="exam_questions",
-            content=markdown,
-            is_essential=False,
-            num_sources=len(source_ids),
+        # ── Update notes stub with exam card count ────────────────────────────
+        # exam_card_writer nodes (parallel fan-out) already persisted the
+        # individual rows into exam_questions + exam_answers.  Here we just
+        # stamp the parent notes row with the final count and status.
+        persisted_ids = final_state.get("persisted_question_ids") or []
+        num_persisted = len(persisted_ids)
+
+        async with get_db_connection() as conn:
+            await conn.execute(
+                """
+                UPDATE notes SET
+                    num_questions        = $1,
+                    is_generated         = $2,
+                    is_essential         = $3,
+                    num_sources_based_on = $4,
+                    note_progress_status = 'COMPLETE',
+                    error_message        = NULL
+                WHERE id = $5
+                """,
+                num_persisted, True, False, len(source_ids), note_id,
+            )
+
+        logger.info(
+            f"✅ Exam agent persisted {num_persisted} question+answer pairs "
+            f"for note {note_id[:8]}…"
         )
-        await self._update_note_progress_async(note_id, "COMPLETE")
         return markdown
 
     async def _handle_note_error(

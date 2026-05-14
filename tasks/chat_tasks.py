@@ -396,6 +396,7 @@ class StreamingChatManager:
         provider: str,
         model_name: str,
         temperature: float = 0.7,
+        subset_document_ids: List[str] = None,
     ) -> str:
         """
         🆕 Main streaming RAG workflow with parallel processing
@@ -458,7 +459,7 @@ class StreamingChatManager:
             # 🆕 Fetch relevant chunks with project isolation
             retrieval_start = time.time()
             relevant_chunks = await self._fetch_relevant_chunks_async(
-                embedding, project_id
+                embedding, project_id, source_ids=subset_document_ids or []
             )
             retrieval_time = time.time() - retrieval_start
             logger.info(f"🔍 Retrieved {len(relevant_chunks)} chunks in {retrieval_time*1000:.0f}ms")
@@ -667,25 +668,32 @@ class StreamingChatManager:
         return client, provider     # Return both for downstream use
 
     async def _fetch_relevant_chunks_async(
-        self, embedding: List[float], project_id: str, k: int = 10
+        self, embedding: List[float], project_id: str, k: int = 10,
+        source_ids: List[str] = None,
     ) -> List[Dict]:
         """
-        Async chunk retrieval with project isolation
-        This function only fetches chunks from the available docs related to <==> project_id
+        Async chunk retrieval with project isolation.
+        Pass source_ids to restrict retrieval to a subset of documents.
         """
-        
-        # Convert Python list to pgvector string format: [0.1,0.2,0.3]
+        import uuid as _uuid
         vector_str = '[' + ','.join(map(str, embedding)) + ']'
-        
+
         async with get_db_connection() as conn:
-            rows = await conn.fetch(
-                "SELECT * FROM match_document_chunks_hnsw($1, $2, $3)",
-                project_id, vector_str, k  # Pass as string
-            )
-        
-        chunks = [dict(row) for row in rows]
-        logger.info(f"🎯Project-specific chunks retrieved: {len(chunks)}")
-        return chunks
+            if source_ids:
+                uuid_list = [_uuid.UUID(sid) for sid in source_ids]
+                rows = await conn.fetch(
+                    "SELECT * FROM match_document_chunks_hnsw($1, $2, $3, NULL, $4)",
+                    project_id, vector_str, k, uuid_list,
+                )
+                logger.info(f"🎯 Subset retrieval ({len(source_ids)} docs): {len(rows)} chunks")
+            else:
+                rows = await conn.fetch(
+                    "SELECT * FROM match_document_chunks_hnsw($1, $2, $3)",
+                    project_id, vector_str, k,
+                )
+                logger.info(f"🎯 Project-wide retrieval: {len(rows)} chunks")
+
+        return [dict(row) for row in rows]
 
     async def _create_assistant_message(
         self, assistant_id: str, user_id: str, chat_session_id: str, parent_id: str
@@ -1640,6 +1648,7 @@ def rag_chat_task(
     provider: str,
     model_name: str,
     temperature: float = 0.7,
+    subset_document_ids: List[str] = None,
 ):
     """
     🚀 Enhanced RAG chat task with high-performance streaming
@@ -1684,15 +1693,16 @@ def rag_chat_task(
             # 🔥 CRITICAL FIX: pass async def function into persistent loop (COTROUTINE → EVENT LOOP)
             result = run_async_in_worker(
                 streaming_manager.process_streaming_query(
-                    task_id=celery_task_id, # 👈 PASS THE ID HERE
+                    task_id=celery_task_id,
                     message_id=message_id,
-                    user_id=user_id, 
-                    chat_session_id=chat_session_id, 
-                    query=query, 
-                    project_id=project_id, 
-                    provider=provider, 
-                    model_name=model_name, 
-                    temperature=temperature
+                    user_id=user_id,
+                    chat_session_id=chat_session_id,
+                    query=query,
+                    project_id=project_id,
+                    provider=provider,
+                    model_name=model_name,
+                    temperature=temperature,
+                    subset_document_ids=subset_document_ids or [],
                 )
             )
         else:

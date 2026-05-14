@@ -908,3 +908,121 @@ async def assembler(state: AgentState) -> Dict:
 
 
 assembler.default_worker_class = "tool_only"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 13. FinalDrafter → ExamCardWriter fan-out
+# ─────────────────────────────────────────────────────────────────────────────
+
+def final_drafter_to_writer(state: AgentState) -> List[Send]:
+    """
+    Map step: fan out one ExamCardWriter per polished VerifiedQuestion.
+
+    Each branch independently coerces and persists one exam_questions row
+    + one exam_answers row, running in parallel across the LangGraph
+    worker pool.  Results reduce back into `persisted_question_ids` before
+    Assembler runs.
+    """
+    return [
+        Send("exam_card_writer", {"question": q, **state})
+        for q in (state.get("verified_questions") or [])
+    ]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 14. ExamCardWriter (parallel leaf, tool_only — deterministic DB write)
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def exam_card_writer(state: Dict) -> Dict:
+    """
+    Persist one exam question + answer pair to the database.
+
+    Runs in parallel via Send fan-out from FinalDrafter (one coroutine per
+    VerifiedQuestion).  Uses ExamProcessor to coerce/validate the question
+    dict before writing, mirroring the pattern used by QuizProcessor in the
+    quiz pipeline.
+
+    Writes:
+      - one row into public.exam_questions  (exam_id → notes.id)
+      - one row into public.exam_answers    (exam_id → notes.id,
+                                             question_id → exam_questions.id)
+
+    Returns {"persisted_question_ids": [<uuid>]} which LangGraph appends
+    into the shared list-typed state field.
+    """
+    import uuid as _uuid
+    from datetime import datetime, timezone
+    from tasks.database import get_db_connection
+    from utils.note_processing.exam_processor import ExamProcessor
+
+    q_raw: Dict = state["question"]
+    exam_id: str = (state.get("job_id") or "").strip()
+    user_id: str = (state.get("user_id") or "").strip()
+
+    if not exam_id:
+        logger.warning("exam_card_writer: job_id missing — skipping DB write")
+        return {"persisted_question_ids": []}
+
+    processor = ExamProcessor()
+    coerced = processor.coerce_one(q_raw, fallback_index=q_raw.get("question_index", 0))
+    if coerced is None:
+        logger.warning("exam_card_writer: coerce_one returned None for Q%s", q_raw.get("question_index"))
+        return {"persisted_question_ids": []}
+
+    question_db_id = str(_uuid.uuid4())
+    answer_db_id   = str(_uuid.uuid4())
+    now            = datetime.now(timezone.utc)
+
+    try:
+        async with get_db_connection() as conn:
+            async with conn.transaction():
+                await conn.execute(
+                    """
+                    INSERT INTO exam_questions (
+                        id, exam_id, user_id, question_index, issue_label,
+                        fact_pattern, call_of_question, grounding_verdict,
+                        revised, created_at
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                    """,
+                    question_db_id,
+                    exam_id,
+                    user_id or None,
+                    coerced["question_index"],
+                    coerced["issue_label"],
+                    coerced["fact_pattern"],
+                    coerced["call_of_question"],
+                    coerced["grounding_verdict"],
+                    coerced["revised"],
+                    now,
+                )
+                import json as _json
+                await conn.execute(
+                    """
+                    INSERT INTO exam_answers (
+                        id, exam_id, question_id, answer_key, citations, created_at
+                    ) VALUES ($1, $2, $3, $4, $5::jsonb, $6)
+                    """,
+                    answer_db_id,
+                    exam_id,
+                    question_db_id,
+                    coerced["answer_key"],
+                    _json.dumps(coerced["citations"]),
+                    now,
+                )
+        logger.info("exam_card_writer: persisted Q%d → %s", coerced["question_index"], question_db_id[:8])
+        return {"persisted_question_ids": [question_db_id]}
+
+    except Exception as exc:
+        logger.error("exam_card_writer: DB write failed for Q%d: %s", coerced["question_index"], exc)
+        await _try_save_artifact(
+            state,
+            artifact_key=f"exam_card_write_error:{coerced['question_index']}",
+            content={"error": str(exc), "question_index": coerced["question_index"]},
+            worker_class="tool_only",
+            node_name="exam_card_writer",
+            artifact_type="error",
+        )
+        return {"persisted_question_ids": []}
+
+
+exam_card_writer.default_worker_class = "tool_only"

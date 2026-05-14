@@ -235,7 +235,7 @@ class SourceIdsRequest(BaseModel):
     source_ids: List[str]
 
 # <---- Models for AI Chatbot assistant (with RAG) ----> #
-class RagQueryRequest(BaseModel):  
+class RagQueryRequest(BaseModel):
     '''
     Pydantic request model for for `POST/rag-chat/` endpoiont
     '''
@@ -246,6 +246,7 @@ class RagQueryRequest(BaseModel):
     provider: str
     model_name: str
     temperature: float
+    subset_document_ids: List[str] = []  # [] = all project docs; non-empty = restrict RAG to these source IDs
 
 class RagQueryResponse(BaseModel):  
     '''
@@ -360,8 +361,8 @@ async def create_new_rag_project(
 ):
     '''LIVE (07-20-2025)
     Endpoint to start document RAG ingest → New AI Note Creation user project id {ID}:
-    - (prior) WeWeb creates a new project
-    - (prior) WeWeb creates a new chat_session and fkeys it to the project
+    - (prior to fire) WeWeb RPC creates a new project
+    - (prior to fire) WeWeb RPC creates a new chat_session and fkeys it to the project
     - Uploads PDFs to AWS S3 and Supabase
     - Initiates chunking and embedding tasks
     - Returns task_id and source_ids for status monitoring
@@ -488,6 +489,7 @@ async def rag_chat(request: RagQueryRequest):
                 request.provider,
                 request.model_name,
                 request.temperature,
+                request.subset_document_ids,
             )
         ).apply_async()
         # Return the task ID to the client
