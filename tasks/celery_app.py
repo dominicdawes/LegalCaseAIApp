@@ -44,8 +44,8 @@ REDIS_LABS_ENDPOINT = (
 )
 
 # 🎛️ Toggle Controls from Environment Variables
-SHOW_CELERY_LOGS = "false"   # os.getenv("SHOW_CELERY_LOGS", "true").lower() == "true"
-SHOW_MANUAL_LOGS = "true"  # os.getenv("SHOW_MANUAL_LOGS", "true").lower() == "true"  ...emoji logs
+SHOW_CELERY_LOGS = False   # os.getenv("SHOW_CELERY_LOGS", "true").lower() == "true"
+SHOW_MANUAL_LOGS = True  # os.getenv("SHOW_MANUAL_LOGS", "true").lower() == "true"  ...emoji logs
 
 # ——— Celery App Initialization ————————————————————————————————————————————————————
 
@@ -162,7 +162,7 @@ def setup_loggers(logger, **kwargs):
             module_logger = logging.getLogger(module_name)
             module_logger.addHandler(handler)
             module_logger.setLevel(logging.INFO)
-            module_logger.propagate = True
+            module_logger.propagate = False
         
         print("✅ Manual logs enabled")
     else:

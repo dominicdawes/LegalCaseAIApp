@@ -154,6 +154,11 @@ async def bm25_search(
     chunk_types = filters.get("chunk_types")          or None
     sec_prefix  = filters.get("section_path_prefix")  or None
 
+    # websearch_to_tsquery ANDs every term; long queries (30+ words) or queries
+    # containing stop-like tokens (numbers, prepositions) can match zero chunks.
+    # Truncate to the first 8 meaningful words to keep the query achievable.
+    bm25_query = " ".join(query_text.split()[:8])
+
     pool = get_global_async_db_pool()
     if not pool:
         await init_async_pools()
@@ -171,11 +176,12 @@ async def bm25_search(
             WHERE project_id = $1::uuid
             """,
             project_id,
-            query_text,
+            bm25_query,
         )
         logger.info(
             f"🔍 [BM25-DEBUG] project={project_id[:8]} "
             f"query={repr(query_text)[:80]} "
+            f"bm25_query={repr(bm25_query)!r} "
             f"tsquery={debug_row['tsquery_text']!r} "
             f"rows={debug_row['total']} populated={debug_row['populated']} nulls={debug_row['nulls']}"
         )
@@ -208,7 +214,7 @@ async def bm25_search(
             LIMIT $6
             """,
             project_id,
-            query_text,
+            bm25_query,
             chunk_types,
             source_ids,
             sec_prefix,

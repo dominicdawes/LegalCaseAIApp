@@ -128,6 +128,14 @@ def _add_budget(state: AgentState, model_name: str, in_tok: int, out_tok: int) -
     return budget
 
 
+def _parse_json(raw: str) -> Any:
+    """Strip markdown code fences then parse JSON. Raises json.JSONDecodeError on failure."""
+    text = raw.strip()
+    text = re.sub(r'^```(?:json)?\s*', '', text)
+    text = re.sub(r'\s*```$', '', text)
+    return json.loads(text.strip())
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 1. Planner
 # ─────────────────────────────────────────────────────────────────────────────
@@ -290,7 +298,7 @@ async def concept_synthesizer(state: AgentState) -> Dict:
 
     raw = await _llm("worker_mid", prompt, max_tokens=1024)
     try:
-        throughlines = json.loads(raw)
+        throughlines = _parse_json(raw)
     except Exception:
         throughlines = []
 
@@ -345,7 +353,7 @@ async def issue_clusterer(state: AgentState) -> Dict:
 
     raw = await _llm("worker_mid", prompt, max_tokens=1024)
     try:
-        clusters: List[IssueCluster] = json.loads(raw)
+        clusters: List[IssueCluster] = _parse_json(raw)
     except Exception:
         clusters = [
             {
@@ -452,7 +460,7 @@ async def question_drafter(state: Dict) -> Dict:
 
     raw = await _llm("orchestrator", prompt, system=system, max_tokens=1500)
     try:
-        data = json.loads(raw)
+        data = _parse_json(raw)
     except Exception:
         data = {
             "fact_pattern":     raw,
@@ -561,7 +569,7 @@ async def grounder(state: Dict) -> Dict:
     )
     claims_raw = await _llm("worker_low", extract_prompt, max_tokens=512)
     try:
-        claims = json.loads(claims_raw)
+        claims = _parse_json(claims_raw)
         if not isinstance(claims, list):
             claims = [claims_raw]
     except Exception:
@@ -650,7 +658,7 @@ async def critic(state: AgentState) -> Dict:
 
     raw = await _llm("worker_low", prompt, max_tokens=1024)
     try:
-        critiques = json.loads(raw)
+        critiques = _parse_json(raw)
     except Exception:
         critiques = []
 
@@ -750,11 +758,12 @@ reviser.escalation_worker_class = "orchestrator"
 
 async def final_drafter(state: AgentState) -> Dict:
     """
-    Final editorial pass over all questions and answer keys.
+    Final editorial pass: polish each question individually in parallel.
 
-    Removes cross-question repetition, smooths prose, enforces consistent
-    party naming and IRAC structure, and tightens markdown formatting.
-    Runs once after the critic/reviser loop exits — always before Assembler.
+    Processing one question per LLM call avoids output-token limits that occur
+    when all questions are batched into a single request. Each call receives the
+    full IRAC style guide and the gold-standard format from exam-questions-prompt.yaml.
+    On JSON parse failure for an individual question the original is kept unchanged.
     """
     questions = sorted(
         state.get("verified_questions") or [],
@@ -763,70 +772,73 @@ async def final_drafter(state: AgentState) -> Dict:
     if not questions:
         return {}
 
-    exam_input = json.dumps(
-        [
-            {
-                "question_index":  q["question_index"],
-                "fact_pattern":    q["fact_pattern"],
-                "call_of_question": q["call_of_question"],
-                "answer_key":      q["answer_key"],
-            }
-            for q in questions
-        ],
-        indent=2,
-    )
-
     system = (
-        f"You are a senior legal examinations editor. "
-        f"Your task is to polish {len(questions)} law exam questions and answer keys "
-        f"as a final editorial review.\n\n"
-        f"Style guide:\n{_IRAC_STYLE_GUIDE}"
+        "You are a senior legal examinations editor. Your task is to polish one "
+        "law exam question and its answer key as a final editorial review.\n\n"
+        "Output format requirements:\n"
+        "  Fact pattern — realistic multi-character narrative, chronological, "
+        "no explicit legal labels embedded in the text.\n"
+        "  Call of the Question — clear, open-ended prompt that tells the student "
+        "what to analyse (e.g. 'Discuss all potential tort claims...').\n"
+        "  Answer key — IRAC structure per sub-issue:\n"
+        "    Issue:       one sentence identifying the precise legal question\n"
+        "    Rule:        applicable rule/standard; cite source materials by name\n"
+        "    Application: apply rule to facts; argue BOTH sides; address counterarguments\n"
+        "    Conclusion:  clear, practical outcome — one sentence\n\n"
+        "Additional constraints:\n"
+        "  - Plain legal English; define technical terms on first use\n"
+        "  - Consistent party names throughout (pick one label per party and keep it)\n"
+        "  - One major IRAC block per paragraph; blank line between blocks\n"
+        "  - No raw JSON, code fences, or formatting artefacts in the fact pattern\n"
+        "  - Markdown headers: ## Question N / **Call of the Question** / "
+        "### Answer Key — Question N\n\n"
+        f"{_IRAC_STYLE_GUIDE}"
     )
 
-    prompt = (
-        f"Review and polish the {len(questions)} exam questions and answer keys below.\n\n"
-        f"For each question:\n"
-        f"  - Remove any sub-issues duplicated across questions\n"
-        f"  - Ensure smooth, readable prose in fact patterns\n"
-        f"  - Enforce consistent party names and legal terminology\n"
-        f"  - Verify IRAC structure in answer keys; fill any missing elements\n"
-        f"  - Tighten wording without altering legal substance\n\n"
-        f"Return a JSON array with the SAME structure as input "
-        f"(question_index, fact_pattern, call_of_question, answer_key). "
-        f"No extra text.\n\n"
-        f"Questions:\n{exam_input}"
-    )
+    async def _polish_one(q: Dict) -> Dict:
+        prompt = (
+            f"Polish the following exam question and answer key.\n\n"
+            f"Fact pattern:\n{q['fact_pattern']}\n\n"
+            f"Call of the question:\n{q['call_of_question']}\n\n"
+            f"Answer key:\n{q['answer_key']}\n\n"
+            f"Editorial instructions:\n"
+            f"  - Ensure the fact pattern reads as smooth, realistic narrative prose — "
+            f"remove any JSON fragments, code fences, or template artefacts\n"
+            f"  - Enforce consistent party names and legal terminology\n"
+            f"  - Verify full IRAC structure in the answer key; fill any missing elements\n"
+            f"  - Tighten wording without altering legal substance\n\n"
+            f"Return JSON with exactly these three keys and no other text:\n"
+            f'  "fact_pattern"     — polished fact pattern (str)\n'
+            f'  "call_of_question" — polished call of the question (str)\n'
+            f'  "answer_key"       — polished answer key (str)\n'
+        )
+        raw = await _llm("orchestrator", prompt, system=system, max_tokens=3000)
+        try:
+            patch = _parse_json(raw)
+            updated = dict(q)
+            updated["fact_pattern"]     = patch.get("fact_pattern",     q["fact_pattern"])
+            updated["call_of_question"] = patch.get("call_of_question", q["call_of_question"])
+            updated["answer_key"]       = patch.get("answer_key",       q["answer_key"])
+            return updated
+        except Exception as exc:
+            logger.warning(
+                "final_drafter: Q%d JSON parse failed (%s) — keeping original",
+                q["question_index"], exc,
+            )
+            return q
 
-    raw = await _llm("orchestrator", prompt, system=system, max_tokens=4000)
-    try:
-        polished = json.loads(raw)
-    except Exception:
-        logger.warning("final_drafter: JSON parse failed — returning questions unchanged")
-        return {}
-
-    polished_map = {p["question_index"]: p for p in polished if isinstance(p, dict)}
-    updated = []
-    for q in questions:
-        patch = polished_map.get(q["question_index"])
-        if patch:
-            updated_q = dict(q)
-            updated_q["fact_pattern"]     = patch.get("fact_pattern",    q["fact_pattern"])
-            updated_q["call_of_question"] = patch.get("call_of_question", q["call_of_question"])
-            updated_q["answer_key"]       = patch.get("answer_key",      q["answer_key"])
-            updated.append(updated_q)
-        else:
-            updated.append(q)
+    polished = list(await asyncio.gather(*[_polish_one(q) for q in questions]))
 
     await _try_save_artifact(
         state,
         artifact_key="polished_questions",
-        content={"questions": [dict(q) for q in updated]},
+        content={"questions": [dict(q) for q in polished]},
         worker_class="orchestrator",
         node_name="final_drafter",
         artifact_type="polished_questions",
         source_ids=state.get("source_ids"),
     )
-    return {"verified_questions": updated}
+    return {"verified_questions": polished}
 
 
 final_drafter.default_worker_class = "orchestrator"

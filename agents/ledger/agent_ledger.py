@@ -261,7 +261,6 @@ class AgentLedgerService:
         Terminal statuses ('succeeded', 'failed', 'cancelled', 'expired') also
         set completed_at.
         """
-        _terminal = {"succeeded", "failed", "cancelled", "expired"}
         now = self._now_utc()
         try:
             pool = await self._pool()
@@ -270,12 +269,12 @@ class AgentLedgerService:
                     """
                     UPDATE agent_jobs
                     SET status_enum  = $1::agent_job_status,
-                        completed_at = CASE WHEN $1 = ANY($2::text[]) THEN $3 ELSE completed_at END,
-                        updated_at   = $3
-                    WHERE id = $4
+                        completed_at = CASE WHEN $1::text = ANY(ARRAY['succeeded', 'failed', 'cancelled', 'expired'])
+                                           THEN $2 ELSE completed_at END,
+                        updated_at   = $2
+                    WHERE id = $3
                     """,
                     status,
-                    list(_terminal),
                     now,
                     job_id,
                 )
