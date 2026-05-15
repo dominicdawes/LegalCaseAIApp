@@ -76,6 +76,8 @@ load_dotenv()
 USE_LIGHTRAG_INTEGRATION = False
 USE_LANGGRAPH_AGENT = os.getenv("USE_LANGGRAPH_AGENT", "false").lower() == "true"
 USE_ATTACK_OUTLINE_AGENT = os.getenv("USE_ATTACK_OUTLINE_AGENT", "false").lower() == "true"
+USE_CASE_BRIEF_AGENT = os.getenv("USE_CASE_BRIEF_AGENT", "false").lower() == "true"
+USE_COLD_CALL_AGENT = os.getenv("USE_COLD_CALL_AGENT", "false").lower() == "true"
 USE_VOYAGE_EMBEDDINGS = os.getenv("USE_VOYAGE_EMBEDDINGS", "false").lower() == "true"
 
 # Queue configuration
@@ -209,6 +211,24 @@ class AsyncNoteManager:
 
             if note_type == "attack_outline" and USE_ATTACK_OUTLINE_AGENT:
                 return await self._generate_attack_outline_agent(
+                    note_id=note_id,
+                    user_id=user_id,
+                    project_id=project_id,
+                    note_title=note_title,
+                    addtl_params=addtl_params or {},
+                )
+
+            if note_type == "case_brief" and USE_CASE_BRIEF_AGENT:
+                return await self._generate_case_brief_agent(
+                    note_id=note_id,
+                    user_id=user_id,
+                    project_id=project_id,
+                    note_title=note_title,
+                    addtl_params=addtl_params or {},
+                )
+
+            if note_type == "cold_call" and USE_COLD_CALL_AGENT:
+                return await self._generate_cold_call_agent(
                     note_id=note_id,
                     user_id=user_id,
                     project_id=project_id,
@@ -1220,6 +1240,251 @@ class AsyncNoteManager:
             )
 
         logger.info(f"✅ Attack outline agent completed for note {note_id[:8]}…")
+        return markdown
+
+    async def _generate_case_brief_agent(
+        self,
+        note_id: str,
+        user_id: str,
+        project_id: str,
+        note_title: str,
+        addtl_params: Dict,
+    ) -> str:
+        """
+        Route case_brief to the LangGraph agentic pipeline when
+        USE_CASE_BRIEF_AGENT=true.  Falls back to the standard RAG path
+        on import error so a missing langgraph install never breaks prod.
+        """
+        try:
+            from agents.case_brief.graph import run_case_brief_agent
+        except ImportError:
+            logger.warning("langgraph not installed — falling back to standard RAG path for case_brief")
+            return await self.generate_note_async(
+                note_id=note_id,
+                user_id=user_id,
+                note_type="case_brief",
+                project_id=project_id,
+                note_title=note_title,
+                provider="anthropic",
+                model_name="claude-opus-4-7",
+                num_sources=10,
+                addtl_params=addtl_params,
+            )
+
+        source_ids = addtl_params.get("source_ids") or []
+
+        # If no explicit source_ids, fetch all for the project
+        if not source_ids:
+            async with get_db_connection() as conn:
+                rows = await conn.fetch(
+                    "SELECT id FROM document_sources WHERE project_id = $1",
+                    uuid.UUID(project_id),
+                )
+            source_ids = [str(r["id"]) for r in rows]
+
+        await self._update_note_progress_async(note_id, "PROCESSING")
+
+        # ── Ledger: initialise job + run ──────────────────────────────────────
+        from agents.ledger import AgentLedgerService
+        ledger = AgentLedgerService()
+        job_uuid = uuid.UUID(note_id)
+        run_meta = None
+        try:
+            await ledger.ensure_job(
+                job_id=job_uuid,
+                project_id=project_id,
+                source_ids=source_ids,
+                job_type="case_brief",
+            )
+            run_meta = await ledger.initialize_run(
+                job_id=job_uuid,
+                graph_name="case_brief",
+            )
+            agent_thread_id = run_meta.langgraph_thread_id
+            agent_run_id    = str(run_meta.run_id)
+        except Exception as ledger_exc:
+            logger.warning(f"Ledger init failed (non-fatal): {ledger_exc}")
+            agent_thread_id = note_id
+            agent_run_id    = None
+
+        # ── Run the agent ─────────────────────────────────────────────────────
+        try:
+            final_state = await run_case_brief_agent(
+                request=note_title,
+                project_id=project_id,
+                source_ids=source_ids,
+                use_voyage=USE_VOYAGE_EMBEDDINGS,
+                thread_id=agent_thread_id,
+                job_id=note_id,
+                run_id=agent_run_id,
+                user_id=user_id,
+            )
+            markdown = final_state.get("final_output") or ""
+        except Exception as e:
+            if run_meta:
+                try:
+                    await ledger.mark_run_failed(run_meta.run_id, e)
+                    await ledger.set_job_status(job_uuid, "failed")
+                except Exception:
+                    pass
+            logger.error(f"Case brief agent failed: {e}", exc_info=True)
+            raise
+
+        # ── Ledger: mark success ──────────────────────────────────────────────
+        if run_meta:
+            try:
+                await ledger.complete_run(run_meta.run_id)
+                await ledger.set_job_status(job_uuid, "succeeded")
+            except Exception as ledger_exc:
+                logger.warning(f"Ledger completion update failed (non-fatal): {ledger_exc}")
+
+        # ── Persist the brief markdown to the notes stub ──────────────────────
+        ref_sources = [uuid.UUID(sid) for sid in source_ids] if source_ids else []
+        async with get_db_connection() as conn:
+            await conn.execute(
+                """
+                UPDATE notes SET
+                    content_markdown     = $1,
+                    is_generated         = $2,
+                    is_essential         = $3,
+                    num_sources_based_on = $4,
+                    referenced_sources   = $5,
+                    note_progress_status = 'COMPLETE',
+                    error_message        = NULL
+                WHERE id = $6
+                """,
+                markdown, True, False, len(source_ids), ref_sources, note_id,
+            )
+
+        logger.info(f"✅ Case brief agent completed for note {note_id[:8]}…")
+        return markdown
+
+    async def _generate_cold_call_agent(
+        self,
+        note_id: str,
+        user_id: str,
+        project_id: str,
+        note_title: str,
+        addtl_params: Dict,
+    ) -> str:
+        """
+        Route cold_call to the LangGraph agentic pipeline when
+        USE_COLD_CALL_AGENT=true.  Falls back to the standard RAG path
+        on import error so a missing langgraph install never breaks prod.
+        """
+        try:
+            from agents.cold_call.graph import run_cold_call_agent
+        except ImportError:
+            logger.warning("langgraph not installed — falling back to standard RAG path for cold_call")
+            return await self.generate_note_async(
+                note_id=note_id,
+                user_id=user_id,
+                note_type="cold_call",
+                project_id=project_id,
+                note_title=note_title,
+                provider="anthropic",
+                model_name="claude-opus-4-7",
+                num_sources=10,
+                addtl_params=addtl_params,
+            )
+
+        source_ids = addtl_params.get("source_ids") or []
+        requested_sequence_count = int(addtl_params.get("num_sequences", 5))
+        target_difficulty = addtl_params.get("target_difficulty", "day_one_t14")
+
+        # If no explicit source_ids, fetch all for the project
+        if not source_ids:
+            async with get_db_connection() as conn:
+                rows = await conn.fetch(
+                    "SELECT id FROM document_sources WHERE project_id = $1",
+                    uuid.UUID(project_id),
+                )
+            source_ids = [str(r["id"]) for r in rows]
+
+        await self._update_note_progress_async(note_id, "PROCESSING")
+
+        # ── Ledger: initialise job + run ──────────────────────────────────────
+        from agents.ledger import AgentLedgerService
+        ledger = AgentLedgerService()
+        job_uuid = uuid.UUID(note_id)
+        run_meta = None
+        try:
+            await ledger.ensure_job(
+                job_id=job_uuid,
+                project_id=project_id,
+                source_ids=source_ids,
+                job_type="cold_call",
+            )
+            run_meta = await ledger.initialize_run(
+                job_id=job_uuid,
+                graph_name="cold_call",
+            )
+            agent_thread_id = run_meta.langgraph_thread_id
+            agent_run_id    = str(run_meta.run_id)
+        except Exception as ledger_exc:
+            logger.warning(f"Ledger init failed (non-fatal): {ledger_exc}")
+            agent_thread_id = note_id
+            agent_run_id    = None
+
+        # ── Run the agent ─────────────────────────────────────────────────────
+        try:
+            final_state = await run_cold_call_agent(
+                request=note_title,
+                project_id=project_id,
+                source_ids=source_ids,
+                requested_sequence_count=requested_sequence_count,
+                target_difficulty=target_difficulty,
+                use_voyage=USE_VOYAGE_EMBEDDINGS,
+                thread_id=agent_thread_id,
+                job_id=note_id,
+                run_id=agent_run_id,
+                user_id=user_id,
+                note_id=note_id,
+            )
+            markdown = final_state.get("final_output") or ""
+        except Exception as e:
+            if run_meta:
+                try:
+                    await ledger.mark_run_failed(run_meta.run_id, e)
+                    await ledger.set_job_status(job_uuid, "failed")
+                except Exception:
+                    pass
+            logger.error(f"Cold call agent failed: {e}", exc_info=True)
+            raise
+
+        # ── Ledger: mark success ──────────────────────────────────────────────
+        if run_meta:
+            try:
+                await ledger.complete_run(run_meta.run_id)
+                await ledger.set_job_status(job_uuid, "succeeded")
+            except Exception as ledger_exc:
+                logger.warning(f"Ledger completion update failed (non-fatal): {ledger_exc}")
+
+        # ── Persist the markdown summary to the notes stub ────────────────────
+        ref_sources = [uuid.UUID(sid) for sid in source_ids] if source_ids else []
+        export_result = final_state.get("export_result") or {}
+        num_sequences = export_result.get("question_sequences_exported", 0)
+
+        async with get_db_connection() as conn:
+            await conn.execute(
+                """
+                UPDATE notes SET
+                    content_markdown     = $1,
+                    is_generated         = $2,
+                    is_essential         = $3,
+                    num_sources_based_on = $4,
+                    referenced_sources   = $5,
+                    note_progress_status = 'COMPLETE',
+                    error_message        = NULL
+                WHERE id = $6
+                """,
+                markdown, True, False, len(source_ids), ref_sources, note_id,
+            )
+
+        logger.info(
+            f"✅ Cold call agent completed for note {note_id[:8]}… "
+            f"({num_sequences} sequences exported)"
+        )
         return markdown
 
     async def _handle_note_error(

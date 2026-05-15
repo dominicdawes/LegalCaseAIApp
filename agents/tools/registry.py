@@ -99,6 +99,84 @@ ATTACK_VERIFIER_TOOLS = [
     "search_passages",
 ]
 
+# ── Case-brief agent tool subsets ─────────────────────────────────────────────
+
+# head_orchestrator surveys available sources
+BRIEF_PLANNER_TOOLS = [
+    "list_sources",
+    "get_doc_outline",
+    "find_docs_about",
+    "get_doc_metadata",
+    "count_tokens",
+]
+
+# source_profiler maps each document's structure and case metadata
+BRIEF_PROFILER_TOOLS = [
+    "get_doc_outline",
+    "find_sections_about",
+    "find_docs_about",
+    "get_doc_metadata",
+]
+
+# planned_retriever executes multi-method retrieval per brief artifact
+BRIEF_RETRIEVER_TOOLS = [
+    "search_passages",
+    "hybrid_search",
+    "expand_query",
+    "find_sections_about",
+    "get_section",
+    "get_parents",
+    "get_neighbors",
+    "find_concept_across_docs",
+]
+
+# section_grounder verifies section claims against source chunks
+BRIEF_VERIFIER_TOOLS = [
+    "verify_claim",
+    "find_supporting_evidence",
+    "get_citations_for",
+    "search_passages",
+]
+
+# ── Cold-call agent tool subsets ─────────────────────────────────────────────
+
+# head_orchestrator surveys available sources
+COLD_CALL_PLANNER_TOOLS = [
+    "list_sources",
+    "get_doc_outline",
+    "find_docs_about",
+    "get_doc_metadata",
+    "count_tokens",
+]
+
+# source_profiler inventories each document for cases / statutes / doctrine sections
+COLD_CALL_PROFILER_TOOLS = [
+    "get_doc_outline",
+    "find_sections_about",
+    "find_docs_about",
+    "get_doc_metadata",
+]
+
+# case_rule_extractor + socratic_thread_builder + socratic_answer_agent retrieve evidence
+COLD_CALL_RETRIEVER_TOOLS = [
+    "search_passages",
+    "hybrid_search",
+    "expand_query",
+    "find_sections_about",
+    "get_section",
+    "get_parents",
+    "get_neighbors",
+    "find_concept_across_docs",
+]
+
+# grounder_agent verifies answer claims against source
+COLD_CALL_VERIFIER_TOOLS = [
+    "verify_claim",
+    "find_supporting_evidence",
+    "get_citations_for",
+    "search_passages",
+]
+
 # Full set — only used when explicit node routing is unavailable
 ALL_TOOLS = [
     "list_sources",
