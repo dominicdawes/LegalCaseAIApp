@@ -75,6 +75,7 @@ load_dotenv()
 # ——— Configuration & Constants ————————————————————————————————————————————————————
 USE_LIGHTRAG_INTEGRATION = False
 USE_LANGGRAPH_AGENT = os.getenv("USE_LANGGRAPH_AGENT", "false").lower() == "true"
+USE_ATTACK_OUTLINE_AGENT = os.getenv("USE_ATTACK_OUTLINE_AGENT", "false").lower() == "true"
 USE_VOYAGE_EMBEDDINGS = os.getenv("USE_VOYAGE_EMBEDDINGS", "false").lower() == "true"
 
 # Queue configuration
@@ -206,6 +207,15 @@ class AsyncNoteManager:
                     addtl_params=addtl_params or {},
                 )
 
+            if note_type == "attack_outline" and USE_ATTACK_OUTLINE_AGENT:
+                return await self._generate_attack_outline_agent(
+                    note_id=note_id,
+                    user_id=user_id,
+                    project_id=project_id,
+                    note_title=note_title,
+                    addtl_params=addtl_params or {},
+                )
+
             # 🆕 PARALLEL EXECUTION - Load prompt and generate embedding concurrently
             logger.info("⚡ Executing parallel tasks: prompt loading + embedding generation")
             
@@ -234,12 +244,23 @@ class AsyncNoteManager:
 
             # Async chunk retrieval (Naive RAG)
             retrieval_start = time.time()
+            subset = addtl_params.get("subset_document_ids") or []
             relevant_chunks = await self._fetch_relevant_chunks_async(
-                embedding, project_id,
-                source_ids=addtl_params.get("subset_document_ids") or [],
+                embedding, project_id, source_ids=subset,
             )
             retrieval_time = time.time() - retrieval_start
             logger.info(f"🔍 Retrieved {len(relevant_chunks)} chunks in {retrieval_time*1000:.0f}ms")
+
+            # Resolve referenced_sources for persistence — all project docs or the explicit subset
+            if subset:
+                referenced_sources = [uuid.UUID(sid) for sid in subset]
+            else:
+                async with get_db_connection() as conn:
+                    src_rows = await conn.fetch(
+                        "SELECT id FROM document_sources WHERE project_id = $1",
+                        uuid.UUID(project_id),
+                    )
+                referenced_sources = [row["id"] for row in src_rows]
             
             # Build context and generate note (typicaly BASE_PROMPT + TEMPLATE + CHUNKS)
             generation_start = time.time()
@@ -271,19 +292,19 @@ class AsyncNoteManager:
                     llm_output=note_content,
                     is_essential=(addtl_params or {}).get('is_essential', False),
                     num_sources=num_sources,
+                    referenced_sources=referenced_sources,
                 )
                 logger.info(f"🃏 Created flashcard deck {deck_id} with {num_cards} cards")
-                
-                # Store success metrics for flashcards
+
                 save_metrics = {
-                    "deck_id": str(deck_id),        # <-- Fix json.dump issue 
+                    "deck_id": str(deck_id),
                     "num_cards": num_cards,
                     "storage_type": "flashcards"
                 }
             elif note_type=="quiz":
                 # Special quiz processing and storage
                 num_questions_requested = (addtl_params or {}).get('num_questions', 10)
-                
+
                 quiz_note_id, num_questions_saved = await self._save_quiz_and_questions_async(
                     note_id=note_id,
                     user_id=user_id,
@@ -291,6 +312,7 @@ class AsyncNoteManager:
                     num_questions_requested=num_questions_requested,
                     is_essential=(addtl_params or {}).get('is_essential', False),
                     num_sources=num_sources,
+                    referenced_sources=referenced_sources,
                 )
                 save_metrics = {
                     "quiz_note_id": str(quiz_note_id),
@@ -304,7 +326,8 @@ class AsyncNoteManager:
                     note_type=note_type,
                     content=note_content,
                     is_essential=(addtl_params or {}).get('is_essential', False),
-                    num_sources=1
+                    num_sources=1,
+                    referenced_sources=referenced_sources,
                 )
                 save_metrics = {"storage_type": "regular_note"}
             
@@ -650,6 +673,7 @@ class AsyncNoteManager:
         content: str,
         is_essential: bool,
         num_sources: int,
+        referenced_sources: List = None,
     ):
         """Async note persistence — updates the stub row created at request time."""
 
@@ -664,11 +688,13 @@ class AsyncNoteManager:
                     is_shareable            = $3,
                     is_essential            = $4,
                     num_sources_based_on    = $5,
+                    referenced_sources      = $6,
                     note_progress_status    = 'COMPLETE',
                     error_message           = NULL
-                WHERE id = $6
+                WHERE id = $7
                 """,
-                content, True, False, is_essential, num_sources, note_id
+                content, True, False, is_essential, num_sources,
+                referenced_sources or [], note_id,
             )
 
         logger.info(f"✅ Note saved successfully")
@@ -682,6 +708,7 @@ class AsyncNoteManager:
         llm_output: str,
         is_essential: bool,
         num_sources: int,
+        referenced_sources: List = None,
     ) -> tuple:
         """
         🆕 Async flashcard processing and database insertion
@@ -730,12 +757,13 @@ class AsyncNoteManager:
                             is_active            = $3,
                             is_essential         = $4,
                             num_sources_based_on = $5,
+                            referenced_sources   = $6,
                             note_progress_status = 'COMPLETE'
-                        WHERE id = $6
+                        WHERE id = $7
                         """,
                         deck_data['description'], deck_data['num_cards'],
                         deck_data.get('is_active', True), is_essential, num_sources,
-                        note_id
+                        referenced_sources or [], note_id,
                     )
                     deck_id = note_id
 
@@ -796,6 +824,7 @@ class AsyncNoteManager:
         num_questions_requested: int,
         is_essential: bool,
         num_sources: int,
+        referenced_sources: List = None,
     ) -> tuple:
         """
         🆕 Async quiz processing and database insertion.
@@ -853,10 +882,12 @@ class AsyncNoteManager:
                             is_generated         = $2,
                             is_essential         = $3,
                             num_sources_based_on = $4,
+                            referenced_sources   = $5,
                             note_progress_status = 'COMPLETE'
-                        WHERE id = $5
+                        WHERE id = $6
                         """,
-                        num_questions_saved, True, is_essential, num_sources, note_id
+                        num_questions_saved, True, is_essential, num_sources,
+                        referenced_sources or [], note_id,
                     )
                     quiz_note_id = note_id
 
@@ -1051,6 +1082,7 @@ class AsyncNoteManager:
         persisted_ids = final_state.get("persisted_question_ids") or []
         num_persisted = len(persisted_ids)
 
+        ref_sources = [uuid.UUID(sid) for sid in source_ids] if source_ids else []
         async with get_db_connection() as conn:
             await conn.execute(
                 """
@@ -1059,17 +1091,135 @@ class AsyncNoteManager:
                     is_generated         = $2,
                     is_essential         = $3,
                     num_sources_based_on = $4,
+                    referenced_sources   = $5,
                     note_progress_status = 'COMPLETE',
                     error_message        = NULL
-                WHERE id = $5
+                WHERE id = $6
                 """,
-                num_persisted, True, False, len(source_ids), note_id,
+                num_persisted, True, False, len(source_ids), ref_sources, note_id,
             )
 
         logger.info(
             f"✅ Exam agent persisted {num_persisted} question+answer pairs "
             f"for note {note_id[:8]}…"
         )
+        return markdown
+
+    async def _generate_attack_outline_agent(
+        self,
+        note_id: str,
+        user_id: str,
+        project_id: str,
+        note_title: str,
+        addtl_params: Dict,
+    ) -> str:
+        """
+        Route attack_outline to the LangGraph agentic pipeline when
+        USE_ATTACK_OUTLINE_AGENT=true.  Falls back to the standard RAG path
+        on import error so a missing langgraph install never breaks prod.
+        """
+        try:
+            from agents.attack_outline.graph import run_attack_outline_agent
+        except ImportError:
+            logger.warning("langgraph not installed — falling back to standard RAG path for attack_outline")
+            return await self.generate_note_async(
+                note_id=note_id,
+                user_id=user_id,
+                note_type="attack_outline",
+                project_id=project_id,
+                note_title=note_title,
+                provider="anthropic",
+                model_name="claude-opus-4-7",
+                num_sources=10,
+                addtl_params=addtl_params,
+            )
+
+        source_ids = addtl_params.get("source_ids") or []
+
+        # If no explicit source_ids, fetch all for the project
+        if not source_ids:
+            async with get_db_connection() as conn:
+                rows = await conn.fetch(
+                    "SELECT id FROM document_sources WHERE project_id = $1",
+                    uuid.UUID(project_id),
+                )
+            source_ids = [str(r["id"]) for r in rows]
+
+        await self._update_note_progress_async(note_id, "PROCESSING")
+
+        # ── Ledger: initialise job + run ──────────────────────────────────────
+        from agents.ledger import AgentLedgerService
+        ledger = AgentLedgerService()
+        job_uuid = uuid.UUID(note_id)
+        run_meta = None
+        try:
+            await ledger.ensure_job(
+                job_id=job_uuid,
+                project_id=project_id,
+                source_ids=source_ids,
+                job_type="attack_outline",
+            )
+            run_meta = await ledger.initialize_run(
+                job_id=job_uuid,
+                graph_name="attack_outline",
+            )
+            agent_thread_id = run_meta.langgraph_thread_id
+            agent_run_id    = str(run_meta.run_id)
+        except Exception as ledger_exc:
+            logger.warning(f"Ledger init failed (non-fatal): {ledger_exc}")
+            agent_thread_id = note_id
+            agent_run_id    = None
+
+        # ── Run the agent ─────────────────────────────────────────────────────
+        try:
+            final_state = await run_attack_outline_agent(
+                request=note_title,
+                project_id=project_id,
+                source_ids=source_ids,
+                use_voyage=USE_VOYAGE_EMBEDDINGS,
+                thread_id=agent_thread_id,
+                job_id=note_id,
+                run_id=agent_run_id,
+                user_id=user_id,
+            )
+            markdown = final_state.get("final_output") or ""
+        except Exception as e:
+            if run_meta:
+                try:
+                    await ledger.mark_run_failed(run_meta.run_id, e)
+                    await ledger.set_job_status(job_uuid, "failed")
+                except Exception:
+                    pass
+            logger.error(f"Attack outline agent failed: {e}", exc_info=True)
+            raise
+
+        # ── Ledger: mark success ──────────────────────────────────────────────
+        if run_meta:
+            try:
+                await ledger.complete_run(run_meta.run_id)
+                await ledger.set_job_status(job_uuid, "succeeded")
+            except Exception as ledger_exc:
+                logger.warning(f"Ledger completion update failed (non-fatal): {ledger_exc}")
+
+        # ── Persist the outline markdown to the notes stub ────────────────────
+        ref_sources = [uuid.UUID(sid) for sid in source_ids] if source_ids else []
+        async with get_db_connection() as conn:
+            await conn.execute(
+                """
+                UPDATE notes SET
+                    content_markdown     = $1,
+                    is_generated         = $2,
+                    is_essential         = $3,
+                    num_sources_based_on = $4,
+                    referenced_sources   = $5,
+                    note_progress_status = 'COMPLETE',
+                    error_message        = NULL
+                WHERE id = $6
+                """,
+                markdown, True, False, len(source_ids), ref_sources, note_id,
+            )
+
+        logger.info(f"✅ Attack outline agent completed for note {note_id[:8]}…")
         return markdown
 
     async def _handle_note_error(

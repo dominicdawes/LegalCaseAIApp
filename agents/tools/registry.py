@@ -51,6 +51,54 @@ SYNTHESIZER_TOOLS = [
     "search_passages",
 ]
 
+# ── Attack-outline agent tool subsets ─────────────────────────────────────────
+
+# head_orchestrator sees discovery + housekeeping to survey available material
+ATTACK_PLANNER_TOOLS = [
+    "list_sources",
+    "get_doc_outline",
+    "find_docs_about",
+    "get_doc_metadata",
+    "count_tokens",
+]
+
+# source_profiler maps each document's structure and doctrine coverage
+ATTACK_PROFILER_TOOLS = [
+    "get_doc_outline",
+    "find_sections_about",
+    "find_docs_about",
+    "get_doc_metadata",
+]
+
+# planned_retriever executes multi-intent retrieval (BM25, vector, section drilldown)
+ATTACK_RETRIEVER_TOOLS = [
+    "search_passages",
+    "hybrid_search",
+    "expand_query",
+    "find_sections_about",
+    "get_section",
+    "get_parents",
+    "get_neighbors",
+    "find_concept_across_docs",
+]
+
+# legal_artifact_extractor reads chunk context and nearby chunks for artifact grounding
+ATTACK_EXTRACTOR_TOOLS = [
+    "search_passages",
+    "hybrid_search",
+    "get_section",
+    "get_neighbors",
+    "find_concept_across_docs",
+]
+
+# grounding_verifier checks claims and fetches citations
+ATTACK_VERIFIER_TOOLS = [
+    "verify_claim",
+    "find_supporting_evidence",
+    "get_citations_for",
+    "search_passages",
+]
+
 # Full set — only used when explicit node routing is unavailable
 ALL_TOOLS = [
     "list_sources",
