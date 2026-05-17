@@ -177,6 +177,45 @@ COLD_CALL_VERIFIER_TOOLS = [
     "search_passages",
 ]
 
+# ── Quiz agent tool subsets ───────────────────────────────────────────────────
+
+# head_orchestrator surveys available sources; source_profiler outlines each doc
+QUIZ_PLANNER_TOOLS = [
+    "list_sources",
+    "get_doc_outline",
+    "find_docs_about",
+    "get_doc_metadata",
+    "count_tokens",
+]
+
+# source_profiler and case_rule_extractor map each document's structure and cases
+QUIZ_PROFILER_TOOLS = [
+    "get_doc_outline",
+    "find_sections_about",
+    "find_docs_about",
+    "get_doc_metadata",
+]
+
+# question_drafter + grounder retrieve evidence per question spec
+QUIZ_RETRIEVER_TOOLS = [
+    "search_passages",
+    "hybrid_search",
+    "expand_query",
+    "find_sections_about",
+    "get_section",
+    "get_parents",
+    "get_neighbors",
+    "find_concept_across_docs",
+]
+
+# grounder verifies question/answer claims against source chunks
+QUIZ_VERIFIER_TOOLS = [
+    "verify_claim",
+    "find_supporting_evidence",
+    "get_citations_for",
+    "search_passages",
+]
+
 # Full set — only used when explicit node routing is unavailable
 ALL_TOOLS = [
     "list_sources",

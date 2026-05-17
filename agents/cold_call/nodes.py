@@ -50,6 +50,19 @@ from .state import (
     SequenceQuestion,
     SourceProfile,
 )
+from .constants import (
+    QUESTION_TYPES_EARLY,
+    QUESTION_TYPES_MIDDLE,
+    QUESTION_TYPES_DEEP,
+    QUESTION_TYPES_REQUIRED_ALWAYS,
+    QUESTION_TYPES_CONDITIONAL_MULTI_CASE_DEEP,
+    QUESTION_TYPES_CONDITIONAL_DISSENT_MIDDLE,
+    QUESTION_TYPES_CONDITIONAL_ADVANCED_DEEP,
+    QUESTION_TYPES_CONDITIONAL_ADVANCED_MIDDLE,
+    QUESTION_TYPES_OPTIONAL_MULTI_CASE,
+    QUESTION_TYPES_OPTIONAL_UPPER_LEVEL,
+    SEED_THEMES,
+)
 from .worker_config import _fetch_worker_model, model_costs
 
 logger = logging.getLogger(__name__)
@@ -692,38 +705,31 @@ async def question_type_bank_selector(state: AgentState) -> Dict:
     has_multi_case = len(cases) > 1
     has_dissent = any(c.get("dissent") for c in cases)
 
-    REQUIRED_ALWAYS = [
-        "PROCEDURAL_POSTURE", "LEGALLY_RELEVANT_FACTS", "ISSUE_PRECISION",
-        "HOLDING_PRECISION", "RULE_EXTRACTION", "REASONING_CHAIN",
-        "FACT_CHANGE_HYPO", "RULE_BOUNDARY", "COUNTERARGUMENT", "POLICY_ANALYSIS",
-        "EXAM_APPLICATION",
-    ]
-
-    EARLY = ["PROCEDURAL_POSTURE", "LEGALLY_RELEVANT_FACTS", "ISSUE_PRECISION", "HOLDING_PRECISION"]
-    MIDDLE = ["RULE_EXTRACTION", "RULE_ELEMENTS", "REASONING_CHAIN", "HOLDING_VS_DICTA", "COUNTERARGUMENT"]
-    DEEP = ["FACT_CHANGE_HYPO", "RULE_BOUNDARY", "POLICY_ANALYSIS", "EXAM_APPLICATION"]
+    early = list(QUESTION_TYPES_EARLY)
+    middle = list(QUESTION_TYPES_MIDDLE)
+    deep = list(QUESTION_TYPES_DEEP)
 
     if has_multi_case:
-        DEEP.append("COMPARE_DISTINGUISH")
+        deep += QUESTION_TYPES_CONDITIONAL_MULTI_CASE_DEEP
     if has_dissent:
-        MIDDLE.append("DISSENT_ANALYSIS")
+        middle += QUESTION_TYPES_CONDITIONAL_DISSENT_MIDDLE
     if target_difficulty == "advanced":
-        DEEP += ["STANDARD_OF_REVIEW", "STATUTORY_INTERPRETATION", "BURDEN_OF_PROOF", "ADMINISTRABILITY"]
-        MIDDLE += ["REMEDY_ANALYSIS", "JURISDICTION_AUTHORITY"]
+        deep += QUESTION_TYPES_CONDITIONAL_ADVANCED_DEEP
+        middle += QUESTION_TYPES_CONDITIONAL_ADVANCED_MIDDLE
 
     optional = []
     if has_multi_case:
-        optional += ["ANALOGY_QUESTION", "DISTINGUISHING_QUESTION"]
+        optional += QUESTION_TYPES_OPTIONAL_MULTI_CASE
     if target_difficulty != "law_1l":
-        optional += ["PROFESSOR_TRAP_QUESTION", "RECOVERY_QUESTION", "FLOODGATES_CONCERN", "FAIRNESS_EQUITY_PROBE"]
+        optional += QUESTION_TYPES_OPTIONAL_UPPER_LEVEL
 
     selection: QuestionTypeSelection = {
         "selected_question_types": {
-            "early": EARLY,
-            "middle": MIDDLE,
-            "deep": DEEP,
+            "early": early,
+            "middle": middle,
+            "deep": deep,
         },
-        "required_types": REQUIRED_ALWAYS,
+        "required_types": QUESTION_TYPES_REQUIRED_ALWAYS,
         "optional_types": optional,
     }
 
@@ -767,17 +773,6 @@ async def cold_call_seed_generator(state: Dict) -> Dict:
         "optional_types": [],
     }
     n_seeds = max(requested, SEEDS_PER_CASE_MULTIPLIER * max(1, requested // max(1, len(state.get("case_rule_objects") or [1]))))
-
-    SEED_THEMES = [
-        "CORE_UNDERSTANDING",
-        "RULE_BOUNDARY",
-        "COMPARE_DISTINGUISH",
-        "POLICY",
-        "EXAM_TRANSFER",
-        "COUNTERARGUMENT",
-        "HYPO_START",
-        "POSTURE_FOCUS",
-    ]
 
     system = (
         "You are generating diverse cold-call seed questions for a law school class. "
@@ -1491,16 +1486,17 @@ async def formatter_export_agent(state: AgentState) -> Dict:
                     await conn.execute(
                         """
                         INSERT INTO cold_call_sequences (
-                            id, run_id, note_id, case_id, case_name,
+                            id, run_id, note_id, user_id, case_id, case_name,
                             sequence_theme, sequence_index, difficulty_label,
                             question_count, coverage_tags, source_refs, metadata,
                             created_at
-                        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,NOW())
+                        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,NOW())
                         ON CONFLICT (id) DO NOTHING
                         """,
                         seq_id,
                         export_batch_id,
                         note_id or None,
+                        state.get("user_id") or None,
                         seq.get("case_id", ""),
                         seq.get("case_name", ""),
                         seq.get("sequence_theme", ""),
@@ -1508,8 +1504,8 @@ async def formatter_export_agent(state: AgentState) -> Dict:
                         (seq.get("questions") or [{}])[-1].get("difficulty_label", "medium"),
                         len(seq.get("questions") or []),
                         seq.get("coverage_tags") or [],
-                        json.dumps(seq.get("source_refs") or []),
-                        json.dumps(seq.get("metadata") or {}),
+                        seq.get("source_refs") or [],
+                        seq.get("metadata") or {},
                     )
                 except Exception as db_exc:
                     logger.warning("cold_call_sequences insert failed (non-fatal): %s", db_exc)
@@ -1538,8 +1534,8 @@ async def formatter_export_agent(state: AgentState) -> Dict:
                             q.get("question_text", ""),
                             q.get("target_skill", ""),
                             q.get("expected_answer_shape", ""),
-                            json.dumps(q.get("source_refs") or []),
-                            json.dumps(q.get("metadata") or {}),
+                            q.get("source_refs") or [],
+                            q.get("metadata") or {},
                         )
                         q_exported += 1
                     except Exception as db_exc:
