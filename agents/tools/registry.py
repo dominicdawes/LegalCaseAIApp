@@ -216,6 +216,37 @@ QUIZ_VERIFIER_TOOLS = [
     "search_passages",
 ]
 
+# ── Flashcard agent tool subsets ─────────────────────────────────────────────
+
+# head_orchestrator surveys sources; source_profiler outlines each doc
+FLASHCARD_PLANNER_TOOLS = [
+    "list_sources",
+    "get_doc_outline",
+    "find_docs_about",
+    "get_doc_metadata",
+    "count_tokens",
+]
+
+# source_profiler maps each document's structure and identified cases
+FLASHCARD_PROFILER_TOOLS = [
+    "get_doc_outline",
+    "find_sections_about",
+    "find_docs_about",
+    "get_doc_metadata",
+]
+
+# concept_extractor + flashcard_drafter retrieve evidence per concept / card spec
+FLASHCARD_RETRIEVER_TOOLS = [
+    "search_passages",
+    "hybrid_search",
+    "expand_query",
+    "find_sections_about",
+    "get_section",
+    "get_parents",
+    "get_neighbors",
+    "find_concept_across_docs",
+]
+
 # Full set — only used when explicit node routing is unavailable
 ALL_TOOLS = [
     "list_sources",
