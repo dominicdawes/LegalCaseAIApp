@@ -79,6 +79,7 @@ from utils.llm_clients.llm_factory import LLMFactory                    # Simple
 from utils.llm_clients.citation_processor import CitationProcessor      # detects citations in streaming chunks
 from utils.llm_clients.performance_monitor import PerformanceMonitor    # 🆕 Performance tracking
 from utils.llm_clients.stream_normalizer import StreamNormalizer        # Format streamed results from several providers
+from utils.llm_clients.citation_stream_buffer import CitationStreamBuffer  # GPT-style citation bracket suppression
 from utils.supabase_utils import (
     insert_note_supabase_record,
     insert_chat_message_supabase_record,
@@ -793,7 +794,9 @@ class StreamingChatManager:
         
         try:
             logger.info(f"🌊 Starting {provider} streaming with smart buffering...")
-            
+
+            citation_buffer = CitationStreamBuffer()  # suppresses [Doc, p. X] from broadcast stream
+
             # 🔀 Process each token from LLM with intelligent buffering
             async for raw_chunk in llm_client.stream_chat(context):
                 # Check for stream cancellation (throttled to ~100ms to reduce Redis load)
@@ -840,7 +843,9 @@ class StreamingChatManager:
                     last_citation_check = accumulated_content
 
                 # 🧠 Smart buffering logic
-                streaming_buffer += chunk_text
+                # 🔄 Filter through citation buffer — suppresses [Doc, p. X] from broadcast
+                for filtered_piece in citation_buffer.feed(chunk_text):
+                    streaming_buffer += filtered_piece
                 time_since_last = (time.time() - last_broadcast) * 1000  # Convert to ms
                 
                 should_send = False
@@ -885,6 +890,10 @@ class StreamingChatManager:
                         content_buffer = ""
                         last_db_update = time.time()
             
+            # 🏁 Flush citation buffer leftovers (e.g. LLM stopped mid-bracket)
+            for leftover in citation_buffer.finalize():
+                streaming_buffer += leftover
+
             # 🏁 FINAL BUFFER FLUSH - Send any remaining content
             if streaming_buffer:
                 logger.info("📤 Final buffer flush")
