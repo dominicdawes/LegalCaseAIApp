@@ -1035,7 +1035,7 @@ async def _generate_chunk_blurbs_async(
     [AGENTIC INGEST]
     Contextual retrieval: generate a 1-2 line situating blurb for every chunk.
     Provider and model are controlled by INGEST_LLM_PROVIDER / INGEST_LLM_MODEL
-    (defaults: gemini / gemini-2.0-flash-lite) and can be hot-swapped via .env.
+    (defaults: gemini / gemini-3.1-flash-lite) and can be hot-swapped via .env.
 
     For table chunks the blurb is a longer LLM-written summary that will be
     used as the embed_text (we embed the summary, not the raw markdown).

@@ -41,7 +41,7 @@ VOYAGE_API_KEY = os.getenv("VOYAGE_API_KEY", "").strip()
 # section_summary generation.  Change INGEST_LLM_PROVIDER + INGEST_LLM_MODEL
 # in .env to switch without touching code.
 INGEST_LLM_PROVIDER = os.getenv("INGEST_LLM_PROVIDER", "gemini").strip()
-INGEST_LLM_MODEL    = os.getenv("INGEST_LLM_MODEL",    "gemini-2.0-flash-lite").strip()
+INGEST_LLM_MODEL    = os.getenv("INGEST_LLM_MODEL",    "gemini-3.1-flash-lite").strip()
 
 # Max characters of document sample passed to extract_doc_* tasks
 DOC_SAMPLE_MAX_CHARS = 8_000
