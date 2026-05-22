@@ -57,6 +57,32 @@ logger = logging.getLogger(__name__)
 MAX_REVISIONS = 2
 
 
+# ── Debug helpers ─────────────────────────────────────────────────────────────
+
+def _node_start(name: str, state: Dict, **extras: Any) -> None:
+    """Log node entry with job context and any caller-supplied key/value pairs."""
+    job = (state.get("job_id") or "")[:8] or "no-job"
+    parts = " ".join(f"{k}={v}" for k, v in extras.items())
+    logger.info("▶ [%s] %s  %s", job, name, parts)
+
+
+def _node_done(name: str, state: Dict, **extras: Any) -> None:
+    """Log node completion with result summary."""
+    job = (state.get("job_id") or "")[:8] or "no-job"
+    parts = " ".join(f"{k}={v}" for k, v in extras.items())
+    logger.info("✓ [%s] %s  %s", job, name, parts)
+
+
+def _node_warn(name: str, state: Dict, msg: str) -> None:
+    """Log a non-fatal warning inside a node."""
+    job = (state.get("job_id") or "")[:8] or "no-job"
+    logger.warning("⚠ [%s] %s  %s", job, name, msg)
+
+
+def _llm_call(name: str, worker_class: str, model_name: str, max_tokens: int) -> None:
+    logger.info("  🤖 [%s] LLM %s (%s) max_tokens=%d", name, worker_class, model_name, max_tokens)
+
+
 # ── Shared helpers ────────────────────────────────────────────────────────────
 
 async def _llm(
@@ -65,9 +91,12 @@ async def _llm(
     system: str = "",
     max_tokens: int = 2048,
     provider: Optional[str] = None,
+    _node: str = "",
 ) -> str:
     from utils.llm_clients.llm_factory import LLMFactory
     _provider, model_name = _fetch_worker_model(worker_class, provider)
+    if _node:
+        _llm_call(_node, worker_class, model_name, max_tokens)
     client = LLMFactory.get_client_for(
         _provider, model_name,
         temperature=0.7, streaming=False, max_output_tokens=max_tokens,
@@ -137,6 +166,10 @@ async def head_orchestrator(state: AgentState) -> Dict:
     Reads the source list, validates IDs, determines outline mode, and produces
     a job plan that downstream nodes can consult for constraints and priorities.
     """
+    _node_start("head_orchestrator", state,
+                n_sources=len(state.get("source_ids") or []),
+                request=repr(state.get("request", "")[:80]))
+
     from agents.tools.base import make_tools
     from agents.tools.registry import ATTACK_PLANNER_TOOLS
 
@@ -148,6 +181,7 @@ async def head_orchestrator(state: AgentState) -> Dict:
     )
     list_sources_tool = next(t for t in tools if t.name == "list_sources")
     sources_json = await list_sources_tool.ainvoke({})
+    logger.info("  📋 [head_orchestrator] list_sources → %d chars", len(sources_json))
 
     system = (
         "You are the orchestrator for a T-14 law-school attack-outline generator. "
@@ -165,10 +199,12 @@ async def head_orchestrator(state: AgentState) -> Dict:
         f"Sources available:\n{sources_json}\n\nUser request: {state['request']}",
         system=system,
         max_tokens=768,
+        _node="head_orchestrator",
     )
     try:
         job_plan = _parse_json(raw)
-    except Exception:
+    except Exception as exc:
+        _node_warn("head_orchestrator", state, f"JSON parse failed ({exc}) — using default plan")
         job_plan = {
             "job_type": "attack_outline",
             "source_ids": state["source_ids"],
@@ -188,6 +224,9 @@ async def head_orchestrator(state: AgentState) -> Dict:
         artifact_type="job_plan",
         source_ids=state.get("source_ids"),
     )
+    _node_done("head_orchestrator", state,
+               mode=job_plan.get("outline_mode"), depth=job_plan.get("retrieval_depth"),
+               course_areas=job_plan.get("course_areas"))
     return {"job_plan": job_plan}
 
 
@@ -211,10 +250,12 @@ async def source_profiler(state: Dict) -> Dict:
     Profile a single source document.
     Identifies course area, document type, likely exam doctrines, and section map.
     """
+    source_id = state["source_id"]
+    _node_start("source_profiler", state, source_id=source_id[:8])
+
     from agents.tools.base import make_tools
     from agents.tools.registry import ATTACK_PROFILER_TOOLS
 
-    source_id = state["source_id"]
     project_id = state["project_id"]
 
     tools = make_tools(
@@ -226,6 +267,11 @@ async def source_profiler(state: Dict) -> Dict:
     outline_tool = next(t for t in tools if t.name == "get_doc_outline")
     outline_json = await outline_tool.ainvoke({"source_id": source_id})
     outline = json.loads(outline_json)
+
+    n_sections = len(outline.get("toc", []))
+    n_concepts = len(outline.get("doc_concepts", []))
+    logger.info("  📄 [source_profiler] source=%s  toc_entries=%d  concepts=%d",
+                source_id[:8], n_sections, n_concepts)
 
     sections_brief = json.dumps(outline.get("toc", [])[:20], indent=2)
     concepts = outline.get("doc_concepts", [])[:15]
@@ -250,10 +296,12 @@ async def source_profiler(state: Dict) -> Dict:
         f"Analyse this document for exam-outline purposes."
     )
 
-    raw = await _llm("worker_mid", prompt, system=system, max_tokens=1200)
+    raw = await _llm("worker_mid", prompt, system=system, max_tokens=1200,
+                     _node="source_profiler")
     try:
         data = _parse_json(raw)
-    except Exception:
+    except Exception as exc:
+        _node_warn("source_profiler", state, f"JSON parse failed ({exc}) — using empty profile")
         data = {}
 
     profile: SourceProfile = {
@@ -274,6 +322,10 @@ async def source_profiler(state: Dict) -> Dict:
         artifact_type="source_profile",
         source_ids=[source_id],
     )
+    _node_done("source_profiler", state,
+               source_id=source_id[:8],
+               course_area=profile["course_area"],
+               n_doctrines=len(profile["likely_exam_doctrines"]))
     return {"source_profiles": [profile]}
 
 
@@ -292,6 +344,9 @@ async def corpus_topic_mapper(state: AgentState) -> Dict:
     """
     profiles = state.get("source_profiles") or []
     job_plan = state.get("job_plan") or {}
+    _node_start("corpus_topic_mapper", state,
+                n_profiles=len(profiles),
+                course_areas=[p.get("course_area") for p in profiles])
 
     profiles_brief = [
         {
@@ -322,11 +377,12 @@ async def corpus_topic_mapper(state: AgentState) -> Dict:
         f"Map all exam-relevant topics across these documents."
     )
 
-    raw = await _llm("worker_mid", prompt, system=system, max_tokens=2048)
+    raw = await _llm("worker_mid", prompt, system=system, max_tokens=2048,
+                     _node="corpus_topic_mapper")
     try:
         topic_map: List[TopicEntry] = _parse_json(raw)
-    except Exception:
-        # Fallback: one topic per doctrine per profile
+    except Exception as exc:
+        _node_warn("corpus_topic_mapper", state, f"JSON parse failed ({exc}) — falling back to per-doctrine topics")
         topic_map = []
         for p in profiles:
             for d in p.get("likely_exam_doctrines", []):
@@ -348,6 +404,9 @@ async def corpus_topic_mapper(state: AgentState) -> Dict:
         artifact_type="topic_map",
         source_ids=state.get("source_ids"),
     )
+    _node_done("corpus_topic_mapper", state,
+               n_topics=len(topic_map),
+               priority_1=[t["label"] for t in topic_map if t.get("priority") == 1][:5])
     return {"topic_map": topic_map}
 
 
@@ -367,6 +426,9 @@ async def retrieval_planner(state: AgentState) -> Dict:
     """
     topic_map = state.get("topic_map") or []
     source_profiles = state.get("source_profiles") or []
+    _node_start("retrieval_planner", state,
+                n_topics=len(topic_map),
+                priority_topics=[t["label"] for t in topic_map if t.get("priority", 2) <= 2][:6])
 
     # Build a section-index for fast lookup
     section_index: Dict[str, List[str]] = {}
@@ -399,11 +461,12 @@ async def retrieval_planner(state: AgentState) -> Dict:
         f"User request: {state['request']}"
     )
 
-    raw = await _llm("orchestrator", prompt, system=system, max_tokens=4096)
+    raw = await _llm("orchestrator", prompt, system=system, max_tokens=4096,
+                     _node="retrieval_planner")
     try:
         plans: List[ConceptRetrievalPlan] = _parse_json(raw)
-    except Exception:
-        # Fallback: minimal plan per topic
+    except Exception as exc:
+        _node_warn("retrieval_planner", state, f"JSON parse failed ({exc}) — falling back to minimal plans")
         plans = [
             {
                 "concept_id": t["topic_id"],
@@ -431,6 +494,9 @@ async def retrieval_planner(state: AgentState) -> Dict:
         artifact_type="retrieval_plan",
         source_ids=state.get("source_ids"),
     )
+    _node_done("retrieval_planner", state,
+               n_plans=len(plans),
+               concepts=[p.get("concept_label") for p in plans[:6]])
     return {"retrieval_plans": plans}
 
 
@@ -439,9 +505,13 @@ retrieval_planner.default_worker_class = "orchestrator"
 
 def retrieval_planner_to_retriever(state: AgentState) -> List[Send]:
     """Fan-out: one planned_retriever per concept retrieval plan."""
+    plans = state.get("retrieval_plans") or []
+    if not plans:
+        logger.warning("retrieval_planner_to_retriever: no retrieval_plans — graph will halt early")
+    logger.info("→ [retrieval_planner_to_retriever] fanning out %d planned_retriever tasks", len(plans))
     return [
         Send("planned_retriever", {"plan": p, **state})
-        for p in (state.get("retrieval_plans") or [])
+        for p in plans
     ]
 
 
@@ -461,6 +531,12 @@ async def planned_retriever(state: Dict) -> Dict:
     plan: ConceptRetrievalPlan = state["plan"]
     project_id = state["project_id"]
     source_ids = plan.get("source_ids") or state.get("source_ids") or []
+    concept_label = plan.get("concept_label", plan.get("concept_id", "?"))
+
+    _node_start("planned_retriever", state,
+                concept=concept_label,
+                n_intents=len(plan.get("retrieval_intents") or []),
+                n_section_filters=len(plan.get("section_filters") or []))
 
     tools = make_tools(
         project_id,
@@ -474,6 +550,7 @@ async def planned_retriever(state: Dict) -> Dict:
 
     seen_ids: set = set()
     all_chunks: List[Dict[str, Any]] = []
+    queries_run = 0
 
     intents = plan.get("retrieval_intents") or []
     for intent in intents[:6]:  # cap intents per concept for cost control
@@ -489,11 +566,21 @@ async def planned_retriever(state: Dict) -> Dict:
                 else:
                     continue
                 chunks = json.loads(raw)
+                before = len(all_chunks)
                 for c in chunks:
-                    cid = c.get("id") or c.get("chunk_id") or ""
-                    if cid and cid not in seen_ids:
-                        seen_ids.add(cid)
+                    # Support multiple key name conventions across tool versions
+                    cid = c.get("id") or c.get("chunk_id") or c.get("chunk_uuid") or ""
+                    if cid:
+                        if cid not in seen_ids:
+                            seen_ids.add(cid)
+                            all_chunks.append(c)
+                    else:
+                        # No ID field — include the chunk; rely on score-sort for quality
                         all_chunks.append(c)
+                queries_run += 1
+                logger.debug("  🔍 [planned_retriever] concept=%s  query=%r  raw=%d  new=%d  total=%d",
+                             concept_label[:40], q[:60], len(chunks),
+                             len(all_chunks) - before, len(all_chunks))
             except Exception as exc:
                 logger.debug("planned_retriever: query '%s' failed: %s", q[:60], exc)
 
@@ -503,11 +590,14 @@ async def planned_retriever(state: Dict) -> Dict:
             if section_tool:
                 raw = await section_tool.ainvoke({"query": plan["concept_label"], "k": 8})
                 chunks = json.loads(raw)
+                before = len(all_chunks)
                 for c in chunks:
                     cid = c.get("id") or c.get("chunk_id") or ""
                     if cid and cid not in seen_ids:
                         seen_ids.add(cid)
                         all_chunks.append(c)
+                logger.debug("  📂 [planned_retriever] section_filter=%s  new=%d",
+                             section_filter, len(all_chunks) - before)
         except Exception:
             pass
 
@@ -516,6 +606,14 @@ async def planned_retriever(state: Dict) -> Dict:
         return float(c.get("score") or c.get("similarity") or 0.0)
 
     ranked = sorted(all_chunks, key=_score, reverse=True)[:30]
+
+    if not ranked:
+        _node_warn("planned_retriever", state,
+                   f"concept={concept_label!r} — 0 chunks after {queries_run} queries; "
+                   "check tool availability and chunk key names")
+    else:
+        logger.info("  ✓ [planned_retriever] concept=%s  queries_run=%d  chunks_kept=%d",
+                    concept_label[:40], queries_run, len(ranked))
 
     bundle: RankedBundle = {
         "concept_id":    plan["concept_id"],
@@ -530,9 +628,16 @@ planned_retriever.default_worker_class = "tool_only"
 
 def retriever_to_extractor(state: AgentState) -> List[Send]:
     """Fan-out: one legal_artifact_extractor per retrieval bundle."""
+    bundles = state.get("retrieval_bundles") or []
+    if not bundles:
+        logger.warning("retriever_to_extractor: no retrieval_bundles — graph will halt early")
+    else:
+        chunk_counts = [(b["concept_label"][:30], len(b["chunks"])) for b in bundles]
+        logger.info("→ [retriever_to_extractor] fanning out %d extractor tasks: %s",
+                    len(bundles), chunk_counts)
     return [
         Send("legal_artifact_extractor", {"bundle": b, **state})
-        for b in (state.get("retrieval_bundles") or [])
+        for b in bundles
     ]
 
 
@@ -549,6 +654,14 @@ async def legal_artifact_extractor(state: Dict) -> Dict:
     bundle: RankedBundle = state["bundle"]
     concept_id = bundle["concept_id"]
     concept_label = bundle["concept_label"]
+    n_chunks = len(bundle.get("chunks") or [])
+
+    _node_start("legal_artifact_extractor", state,
+                concept=concept_label[:40], n_chunks=n_chunks)
+
+    if n_chunks == 0:
+        _node_warn("legal_artifact_extractor", state,
+                   f"concept={concept_label!r} — bundle has 0 chunks; artifacts will be empty")
 
     context = "\n\n---\n\n".join(
         f"[chunk_id:{c.get('id', c.get('chunk_id', '?'))} "
@@ -587,12 +700,15 @@ async def legal_artifact_extractor(state: Dict) -> Dict:
         f"Extract all legal artifacts present."
     )
 
-    raw = await _llm("worker_mid", prompt, system=system, max_tokens=3000)
+    raw = await _llm("worker_mid", prompt, system=system, max_tokens=3000,
+                     _node="legal_artifact_extractor")
     try:
         artifacts_raw = _parse_json(raw)
         if not isinstance(artifacts_raw, list):
             artifacts_raw = []
-    except Exception:
+    except Exception as exc:
+        _node_warn("legal_artifact_extractor", state,
+                   f"concept={concept_label!r} JSON parse failed ({exc}) — 0 artifacts")
         artifacts_raw = []
 
     artifacts: List[LegalArtifact] = []
@@ -618,6 +734,11 @@ async def legal_artifact_extractor(state: Dict) -> Dict:
         artifact_type="raw_artifacts",
         source_ids=state.get("source_ids"),
     )
+    by_type = {}
+    for a in artifacts:
+        by_type[a["artifact_type"]] = by_type.get(a["artifact_type"], 0) + 1
+    _node_done("legal_artifact_extractor", state,
+               concept=concept_label[:40], n_artifacts=len(artifacts), by_type=by_type)
     return {"raw_artifacts": artifacts}
 
 
@@ -635,7 +756,9 @@ async def artifact_normalizer(state: AgentState) -> Dict:
     artifacts, and flags meaningful disagreements across sources.
     """
     raw_artifacts = state.get("raw_artifacts") or []
+    _node_start("artifact_normalizer", state, n_raw_artifacts=len(raw_artifacts))
     if not raw_artifacts:
+        _node_warn("artifact_normalizer", state, "0 raw_artifacts received — returning empty")
         return {"normalized_artifacts": []}
 
     # Group artifacts by concept_id
@@ -680,12 +803,14 @@ async def artifact_normalizer(state: AgentState) -> Dict:
         f"Normalise, deduplicate, and clean."
     )
 
-    raw = await _llm("worker_mid", prompt, system=system, max_tokens=4096)
+    raw = await _llm("worker_mid", prompt, system=system, max_tokens=4096,
+                     _node="artifact_normalizer")
     try:
         normalised: List[NormalizedArtifact] = _parse_json(raw)
         if not isinstance(normalised, list):
             normalised = []
-    except Exception:
+    except Exception as exc:
+        _node_warn("artifact_normalizer", state, f"JSON parse failed ({exc}) — using direct fallback")
         # Fallback: build minimal normalised artifacts directly from grouped data
         normalised = [
             {
@@ -709,6 +834,9 @@ async def artifact_normalizer(state: AgentState) -> Dict:
         artifact_type="normalized_artifacts",
         source_ids=state.get("source_ids"),
     )
+    _node_done("artifact_normalizer", state,
+               n_normalised=len(normalised),
+               concepts=[n.get("canonical_name", n.get("concept_id", "?"))[:30] for n in normalised[:6]])
     return {"normalized_artifacts": normalised}
 
 
@@ -726,6 +854,8 @@ async def concept_clusterer(state: AgentState) -> Dict:
     """
     normalised = state.get("normalized_artifacts") or []
     topic_map = state.get("topic_map") or []
+    _node_start("concept_clusterer", state,
+                n_normalised=len(normalised), n_topics=len(topic_map))
 
     concepts_brief = [
         {
@@ -760,12 +890,19 @@ async def concept_clusterer(state: AgentState) -> Dict:
         f"User request: {state['request']}"
     )
 
-    raw = await _llm("worker_mid", prompt, system=system, max_tokens=2048)
+    raw = await _llm("worker_mid", prompt, system=system, max_tokens=2048,
+                     _node="concept_clusterer")
     try:
         clusters: List[ConceptCluster] = _parse_json(raw)
         if not isinstance(clusters, list):
             clusters = []
-    except Exception:
+    except Exception as exc:
+        _node_warn("concept_clusterer", state, f"JSON parse failed ({exc}) — using fallbacks")
+        clusters = []
+
+    # Primary fallback: one cluster per normalised artifact
+    if not clusters and normalised:
+        logger.info("  ↩ [concept_clusterer] using primary fallback (1 cluster per artifact)")
         clusters = [
             {
                 "cluster_id":   n["concept_id"],
@@ -777,6 +914,20 @@ async def concept_clusterer(state: AgentState) -> Dict:
             for n in normalised
         ]
 
+    # Secondary fallback: one cluster per topic_map entry (no artifacts extracted)
+    if not clusters:
+        logger.info("  ↩ [concept_clusterer] using secondary fallback (1 cluster per topic_map entry)")
+        clusters = [
+            {
+                "cluster_id":   t["topic_id"],
+                "label":        t["label"],
+                "artifact_ids": [],
+                "parent_topic": "",
+                "priority":     t.get("priority", 2),
+            }
+            for t in (state.get("topic_map") or [])[:8]
+        ]
+
     await _try_save_artifact(
         state,
         artifact_key="concept_clusters",
@@ -786,6 +937,9 @@ async def concept_clusterer(state: AgentState) -> Dict:
         artifact_type="concept_clusters",
         source_ids=state.get("source_ids"),
     )
+    _node_done("concept_clusterer", state,
+               n_clusters=len(clusters),
+               labels=[c["label"][:30] for c in clusters[:6]])
     return {"concept_clusters": clusters}
 
 
@@ -802,6 +956,7 @@ async def doctrine_graph_builder(state: AgentState) -> Dict:
     conditional transitions between doctrine blocks.
     """
     clusters = state.get("concept_clusters") or []
+    _node_start("doctrine_graph_builder", state, n_clusters=len(clusters))
 
     cluster_info = [
         {
@@ -833,12 +988,15 @@ async def doctrine_graph_builder(state: AgentState) -> Dict:
         f"Build the if/then doctrine analysis graph."
     )
 
-    raw = await _llm("orchestrator", prompt, system=system, max_tokens=2048)
+    raw = await _llm("orchestrator", prompt, system=system, max_tokens=2048,
+                     _node="doctrine_graph_builder")
     try:
         graph_data = _parse_json(raw)
         nodes = graph_data.get("nodes", [])
         edges = graph_data.get("edges", [])
-    except Exception:
+    except Exception as exc:
+        _node_warn("doctrine_graph_builder", state,
+                   f"JSON parse failed ({exc}) — using linear fallback graph")
         nodes = [{"id": c["cluster_id"], "label": c["label"]} for c in clusters]
         edges = []
 
@@ -853,6 +1011,8 @@ async def doctrine_graph_builder(state: AgentState) -> Dict:
         artifact_type="doctrine_graph",
         source_ids=state.get("source_ids"),
     )
+    _node_done("doctrine_graph_builder", state,
+               n_nodes=len(nodes), n_edges=len(edges))
     return {"doctrine_graph": doctrine_graph}
 
 
@@ -862,6 +1022,8 @@ doctrine_graph_builder.default_worker_class = "orchestrator"
 def doctrine_to_block_builder(state: AgentState) -> List[Send]:
     """Fan-out: one attack_block_builder per concept cluster."""
     clusters = state.get("concept_clusters") or []
+    logger.info("→ [doctrine_to_block_builder] fanning out %d attack_block_builder tasks: %s",
+                len(clusters), [c["label"][:25] for c in clusters[:6]])
     return [
         Send("attack_block_builder", {"cluster": c, **state})
         for c in clusters
@@ -887,6 +1049,11 @@ async def attack_block_builder(state: Dict) -> Dict:
     cluster_cids = set(cluster.get("artifact_ids", [cluster["cluster_id"]]))
     relevant_normalised = [n for n in normalised if n["concept_id"] in cluster_cids]
     relevant_raw = [a for a in raw_artifacts if a["concept_id"] in cluster_cids]
+
+    _node_start("attack_block_builder", state,
+                cluster=cluster["label"][:40],
+                n_normalised=len(relevant_normalised),
+                n_raw=len(relevant_raw))
 
     # Build source-grounded context from raw artifacts
     rules_text     = "\n".join(n.get("rules", []) for n in relevant_normalised for _ in [None])
@@ -934,10 +1101,13 @@ async def attack_block_builder(state: Dict) -> Dict:
         f"Build the attack block."
     )
 
-    raw = await _llm("worker_mid", prompt, system=system, max_tokens=2500)
+    raw = await _llm("worker_mid", prompt, system=system, max_tokens=2500,
+                     _node="attack_block_builder")
     try:
         data = _parse_json(raw)
-    except Exception:
+    except Exception as exc:
+        _node_warn("attack_block_builder", state,
+                   f"cluster={cluster['label']!r} JSON parse failed ({exc}) — using empty block")
         data = {}
 
     block: AttackBlock = {
@@ -960,6 +1130,10 @@ async def attack_block_builder(state: Dict) -> Dict:
         artifact_type="attack_block",
         source_ids=state.get("source_ids"),
     )
+    _node_done("attack_block_builder", state,
+               cluster=cluster["label"][:40],
+               n_steps=len(block.get("attack_steps", [])),
+               n_traps=len(block.get("exam_traps", [])))
     return {"raw_blocks": [block]}
 
 
@@ -1016,8 +1190,32 @@ async def attack_outline_assembler(state: AgentState) -> Dict:
     raw_blocks = state.get("raw_blocks") or []
     doctrine_graph = state.get("doctrine_graph") or {"nodes": [], "edges": []}
 
+    _node_start("attack_outline_assembler", state,
+                n_raw_blocks=len(raw_blocks),
+                n_graph_nodes=len(doctrine_graph.get("nodes", [])),
+                n_graph_edges=len(doctrine_graph.get("edges", [])))
+
     if not raw_blocks:
-        return {"assembled_outline": "", "attack_blocks": []}
+        # No blocks were built — generate a minimal stub outline from topic_map
+        # so the graph can still reach final_compressor_formatter with some output.
+        topic_map = state.get("topic_map") or []
+        stub_sections = [
+            f"## {t['label']}\n\n"
+            f"**Trigger:** Analyse {t['label']} when the fact pattern raises this issue.\n\n"
+            f"*[Retrieval produced insufficient evidence for this doctrine. "
+            f"Please check source document quality and retry with additional sources.]*"
+            for t in topic_map[:8]
+        ]
+        stub_outline = "\n\n---\n\n".join(stub_sections) if stub_sections else (
+            "*Attack outline generation did not produce sufficient content. "
+            "The source documents may not contain enough doctrine coverage. "
+            "Please upload more comprehensive sources and retry.*"
+        )
+        _node_warn("attack_outline_assembler", state,
+                   f"no raw_blocks — stub outline from {len(topic_map)} topic_map entries")
+        _node_done("attack_outline_assembler", state,
+                   path="stub", n_blocks=0, outline_chars=len(stub_outline))
+        return {"assembled_outline": stub_outline, "attack_blocks": []}
 
     ordered_blocks = _topological_order(raw_blocks, doctrine_graph)
 
@@ -1088,6 +1286,9 @@ async def attack_outline_assembler(state: AgentState) -> Dict:
         artifact_type="assembled_outline",
         source_ids=state.get("source_ids"),
     )
+    _node_done("attack_outline_assembler", state,
+               path="full", n_blocks=len(ordered_blocks),
+               outline_chars=len(assembled))
     return {
         "assembled_outline": assembled,
         "attack_blocks": ordered_blocks,  # working list for revision + verifier
@@ -1097,9 +1298,21 @@ async def attack_outline_assembler(state: AgentState) -> Dict:
 attack_outline_assembler.default_worker_class = "tool_only"
 
 
-def assembler_to_verifier(state: AgentState) -> List[Send]:
-    """Fan-out: one grounding_verifier per attack block."""
+def assembler_to_verifier(state: AgentState):
+    """
+    Fan-out: one grounding_verifier per attack block.
+    Falls back to 'final_compressor_formatter' (string route) when there are
+    no blocks — an empty List[Send] would terminate the graph silently.
+    """
     blocks = state.get("attack_blocks") or []
+    if not blocks:
+        logger.warning(
+            "assembler_to_verifier: no attack_blocks in state — "
+            "routing directly to final_compressor_formatter"
+        )
+        return "final_compressor_formatter"
+    logger.info("→ [assembler_to_verifier] fanning out %d grounding_verifier tasks: %s",
+                len(blocks), [b.get("title", b["concept_id"])[:25] for b in blocks[:6]])
     return [
         Send("grounding_verifier", {"block": b, **state})
         for b in blocks
@@ -1121,6 +1334,10 @@ async def grounding_verifier(state: Dict) -> Dict:
     block: AttackBlock = state["block"]
     project_id = state["project_id"]
 
+    _node_start("grounding_verifier", state,
+                block_id=block["concept_id"][:20],
+                title=block.get("title", "?")[:40])
+
     tools = make_tools(
         project_id,
         source_ids=state.get("source_ids", []),
@@ -1129,6 +1346,10 @@ async def grounding_verifier(state: Dict) -> Dict:
     )
     verify_tool = next((t for t in tools if t.name == "verify_claim"), None)
     cite_tool   = next((t for t in tools if t.name == "get_citations_for"), None)
+
+    if not verify_tool:
+        _node_warn("grounding_verifier", state,
+                   f"block={block.get('title', '?')!r} — verify_claim tool unavailable; all claims marked weak")
 
     # Extract claims: rules + elements from attack steps
     claims_to_verify: List[str] = []
@@ -1201,6 +1422,12 @@ async def grounding_verifier(state: Dict) -> Dict:
         artifact_type="verification_report",
         source_ids=state.get("source_ids"),
     )
+    _node_done("grounding_verifier", state,
+               block=block.get("title", block["concept_id"])[:30],
+               verdict=overall,
+               n_supported=len(supported),
+               n_unsupported=len(unsupported),
+               n_weak=len(weak))
     return {"verification_reports": [report]}
 
 
@@ -1225,6 +1452,13 @@ async def attack_outline_critic(state: AgentState) -> Dict:
     # Summarise verification verdicts
     verdict_summary = {r["block_id"]: r["overall_verdict"] for r in verification_reports}
     failed_blocks = [bid for bid, v in verdict_summary.items() if v == "fail"]
+
+    _node_start("attack_outline_critic", state,
+                n_blocks=len(attack_blocks),
+                n_verifications=len(verification_reports),
+                n_failed=len(failed_blocks),
+                revision_count=state.get("revision_count", 0),
+                outline_chars=len(assembled))
 
     # Abbreviate outline for critic (avoid token overflow)
     outline_excerpt = assembled[:4000] if len(assembled) > 4000 else assembled
@@ -1255,10 +1489,13 @@ async def attack_outline_critic(state: AgentState) -> Dict:
         f"Evaluate this attack outline."
     )
 
-    raw = await _llm("orchestrator", prompt, system=system, max_tokens=1024)
+    raw = await _llm("orchestrator", prompt, system=system, max_tokens=1024,
+                     _node="attack_outline_critic")
     try:
         data = _parse_json(raw)
-    except Exception:
+    except Exception as exc:
+        _node_warn("attack_outline_critic", state,
+                   f"JSON parse failed ({exc}) — defaulting to pass (score=7.0, must_revise=False)")
         data = {}
 
     # Ensure failed grounding blocks are always in revision_targets
@@ -1292,6 +1529,11 @@ async def attack_outline_critic(state: AgentState) -> Dict:
         artifact_type="critique",
         source_ids=state.get("source_ids"),
     )
+    _node_done("attack_outline_critic", state,
+               overall_score=critique["overall_score"],
+               must_revise=critique["must_revise"],
+               n_targets=len(critique["revision_targets"]),
+               revision_targets=critique["revision_targets"][:4])
     return {"critique": critique}
 
 
@@ -1305,10 +1547,17 @@ def should_revise(state: AgentState) -> str:
     """
     count = state.get("revision_count") or 0
     if count >= MAX_REVISIONS:
+        logger.info("→ [should_revise] revision_count=%d >= MAX_REVISIONS=%d → final_compressor_formatter",
+                    count, MAX_REVISIONS)
         return "final_compressor_formatter"
     critique = state.get("critique")
     if critique and critique.get("must_revise") and critique.get("revision_targets"):
+        logger.info("→ [should_revise] must_revise=True  targets=%s  count=%d → revision_agent",
+                    critique.get("revision_targets", [])[:4], count)
         return "revision_agent"
+    score = (critique or {}).get("overall_score", "?")
+    logger.info("→ [should_revise] must_revise=False  score=%s  count=%d → final_compressor_formatter",
+                score, count)
     return "final_compressor_formatter"
 
 
@@ -1330,6 +1579,12 @@ async def revision_agent(state: AgentState) -> Dict:
     instructions = critique.get("revision_instructions") or ""
     attack_blocks = list(state.get("attack_blocks") or [])
     doctrine_graph = state.get("doctrine_graph") or {"nodes": [], "edges": []}
+
+    _node_start("revision_agent", state,
+                revision_count=(state.get("revision_count") or 0) + 1,
+                n_targets=len(targets),
+                targets=targets[:4],
+                n_blocks=len(attack_blocks))
 
     tools = make_tools(
         state["project_id"],
@@ -1373,7 +1628,8 @@ async def revision_agent(state: AgentState) -> Dict:
             f"Revise this block to address the critique."
         )
 
-        raw = await _llm("worker_mid", prompt, system=system, max_tokens=2000)
+        raw = await _llm("worker_mid", prompt, system=system, max_tokens=2000,
+                         _node="revision_agent")
         try:
             revised_data = _parse_json(raw)
             revised_block: AttackBlock = {
@@ -1387,8 +1643,10 @@ async def revision_agent(state: AgentState) -> Dict:
                 "revised":            True,
             }
             revised_map[target_id] = revised_block
-        except Exception:
+        except Exception as exc:
             # Fallback: mark the original as revised without content change
+            _node_warn("revision_agent", state,
+                       f"target={target_id!r} JSON parse failed ({exc}) — keeping original block")
             updated = dict(block)
             updated["revised"] = True
             revised_map[target_id] = updated  # type: ignore[assignment]
@@ -1448,6 +1706,12 @@ async def revision_agent(state: AgentState) -> Dict:
 
     revised_outline = "\n\n---\n\n".join(sections)
 
+    n_revised = sum(1 for b in updated_blocks if b.get("revised"))
+    _node_done("revision_agent", state,
+               n_blocks=len(updated_blocks),
+               n_revised=n_revised,
+               outline_chars=len(revised_outline),
+               new_revision_count=(state.get("revision_count") or 0) + 1)
     return {
         "attack_blocks":    updated_blocks,
         "assembled_outline": revised_outline,
@@ -1473,8 +1737,21 @@ async def final_compressor_formatter(state: AgentState) -> Dict:
     attack_blocks = state.get("attack_blocks") or []
     budget = state.get("budget") or {}
 
+    _node_start("final_compressor_formatter", state,
+                assembled_chars=len(assembled),
+                n_blocks=len(attack_blocks),
+                revision_count=state.get("revision_count", 0))
+
     if not assembled:
-        return {"final_output": ""}
+        _node_warn("final_compressor_formatter", state,
+                   "assembled_outline is empty — returning error stub")
+        return {
+            "final_output": (
+                "*Attack outline generation produced no content. "
+                "The source documents may lack sufficient legal doctrine coverage. "
+                "Please upload additional sources and retry.*"
+            )
+        }
 
     system = (
         "You are a law-exam prep editor. Format the attack outline for student use. "
@@ -1496,7 +1773,8 @@ async def final_compressor_formatter(state: AgentState) -> Dict:
         f"Format for exam-day student use."
     )
 
-    formatted = await _llm("worker_low", prompt, system=system, max_tokens=6000)
+    formatted = await _llm("worker_low", prompt, system=system, max_tokens=6000,
+                           _node="final_compressor_formatter")
 
     # Append budget comment
     budget_note = (
@@ -1517,6 +1795,10 @@ async def final_compressor_formatter(state: AgentState) -> Dict:
         artifact_type="final_output",
         source_ids=state.get("source_ids"),
     )
+    _node_done("final_compressor_formatter", state,
+               final_chars=len(final),
+               n_blocks=len(attack_blocks),
+               revision_count=state.get("revision_count", 0))
     return {"final_output": final}
 
 

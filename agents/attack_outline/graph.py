@@ -148,7 +148,14 @@ def _build_graph(checkpointer):
     builder.add_edge("attack_block_builder", "attack_outline_assembler")
 
     # attack_outline_assembler → parallel grounding_verifier (one per block)
-    builder.add_conditional_edges("attack_outline_assembler", assembler_to_verifier)
+    # OR → final_compressor_formatter directly when no blocks were produced.
+    # The path_map entry tells LangGraph that the string route is valid;
+    # the List[Send] branch needs no entry (LangGraph handles it automatically).
+    builder.add_conditional_edges(
+        "attack_outline_assembler",
+        assembler_to_verifier,
+        {"final_compressor_formatter": "final_compressor_formatter"},
+    )
 
     # all grounding_verifier branches merge → attack_outline_critic
     builder.add_edge("grounding_verifier", "attack_outline_critic")
