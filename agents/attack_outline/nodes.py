@@ -771,7 +771,15 @@ async def legal_artifact_extractor(state: Dict) -> Dict:
         "  source_refs: [{source_id, chunk_id, page}] for each supporting chunk\n"
         "  confidence: 0.0-1.0\n\n"
         "Extract only what is explicitly supported by the provided context. "
-        "Do NOT invent or paraphrase without support. Return only the JSON array."
+        "Do NOT invent or paraphrase without support. Return only the JSON array.\n\n"
+        "BUDGET RULES — follow strictly:\n"
+        "• Return at most 6 artifacts total across all types. Prioritise: "
+        "rule_card → element_card → case_card → exception_card → issue_trigger_card → exam_trap_card.\n"
+        "• text field: max 3 sentences.\n"
+        "• elements / exceptions lists: max 4 items each.\n"
+        "• source_refs per artifact: max 2 entries.\n"
+        "• Omit artifact types with no direct support in the context — do NOT generate them.\n"
+        "• Output nothing outside the JSON array."
     )
 
     prompt = (
@@ -1168,7 +1176,15 @@ async def attack_block_builder(state: Dict) -> Dict:
         "  source_refs: list of chunk_ids supporting this block overall\n"
         "  revised: false\n\n"
         "Keep each attack_step focused. Argue BOTH sides in arguments_for/against. "
-        "Return only JSON."
+        "Return only JSON.\n\n"
+        "BUDGET RULES — follow strictly:\n"
+        "• attack_steps: maximum 5 steps. Merge minor sub-issues into one step rather than splitting.\n"
+        "• rule field per step: one sentence, black-letter only — no examples.\n"
+        "• ask list per step: max 3 questions.\n"
+        "• arguments_for / arguments_against: max 2 items each, ≤ 15 words per item.\n"
+        "• exceptions_or_limits: max 3 items.\n"
+        "• exam_traps: max 3 items.\n"
+        "• Output nothing outside the JSON object."
     )
 
     prompt = (
