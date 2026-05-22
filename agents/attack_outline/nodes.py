@@ -923,7 +923,7 @@ async def artifact_normalizer(state: AgentState) -> Dict:
     return {"normalized_artifacts": normalised}
 
 
-artifact_normalizer.default_worker_class = "worker_mid"
+artifact_normalizer.default_worker_class = "worker_low"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1027,7 +1027,7 @@ async def concept_clusterer(state: AgentState) -> Dict:
     return {"concept_clusters": clusters}
 
 
-concept_clusterer.default_worker_class = "worker_mid"
+concept_clusterer.default_worker_class = "worker_low"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
