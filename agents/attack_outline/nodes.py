@@ -780,7 +780,7 @@ async def legal_artifact_extractor(state: Dict) -> Dict:
         f"Extract all legal artifacts present."
     )
 
-    raw = await _llm("worker_mid", prompt, system=system, max_tokens=3500,
+    raw = await _llm("worker_mid", prompt, system=system, max_tokens=7090,
                      _node="legal_artifact_extractor")
     try:
         artifacts_raw = _parse_json(raw)
@@ -1184,7 +1184,7 @@ async def attack_block_builder(state: Dict) -> Dict:
         f"Build the attack block."
     )
 
-    raw = await _llm("worker_mid", prompt, system=system, max_tokens=2500,
+    raw = await _llm("worker_mid", prompt, system=system, max_tokens=6090,
                      _node="attack_block_builder")
     try:
         data = _parse_json(raw)
