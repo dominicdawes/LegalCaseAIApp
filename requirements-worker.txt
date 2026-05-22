@@ -19,6 +19,7 @@ openai>=1.54.0
 tiktoken==0.7.0
 anthropic==0.29.0
 google-cloud-aiplatform==1.56.0
+google-generativeai>=0.8.0  # <-- Add this for Google AI Studio support
 
 # LangChain / LangGraph
 langchain==0.2.5

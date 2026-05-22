@@ -6,37 +6,54 @@ import asyncio
 import time
 from dotenv import load_dotenv
 
-import vertexai
-from vertexai.generative_models import (
-    GenerativeModel, GenerationConfig, HarmCategory, HarmBlockThreshold
-)
-from google.oauth2 import service_account
-from google.api_core import exceptions as google_exceptions
+# --- VERTEX AI IMPORTS (Commented out) ---
+# import vertexai
+# from vertexai.generative_models import (
+#     GenerativeModel, GenerationConfig, HarmCategory, HarmBlockThreshold
+# )
+# from google.oauth2 import service_account
+# from google.api_core import exceptions as google_exceptions
+
+# --- GOOGLE AI STUDIO IMPORTS ---
+import google.generativeai as genai
+from google.generativeai.types import HarmCategory, HarmBlockThreshold
 
 load_dotenv()
 
-# Configuration
-GOOGLE_PROJECT_ID = os.getenv("GEMINI_PROJECT_ID", "").strip()
-GEMINI_LOCATION = os.getenv("GEMINI_LOCATION", "us-central1").strip()
-CREDENTIALS_JSON_STR = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON", "")
-CREDENTIALS_FILE_PATH = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_FILE", "")
+# --- VERTEX AI CONFIGURATION (@AGENT: Not using Vertex/GPC at the moment) ---
+# GOOGLE_PROJECT_ID = os.getenv("GEMINI_PROJECT_ID", "").strip()
+# GEMINI_LOCATION = os.getenv("GEMINI_LOCATION", "us-central1").strip()
+# CREDENTIALS_JSON_STR = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON", "")
+# CREDENTIALS_FILE_PATH = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_FILE", "")
+#
+# if not GOOGLE_PROJECT_ID:
+#     raise ValueError("GEMINI_PROJECT_ID environment variable not set")
+#
+# # Initialize Vertex AI
+# try:
+#     if CREDENTIALS_FILE_PATH:
+#         credentials = service_account.Credentials.from_service_account_file(CREDENTIALS_FILE_PATH)
+#         vertexai.init(project=GOOGLE_PROJECT_ID, location=GEMINI_LOCATION, credentials=credentials)
+#     elif CREDENTIALS_JSON_STR:
+#         info = json.loads(CREDENTIALS_JSON_STR)
+#         credentials = service_account.Credentials.from_service_account_info(info)
+#         vertexai.init(project=GOOGLE_PROJECT_ID, location=GEMINI_LOCATION, credentials=credentials)
+#     else:
+#         vertexai.init(project=GOOGLE_PROJECT_ID, location=GEMINI_LOCATION)
+# except Exception as e:
+#     raise RuntimeError(f"Failed to initialize Vertex AI: {e}")
 
-if not GOOGLE_PROJECT_ID:
-    raise ValueError("GEMINI_PROJECT_ID environment variable not set")
+# --- GOOGLE AI STUDIO CONFIGURATION ---
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY_AI_STUDIO", "").strip()
 
-# Initialize Vertex AI
+if not GEMINI_API_KEY:
+    raise ValueError("GEMINI_API_KEY_AI_STUDIO environment variable not set")
+
 try:
-    if CREDENTIALS_FILE_PATH:
-        credentials = service_account.Credentials.from_service_account_file(CREDENTIALS_FILE_PATH)
-        vertexai.init(project=GOOGLE_PROJECT_ID, location=GEMINI_LOCATION, credentials=credentials)
-    elif CREDENTIALS_JSON_STR:
-        info = json.loads(CREDENTIALS_JSON_STR)
-        credentials = service_account.Credentials.from_service_account_info(info)
-        vertexai.init(project=GOOGLE_PROJECT_ID, location=GEMINI_LOCATION, credentials=credentials)
-    else:
-        vertexai.init(project=GOOGLE_PROJECT_ID, location=GEMINI_LOCATION)
+    genai.configure(api_key=GEMINI_API_KEY)
 except Exception as e:
-    raise RuntimeError(f"Failed to initialize Vertex AI: {e}")
+    raise RuntimeError(f"Failed to configure Google AI Studio: {e}")
+
 
 class GeminiClient:
     """
@@ -63,7 +80,16 @@ class GeminiClient:
         self.callback_manager = callback_manager
         self.max_tokens = max_output_tokens
         
-        self.generation_config = GenerationConfig(
+        # --- VERTEX AI CONFIG (@AGENT: Not using GCP/Vertex right now, Commented out) ---
+        # self.generation_config = GenerationConfig(
+        #     temperature=temperature,
+        #     max_output_tokens=max_output_tokens,
+        #     top_p=top_p,
+        #     top_k=top_k
+        # )
+
+        # --- GOOGLE AI STUDIO CONFIG ---
+        self.generation_config = genai.types.GenerationConfig(
             temperature=temperature,
             max_output_tokens=max_output_tokens,
             top_p=top_p,
@@ -80,7 +106,11 @@ class GeminiClient:
                 HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
             }
         
-        self._model = GenerativeModel(self.model_name)
+        # --- VERTEX AI MODEL INIT (@AGENT: Not using GCP/Vertex right now, Commented out) ---
+        # self._model = GenerativeModel(self.model_name)
+
+        # --- GOOGLE AI STUDIO MODEL INIT ---
+        self._model = genai.GenerativeModel(self.model_name)
 
     def _handle_response(self, response):
         """Extract text from Gemini response with safety checking"""
@@ -122,65 +152,11 @@ class GeminiClient:
         except Exception as e:
             raise RuntimeError(f"Gemini API error: {e}")
 
-    # def stream_chat(self, prompt: str, system_prompt: str = None):
-    #     """Stream chat response with optional system prompt"""
-    #     try:
-    #         if system_prompt:
-    #             full_prompt = f"{system_prompt}\n\n{prompt}"
-    #         else:
-    #             full_prompt = prompt
-            
-    #         # Only pass safety_settings if enabled
-    #         kwargs = {
-    #             "generation_config": self.generation_config,
-    #             "stream": True
-    #         }
-    #         if self.safety_settings:
-    #             kwargs["safety_settings"] = self.safety_settings
-            
-    #         response_stream = self._model.generate_content(full_prompt, **kwargs)
-            
-    #         for chunk in response_stream:
-    #             if chunk.text:
-    #                 yield chunk.text
-                    
-    #     except Exception as e:
-    #         raise RuntimeError(f"Gemini streaming error: {e}")
-
-    # # Add retry methods for consistency with other clients
-    # def chat_with_retry(self, prompt: str, max_retries: int = 3, system_prompt: str = None) -> str:
-    #     """Chat with automatic retry on provider outage"""
-    #     for attempt in range(max_retries):
-    #         try:
-    #             return self.chat(prompt, system_prompt)
-    #         except Exception as e:
-    #             if attempt == max_retries - 1:
-    #                 raise Exception(f"Gemini failed after {max_retries} attempts: {e}")
-                
-    #             wait_time = 2 ** attempt
-    #             print(f"⚠️ Gemini attempt {attempt + 1} failed: {e}. Retrying in {wait_time}s...")
-    #             time.sleep(wait_time)
-
-    # async def stream_chat_with_retry(self, prompt: str, max_retries: int = 3, system_prompt: str = None):
-    #     """Streaming chat with retry logic"""
-    #     for attempt in range(max_retries):
-    #         try:
-    #             for chunk in self.stream_chat(prompt, system_prompt):
-    #                 yield chunk
-    #             return
-    #         except Exception as e:
-    #             if attempt == max_retries - 1:
-    #                 raise Exception(f"Gemini streaming failed after {max_retries} attempts: {e}")
-                
-    #             wait_time = 2 ** attempt
-    #             print(f"⚠️ Gemini streaming attempt {attempt + 1} failed: {e}. Retrying in {wait_time}s...")
-    #             await asyncio.sleep(wait_time)
-
     #  Labeled as 'FIX 1'
     async def stream_chat(self, prompt: str, system_prompt: str = None):
         """Stream chat response without blocking the async event loop.
 
-        The Vertex AI SDK's streaming iterator is synchronous — each next() call
+        The AI Studio SDK's streaming iterator is synchronous — each next() call
         blocks until the next network chunk arrives.  Running it in a thread and
         bridging via asyncio.Queue lets the event loop stay free to handle Redis
         publishes and WebSocket sends between chunks.
