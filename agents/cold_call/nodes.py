@@ -131,10 +131,23 @@ async def _try_save_artifact(
 
 
 def _parse_json(raw: str) -> Any:
+    """Strip markdown code fences then parse JSON. Raises json.JSONDecodeError on failure.
+    Automatically emits a 😵‍💫 warning when the failure looks like output truncation.
+    """
+    import inspect
     text = raw.strip()
     text = re.sub(r'^```(?:json)?\s*', '', text)
     text = re.sub(r'\s*```$', '', text)
-    return json.loads(text.strip())
+    try:
+        return json.loads(text.strip())
+    except json.JSONDecodeError as exc:
+        frame = inspect.currentframe()
+        try:
+            caller = frame.f_back.f_code.co_name if frame and frame.f_back else "?"
+        finally:
+            del frame
+        _check_token_limit(exc, caller, {})
+        raise
 
 
 def _check_token_limit(exc: Exception, node_name: str, state: Dict) -> None:
