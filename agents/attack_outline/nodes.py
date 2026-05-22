@@ -51,20 +51,20 @@ from .state import (
     VerificationReport,
 )
 from .worker_config import _fetch_worker_model, model_costs
+from utils.llm_clients.anthropic_rate_limits import get_llm_semaphore
 
 logger = logging.getLogger(__name__)
 
 MAX_REVISIONS = 2
 
 # ── Rate-limit guard ──────────────────────────────────────────────────────────
-# Cap concurrent LLM calls to stay within org-level output-token rate limits.
-# Anthropic Tier-1 allows only 8 000 output tokens/min for claude-sonnet-4-6.
-# With a semaphore of 2 and typical ~3 500 tokens per parallel extractor call,
-# at most 7 000 tokens are in-flight simultaneously — just under the limit.
-# Raise this value only after upgrading the org to a higher Anthropic tier.
-_LLM_SEMAPHORE = asyncio.Semaphore(2)
+# The semaphore is now DYNAMIC — sized from the org's actual Anthropic tier by
+# utils/llm_clients/anthropic_rate_limits.py (hourly heartbeat probe).
+# Tier 1 (8 K tok/min) → Semaphore(2); Tier 2 (80 K tok/min) → Semaphore(10), etc.
+# These constants control the 429-retry loop that fires when the semaphore alone
+# isn't enough (e.g. burst of sequential nodes that together exceed the minute bucket).
 _LLM_RATE_LIMIT_RETRIES = 3   # additional attempts after the first 429
-_LLM_RATE_LIMIT_DELAY   = 60  # seconds to wait before each retry (linear backoff)
+_LLM_RATE_LIMIT_DELAY   = 60  # seconds to wait before each retry (linear: 60, 120, 180 s)
 
 
 # ── Debug helpers ─────────────────────────────────────────────────────────────
@@ -105,9 +105,10 @@ async def _llm(
 ) -> str:
     """Call the LLM with rate-limit protection.
 
-    Acquires a global semaphore before each call so that at most
-    _LLM_SEMAPHORE.value concurrent calls run at the same time — keeping
-    total output token throughput within the org-level rate limit.
+    Acquires a dynamic semaphore (sized to the org's Anthropic tier via
+    utils/llm_clients/anthropic_rate_limits.py) before each call, capping
+    concurrency to keep total output token throughput within the org's
+    tokens-per-minute limit.
 
     On a 429 RateLimitError, waits _LLM_RATE_LIMIT_DELAY seconds and retries
     up to _LLM_RATE_LIMIT_RETRIES times before re-raising.  This prevents the
@@ -123,7 +124,7 @@ async def _llm(
         temperature=0.7, streaming=False, max_output_tokens=max_tokens,
     )
 
-    async with _LLM_SEMAPHORE:
+    async with await get_llm_semaphore():
         for attempt in range(_LLM_RATE_LIMIT_RETRIES + 1):
             try:
                 if hasattr(client, "achat"):
