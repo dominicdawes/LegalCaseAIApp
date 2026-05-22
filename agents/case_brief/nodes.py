@@ -140,6 +140,20 @@ def _parse_json(raw: str) -> Any:
     return json.loads(text.strip())
 
 
+def _check_token_limit(exc: Exception, node_name: str, state: Dict) -> None:
+    """
+    Detect when a JSON parse failure was caused by output truncation (max_tokens hit).
+    'Unterminated string' / 'Unexpected end' are the json module's tell-tale messages
+    when the LLM response was cut off mid-JSON.
+    Logs a distinct 😵‍💫 line so token-limit failures are instantly recognisable in logs.
+    """
+    err = str(exc).lower()
+    if "unterminated string" in err or "unexpected end" in err or "end of data" in err:
+        job = (state.get("job_id") or "")[:8] or "no-job"
+        logger.warning("😵‍💫 [%s] %s  Output-token-limit error — response truncated mid-JSON; "
+                       "increase max_tokens for this node", job, node_name)
+
+
 def _add_budget(state: AgentState, model_name: str, in_tok: int, out_tok: int) -> Dict:
     in_cost, out_cost = model_costs(model_name)
     delta = in_tok * in_cost + out_tok * out_cost

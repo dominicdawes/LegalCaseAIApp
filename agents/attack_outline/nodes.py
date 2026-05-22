@@ -146,6 +146,20 @@ def _parse_json(raw: str) -> Any:
     return json.loads(text.strip())
 
 
+def _check_token_limit(exc: Exception, node_name: str, state: Dict) -> None:
+    """
+    Detect when a JSON parse failure was caused by output truncation (max_tokens hit).
+    'Unterminated string' / 'Unexpected end' are the json module's tell-tale messages
+    when the LLM response was cut off mid-JSON.
+    Logs a distinct 😵‍💫 line so token-limit failures are instantly recognisable in logs.
+    """
+    err = str(exc).lower()
+    if "unterminated string" in err or "unexpected end" in err or "end of data" in err:
+        job = (state.get("job_id") or "")[:8] or "no-job"
+        logger.warning("😵‍💫 [%s] %s  Output-token-limit error — response truncated mid-JSON; "
+                       "increase max_tokens for this node", job, node_name)
+
+
 def _add_budget(state: AgentState, model_name: str, in_tok: int, out_tok: int) -> Dict:
     in_cost, out_cost = model_costs(model_name)
     delta = in_tok * in_cost + out_tok * out_cost
@@ -204,6 +218,7 @@ async def head_orchestrator(state: AgentState) -> Dict:
     try:
         job_plan = _parse_json(raw)
     except Exception as exc:
+        _check_token_limit(exc, "head_orchestrator", state)
         _node_warn("head_orchestrator", state, f"JSON parse failed ({exc}) — using default plan")
         job_plan = {
             "job_type": "attack_outline",
@@ -273,9 +288,11 @@ async def source_profiler(state: Dict) -> Dict:
     logger.info("  📄 [source_profiler] source=%s  toc_entries=%d  concepts=%d",
                 source_id[:8], n_sections, n_concepts)
 
-    sections_brief = json.dumps(outline.get("toc", [])[:20], indent=2)
-    concepts = outline.get("doc_concepts", [])[:15]
-    doc_summary = outline.get("doc_summary") or ""
+    # Cap input sizes to avoid inflating the output beyond max_tokens
+    toc_entries = outline.get("toc", [])[:12]          # was [:20] — shorten to keep output tight
+    sections_brief = json.dumps(toc_entries, indent=2)
+    concepts = outline.get("doc_concepts", [])[:10]    # was [:15]
+    doc_summary = (outline.get("doc_summary") or "")[:600]
 
     system = (
         "You are a law professor analysing a legal source document. "
@@ -284,8 +301,8 @@ async def source_profiler(state: Dict) -> Dict:
         "  document_type: string (lecture_notes | casebook | outline | statute | other)\n"
         "  document_summary: string (2-3 sentences)\n"
         "  likely_exam_doctrines: array of {doctrine, sections (list of section_ids), "
-        "priority (high|medium|low), reason}\n"
-        "  section_map: array of {section_id, heading, summary} for the 10 most important sections\n"
+        "priority (high|medium|low), reason} — at most 10 entries\n"
+        "  section_map: array of {section_id, heading, summary} for the 8 most important sections\n"
         "Return only JSON — no other text."
     )
 
@@ -296,13 +313,33 @@ async def source_profiler(state: Dict) -> Dict:
         f"Analyse this document for exam-outline purposes."
     )
 
-    raw = await _llm("worker_mid", prompt, system=system, max_tokens=1200,
+    raw = await _llm("worker_mid", prompt, system=system, max_tokens=3500,
                      _node="source_profiler")
     try:
         data = _parse_json(raw)
     except Exception as exc:
-        _node_warn("source_profiler", state, f"JSON parse failed ({exc}) — using empty profile")
-        data = {}
+        _check_token_limit(exc, "source_profiler", state)
+        _node_warn("source_profiler", state, f"JSON parse failed ({exc}) — building minimal fallback profile from doc outline")
+        # Build a minimal but usable profile from the raw doc outline so
+        # corpus_topic_mapper's per-doctrine fallback has something to work with.
+        fallback_doctrines = []
+        for entry in toc_entries[:8]:
+            heading = entry.get("heading") or entry.get("title") or entry.get("section_id") or ""
+            if heading:
+                tid = re.sub(r'\W+', '_', heading.lower())[:40]
+                fallback_doctrines.append({
+                    "doctrine": heading,
+                    "sections": [entry.get("section_id", tid)],
+                    "priority": "medium",
+                    "reason": "Extracted from document table of contents",
+                })
+        data = {
+            "course_area": "Law",
+            "document_type": "other",
+            "document_summary": doc_summary[:500],
+            "likely_exam_doctrines": fallback_doctrines,
+            "section_map": [],
+        }
 
     profile: SourceProfile = {
         "source_id": source_id,
@@ -377,11 +414,12 @@ async def corpus_topic_mapper(state: AgentState) -> Dict:
         f"Map all exam-relevant topics across these documents."
     )
 
-    raw = await _llm("worker_mid", prompt, system=system, max_tokens=2048,
+    raw = await _llm("worker_mid", prompt, system=system, max_tokens=4096,
                      _node="corpus_topic_mapper")
     try:
         topic_map: List[TopicEntry] = _parse_json(raw)
     except Exception as exc:
+        _check_token_limit(exc, "corpus_topic_mapper", state)
         _node_warn("corpus_topic_mapper", state, f"JSON parse failed ({exc}) — falling back to per-doctrine topics")
         topic_map = []
         for p in profiles:
@@ -466,6 +504,7 @@ async def retrieval_planner(state: AgentState) -> Dict:
     try:
         plans: List[ConceptRetrievalPlan] = _parse_json(raw)
     except Exception as exc:
+        _check_token_limit(exc, "retrieval_planner", state)
         _node_warn("retrieval_planner", state, f"JSON parse failed ({exc}) — falling back to minimal plans")
         plans = [
             {
@@ -707,6 +746,7 @@ async def legal_artifact_extractor(state: Dict) -> Dict:
         if not isinstance(artifacts_raw, list):
             artifacts_raw = []
     except Exception as exc:
+        _check_token_limit(exc, "legal_artifact_extractor", state)
         _node_warn("legal_artifact_extractor", state,
                    f"concept={concept_label!r} JSON parse failed ({exc}) — 0 artifacts")
         artifacts_raw = []
@@ -810,6 +850,7 @@ async def artifact_normalizer(state: AgentState) -> Dict:
         if not isinstance(normalised, list):
             normalised = []
     except Exception as exc:
+        _check_token_limit(exc, "artifact_normalizer", state)
         _node_warn("artifact_normalizer", state, f"JSON parse failed ({exc}) — using direct fallback")
         # Fallback: build minimal normalised artifacts directly from grouped data
         normalised = [
@@ -897,6 +938,7 @@ async def concept_clusterer(state: AgentState) -> Dict:
         if not isinstance(clusters, list):
             clusters = []
     except Exception as exc:
+        _check_token_limit(exc, "concept_clusterer", state)
         _node_warn("concept_clusterer", state, f"JSON parse failed ({exc}) — using fallbacks")
         clusters = []
 
@@ -988,13 +1030,14 @@ async def doctrine_graph_builder(state: AgentState) -> Dict:
         f"Build the if/then doctrine analysis graph."
     )
 
-    raw = await _llm("orchestrator", prompt, system=system, max_tokens=2048,
+    raw = await _llm("orchestrator", prompt, system=system, max_tokens=3000,
                      _node="doctrine_graph_builder")
     try:
         graph_data = _parse_json(raw)
         nodes = graph_data.get("nodes", [])
         edges = graph_data.get("edges", [])
     except Exception as exc:
+        _check_token_limit(exc, "doctrine_graph_builder", state)
         _node_warn("doctrine_graph_builder", state,
                    f"JSON parse failed ({exc}) — using linear fallback graph")
         nodes = [{"id": c["cluster_id"], "label": c["label"]} for c in clusters]
@@ -1106,6 +1149,7 @@ async def attack_block_builder(state: Dict) -> Dict:
     try:
         data = _parse_json(raw)
     except Exception as exc:
+        _check_token_limit(exc, "attack_block_builder", state)
         _node_warn("attack_block_builder", state,
                    f"cluster={cluster['label']!r} JSON parse failed ({exc}) — using empty block")
         data = {}
@@ -1494,6 +1538,7 @@ async def attack_outline_critic(state: AgentState) -> Dict:
     try:
         data = _parse_json(raw)
     except Exception as exc:
+        _check_token_limit(exc, "attack_outline_critic", state)
         _node_warn("attack_outline_critic", state,
                    f"JSON parse failed ({exc}) — defaulting to pass (score=7.0, must_revise=False)")
         data = {}
@@ -1645,6 +1690,7 @@ async def revision_agent(state: AgentState) -> Dict:
             revised_map[target_id] = revised_block
         except Exception as exc:
             # Fallback: mark the original as revised without content change
+            _check_token_limit(exc, "revision_agent", state)
             _node_warn("revision_agent", state,
                        f"target={target_id!r} JSON parse failed ({exc}) — keeping original block")
             updated = dict(block)
