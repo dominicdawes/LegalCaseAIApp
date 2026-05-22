@@ -151,26 +151,33 @@ def setup_loggers(logger, **kwargs):
         # Configure all your task module loggers
         task_modules = [
             'tasks.upload_tasks',
-            'tasks.note_tasks', 
+            'tasks.note_tasks',
             'tasks.chat_tasks',
             'tasks.chat_streaming_tasks',
             'tasks.profile_tasks',
-            'tasks.sample_tasks'
+            'tasks.sample_tasks',
+            # Agent pipeline — one entry covers all agents.*.nodes/graph/ledger sub-loggers
+            'agents',
+            'utils.llm_clients',
         ]
-        
+
         for module_name in task_modules:
             module_logger = logging.getLogger(module_name)
             module_logger.addHandler(handler)
             module_logger.setLevel(logging.INFO)
             module_logger.propagate = False
-        
+
         print("✅ Manual logs enabled")
     else:
         # Disable manual logs by setting high threshold
-        for module_name in ['tasks.upload_tasks', 'tasks.note_tasks', 'tasks.chat_tasks', 'tasks.chat_streaming_tasks', 'tasks.sample_tasks']:
+        for module_name in [
+            'tasks.upload_tasks', 'tasks.note_tasks', 'tasks.chat_tasks',
+            'tasks.chat_streaming_tasks', 'tasks.sample_tasks',
+            'agents', 'utils.llm_clients',
+        ]:
             module_logger = logging.getLogger(module_name)
             module_logger.setLevel(logging.ERROR)  # Only errors
-        
+
         print("🔇 Manual logs disabled")
 
 # ——— Celery Configuration ————————————————————————————————————————————————————————
