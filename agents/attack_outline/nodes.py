@@ -774,7 +774,7 @@ async def legal_artifact_extractor(state: Dict) -> Dict:
         "Do NOT invent or paraphrase without support. Return only the JSON array.\n\n"
         "BUDGET RULES — follow strictly:\n"
         "• Return at most 6 artifacts total across all types. Prioritise: "
-        "rule_card → element_card → case_card → exception_card → issue_trigger_card → exam_trap_card.\n"
+        "rule_card → element_card → defense_card → exception_card → issue_trigger_card → case_card.\n"
         "• text field: max 3 sentences.\n"
         "• elements / exceptions lists: max 4 items each.\n"
         "• source_refs per artifact: max 2 entries.\n"
