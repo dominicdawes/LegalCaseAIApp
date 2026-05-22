@@ -10,11 +10,14 @@ import logging
 import os
 from typing import List
 
+from dotenv import load_dotenv
 from langchain_core.tools import tool
 
 from .base import ToolContext
 
+# ——— Logging & Env Load ───────────────────────────────────────────────────────
 logger = logging.getLogger(__name__)
+load_dotenv()
 
 
 def build_discovery_tools(ctx: ToolContext) -> list:

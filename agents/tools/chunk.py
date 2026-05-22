@@ -11,11 +11,14 @@ import logging
 import os
 from typing import List, Optional
 
+from dotenv import load_dotenv
 from langchain_core.tools import tool
 
 from .base import ToolContext
 
+# ——— Logging & Env Load ───────────────────────────────────────────────────────
 logger = logging.getLogger(__name__)
+load_dotenv()
 
 _CHUNK_SUMMARY_KEYS = ("id", "source_id", "chunk_type", "section_path",
                        "page_number", "chunk_index", "similarity",

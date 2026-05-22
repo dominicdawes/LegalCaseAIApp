@@ -14,6 +14,11 @@ Override provider with env var QUIZ_AGENT_PROVIDER (default: anthropic).
 import os
 from typing import Dict, Optional, Tuple
 
+from dotenv import load_dotenv
+
+# ——— Logging & Env Load ───────────────────────────────────────────────────────
+load_dotenv()
+
 WorkerClass = str  # Literal["tool_only", "worker_low", "worker_mid", "orchestrator"]
 
 DEFAULT_PROVIDER: str = os.getenv("QUIZ_AGENT_PROVIDER", "anthropic")

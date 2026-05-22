@@ -32,7 +32,11 @@ import os
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator, Dict, List, Optional
 
+from dotenv import load_dotenv
+
+# ——— Logging & Env Load ───────────────────────────────────────────────────────
 logger = logging.getLogger(__name__)
+load_dotenv()
 
 USE_QUIZ_AGENT = os.getenv("USE_QUIZ_AGENT", "false").lower() == "true"
 

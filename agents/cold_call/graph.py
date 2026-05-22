@@ -39,7 +39,11 @@ import os
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator, Dict, List, Optional
 
+from dotenv import load_dotenv
+
+# ——— Logging & Env Load ───────────────────────────────────────────────────────
 logger = logging.getLogger(__name__)
+load_dotenv()
 
 USE_COLD_CALL_AGENT = os.getenv("USE_COLD_CALL_AGENT", "false").lower() == "true"
 

@@ -13,8 +13,12 @@ import logging
 import os
 from typing import List, Optional
 
+from dotenv import load_dotenv
+
 from tasks.database import get_db_connection, get_global_async_db_pool, init_async_pools
 from .types import RetrievedChunk, SearchFilters, vec_to_pg
+
+load_dotenv()
 
 logger = logging.getLogger(__name__)
 

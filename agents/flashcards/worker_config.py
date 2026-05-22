@@ -12,6 +12,11 @@ Tier map:
 import os
 from typing import Dict, Optional, Tuple
 
+from dotenv import load_dotenv
+
+# ——— Logging & Env Load ───────────────────────────────────────────────────────
+load_dotenv()
+
 WorkerClass = str  # Literal["tool_only", "worker_low", "worker_mid", "orchestrator"]
 
 DEFAULT_PROVIDER: str = os.getenv("FLASHCARD_AGENT_PROVIDER", "anthropic")

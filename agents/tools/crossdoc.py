@@ -9,11 +9,14 @@ import logging
 import os
 from typing import Optional
 
+from dotenv import load_dotenv
 from langchain_core.tools import tool
 
 from .base import ToolContext
 
+# ——— Logging & Env Load ───────────────────────────────────────────────────────
 logger = logging.getLogger(__name__)
+load_dotenv()
 
 
 def build_crossdoc_tools(ctx: ToolContext) -> list:

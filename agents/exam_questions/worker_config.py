@@ -13,6 +13,11 @@ Usage:
 import os
 from typing import Dict, Optional, Tuple
 
+from dotenv import load_dotenv
+
+# ——— Logging & Env Load ───────────────────────────────────────────────────────
+load_dotenv()
+
 # ── Type alias ────────────────────────────────────────────────────────────────
 # "tool_only"   — no LLM, purely tool/deterministic logic
 # "worker_low"  — cheapest model; fast routing, grounding, claim extraction
