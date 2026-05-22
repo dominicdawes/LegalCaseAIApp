@@ -56,6 +56,16 @@ logger = logging.getLogger(__name__)
 
 MAX_REVISIONS = 2
 
+# ── Rate-limit guard ──────────────────────────────────────────────────────────
+# Cap concurrent LLM calls to stay within org-level output-token rate limits.
+# Anthropic Tier-1 allows only 8 000 output tokens/min for claude-sonnet-4-6.
+# With a semaphore of 2 and typical ~3 500 tokens per parallel extractor call,
+# at most 7 000 tokens are in-flight simultaneously — just under the limit.
+# Raise this value only after upgrading the org to a higher Anthropic tier.
+_LLM_SEMAPHORE = asyncio.Semaphore(2)
+_LLM_RATE_LIMIT_RETRIES = 3   # additional attempts after the first 429
+_LLM_RATE_LIMIT_DELAY   = 60  # seconds to wait before each retry (linear backoff)
+
 
 # ── Debug helpers ─────────────────────────────────────────────────────────────
 
@@ -93,6 +103,17 @@ async def _llm(
     provider: Optional[str] = None,
     _node: str = "",
 ) -> str:
+    """Call the LLM with rate-limit protection.
+
+    Acquires a global semaphore before each call so that at most
+    _LLM_SEMAPHORE.value concurrent calls run at the same time — keeping
+    total output token throughput within the org-level rate limit.
+
+    On a 429 RateLimitError, waits _LLM_RATE_LIMIT_DELAY seconds and retries
+    up to _LLM_RATE_LIMIT_RETRIES times before re-raising.  This prevents the
+    entire LangGraph run from crashing when a burst of parallel calls (e.g.
+    legal_artifact_extractor fan-out) temporarily exhausts the token bucket.
+    """
     from utils.llm_clients.llm_factory import LLMFactory
     _provider, model_name = _fetch_worker_model(worker_class, provider)
     if _node:
@@ -101,12 +122,32 @@ async def _llm(
         _provider, model_name,
         temperature=0.7, streaming=False, max_output_tokens=max_tokens,
     )
-    if hasattr(client, "achat"):
-        return await client.achat(prompt, system_prompt=system or None)
-    chunks: List[str] = []
-    async for chunk in client.stream_chat(prompt, system_prompt=system or None):
-        chunks.append(chunk)
-    return "".join(chunks)
+
+    async with _LLM_SEMAPHORE:
+        for attempt in range(_LLM_RATE_LIMIT_RETRIES + 1):
+            try:
+                if hasattr(client, "achat"):
+                    return await client.achat(prompt, system_prompt=system or None)
+                chunks: List[str] = []
+                async for chunk in client.stream_chat(prompt, system_prompt=system or None):
+                    chunks.append(chunk)
+                return "".join(chunks)
+            except Exception as exc:
+                err = str(exc)
+                is_rate_limit = (
+                    "429" in err
+                    or "rate_limit" in err.lower()
+                    or "rate limit" in err.lower()
+                )
+                if is_rate_limit and attempt < _LLM_RATE_LIMIT_RETRIES:
+                    wait = _LLM_RATE_LIMIT_DELAY * (attempt + 1)  # 60, 120, 180 s
+                    logger.warning(
+                        "🚦 [%s] Rate limit hit (429) — waiting %ds before retry %d/%d",
+                        _node or worker_class, wait, attempt + 1, _LLM_RATE_LIMIT_RETRIES,
+                    )
+                    await asyncio.sleep(wait)
+                    continue
+                raise
 
 
 async def _try_save_artifact(
@@ -499,7 +540,7 @@ async def retrieval_planner(state: AgentState) -> Dict:
         f"User request: {state['request']}"
     )
 
-    raw = await _llm("orchestrator", prompt, system=system, max_tokens=4096,
+    raw = await _llm("orchestrator", prompt, system=system, max_tokens=6000,
                      _node="retrieval_planner")
     try:
         plans: List[ConceptRetrievalPlan] = _parse_json(raw)
@@ -739,7 +780,7 @@ async def legal_artifact_extractor(state: Dict) -> Dict:
         f"Extract all legal artifacts present."
     )
 
-    raw = await _llm("worker_mid", prompt, system=system, max_tokens=3000,
+    raw = await _llm("worker_mid", prompt, system=system, max_tokens=3500,
                      _node="legal_artifact_extractor")
     try:
         artifacts_raw = _parse_json(raw)
