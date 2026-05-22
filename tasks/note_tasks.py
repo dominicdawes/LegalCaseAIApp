@@ -1102,7 +1102,7 @@ class AsyncNoteManager:
         persisted_ids = final_state.get("persisted_question_ids") or []
         num_persisted = len(persisted_ids)
 
-        ref_sources = [uuid.UUID(sid) for sid in source_ids] if source_ids else []
+        ref_sources = [str(sid) for sid in source_ids] if source_ids else []
         async with get_db_connection() as conn:
             await conn.execute(
                 """
@@ -1111,7 +1111,7 @@ class AsyncNoteManager:
                     is_generated         = $2,
                     is_essential         = $3,
                     num_sources_based_on = $4,
-                    referenced_sources   = $5,
+                    referenced_sources   = $5::uuid[],
                     note_progress_status = 'COMPLETE',
                     error_message        = NULL
                 WHERE id = $6
@@ -1222,7 +1222,11 @@ class AsyncNoteManager:
                 logger.warning(f"Ledger completion update failed (non-fatal): {ledger_exc}")
 
         # ── Persist the outline markdown to the notes stub ────────────────────
-        ref_sources = [uuid.UUID(sid) for sid in source_ids] if source_ids else []
+        # Pass source_ids as strings with an explicit ::uuid[] cast so asyncpg
+        # sends a text array and Postgres handles the str→uuid coercion.
+        # Passing uuid.UUID objects directly triggers "expected str, got UUID"
+        # when the array codec infers text[] from the Python list type.
+        ref_sources = [str(sid) for sid in source_ids] if source_ids else []
         async with get_db_connection() as conn:
             await conn.execute(
                 """
@@ -1231,7 +1235,7 @@ class AsyncNoteManager:
                     is_generated         = $2,
                     is_essential         = $3,
                     num_sources_based_on = $4,
-                    referenced_sources   = $5,
+                    referenced_sources   = $5::uuid[],
                     note_progress_status = 'COMPLETE',
                     error_message        = NULL
                 WHERE id = $6
@@ -1339,7 +1343,7 @@ class AsyncNoteManager:
                 logger.warning(f"Ledger completion update failed (non-fatal): {ledger_exc}")
 
         # ── Persist the brief markdown to the notes stub ──────────────────────
-        ref_sources = [uuid.UUID(sid) for sid in source_ids] if source_ids else []
+        ref_sources = [str(sid) for sid in source_ids] if source_ids else []
         async with get_db_connection() as conn:
             await conn.execute(
                 """
@@ -1348,7 +1352,7 @@ class AsyncNoteManager:
                     is_generated         = $2,
                     is_essential         = $3,
                     num_sources_based_on = $4,
-                    referenced_sources   = $5,
+                    referenced_sources   = $5::uuid[],
                     note_progress_status = 'COMPLETE',
                     error_message        = NULL
                 WHERE id = $6
@@ -1461,7 +1465,7 @@ class AsyncNoteManager:
                 logger.warning(f"Ledger completion update failed (non-fatal): {ledger_exc}")
 
         # ── Persist the markdown summary to the notes stub ────────────────────
-        ref_sources = [uuid.UUID(sid) for sid in source_ids] if source_ids else []
+        ref_sources = [str(sid) for sid in source_ids] if source_ids else []
         export_result = final_state.get("export_result") or {}
         num_sequences = export_result.get("question_sequences_exported", 0)
 
@@ -1473,7 +1477,7 @@ class AsyncNoteManager:
                     is_generated         = $2,
                     is_essential         = $3,
                     num_sources_based_on = $4,
-                    referenced_sources   = $5,
+                    referenced_sources   = $5::uuid[],
                     note_progress_status = 'COMPLETE',
                     error_message        = NULL
                 WHERE id = $6
