@@ -93,6 +93,15 @@ def _llm_call(name: str, worker_class: str, model_name: str, max_tokens: int) ->
     logger.info("  🤖 [%s] LLM %s (%s) max_tokens=%d", name, worker_class, model_name, max_tokens)
 
 
+def _dbg_artifact(node: str, data: Any) -> None:
+    """Temporary: log first 500 chars of a node artifact for in-flight debugging. Remove before prod."""
+    try:
+        preview = json.dumps(data, default=str)[:500]
+    except Exception:
+        preview = str(data)[:500]
+    logger.info("  📦 [%s] artifact(500): %s", node, preview)
+
+
 # ── Shared helpers ────────────────────────────────────────────────────────────
 
 async def _llm(
@@ -259,6 +268,7 @@ async def head_orchestrator(state: AgentState) -> Dict:
     )
     try:
         job_plan = _parse_json(raw)
+        _dbg_artifact("head_orchestrator", job_plan)
     except Exception as exc:
         _check_token_limit(exc, "head_orchestrator", state)
         _node_warn("head_orchestrator", state, f"JSON parse failed ({exc}) — using default plan")
@@ -361,6 +371,7 @@ async def source_profiler(state: Dict) -> Dict:
                      _node="source_profiler")
     try:
         data = _parse_json(raw)
+        _dbg_artifact("source_profiler", data)
     except Exception as exc:
         _check_token_limit(exc, "source_profiler", state)
         _node_warn("source_profiler", state, f"JSON parse failed ({exc}) — building minimal fallback profile from doc outline")
@@ -462,6 +473,7 @@ async def corpus_topic_mapper(state: AgentState) -> Dict:
                      _node="corpus_topic_mapper")
     try:
         topic_map: List[TopicEntry] = _parse_json(raw)
+        _dbg_artifact("corpus_topic_mapper", topic_map)
     except Exception as exc:
         _check_token_limit(exc, "corpus_topic_mapper", state)
         _node_warn("corpus_topic_mapper", state, f"JSON parse failed ({exc}) — falling back to per-doctrine topics")
@@ -547,6 +559,7 @@ async def retrieval_planner(state: AgentState) -> Dict:
                      _node="retrieval_planner")
     try:
         plans: List[ConceptRetrievalPlan] = _parse_json(raw)
+        _dbg_artifact("retrieval_planner", plans)
     except Exception as exc:
         _check_token_limit(exc, "retrieval_planner", state)
         _node_warn("retrieval_planner", state, f"JSON parse failed ({exc}) — falling back to minimal plans")
@@ -794,6 +807,7 @@ async def legal_artifact_extractor(state: Dict) -> Dict:
         artifacts_raw = _parse_json(raw)
         if not isinstance(artifacts_raw, list):
             artifacts_raw = []
+        _dbg_artifact("legal_artifact_extractor", artifacts_raw)
     except Exception as exc:
         _check_token_limit(exc, "legal_artifact_extractor", state)
         _node_warn("legal_artifact_extractor", state,
@@ -892,12 +906,13 @@ async def artifact_normalizer(state: AgentState) -> Dict:
         f"Normalise, deduplicate, and clean."
     )
 
-    raw = await _llm("worker_mid", prompt, system=system, max_tokens=4096,
+    raw = await _llm("worker_low", prompt, system=system, max_tokens=7000,
                      _node="artifact_normalizer")
     try:
         normalised: List[NormalizedArtifact] = _parse_json(raw)
         if not isinstance(normalised, list):
             normalised = []
+        _dbg_artifact("artifact_normalizer", normalised)
     except Exception as exc:
         _check_token_limit(exc, "artifact_normalizer", state)
         _node_warn("artifact_normalizer", state, f"JSON parse failed ({exc}) — using direct fallback")
@@ -980,12 +995,13 @@ async def concept_clusterer(state: AgentState) -> Dict:
         f"User request: {state['request']}"
     )
 
-    raw = await _llm("worker_mid", prompt, system=system, max_tokens=2048,
+    raw = await _llm("worker_low", prompt, system=system, max_tokens=2048,
                      _node="concept_clusterer")
     try:
         clusters: List[ConceptCluster] = _parse_json(raw)
         if not isinstance(clusters, list):
             clusters = []
+        _dbg_artifact("concept_clusterer", clusters)
     except Exception as exc:
         _check_token_limit(exc, "concept_clusterer", state)
         _node_warn("concept_clusterer", state, f"JSON parse failed ({exc}) — using fallbacks")
@@ -1085,6 +1101,7 @@ async def doctrine_graph_builder(state: AgentState) -> Dict:
         graph_data = _parse_json(raw)
         nodes = graph_data.get("nodes", [])
         edges = graph_data.get("edges", [])
+        _dbg_artifact("doctrine_graph_builder", graph_data)
     except Exception as exc:
         _check_token_limit(exc, "doctrine_graph_builder", state)
         _node_warn("doctrine_graph_builder", state,
@@ -1147,9 +1164,11 @@ async def attack_block_builder(state: Dict) -> Dict:
                 n_raw=len(relevant_raw))
 
     # Build source-grounded context from raw artifacts
-    rules_text     = "\n".join(n.get("rules", []) for n in relevant_normalised for _ in [None])
-    elements_text  = json.dumps(list({el for n in relevant_normalised for el in n.get("elements", [])}))
-    exceptions_text = json.dumps(list({ex for n in relevant_normalised for ex in n.get("exceptions", [])}))
+    rules_text     = "\n".join(
+        r for n in relevant_normalised for r in (n.get("rules") or []) if isinstance(r, str)
+    )
+    elements_text  = json.dumps(list({el for n in relevant_normalised for el in (n.get("elements") or []) if isinstance(el, str)}))
+    exceptions_text = json.dumps(list({ex for n in relevant_normalised for ex in (n.get("exceptions") or []) if isinstance(ex, str)}))
     issue_triggers = [a["text"] for a in relevant_raw if a["artifact_type"] == "issue_trigger_card"][:3]
     defenses       = [a["text"] for a in relevant_raw if a["artifact_type"] == "defense_card"][:3]
     exam_traps_src = [a["text"] for a in relevant_raw if a["artifact_type"] == "exam_trap_card"][:4]
@@ -1204,6 +1223,7 @@ async def attack_block_builder(state: Dict) -> Dict:
                      _node="attack_block_builder")
     try:
         data = _parse_json(raw)
+        _dbg_artifact("attack_block_builder", data)
     except Exception as exc:
         _check_token_limit(exc, "attack_block_builder", state)
         _node_warn("attack_block_builder", state,
@@ -1592,6 +1612,7 @@ async def attack_outline_critic(state: AgentState) -> Dict:
                      _node="attack_outline_critic")
     try:
         data = _parse_json(raw)
+        _dbg_artifact("attack_outline_critic", data)
     except Exception as exc:
         _check_token_limit(exc, "attack_outline_critic", state)
         _node_warn("attack_outline_critic", state,
@@ -1732,6 +1753,7 @@ async def revision_agent(state: AgentState) -> Dict:
                          _node="revision_agent")
         try:
             revised_data = _parse_json(raw)
+            _dbg_artifact("revision_agent", revised_data)
             revised_block: AttackBlock = {
                 "concept_id":         block["concept_id"],
                 "title":              revised_data.get("title", block["title"]),
