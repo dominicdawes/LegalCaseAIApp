@@ -200,9 +200,11 @@ head_orchestrator.default_worker_class = "worker_mid"
 
 def head_orchestrator_to_profiler(state: AgentState) -> List[Send]:
     """Fan-out: one source_profiler per source document."""
+    source_ids = state["source_ids"]
+    logger.info("quiz x%d node fan out for source_profiler", len(source_ids))
     return [
         Send("source_profiler", {"source_id": sid, **state})
-        for sid in state["source_ids"]
+        for sid in source_ids
     ]
 
 

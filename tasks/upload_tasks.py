@@ -119,6 +119,12 @@ USE_LIGHTRAG_INTEGRATION = False
 USE_HIERARCHICAL_INGEST = os.getenv("USE_HIERARCHICAL_INGEST", "false").lower() == "true"
 USE_VOYAGE_EMBEDDINGS   = os.getenv("USE_VOYAGE_EMBEDDINGS",   "false").lower() == "true"
 
+# ── Ingest LLM — hot-swappable via env vars ──────────────────────────────────
+# Controls the provider/model used for chunk blurb generation.
+# Must match the same vars read by hierarchical_ingest_tasks.py.
+INGEST_LLM_PROVIDER = os.getenv("INGEST_LLM_PROVIDER", "gemini").strip()
+INGEST_LLM_MODEL    = os.getenv("INGEST_LLM_MODEL",    "gemini-3.1-flash-lite").strip()
+
 # Queue configuration
 INGEST_QUEUE = 'ingest'
 PARSE_QUEUE = 'parsing'
@@ -1027,8 +1033,9 @@ async def _generate_chunk_blurbs_async(
 ) -> List[Dict]:
     """
     [AGENTIC INGEST]
-    Contextual retrieval: generate a 1-2 line situating blurb for every chunk
-    using Haiku 4.5 with prompt-caching on the full document text.
+    Contextual retrieval: generate a 1-2 line situating blurb for every chunk.
+    Provider and model are controlled by INGEST_LLM_PROVIDER / INGEST_LLM_MODEL
+    (defaults: gemini / gemini-2.0-flash-lite) and can be hot-swapped via .env.
 
     For table chunks the blurb is a longer LLM-written summary that will be
     used as the embed_text (we embed the summary, not the raw markdown).
@@ -1042,17 +1049,29 @@ async def _generate_chunk_blurbs_async(
 
     Returns the updated metadatas list.
     """
-    ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "").strip()
-    if not ANTHROPIC_API_KEY:
-        logger.warning("⚠️ ANTHROPIC_API_KEY not set — skipping blurb generation")
-        return metadatas
+    from utils.llm_clients.llm_factory import LLMFactory
 
     short_id = doc_id[:8]
 
-    # Build the cached system context from the first ~50k chars of the document
+    # Build document context passed as system prompt to every chunk call
     full_doc_text = "\n\n".join(chunks)[:50_000]
+    system_prompt = (
+        "You are a legal-document analyst helping to build a retrieval index.\n\n"
+        f"<document>\n{full_doc_text}\n</document>"
+    )
 
-    # Semaphore caps concurrent Haiku calls (prompt cache keeps these cheap)
+    # One client per document — reused across all concurrent blurb calls
+    try:
+        client = LLMFactory.get_client_for(
+            INGEST_LLM_PROVIDER, INGEST_LLM_MODEL,
+            temperature=0.2, streaming=False, max_output_tokens=200,
+        )
+    except Exception as e:
+        logger.warning(f"⚠️ [BLURB-{short_id}] Could not create ingest LLM client ({INGEST_LLM_PROVIDER}/{INGEST_LLM_MODEL}): {e} — skipping blurbs")
+        return metadatas
+
+    loop = asyncio.get_event_loop()
+    # Semaphore caps concurrent calls to avoid rate-limit exhaustion
     semaphore = asyncio.Semaphore(10)
 
     async def _blurb_one(idx: int, text: str, meta: Dict) -> tuple:
@@ -1078,34 +1097,10 @@ async def _generate_chunk_blurbs_async(
 
         async with semaphore:
             try:
-                async with httpx.AsyncClient(timeout=45.0) as client:
-                    resp = await client.post(
-                        "https://api.anthropic.com/v1/messages",
-                        headers={
-                            "x-api-key": ANTHROPIC_API_KEY,
-                            "anthropic-version": "2023-06-01",
-                            "anthropic-beta": "prompt-caching-2024-07-31",
-                            "content-type": "application/json",
-                        },
-                        json={
-                            "model": "claude-haiku-4-5-20251001",
-                            "max_tokens": 200,
-                            "system": [
-                                {
-                                    "type": "text",
-                                    "text": (
-                                        "You are a legal-document analyst helping to build "
-                                        "a retrieval index.\n\n"
-                                        f"<document>\n{full_doc_text}\n</document>"
-                                    ),
-                                    "cache_control": {"type": "ephemeral"},
-                                }
-                            ],
-                            "messages": [{"role": "user", "content": user_msg}],
-                        },
-                    )
-                    resp.raise_for_status()
-                    blurb = resp.json()["content"][0]["text"].strip()
+                blurb = await loop.run_in_executor(
+                    None, lambda: client.chat(user_msg, system_prompt)
+                )
+                blurb = blurb.strip()
             except Exception as e:
                 logger.debug(f"Blurb gen failed for chunk {idx}: {e}")
                 blurb = ""
@@ -1132,7 +1127,7 @@ async def _generate_chunk_blurbs_async(
             updated[idx] = meta
 
     n_ok = sum(1 for r in results if isinstance(r, tuple) and r[1].get('chunk_summary'))
-    logger.info(f"📝 [BLURB-{short_id}] {n_ok}/{len(chunks)} blurbs generated")
+    logger.info(f"📝 [BLURB-{short_id}] {n_ok}/{len(chunks)} blurbs generated via {INGEST_LLM_PROVIDER}/{INGEST_LLM_MODEL}")
     return updated
 
 

@@ -22,7 +22,6 @@ import uuid
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
-import httpx
 from celery.utils.log import get_task_logger
 from dotenv import load_dotenv
 
@@ -35,14 +34,14 @@ logger.propagate = False
 
 # ——— Config ———————————————————————————————————————————————————————————————————
 
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "").strip()
 VOYAGE_API_KEY = os.getenv("VOYAGE_API_KEY", "").strip()
 
-# Cheap model for doc-level metadata extraction
-CHEAP_MODEL = "claude-haiku-4-5-20251001"
-
-# Section summary model (same cheap tier)
-SECTION_SUMMARY_MODEL = "claude-haiku-4-5-20251001"
+# ── Ingest LLM — hot-swappable via env vars ──────────────────────────────────
+# Controls which provider/model is used for doc_summary, doc_concepts, and
+# section_summary generation.  Change INGEST_LLM_PROVIDER + INGEST_LLM_MODEL
+# in .env to switch without touching code.
+INGEST_LLM_PROVIDER = os.getenv("INGEST_LLM_PROVIDER", "gemini").strip()
+INGEST_LLM_MODEL    = os.getenv("INGEST_LLM_MODEL",    "gemini-2.0-flash-lite").strip()
 
 # Max characters of document sample passed to extract_doc_* tasks
 DOC_SAMPLE_MAX_CHARS = 8_000
@@ -51,29 +50,22 @@ DOC_SAMPLE_MAX_CHARS = 8_000
 SECTION_TEXT_MAX_CHARS = 4_000
 
 
-# ——— Shared HTTP helper ——————————————————————————————————————————————————————
+# ——— Shared LLM helper ———————————————————————————————————————————————————————
 
 
-async def _call_anthropic_simple(prompt: str, max_tokens: int = 256) -> str:
-    """Minimal Anthropic call (no caching) for doc-level metadata extraction."""
-    if not ANTHROPIC_API_KEY:
-        raise ValueError("ANTHROPIC_API_KEY not set")
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        resp = await client.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={
-                "x-api-key": ANTHROPIC_API_KEY,
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json",
-            },
-            json={
-                "model": CHEAP_MODEL,
-                "max_tokens": max_tokens,
-                "messages": [{"role": "user", "content": prompt}],
-            },
-        )
-        resp.raise_for_status()
-        return resp.json()["content"][0]["text"].strip()
+async def _call_ingest_llm(prompt: str, max_tokens: int = 256) -> str:
+    """
+    Single-turn completion using the configured ingest LLM.
+    Provider and model are read from INGEST_LLM_PROVIDER / INGEST_LLM_MODEL
+    so they can be hot-swapped via .env without code changes.
+    """
+    from utils.llm_clients.llm_factory import LLMFactory
+    loop = asyncio.get_event_loop()
+    client = LLMFactory.get_client_for(
+        INGEST_LLM_PROVIDER, INGEST_LLM_MODEL,
+        temperature=0.2, streaming=False, max_output_tokens=max_tokens,
+    )
+    return await loop.run_in_executor(None, lambda: client.chat(prompt))
 
 
 # ——— Task: extract_doc_summary ————————————————————————————————————————————————
@@ -109,7 +101,7 @@ async def _extract_doc_summary_async(source_id: str, doc_sample_text: str) -> st
         f"DOCUMENT EXCERPT:\n{doc_sample_text[:DOC_SAMPLE_MAX_CHARS]}"
     )
 
-    summary = await _call_anthropic_simple(prompt, max_tokens=80)
+    summary = await _call_ingest_llm(prompt, max_tokens=80)
     summary = summary[:140]  # hard cap
 
     async with get_db_connection() as conn:
@@ -155,7 +147,7 @@ async def _extract_doc_concepts_async(source_id: str, doc_sample_text: str) -> L
         f"DOCUMENT EXCERPT:\n{doc_sample_text[:DOC_SAMPLE_MAX_CHARS]}"
     )
 
-    raw = await _call_anthropic_simple(prompt, max_tokens=200)
+    raw = await _call_ingest_llm(prompt, max_tokens=200)
 
     # Robust JSON parse
     try:
@@ -269,7 +261,7 @@ async def _build_section_summaries_async(source_id: str, project_id: str) -> Dic
             f"SECTION TEXT:\n{section_text}"
         )
         try:
-            section_summary = await _call_anthropic_simple(summary_prompt, max_tokens=200)
+            section_summary = await _call_ingest_llm(summary_prompt, max_tokens=200)
         except Exception as e:
             logger.warning(f"⚠️ Section summary failed for '{section_path[:40]}': {e}")
             section_summary = section_text[:400]

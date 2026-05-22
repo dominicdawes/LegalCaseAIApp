@@ -6,11 +6,9 @@ returns an instance of whichever client class you need.
 '''
 
 from typing import Any
-from utils.llm_clients.openai_client import OpenAIClient
-from utils.llm_clients.deepseek_client import DeepSeekClient
-from utils.llm_clients.anthropic_client import AnthropicClient
-from utils.llm_clients.gemini_client import GeminiClient
-# from utils.llm_clients.qwen_client import QWENClient
+# Provider clients are imported lazily inside get_client_for() so that a missing
+# credential for one provider (e.g. no GEMINI_PROJECT_ID) doesn't prevent the
+# module from loading when a different provider is active.
 from celery.utils.log import get_task_logger
 
 logger = get_task_logger(__name__)

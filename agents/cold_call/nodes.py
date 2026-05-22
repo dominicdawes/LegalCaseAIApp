@@ -243,9 +243,11 @@ head_orchestrator.default_worker_class = "orchestrator"
 
 def head_orchestrator_to_profiler(state: AgentState) -> List[Send]:
     """Fan-out: one source_profiler per source document."""
+    source_ids = state["source_ids"]
+    logger.info("cold_call x%d node fan out for source_profiler", len(source_ids))
     return [
         Send("source_profiler", {"source_id": sid, **state})
-        for sid in state["source_ids"]
+        for sid in source_ids
     ]
 
 
@@ -415,6 +417,7 @@ corpus_synthesizer.default_worker_class = "worker_mid"
 def corpus_synthesizer_to_extractor(state: AgentState) -> List[Send]:
     """Fan-out: one case_rule_extractor per identified case."""
     cases = (state.get("corpus_analysis") or {}).get("cases", [])
+    logger.info("cold_call x%d node fan out for case_rule_extractor", len(cases))
     if not cases:
         return []
     return [
@@ -774,6 +777,7 @@ question_type_bank_selector.default_worker_class = "worker_mid"
 def type_selector_to_seed_generators(state: AgentState) -> List[Send]:
     """Fan-out: one cold_call_seed_generator per extracted case."""
     cases = state.get("case_rule_objects") or []
+    logger.info("cold_call x%d node fan out for cold_call_seed_generator", len(cases))
     if not cases:
         return []
     return [
@@ -963,6 +967,7 @@ def seeds_routing(state: AgentState) -> List[Send]:
 
     if needs_retry:
         logger.info("seed_diversity_agent: retry %d/%d — insufficient diversity", attempt, MAX_SEED_RETRIES)
+        logger.info("cold_call x%d node fan out for cold_call_seed_generator (diversity retry)", len(cases))
         return [
             Send("cold_call_seed_generator", {"case_obj": case, **state})
             for case in cases
@@ -988,6 +993,7 @@ def seeds_routing(state: AgentState) -> List[Send]:
         }
         sends.append(Send("socratic_thread_builder", {"seed": synthetic_seed, **state}))
 
+    logger.info("cold_call x%d node fan out for socratic_thread_builder", len(sends))
     return sends
 
 
@@ -1146,9 +1152,11 @@ socratic_thread_builder.escalation_worker_class = "orchestrator"
 
 def thread_builders_to_answer_agents(state: AgentState) -> List[Send]:
     """Fan-out: one socratic_answer_agent per completed question sequence."""
+    seqs = state.get("socratic_sequences") or []
+    logger.info("cold_call x%d node fan out for socratic_answer_agent", len(seqs))
     return [
         Send("socratic_answer_agent", {"sequence": seq, **state})
-        for seq in (state.get("socratic_sequences") or [])
+        for seq in seqs
     ]
 
 
@@ -1269,9 +1277,11 @@ socratic_answer_agent.escalation_worker_class = "orchestrator"
 
 def answer_agents_to_grounders(state: AgentState) -> List[Send]:
     """Fan-out: one grounder_agent per answer sequence."""
+    answers = state.get("answer_sequences") or []
+    logger.info("cold_call x%d node fan out for grounder_agent", len(answers))
     return [
         Send("grounder_agent", {"answer_seq": ans, **state})
-        for ans in (state.get("answer_sequences") or [])
+        for ans in answers
     ]
 
 

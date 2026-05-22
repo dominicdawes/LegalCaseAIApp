@@ -257,9 +257,11 @@ head_orchestrator.default_worker_class = "orchestrator"
 
 def head_orchestrator_to_profiler(state: AgentState) -> List[Send]:
     """Fan-out: one source_profiler per source document."""
+    source_ids = state["source_ids"]
+    logger.info("case_brief x%d node fan out for source_profiler", len(source_ids))
     return [
         Send("source_profiler", {"source_id": sid, **state})
-        for sid in state["source_ids"]
+        for sid in source_ids
     ]
 
 
@@ -506,9 +508,11 @@ retrieval_planner.default_worker_class = "orchestrator"
 
 def retrieval_planner_to_retriever(state: AgentState) -> List[Send]:
     """Fan-out: one planned_retriever per retrieval plan."""
+    plans = state.get("retrieval_plans") or []
+    logger.info("case_brief x%d node fan out for planned_retriever", len(plans))
     return [
         Send("planned_retriever", {"plan": p, **state})
-        for p in (state.get("retrieval_plans") or [])
+        for p in plans
     ]
 
 
@@ -596,9 +600,11 @@ planned_retriever.default_worker_class = "tool_only"
 
 def retriever_to_card_builder(state: AgentState) -> List[Send]:
     """Fan-out: one evidence_card_builder per retrieval bundle."""
+    bundles = state.get("retrieval_bundles") or []
+    logger.info("case_brief x%d node fan out for evidence_card_builder", len(bundles))
     return [
         Send("evidence_card_builder", {"bundle": b, **state})
-        for b in (state.get("retrieval_bundles") or [])
+        for b in bundles
     ]
 
 
@@ -697,6 +703,7 @@ evidence_card_builder.default_worker_class = "worker_low"
 def card_builder_to_extractors(state: AgentState) -> List[Send]:
     """Fan-out: spawn all 4 legal artifact extractors in parallel."""
     extractor_types = ["facts_posture", "issue_holding", "rule_reasoning", "dissent"]
+    logger.info("case_brief x%d node fan out for legal_artifact_extractor", len(extractor_types))
     return [
         Send("legal_artifact_extractor", {"extractor_type": et, **state})
         for et in extractor_types
@@ -977,11 +984,13 @@ def drafter_to_writers(state: AgentState) -> List[Send]:
     """Fan-out: one section_writer per section type in the drafting manifest."""
     manifest = state.get("drafting_manifest") or {}
     section_plan = manifest.get("section_plan") or [{"section_id": st, "include": True} for st in SECTION_TYPES]
-    return [
+    sends = [
         Send("section_writer", {"section_type": sp["section_id"], **state})
         for sp in section_plan
         if sp.get("include", True)
     ]
+    logger.info("case_brief x%d node fan out for section_writer", len(sends))
+    return sends
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1158,9 +1167,11 @@ section_writer.escalation_worker_class = "orchestrator"
 
 def writers_to_grounders(state: AgentState) -> List[Send]:
     """Fan-out: one section_grounder per drafted section."""
+    sections = state.get("raw_sections") or []
+    logger.info("case_brief x%d node fan out for section_grounder", len(sections))
     return [
         Send("section_grounder", {"section": s, **state})
-        for s in (state.get("raw_sections") or [])
+        for s in sections
     ]
 
 

@@ -201,9 +201,11 @@ planner.default_worker_class = "worker_mid"
 
 def planner_to_profiler(state: AgentState) -> List[Send]:
     """Fan-out: one SourceProfiler invocation per source document."""
+    source_ids = state["source_ids"]
+    logger.info("exam_questions x%d node fan out for source_profiler", len(source_ids))
     return [
         Send("source_profiler", {"source_id": sid, **state})
-        for sid in state["source_ids"]
+        for sid in source_ids
     ]
 
 
@@ -398,9 +400,11 @@ issue_clusterer.default_worker_class = "worker_mid"
 
 def clusterer_to_retriever(state: AgentState) -> List[Send]:
     """Fan-out: one Retriever per issue cluster."""
+    issues = state.get("chosen_issues") or []
+    logger.info("exam_questions x%d node fan out for retriever", len(issues))
     return [
         Send("retriever", {"issue": issue, **state})
-        for issue in (state.get("chosen_issues") or [])
+        for issue in issues
     ]
 
 
@@ -446,6 +450,7 @@ retriever.default_worker_class = "tool_only"
 def retriever_to_drafter(state: AgentState) -> List[Send]:
     """Fan-out: one QuestionDrafter per retrieval bundle."""
     bundles = state.get("retrieval_bundles") or []
+    logger.info("exam_questions x%d node fan out for question_drafter", len(bundles))
     return [
         Send("question_drafter", {"bundle": b, "bundle_index": i, **state})
         for i, b in enumerate(bundles)
@@ -513,6 +518,7 @@ def drafter_to_answerkey(state: AgentState) -> List[Send]:
     drafts = state.get("draft_questions") or []
     bundles = state.get("retrieval_bundles") or []
     bundle_map = {b["issue_label"]: b for b in bundles}
+    logger.info("exam_questions x%d node fan out for answer_key_builder", len(drafts))
     return [
         Send("answer_key_builder", {
             "draft":  d,
@@ -562,9 +568,11 @@ answer_key_builder.default_worker_class = "orchestrator"
 
 def answerkey_to_grounder(state: AgentState) -> List[Send]:
     """Fan-out: one Grounder per drafted question."""
+    drafts = state.get("draft_questions") or []
+    logger.info("exam_questions x%d node fan out for grounder", len(drafts))
     return [
         Send("grounder", {"draft": d, **state})
-        for d in (state.get("draft_questions") or [])
+        for d in drafts
     ]
 
 
@@ -949,9 +957,11 @@ def final_drafter_to_writer(state: AgentState) -> List[Send]:
     worker pool.  Results reduce back into `persisted_question_ids` before
     Assembler runs.
     """
+    questions = state.get("verified_questions") or []
+    logger.info("exam_questions x%d node fan out for exam_card_writer", len(questions))
     return [
         Send("exam_card_writer", {"question": q, **state})
-        for q in (state.get("verified_questions") or [])
+        for q in questions
     ]
 
 
