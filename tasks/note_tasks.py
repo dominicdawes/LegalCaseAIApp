@@ -1045,6 +1045,7 @@ class AsyncNoteManager:
         ledger = AgentLedgerService()
         job_uuid = uuid.UUID(note_id)
         run_meta = None
+        _ledger_ok = False
         try:
             await ledger.ensure_job(
                 job_id=job_uuid,
@@ -1058,9 +1059,10 @@ class AsyncNoteManager:
             )
             agent_thread_id = run_meta.langgraph_thread_id
             agent_run_id    = str(run_meta.run_id)
+            _ledger_ok = True
         except Exception as ledger_exc:
             logger.warning(f"Ledger init failed (non-fatal, running without persistence): {ledger_exc}")
-            agent_thread_id = note_id   # fall back to old behaviour
+            agent_thread_id = note_id
             agent_run_id    = None
 
         # ── Run the agent ─────────────────────────────────────────────────────
@@ -1072,7 +1074,7 @@ class AsyncNoteManager:
                 n_questions=n_questions,
                 use_voyage=USE_VOYAGE_EMBEDDINGS,
                 thread_id=agent_thread_id,
-                job_id=note_id,
+                job_id=note_id if _ledger_ok else "",
                 run_id=agent_run_id,
                 user_id=user_id,
             )
@@ -1172,6 +1174,7 @@ class AsyncNoteManager:
         ledger = AgentLedgerService()
         job_uuid = uuid.UUID(note_id)
         run_meta = None
+        _ledger_ok = False          # tracks whether ensure_job committed a row
         try:
             await ledger.ensure_job(
                 job_id=job_uuid,
@@ -1185,7 +1188,11 @@ class AsyncNoteManager:
             )
             agent_thread_id = run_meta.langgraph_thread_id
             agent_run_id    = str(run_meta.run_id)
+            _ledger_ok = True
         except Exception as ledger_exc:
+            # Ledger is down — continue without it, but blank out job_id so
+            # _try_save_artifact calls inside nodes no-op instead of hammering
+            # the DB with artifact saves that will FK-fail (no agent_jobs row).
             logger.warning(f"Ledger init failed (non-fatal): {ledger_exc}")
             agent_thread_id = note_id
             agent_run_id    = None
@@ -1198,7 +1205,7 @@ class AsyncNoteManager:
                 source_ids=source_ids,
                 use_voyage=USE_VOYAGE_EMBEDDINGS,
                 thread_id=agent_thread_id,
-                job_id=note_id,
+                job_id=note_id if _ledger_ok else "",
                 run_id=agent_run_id,
                 user_id=user_id,
             )
@@ -1293,6 +1300,7 @@ class AsyncNoteManager:
         ledger = AgentLedgerService()
         job_uuid = uuid.UUID(note_id)
         run_meta = None
+        _ledger_ok = False
         try:
             await ledger.ensure_job(
                 job_id=job_uuid,
@@ -1306,6 +1314,7 @@ class AsyncNoteManager:
             )
             agent_thread_id = run_meta.langgraph_thread_id
             agent_run_id    = str(run_meta.run_id)
+            _ledger_ok = True
         except Exception as ledger_exc:
             logger.warning(f"Ledger init failed (non-fatal): {ledger_exc}")
             agent_thread_id = note_id
@@ -1319,7 +1328,7 @@ class AsyncNoteManager:
                 source_ids=source_ids,
                 use_voyage=USE_VOYAGE_EMBEDDINGS,
                 thread_id=agent_thread_id,
-                job_id=note_id,
+                job_id=note_id if _ledger_ok else "",
                 run_id=agent_run_id,
                 user_id=user_id,
             )

@@ -21,6 +21,14 @@ if not DEEPSEEK_API_KEY:
 class DeepSeekClient:
     # Model name mappings for different DeepSeek models
     MODEL_MAPPINGS = {
+        # New V4 models (recommended)
+        "deepseek-v4-flash": "deepseek-v4-flash",
+        "deepseek-v4-pro": "deepseek-v4-pro",
+        
+        # Deprecated aliases (for backward compatibility)
+        "deepseek-chat": "deepseek-v4-flash",  # Non-thinking mode of flash
+        "deepseek-reasoner": "deepseek-v4-flash",  # Thinking mode of flash
+
         # Latest models (recommended)
         "deepseek-chat": "deepseek-chat",  # Default chat model
         "deepseek-coder": "deepseek-coder",  # Latest coding model
@@ -41,26 +49,32 @@ class DeepSeekClient:
     
     def __init__(
         self,
-        model_name: str = "deepseek-chat", # <-- default to: deepseek-chat 
+        model_name: str = "deepseek-v4-flash",  # Update default
         temperature: float = 0.7,
         streaming: bool = False,
         max_output_tokens: int = 4096,
         base_url: Optional[str] = None,
+        thinking: Optional[bool] = None,  # New parameter
         **kwargs
     ):
-        # Map model name to actual API model name
+        # Map model name
         self.actual_model_name = self.MODEL_MAPPINGS.get(model_name, model_name)
-        self.model_name = model_name  # Keep original for reference
+        self.model_name = model_name
         self.temperature = temperature
         self.max_output_tokens = max_output_tokens
         
-        # Use provided base_url or default
-        self.base_url = base_url or DEEPSEEK_BASE_URL
+        # Handle base URL (without /v1 suffix)
+        self.base_url = base_url or "https://api.deepseek.com"
         
-        # Additional parameters
-        self.kwargs = kwargs
+        # Handle thinking mode
+        if thinking is not None:
+            kwargs["thinking"] = thinking
+        elif model_name == "deepseek-chat":
+            kwargs["thinking"] = False  # Non-thinking
+        elif model_name == "deepseek-reasoner":
+            kwargs["thinking"] = True   # Thinking mode
         
-        # Create both regular and streaming clients
+        # Create clients
         common_params = {
             "model": self.actual_model_name,
             "temperature": temperature,
@@ -70,17 +84,8 @@ class DeepSeekClient:
             **kwargs
         }
         
-        self._client = ChatOpenAI(
-            **common_params,
-            streaming=False
-        )
-        
-        self._streaming_client = ChatOpenAI(
-            **common_params,
-            streaming=True
-        )
-        
-        # Also create raw OpenAI client for direct API calls
+        self._client = ChatOpenAI(**common_params, streaming=False)
+        self._streaming_client = ChatOpenAI(**common_params, streaming=True)
         self._raw_client = OpenAI(
             api_key=DEEPSEEK_API_KEY,
             base_url=self.base_url

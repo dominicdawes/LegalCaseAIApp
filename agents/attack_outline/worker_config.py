@@ -22,7 +22,7 @@ load_dotenv()
 
 WorkerClass = str  # Literal["tool_only", "worker_low", "worker_mid", "orchestrator"]
 
-DEFAULT_PROVIDER: str = os.getenv("ATTACK_AGENT_PROVIDER", "anthropic")
+DEFAULT_PROVIDER: str = os.getenv("ATTACK_AGENT_PROVIDER", "deepseek")
 
 WORKER_MODEL_MAP: Dict[str, Dict[str, str]] = {
     "tool_only": {},
@@ -30,29 +30,36 @@ WORKER_MODEL_MAP: Dict[str, Dict[str, str]] = {
         "anthropic": "claude-haiku-4-5-20251001",
         "openai":    "gpt-4o-mini",
         "gemini":    "gemini-2.0-flash",
-        "deepseek":  "deepseek-chat",
+        "deepseek":  "deepseek-v4-flash",
     },
     "worker_mid": {
         "anthropic": "claude-sonnet-4-6",
         "openai":    "gpt-4o",
         "gemini":    "gemini-2.5-flash",
-        "deepseek":  "deepseek-reasoner",
+        "deepseek":  "deepseek-v4-pro",   # default — cost-effective alternative to sonnet
     },
     "orchestrator": {
         "anthropic": "claude-opus-4-7",
         "openai":    "o4-mini",
         "gemini":    "gemini-2.5-pro",
-        "deepseek":  "deepseek-reasoner",
+        "deepseek":  "deepseek-v4-pro",
     },
 }
 
 MODEL_COST_MAP: Dict[str, Tuple[float, float]] = {
-    "claude-haiku-4-5-20251001": (0.25e-6, 1.25e-6),
-    "claude-sonnet-4-6":         (3e-6,   15e-6),
-    "claude-opus-4-7":           (15e-6,  75e-6),
-    "gpt-4o-mini":               (0.15e-6, 0.6e-6),
-    "gpt-4o":                    (2.5e-6, 10e-6),
-    "o4-mini":                   (1.1e-6,  4.4e-6),
+    # Anthropic
+    "claude-haiku-4-5-20251001": (0.25e-6,  1.25e-6),
+    "claude-sonnet-4-6":         (3e-6,    15e-6),
+    "claude-opus-4-7":           (15e-6,   75e-6),
+    # OpenAI
+    "gpt-4o-mini":               (0.15e-6,  0.6e-6),
+    "gpt-4o":                    (2.5e-6,  10e-6),
+    "o4-mini":                   (1.1e-6,   4.4e-6),
+    # DeepSeek (prices per token, approximate)
+    "deepseek-v4-flash":         (0.07e-6,  0.28e-6),
+    "deepseek-v4-pro":           (0.27e-6,  1.10e-6),
+    "deepseek-chat":             (0.27e-6,  1.10e-6),
+    "deepseek-reasoner":         (0.55e-6,  2.19e-6),
 }
 
 
