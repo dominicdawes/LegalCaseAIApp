@@ -143,7 +143,9 @@ async def _llm(
     if _node:
         _llm_call(_node, worker_class, model_name, max_tokens)
 
-    # Build kwargs — only pass thinking for providers that support it
+    # Pass thinking=True/False for DeepSeek (None for other providers = no-op).
+    # DeepSeekClient translates this to extra_body={"thinking": {"type": ...}}
+    # which is the correct V4 API format (April 2026+).
     client_kwargs: Dict[str, Any] = {}
     if thinking is not None:
         client_kwargs["thinking"] = thinking

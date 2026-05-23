@@ -42,7 +42,7 @@ WORKER_MODEL_MAP: Dict[str, Dict[str, str]] = {
         "anthropic": "claude-opus-4-7",
         "openai":    "o4-mini",
         "gemini":    "gemini-2.5-pro",
-        "deepseek":  "deepseek-v4-pro",
+        "deepseek":  "deepseek-v4-pro",   # thinking=True passed via extra_body
     },
 }
 
@@ -63,9 +63,11 @@ MODEL_COST_MAP: Dict[str, Tuple[float, float]] = {
 }
 
 
-# ——— Thinking-mode per worker class (DeepSeek only) ──────────────────────────
-# orchestrator nodes need deep reasoning (planning, critique, graph building)
-# worker_mid nodes do structured extraction — thinking overhead hurts throughput
+# ——— Thinking-mode per worker class (DeepSeek V4, April 2026+) ───────────────
+# DeepSeek V4 models default to thinking=enabled.  Must be explicitly disabled for
+# worker_mid/low nodes (structured extraction — no reasoning depth needed) and kept
+# enabled for orchestrator nodes (planning, critique, graph building).
+# DeepSeekClient translates True/False → extra_body={"thinking": {"type": ...}}.
 WORKER_THINKING_MAP: Dict[str, Dict[str, Optional[bool]]] = {
     "orchestrator": {"deepseek": True},
     "worker_mid":   {"deepseek": False},
@@ -79,8 +81,8 @@ def _fetch_worker_model(
 ) -> Tuple[str, str, Optional[bool]]:
     """Return (provider, model_name, thinking) for the given worker class.
 
-    ``thinking`` is ``True``/``False`` for DeepSeek models that support the
-    thinking flag, or ``None`` for all other providers (no-op kwarg).
+    ``thinking`` is True/False for DeepSeek (forwarded via extra_body to the V4 API),
+    or None for all other providers (ignored — not forwarded).
     """
     _provider = (provider or DEFAULT_PROVIDER).lower()
     tier = WORKER_MODEL_MAP.get(worker_class, WORKER_MODEL_MAP["worker_mid"])
