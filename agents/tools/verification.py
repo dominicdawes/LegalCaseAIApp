@@ -19,6 +19,12 @@ from .base import ToolContext
 logger = logging.getLogger(__name__)
 load_dotenv()
 
+# ——— Verification LLM config (via LLMFactory) ────────────────────────────────
+# Defaults to gemini-2.5-flash (worker_mid equivalent) — fast, no thinking overhead.
+# Override via env vars without redeploying.
+_VERIFY_PROVIDER: str = os.getenv("VERIFY_LLM_PROVIDER", "gemini")
+_VERIFY_MODEL: str    = os.getenv("VERIFY_LLM_MODEL",    "gemini-2.5-flash")
+
 
 def build_verification_tools(ctx: ToolContext) -> list:
 
@@ -42,7 +48,6 @@ def build_verification_tools(ctx: ToolContext) -> list:
                        confidence: 0-1, supporting_chunks: [...], reasoning: str}
         """
         from utils.retrieval import vector_search, bm25_search, rrf_fuse, SearchFilters
-        import httpx
 
         k = max(5, min(k, 20))
 
@@ -52,14 +57,12 @@ def build_verification_tools(ctx: ToolContext) -> list:
             client = VoyageEmbeddingsClient()
             embedding = await loop.run_in_executor(None, client.embed_query, claim)
         else:
-            async with httpx.AsyncClient(timeout=30.0) as http:
-                resp = await http.post(
-                    "https://api.openai.com/v1/embeddings",
-                    headers={"Authorization": f"Bearer {os.getenv('OPENAI_API_KEY', '')}"},
-                    json={"model": "text-embedding-ada-002", "input": claim},
-                )
-                resp.raise_for_status()
-                embedding = resp.json()["data"][0]["embedding"]
+            # Corpus is indexed with Voyage-law-2 — ada-002 vectors are incompatible.
+            # This branch should never be reached (USE_VOYAGE_EMBEDDINGS defaults to True).
+            raise RuntimeError(
+                "verify_claim: use_voyage=False but corpus is Voyage-indexed. "
+                "Set USE_VOYAGE_EMBEDDINGS=true (or use_voyage=True in agent state)."
+            )
 
         filters: SearchFilters = {}
         if ctx.source_ids:
@@ -81,9 +84,6 @@ def build_verification_tools(ctx: ToolContext) -> list:
         context = "\n\n---\n\n".join(
             f"[chunk {c['id']}]\n{c['content']}" for c in chunks[:8]
         )
-        anthropic_key = os.getenv("ANTHROPIC_API_KEY", "")
-        if not anthropic_key:
-            return json.dumps({"error": "ANTHROPIC_API_KEY not set"})
 
         prompt = (
             "You are a legal fact-checker.  Given the passages below and the claim, "
@@ -95,27 +95,27 @@ def build_verification_tools(ctx: ToolContext) -> list:
             "Return only valid JSON, no extra text."
         )
 
-        async with httpx.AsyncClient(timeout=30.0) as http:
-            resp = await http.post(
-                "https://api.anthropic.com/v1/messages",
-                headers={
-                    "x-api-key": anthropic_key,
-                    "anthropic-version": "2023-06-01",
-                    "content-type": "application/json",
-                },
-                json={
-                    "model": "claude-haiku-4-5-20251001",
-                    "max_tokens": 256,
-                    "messages": [{"role": "user", "content": prompt}],
-                },
-            )
-            resp.raise_for_status()
-            raw = resp.json()["content"][0]["text"].strip()
+        from utils.llm_clients.llm_factory import LLMFactory
+        llm = LLMFactory.get_client_for(
+            _VERIFY_PROVIDER, _VERIFY_MODEL,
+            temperature=0.0, streaming=False, max_output_tokens=512,
+        )
+        try:
+            if hasattr(llm, "achat"):
+                raw = await llm.achat(prompt)
+            else:
+                parts: list = []
+                async for chunk in llm.stream_chat(prompt):
+                    parts.append(chunk)
+                raw = "".join(parts)
+        except Exception as llm_exc:
+            logger.warning("verify_claim LLM call failed (%s) — returning insufficient", llm_exc)
+            raw = ""
 
         try:
             verdict_obj = json.loads(raw)
         except Exception:
-            verdict_obj = {"verdict": "insufficient", "confidence": 0.0, "reasoning": raw}
+            verdict_obj = {"verdict": "insufficient", "confidence": 0.0, "reasoning": raw or "LLM call failed"}
 
         verdict_obj["supporting_chunks"] = [
             {"id": c["id"], "content": c["content"][:300]} for c in chunks[:5]
