@@ -66,6 +66,20 @@ MAX_REVISIONS = 2
 _LLM_RATE_LIMIT_RETRIES = 3   # additional attempts after the first 429
 _LLM_RATE_LIMIT_DELAY   = 60  # seconds to wait before each retry (linear: 60, 120, 180 s)
 
+# DeepSeek has much higher RPM than Anthropic Tier 1 — allow up to 10 concurrent
+# calls instead of the 2 returned by the Anthropic-probe semaphore.
+# Lazy-initialized inside the running event loop to avoid loop-attachment issues
+# when the module is imported before the Celery worker loop is created.
+_DEEPSEEK_SEMAPHORE: Optional[asyncio.Semaphore] = None
+
+
+def _get_deepseek_semaphore() -> asyncio.Semaphore:
+    """Return (creating if needed) the per-loop DeepSeek concurrency semaphore."""
+    global _DEEPSEEK_SEMAPHORE
+    if _DEEPSEEK_SEMAPHORE is None:
+        _DEEPSEEK_SEMAPHORE = asyncio.Semaphore(10)
+    return _DEEPSEEK_SEMAPHORE
+
 
 # ── Debug helpers ─────────────────────────────────────────────────────────────
 
@@ -125,15 +139,29 @@ async def _llm(
     legal_artifact_extractor fan-out) temporarily exhausts the token bucket.
     """
     from utils.llm_clients.llm_factory import LLMFactory
-    _provider, model_name = _fetch_worker_model(worker_class, provider)
+    _provider, model_name, thinking = _fetch_worker_model(worker_class, provider)
     if _node:
         _llm_call(_node, worker_class, model_name, max_tokens)
+
+    # Build kwargs — only pass thinking for providers that support it
+    client_kwargs: Dict[str, Any] = {}
+    if thinking is not None:
+        client_kwargs["thinking"] = thinking
+
     client = LLMFactory.get_client_for(
         _provider, model_name,
         temperature=0.7, streaming=False, max_output_tokens=max_tokens,
+        **client_kwargs,
     )
 
-    async with await get_llm_semaphore():
+    # Option B: DeepSeek has much higher RPM than Anthropic — bypass the
+    # Anthropic-probe semaphore and use a larger static concurrency window.
+    if _provider == "deepseek":
+        sem = _get_deepseek_semaphore()
+    else:
+        sem = await get_llm_semaphore()
+
+    async with sem:
         for attempt in range(_LLM_RATE_LIMIT_RETRIES + 1):
             try:
                 if hasattr(client, "achat"):
@@ -263,7 +291,7 @@ async def head_orchestrator(state: AgentState) -> Dict:
         "orchestrator",
         f"Sources available:\n{sources_json}\n\nUser request: {state['request']}",
         system=system,
-        max_tokens=768,
+        max_tokens=1500,
         _node="head_orchestrator",
     )
     try:
@@ -548,14 +576,23 @@ async def retrieval_planner(state: AgentState) -> Dict:
         "Produce plans for ALL topics. Return a JSON array — no other text."
     )
 
-    priority_topics = [t for t in topic_map if t.get("priority", 2) <= 2][:20]
+    # Option E: send only priority-1 topics to the planner to avoid spending
+    # 100+ s generating plans for thin topics that return 0 artifacts.
+    # Topics without an explicit priority field are treated as priority=1
+    # (include by default); topics explicitly marked priority=2+ are skipped.
+    priority_topics = [t for t in topic_map if t.get("priority", 1) == 1][:6]
+    if not priority_topics:
+        # Fallback: take the top 4 by priority if the mapper didn't set priority=1
+        priority_topics = sorted(topic_map, key=lambda t: t.get("priority", 99))[:4]
+    logger.info("retrieval_planner: %d/%d topics selected (priority=1)", len(priority_topics), len(topic_map))
+
     prompt = (
         f"Topics to plan retrieval for:\n{json.dumps(priority_topics, indent=2)}\n\n"
         f"Available sections by source:\n{json.dumps(section_index, indent=2)}\n\n"
         f"User request: {state['request']}"
     )
 
-    raw = await _llm("orchestrator", prompt, system=system, max_tokens=6000,
+    raw = await _llm("orchestrator", prompt, system=system, max_tokens=10000,
                      _node="retrieval_planner")
     try:
         plans: List[ConceptRetrievalPlan] = _parse_json(raw)
@@ -756,11 +793,15 @@ async def legal_artifact_extractor(state: Dict) -> Dict:
         _node_warn("legal_artifact_extractor", state,
                    f"concept={concept_label!r} — bundle has 0 chunks; artifacts will be empty")
 
+    # Option C: cap at top-6 ranked chunks — planned_retriever already reranks
+    # by relevance so the best evidence is at the front.  Sending all 14-20 chunks
+    # roughly doubles prompt size and thinking-model latency with diminishing returns.
+    TOP_K_CHUNKS = 6
     context = "\n\n---\n\n".join(
         f"[chunk_id:{c.get('id', c.get('chunk_id', '?'))} "
         f"source:{c.get('source_id', '?')} p.{c.get('page_number', '?')}]\n"
         f"{c.get('content', '')}"
-        for c in bundle["chunks"][:20]
+        for c in bundle["chunks"][:TOP_K_CHUNKS]
     )
 
     system = (
@@ -1608,7 +1649,7 @@ async def attack_outline_critic(state: AgentState) -> Dict:
         f"Evaluate this attack outline."
     )
 
-    raw = await _llm("orchestrator", prompt, system=system, max_tokens=1024,
+    raw = await _llm("orchestrator", prompt, system=system, max_tokens=2048,
                      _node="attack_outline_critic")
     try:
         data = _parse_json(raw)

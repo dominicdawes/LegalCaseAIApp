@@ -63,14 +63,30 @@ MODEL_COST_MAP: Dict[str, Tuple[float, float]] = {
 }
 
 
+# ——— Thinking-mode per worker class (DeepSeek only) ──────────────────────────
+# orchestrator nodes need deep reasoning (planning, critique, graph building)
+# worker_mid nodes do structured extraction — thinking overhead hurts throughput
+WORKER_THINKING_MAP: Dict[str, Dict[str, Optional[bool]]] = {
+    "orchestrator": {"deepseek": True},
+    "worker_mid":   {"deepseek": False},
+    "worker_low":   {"deepseek": False},
+}
+
+
 def _fetch_worker_model(
     worker_class: WorkerClass,
     provider: Optional[str] = None,
-) -> Tuple[str, str]:
+) -> Tuple[str, str, Optional[bool]]:
+    """Return (provider, model_name, thinking) for the given worker class.
+
+    ``thinking`` is ``True``/``False`` for DeepSeek models that support the
+    thinking flag, or ``None`` for all other providers (no-op kwarg).
+    """
     _provider = (provider or DEFAULT_PROVIDER).lower()
     tier = WORKER_MODEL_MAP.get(worker_class, WORKER_MODEL_MAP["worker_mid"])
     model_name = tier.get(_provider) or tier.get("anthropic", "claude-sonnet-4-6")
-    return _provider, model_name
+    thinking: Optional[bool] = WORKER_THINKING_MAP.get(worker_class, {}).get(_provider)
+    return _provider, model_name, thinking
 
 
 def model_costs(model_name: str) -> Tuple[float, float]:
