@@ -8,6 +8,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 from typing import Optional
 
 from dotenv import load_dotenv
@@ -112,10 +113,12 @@ def build_verification_tools(ctx: ToolContext) -> list:
             logger.warning("verify_claim LLM call failed (%s) — returning insufficient", llm_exc)
             raw = ""
 
+        # Strip markdown code fences — Gemini 2.5-flash wraps JSON in ```json...```
+        raw_stripped = re.sub(r"^```(?:json)?\s*|\s*```\s*$", "", raw.strip(), flags=re.DOTALL)
         try:
-            verdict_obj = json.loads(raw)
+            verdict_obj = json.loads(raw_stripped)
         except Exception:
-            verdict_obj = {"verdict": "insufficient", "confidence": 0.0, "reasoning": raw or "LLM call failed"}
+            verdict_obj = {"verdict": "insufficient", "confidence": 0.0, "reasoning": raw_stripped or "LLM call failed"}
 
         verdict_obj["supporting_chunks"] = [
             {"id": c["id"], "content": c["content"][:300]} for c in chunks[:5]
