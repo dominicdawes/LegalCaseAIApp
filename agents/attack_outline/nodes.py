@@ -280,13 +280,19 @@ async def head_orchestrator(state: AgentState) -> Dict:
 
     system = (
         "You are the orchestrator for a T-14 law-school attack-outline generator. "
-        "Given the available source documents, create a concise job plan for building "
-        "a source-grounded attack outline. Identify: (1) how many distinct course areas "
-        "are covered, (2) the likely depth of doctrine coverage, (3) whether the outline "
-        "should be single-course or multi-course, (4) any retrieval constraints. "
-        "Return JSON with keys: job_type, source_ids, outline_mode "
-        "(single_course|multi_course), course_areas (list), target_format, stages (list), "
-        "retrieval_depth (shallow|standard|deep)."
+        "Your job is to plan the construction of a comprehensive, exam-depth attack outline "
+        "that matches the quality of a top T-14 law school — covering every claim, defense, "
+        "and remedy with full element-by-element analysis, key facts (for and against), "
+        "exam analysis paragraphs, and if/then decision logic.\n\n"
+        "Given the available source documents, create a job plan. Identify: "
+        "(1) how many distinct course areas are covered, "
+        "(2) the likely depth of doctrine coverage, "
+        "(3) whether the outline should be single-course or multi-course, "
+        "(4) any retrieval constraints.\n\n"
+        "Return JSON with keys: job_type, source_ids, "
+        "outline_mode (single_course|multi_course), course_areas (list), "
+        "target_format (always set to 'T-14 comprehensive attack outline'), "
+        "stages (list), retrieval_depth (always 'deep' for attack outlines)."
     )
 
     raw = await _llm(
@@ -307,9 +313,9 @@ async def head_orchestrator(state: AgentState) -> Dict:
             "source_ids": state["source_ids"],
             "outline_mode": "single_course",
             "course_areas": [],
-            "target_format": "concise decision-tree checklist",
+            "target_format": "T-14 comprehensive attack outline",
             "stages": ["profiling", "retrieval", "extraction", "doctrine_graph", "assembly", "critique"],
-            "retrieval_depth": "standard",
+            "retrieval_depth": "deep",
         }
 
     await _try_save_artifact(
@@ -379,14 +385,23 @@ async def source_profiler(state: Dict) -> Dict:
     doc_summary = (outline.get("doc_summary") or "")[:600]
 
     system = (
-        "You are a law professor analysing a legal source document. "
+        "You are a T-14 law professor analysing a source document to prepare a comprehensive "
+        "attack outline. Your job is to identify EVERY exam-testable doctrine in this document — "
+        "not just primary claims, but also: affirmative defenses, procedural defenses, remedies, "
+        "counter-arguments, exceptions to rules, and policy-based limits.\n\n"
+        "For a contracts case, for example, you must separately identify: offer, acceptance, "
+        "consideration, mutual assent, definiteness, statute of frauds, each defense (jest, "
+        "intoxication, capacity, duress, etc.), and each remedy (specific performance, "
+        "expectation damages, etc.) as distinct doctrine entries.\n\n"
         "Return JSON with exactly these keys:\n"
         "  course_area: string (e.g. 'Civil Procedure', 'Torts', 'Contracts')\n"
         "  document_type: string (lecture_notes | casebook | outline | statute | other)\n"
         "  document_summary: string (2-3 sentences)\n"
         "  likely_exam_doctrines: array of {doctrine, sections (list of section_ids), "
-        "priority (high|medium|low), reason} — at most 10 entries\n"
-        "  section_map: array of {section_id, heading, summary} for the 8 most important sections\n"
+        "priority (high|medium|low), reason} — list EVERY testable doctrine including "
+        "all defenses, remedies, and exceptions; do not merge distinct doctrines; "
+        "no artificial cap on entries\n"
+        "  section_map: array of {section_id, heading, summary} for the most important sections\n"
         "Return only JSON — no other text."
     )
 
@@ -481,15 +496,25 @@ async def corpus_topic_mapper(state: AgentState) -> Dict:
     ]
 
     system = (
-        "You are a law professor mapping legal doctrine coverage across multiple documents. "
+        "You are a T-14 law professor building the topic map for a comprehensive exam attack outline. "
+        "Your output determines what gets a full block in the outline — so completeness is critical.\n\n"
+        "T-14 MAPPING RULES:\n"
+        "• Each distinct claim, defense, and remedy gets its OWN topic entry — do NOT merge them.\n"
+        "  Example: 'Jest Defense' and 'Intoxication Defense' are separate topics, not one.\n"
+        "  Example: 'Breach of Contract' and 'Specific Performance' are separate topics.\n"
+        "• Mark primary claims priority=1, affirmative defenses priority=1, remedies priority=1.\n"
+        "• Elements of a single doctrine (offer, acceptance, consideration) belong under ONE topic "
+        "for that doctrine — they are NOT separate topics.\n"
+        "• Include every doctrine a T-14 exam could test, even if coverage is thin in the sources.\n"
+        "• Do NOT merge near-duplicates unless they are genuinely the same black-letter doctrine.\n\n"
         "Return a JSON array of topic objects, each with:\n"
         "  topic_id: short_snake_case string\n"
         "  label: human-readable doctrine/topic name\n"
         "  source_ids: list of source UUIDs that cover this topic\n"
         "  sections: list of section_ids hinted from source profiles\n"
-        "  priority: 1 (must include) | 2 (should include) | 3 (if space permits)\n\n"
-        "Order by priority. Include all major doctrines; merge near-duplicates. "
-        "Return only the JSON array — no other text."
+        "  priority: 1 (must include — claims, defenses, remedies) | "
+        "2 (should include) | 3 (supplemental)\n\n"
+        "Order by priority. Return only the JSON array — no other text."
     )
 
     prompt = (
@@ -930,17 +955,24 @@ async def artifact_normalizer(state: AgentState) -> Dict:
         }
 
     system = (
-        "You are a legal editor normalising and deduplicating a law-school outline artifact set. "
-        "For each concept, merge duplicate rules (preserving meaningful disagreement as conflicts), "
-        "canonicalise element names, remove unsupported claims, and produce a cleaned summary.\n\n"
+        "You are a T-14 legal editor normalising and deduplicating a law-school outline artifact set. "
+        "Your job is to clean and consolidate — NOT to discard depth.\n\n"
+        "NORMALISATION RULES:\n"
+        "• Merge rules that say the same thing in different words — keep the most complete version.\n"
+        "• Preserve ALL distinct rule statements, elements, and exceptions — do not delete content "
+        "just because it lacks a verbatim chunk citation; paraphrased or synthesised rules are valid.\n"
+        "• Canonicalise element names (e.g. 'mutual assent' and 'meeting of the minds' → one entry) "
+        "but keep the fuller description.\n"
+        "• Flag genuine cross-source conflicts in the conflicts field — do not silently discard them.\n"
+        "• Preserve every exception and carve-out — these are exam gold.\n\n"
         "Return a JSON array. Each item:\n"
         "  concept_id: the concept identifier\n"
         "  canonical_name: the authoritative doctrine name\n"
-        "  rules: list of merged, cleaned rule statements (unique)\n"
+        "  rules: list of merged, cleaned rule statements — keep all that add distinct content\n"
         "  elements: list of required elements (unique, canonical names)\n"
-        "  exceptions: list of exception/carve-out statements (unique)\n"
+        "  exceptions: list of ALL exception/carve-out statements (unique)\n"
         "  conflicts: list of cross-source disagreements (if any)\n"
-        "  source_refs: [{source_id, chunk_id, page}] for the strongest supporting chunks\n\n"
+        "  source_refs: [{source_id, chunk_id, page}] for supporting chunks\n\n"
         "Return only the JSON array."
     )
 
@@ -1021,15 +1053,27 @@ async def concept_clusterer(state: AgentState) -> Dict:
     ]
 
     system = (
-        "You are a law professor organising doctrine into exam attack blocks. "
-        "Group the provided concepts into coherent cluster objects, one cluster per "
-        "standalone attack block. Sub-elements of the same doctrine should be in the same cluster.\n\n"
+        "You are a T-14 law professor organising extracted doctrine into exam attack blocks. "
+        "Each cluster you create becomes ONE dedicated block in the final attack outline, "
+        "with its own full element-by-element analysis, key facts, and if/then decision tree.\n\n"
+        "T-14 CLUSTERING RULES:\n"
+        "• ONE cluster per standalone legal issue — each claim, each defense, and each remedy "
+        "gets its own cluster. Do NOT combine 'Breach of Contract' with 'Specific Performance', "
+        "or 'Jest Defense' with 'Intoxication Defense'.\n"
+        "• Sub-elements of a SINGLE doctrine belong together in one cluster — 'offer', "
+        "'acceptance', 'consideration' are all sub-elements of the Contract Formation cluster.\n"
+        "• The correct T-14 exam ordering is: primary claim(s) first → affirmative defenses → "
+        "procedural defenses → remedy/equitable relief → policy/exception blocks.\n"
+        "• Label clusters with the exam-ready name a student would write as a section header "
+        "(e.g. 'Claim: Breach of Contract', 'Defense: Jest / Joke', "
+        "'Defense: Intoxication', 'Remedy: Specific Performance').\n"
+        "• Priority 1 = every cluster that has a primary claim, affirmative defense, or remedy.\n\n"
         "Return a JSON array. Each item:\n"
         "  cluster_id: short_snake_case\n"
-        "  label: human-readable doctrine name (e.g. 'Negligence — Duty of Care')\n"
+        "  label: exam-ready doctrine name with prefix (Claim: / Defense: / Remedy: / Doctrine:)\n"
         "  artifact_ids: list of concept_ids in this cluster\n"
         "  parent_topic: topic_id this cluster belongs to\n"
-        "  priority: 1 (high) | 2 (medium) | 3 (low)\n\n"
+        "  priority: 1 (claim/defense/remedy) | 2 (supporting doctrine) | 3 (supplemental)\n\n"
         "Return only the JSON array."
     )
 
@@ -1120,17 +1164,25 @@ async def doctrine_graph_builder(state: AgentState) -> Dict:
     ]
 
     system = (
-        "You are a law professor building a doctrine analysis graph for an attack outline. "
-        "Create a graph that shows:\n"
-        "  - The order a student should analyse doctrines (nodes)\n"
-        "  - Conditional transitions: when to proceed from one doctrine to another (edges)\n"
-        "  - Fallback paths and alternative theories\n\n"
+        "You are a T-14 law professor building the doctrine analysis graph for an exam attack outline. "
+        "This graph controls the ordering and if/then flow of the final outline — it must follow "
+        "canonical T-14 exam analysis sequence.\n\n"
+        "T-14 ORDERING RULES:\n"
+        "• Primary claims come first (e.g. Breach of Contract, Negligence, Battery).\n"
+        "• Within a claim: analyse elements in the order courts apply them — offer → acceptance → "
+        "consideration → mutual assent → definiteness → statute of frauds.\n"
+        "• Affirmative defenses follow the primary claim they attack "
+        "(e.g. Jest Defense, Intoxication, Capacity immediately after Contract Formation).\n"
+        "• Procedural defenses (statute of limitations, standing) come after affirmative defenses.\n"
+        "• Remedy / equitable relief blocks come last (Specific Performance, Damages).\n"
+        "• Each edge transition_text is the one-sentence 'If X, proceed to Y; if not, Z' "
+        "that a student would write in the transition of their exam answer.\n\n"
         "Return JSON with:\n"
-        "  nodes: [{id, label}] — one node per doctrine cluster\n"
+        "  nodes: [{id, label}] — one node per doctrine cluster, in T-14 analysis order\n"
         "  edges: [{from_node, to_node, condition, transition_text}]\n"
         "    condition: the if/then trigger for this transition\n"
-        "    transition_text: one sentence a student reads at this branch point\n\n"
-        "Order nodes by typical exam analysis sequence. Return only JSON."
+        "    transition_text: one concise sentence a student reads at this branch point\n\n"
+        "Return only JSON."
     )
 
     prompt = (
