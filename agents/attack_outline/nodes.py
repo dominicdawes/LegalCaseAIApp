@@ -582,10 +582,10 @@ async def retrieval_planner(state: AgentState) -> Dict:
     # 100+ s generating plans for thin topics that return 0 artifacts.
     # Topics without an explicit priority field are treated as priority=1
     # (include by default); topics explicitly marked priority=2+ are skipped.
-    priority_topics = [t for t in topic_map if t.get("priority", 1) == 1][:6]
+    priority_topics = [t for t in topic_map if t.get("priority", 1) == 1][:10]
     if not priority_topics:
-        # Fallback: take the top 4 by priority if the mapper didn't set priority=1
-        priority_topics = sorted(topic_map, key=lambda t: t.get("priority", 99))[:4]
+        # Fallback: take the top 6 by priority if the mapper didn't set priority=1
+        priority_topics = sorted(topic_map, key=lambda t: t.get("priority", 99))[:6]
     logger.info("retrieval_planner: %d/%d topics selected (priority=1)", len(priority_topics), len(topic_map))
 
     prompt = (
@@ -798,7 +798,7 @@ async def legal_artifact_extractor(state: Dict) -> Dict:
     # Option C: cap at top-6 ranked chunks — planned_retriever already reranks
     # by relevance so the best evidence is at the front.  Sending all 14-20 chunks
     # roughly doubles prompt size and thinking-model latency with diminishing returns.
-    TOP_K_CHUNKS = 6
+    TOP_K_CHUNKS = 10
     context = "\n\n---\n\n".join(
         f"[chunk_id:{c.get('id', c.get('chunk_id', '?'))} "
         f"source:{c.get('source_id', '?')} p.{c.get('page_number', '?')}]\n"
@@ -828,12 +828,13 @@ async def legal_artifact_extractor(state: Dict) -> Dict:
         "  confidence: 0.0-1.0\n\n"
         "Extract only what is explicitly supported by the provided context. "
         "Do NOT invent or paraphrase without support. Return only the JSON array.\n\n"
-        "BUDGET RULES — follow strictly:\n"
-        "• Return at most 6 artifacts total across all types. Prioritise: "
-        "rule_card → element_card → defense_card → exception_card → issue_trigger_card → case_card.\n"
-        "• text field: max 3 sentences.\n"
-        "• elements / exceptions lists: max 4 items each.\n"
-        "• source_refs per artifact: max 2 entries.\n"
+        "DEPTH REQUIREMENTS:\n"
+        "• Return ALL relevant artifacts found — there is no cap on quantity.\n"
+        "• text field: write the full rule text, as many sentences as needed — do not truncate.\n"
+        "• elements / exceptions: list ALL items present in the context, no cap.\n"
+        "• source_refs per artifact: include all supporting chunks (up to 5 entries).\n"
+        "• Prioritise: rule_card → element_card → defense_card → exception_card → "
+        "issue_trigger_card → case_card → remedy_card.\n"
         "• Omit artifact types with no direct support in the context — do NOT generate them.\n"
         "• Output nothing outside the JSON array."
     )
@@ -844,7 +845,7 @@ async def legal_artifact_extractor(state: Dict) -> Dict:
         f"Extract all legal artifacts present."
     )
 
-    raw = await _llm("worker_mid", prompt, system=system, max_tokens=7090,
+    raw = await _llm("worker_mid", prompt, system=system, max_tokens=10000,
                      _node="legal_artifact_extractor")
     try:
         artifacts_raw = _parse_json(raw)
@@ -1223,30 +1224,46 @@ async def attack_block_builder(state: Dict) -> Dict:
     outgoing_conditions = [e["transition_text"] for e in graph_edges if e.get("from_node") == cluster["cluster_id"]][:2]
 
     system = (
-        "You are a law professor building an exam attack block. "
-        "The block must be concise, rule-heavy, and decision-tree-like — NOT a summary. "
-        "Every element must be source-grounded.\n\n"
+        "You are a top-tier T-14 law school student and professor building one doctrine block "
+        "for a comprehensive exam attack outline. This block must match the depth and completeness "
+        "of a T-14 law school attack outline — NOT a brief checklist. Your output must be thorough "
+        "enough for a student to score in the top 10% on an exam testing this doctrine.\n\n"
         "Return JSON with:\n"
         "  concept_id: string\n"
-        "  title: doctrine name\n"
+        "  title: full doctrine name (e.g. 'Claim 1: Breach of Contract', 'Defense: Jest / Joke')\n"
+        "  big_exam_takeaway: 2-3 sentences capturing the central exam lesson of this doctrine\n"
+        "  claims_and_defenses: list of specific causes of action or defenses this block addresses\n"
         "  trigger: one sentence — the fact-pattern signal that raises this issue\n"
-        "  attack_steps: array of {step (int), label, rule (black-letter), "
-        "ask (list of checklist questions), arguments_for (list), "
-        "arguments_against (list), source_refs (list of chunk_ids)}\n"
-        "  exceptions_or_limits: list of exception/limitation statements\n"
-        "  exam_traps: list of common errors to avoid\n"
+        "  elements_checklist: flat list of ALL required elements for this doctrine\n"
+        "  attack_steps: array — ONE item PER ELEMENT, each with:\n"
+        "    step (int), label (element name),\n"
+        "    rule: full black-letter rule statement — cite Restatement or case where available; "
+        "do NOT limit to one sentence; include sub-elements where the rule has them,\n"
+        "    key_facts_for: list of specific key facts from the source that support this element,\n"
+        "    key_facts_against: list of specific key facts cutting against this element,\n"
+        "    exam_analysis: 2-3 sentence application paragraph (e.g. 'The court held...', 'On these facts...'),\n"
+        "    if_then_logic: list of decision-tree strings (e.g. 'If binding language → offer established; "
+        "If only vague negotiation language → no offer'),\n"
+        "    ask: list of all checklist questions a student should ask,\n"
+        "    arguments_for: list of full-sentence arguments for the party asserting this element,\n"
+        "    arguments_against: list of full-sentence arguments against,\n"
+        "    source_refs: list of chunk_ids\n"
+        "  exceptions_or_limits: ALL exceptions, carve-outs, and limiting doctrines — no cap\n"
+        "  exam_traps: ALL common student errors and hidden traps for this doctrine (aim for 4-6)\n"
+        "  exam_ready_rule_statement: one complete, cite-worthy rule statement a student can write verbatim\n"
+        "  one_paragraph_application: a model application paragraph showing how to write this issue on an exam\n"
         "  source_refs: list of chunk_ids supporting this block overall\n"
         "  revised: false\n\n"
-        "Keep each attack_step focused. Argue BOTH sides in arguments_for/against. "
-        "Return only JSON.\n\n"
-        "BUDGET RULES — follow strictly:\n"
-        "• attack_steps: maximum 5 steps. Merge minor sub-issues into one step rather than splitting.\n"
-        "• rule field per step: one sentence, black-letter only — no examples.\n"
-        "• ask list per step: max 3 questions.\n"
-        "• arguments_for / arguments_against: max 2 items each, ≤ 15 words per item.\n"
-        "• exceptions_or_limits: max 3 items.\n"
-        "• exam_traps: max 3 items.\n"
-        "• Output nothing outside the JSON object."
+        "T-14 DEPTH STANDARDS — follow strictly:\n"
+        "• Include ALL elements — do not merge distinct issues into one step.\n"
+        "• For the central/dispositive element (mutual assent, duty, causation, etc.): provide 6+ key facts "
+        "each side, a full exam analysis paragraph, and a complete if/then tree.\n"
+        "• rule field: full statement — never a fragment; use sub-bullets where the rule has sub-elements.\n"
+        "• Argue BOTH sides with real sentences, not 15-word fragments.\n"
+        "• exam_traps: at minimum 4 specific traps — vague generics do not count.\n"
+        "• Never produce fewer than 5 attack_steps for a full contract, tort, or property claim.\n"
+        "• Every step MUST have exam_analysis and if_then_logic populated — these are not optional.\n"
+        "• Return only the JSON object — no explanation or wrapper text."
     )
 
     prompt = (
@@ -1262,7 +1279,7 @@ async def attack_block_builder(state: Dict) -> Dict:
         f"Build the attack block."
     )
 
-    raw = await _llm("worker_mid", prompt, system=system, max_tokens=6090,
+    raw = await _llm("worker_mid", prompt, system=system, max_tokens=10000,
                      _node="attack_block_builder")
     try:
         data = _parse_json(raw)
@@ -1274,14 +1291,20 @@ async def attack_block_builder(state: Dict) -> Dict:
         data = {}
 
     block: AttackBlock = {
-        "concept_id":         cluster["cluster_id"],
-        "title":              data.get("title", cluster["label"]),
-        "trigger":            data.get("trigger", f"Analyse {cluster['label']} when..."),
-        "attack_steps":       data.get("attack_steps", []),
-        "exceptions_or_limits": data.get("exceptions_or_limits", []),
-        "exam_traps":         data.get("exam_traps", exam_traps_src),
-        "source_refs":        data.get("source_refs", source_refs),
-        "revised":            False,
+        "concept_id":              cluster["cluster_id"],
+        "title":                   data.get("title", cluster["label"]),
+        "trigger":                 data.get("trigger", f"Analyse {cluster['label']} when..."),
+        "attack_steps":            data.get("attack_steps", []),
+        "exceptions_or_limits":    data.get("exceptions_or_limits", []),
+        "exam_traps":              data.get("exam_traps", exam_traps_src),
+        "source_refs":             data.get("source_refs", source_refs),
+        "revised":                 False,
+        # T-14 depth fields
+        "big_exam_takeaway":       data.get("big_exam_takeaway", ""),
+        "claims_and_defenses":     data.get("claims_and_defenses", []),
+        "elements_checklist":      data.get("elements_checklist", []),
+        "exam_ready_rule_statement": data.get("exam_ready_rule_statement", ""),
+        "one_paragraph_application": data.get("one_paragraph_application", ""),
     }
 
     await _try_save_artifact(
@@ -1306,6 +1329,122 @@ attack_block_builder.default_worker_class = "worker_mid"
 # ─────────────────────────────────────────────────────────────────────────────
 # 11. attack_outline_assembler
 # ─────────────────────────────────────────────────────────────────────────────
+
+def _to_roman(n: int) -> str:
+    """Convert a positive integer to a Roman numeral string."""
+    vals = [
+        (1000, "M"), (900, "CM"), (500, "D"), (400, "CD"),
+        (100, "C"), (90, "XC"), (50, "L"), (40, "XL"),
+        (10, "X"), (9, "IX"), (5, "V"), (4, "IV"), (1, "I"),
+    ]
+    result = ""
+    for value, numeral in vals:
+        while n >= value:
+            result += numeral
+            n -= value
+    return result
+
+
+def _render_block_md(block: "AttackBlock", edge_map: Dict[str, str], section_num: int) -> str:
+    """
+    Render one AttackBlock as T-14 standard Markdown.
+    section_num is the Roman numeral index (2 = II, 3 = III, ...).
+    """
+    cid   = block["concept_id"]
+    title = block.get("title", cid)
+    roman = _to_roman(section_num)
+
+    # ── Header ──────────────────────────────────────────────────────────────────
+    lines: List[str] = [f"## {roman}. {title}"]
+
+    big_takeaway = block.get("big_exam_takeaway", "")
+    if big_takeaway:
+        lines.append(f"\n> **Big Exam Takeaway:** {big_takeaway}")
+
+    trigger = block.get("trigger", "")
+    if trigger:
+        lines.append(f"\n**Trigger:** {trigger}")
+
+    # ── A. Elements Checklist ────────────────────────────────────────────────────
+    elements = block.get("elements_checklist", [])
+    # Fall back to step labels if the new field is absent (pre-upgrade blocks)
+    if not elements:
+        elements = [s.get("label", "") for s in block.get("attack_steps", []) if s.get("label")]
+    if elements:
+        lines.append("\n### A. Elements Checklist")
+        for el in elements:
+            lines.append(f"- **{el}**")
+
+    # ── B. Element-by-Element Analysis ──────────────────────────────────────────
+    steps = block.get("attack_steps", [])
+    if steps:
+        lines.append("\n### B. Element-by-Element Analysis")
+        for s in steps:
+            step_num = s.get("step", "?")
+            label    = s.get("label", "")
+            rule     = s.get("rule", "")
+            kff      = s.get("key_facts_for", [])
+            kfa      = s.get("key_facts_against", [])
+            analysis = s.get("exam_analysis", "")
+            ifthen   = s.get("if_then_logic", [])
+            asks     = s.get("ask", [])
+            args_for = s.get("arguments_for", [])
+            args_ag  = s.get("arguments_against", [])
+
+            lines.append(f"\n#### {step_num}. {label}")
+
+            if rule:
+                lines.append(f"\n**Rule:** {rule}")
+
+            # Key Facts
+            if kff or kfa:
+                lines.append("\n**Key Facts**")
+                for f in kff:
+                    lines.append(f"- *For:* {f}")
+                for f in kfa:
+                    lines.append(f"- *Against:* {f}")
+            # Fall back to old arguments_for/against if new fields absent
+            elif args_for or args_ag:
+                lines.append("\n**Key Facts**")
+                for f in args_for:
+                    lines.append(f"- *For:* {f}")
+                for f in args_ag:
+                    lines.append(f"- *Against:* {f}")
+
+            if analysis:
+                lines.append(f"\n**Exam Analysis**\n{analysis}")
+
+            if ifthen:
+                lines.append("\n**If/Then Logic**")
+                for it in ifthen:
+                    lines.append(f"- {it}")
+
+            if asks:
+                lines.append("\n**Checklist**")
+                for q in asks:
+                    lines.append(f"- [ ] {q}")
+
+    # ── Exceptions / Limits ─────────────────────────────────────────────────────
+    exceptions = block.get("exceptions_or_limits", [])
+    if exceptions:
+        lines.append("\n**Exceptions / Limits:**")
+        for e in exceptions:
+            lines.append(f"- {e}")
+
+    # ── Exam Traps ──────────────────────────────────────────────────────────────
+    traps = block.get("exam_traps", [])
+    if traps:
+        lines.append("\n**Exam Traps:**")
+        for t in traps:
+            lines.append(f"- ⚠️ {t}")
+
+    # ── Transition arrow ─────────────────────────────────────────────────────────
+    transition = edge_map.get(cid, "")
+    if transition:
+        lines.append(f"\n*→ {transition}*")
+
+    return "\n".join(lines)
+
 
 def _topological_order(
     blocks: List[AttackBlock],
@@ -1388,57 +1527,92 @@ async def attack_outline_assembler(state: AgentState) -> Dict:
         for e in doctrine_graph.get("edges", [])
     }
 
-    sections: List[str] = []
+    # ── I. Spot the Issues ───────────────────────────────────────────────────────
+    spot_lines: List[str] = ["## I. Spot the Issues — Potential Claims & Defenses"]
+    idx = 1
     for block in ordered_blocks:
-        cid = block["concept_id"]
-        title = block.get("title", cid)
-        trigger = block.get("trigger", "")
-        steps = block.get("attack_steps", [])
-        exceptions = block.get("exceptions_or_limits", [])
-        traps = block.get("exam_traps", [])
-        transition = edge_map.get(cid, "")
+        cd_list = block.get("claims_and_defenses", [])
+        label = block.get("title", block["concept_id"])
+        if cd_list:
+            for cd in cd_list:
+                spot_lines.append(f"{idx}. **{cd}**")
+                idx += 1
+        else:
+            spot_lines.append(f"{idx}. **{label}**")
+            idx += 1
+    header_section = "\n".join(spot_lines)
 
-        # Build step checklist
-        step_lines: List[str] = []
-        for s in steps:
-            step_num = s.get("step", "?")
-            label = s.get("label", "")
-            rule = s.get("rule", "")
-            asks = s.get("ask", [])
-            args_for = s.get("arguments_for", [])
-            args_against = s.get("arguments_against", [])
+    # ── Per-block sections (II, III, …) ─────────────────────────────────────────
+    sections: List[str] = []
+    for i, block in enumerate(ordered_blocks):
+        sections.append(_render_block_md(block, edge_map, section_num=i + 2))
 
-            step_lines.append(f"  **{step_num}. {label}**")
-            if rule:
-                step_lines.append(f"  > *Rule:* {rule}")
-            for q in asks:
-                step_lines.append(f"  - [ ] {q}")
-            if args_for:
-                step_lines.append(f"  - *For:* " + "; ".join(args_for[:2]))
-            if args_against:
-                step_lines.append(f"  - *Against:* " + "; ".join(args_against[:2]))
+    # ── Footer sections ──────────────────────────────────────────────────────────
+    footer_parts: List[str] = []
 
-        exceptions_md = ""
-        if exceptions:
-            exceptions_md = "\n**Exceptions / Limits:**\n" + "\n".join(f"- {e}" for e in exceptions)
-
-        traps_md = ""
-        if traps:
-            traps_md = "\n**Exam Traps:**\n" + "\n".join(f"- ⚠️ {t}" for t in traps)
-
-        transition_md = f"\n*→ {transition}*" if transition else ""
-
-        block_md = (
-            f"## {title}\n\n"
-            f"**Trigger:** {trigger}\n\n"
-            + "\n".join(step_lines)
-            + exceptions_md
-            + traps_md
-            + transition_md
+    # Doctrinal Takeaways table
+    dt_rows = []
+    for block in ordered_blocks:
+        rule_stmt = block.get("exam_ready_rule_statement", "")
+        if rule_stmt:
+            dt_rows.append(f"| **{block.get('title', block['concept_id'])}** | {rule_stmt} | — |")
+    if dt_rows:
+        dt_section = (
+            "## Doctrinal Takeaways — Quick Reference\n"
+            "| Doctrine | Rule | Source |\n"
+            "|---|---|---|\n"
+            + "\n".join(dt_rows)
         )
-        sections.append(block_md)
+        footer_parts.append(dt_section)
 
-    assembled = "\n\n---\n\n".join(sections)
+    # Legal Case Map from doctrine graph edges
+    graph_edges = doctrine_graph.get("edges", [])
+    node_label_map = {n.get("id", ""): n.get("label", "") for n in doctrine_graph.get("nodes", [])}
+    if graph_edges:
+        map_lines = [f"## {_to_roman(len(ordered_blocks) + 2)}. Legal Case Map — Full Exam Flow"]
+        for step_i, edge in enumerate(graph_edges, 1):
+            from_lbl = node_label_map.get(edge.get("from_node", ""), edge.get("from_node", "?"))
+            to_lbl   = node_label_map.get(edge.get("to_node", ""), edge.get("to_node", "?"))
+            cond     = edge.get("condition", "")
+            trans    = edge.get("transition_text", "")
+            map_lines.append(f"**Step {step_i}:** {from_lbl} → {to_lbl}")
+            if cond:
+                map_lines.append(f"  - If {cond}")
+            if trans:
+                map_lines.append(f"  - {trans}")
+        footer_parts.append("\n".join(map_lines))
+
+    # Exam Spotting Checklist (aggregate all exam_traps)
+    all_traps: List[str] = []
+    for block in ordered_blocks:
+        all_traps.extend(block.get("exam_traps", []))
+    if all_traps:
+        checklist_lines = ["## Exam Spotting Checklist"]
+        seen: set = set()
+        for trap in all_traps:
+            key = trap.strip().lower()[:80]
+            if key not in seen:
+                checklist_lines.append(f"- [ ] ⚠️ {trap}")
+                seen.add(key)
+        footer_parts.append("\n".join(checklist_lines))
+
+    # Exam-Ready Rule Statements
+    rule_stmt_lines = ["## Exam-Ready Rule Statements"]
+    for block in ordered_blocks:
+        stmt = block.get("exam_ready_rule_statement", "")
+        if stmt:
+            rule_stmt_lines.append(f"\n**{block.get('title', block['concept_id'])}:** {stmt}")
+    if len(rule_stmt_lines) > 1:
+        footer_parts.append("\n".join(rule_stmt_lines))
+
+    # One-Paragraph Exam Application (use first block's, or note if absent)
+    apps = [b.get("one_paragraph_application", "") for b in ordered_blocks if b.get("one_paragraph_application")]
+    if apps:
+        footer_parts.append("## One-Paragraph Exam Application\n\n" + "\n\n".join(apps))
+
+    # ── Assemble full outline ────────────────────────────────────────────────────
+    all_parts = [header_section] + sections + footer_parts
+    assembled = "\n\n---\n\n".join(all_parts)
 
     await _try_save_artifact(
         state,
@@ -1626,21 +1800,30 @@ async def attack_outline_critic(state: AgentState) -> Dict:
     outline_excerpt = assembled[:4000] if len(assembled) > 4000 else assembled
 
     system = (
-        "You are a senior law professor and bar-exam coach evaluating an attack outline. "
+        "You are a senior T-14 law professor and bar-exam coach evaluating an attack outline "
+        "against T-14 depth standards.\n\n"
         "Score the outline on these dimensions (0-10 each):\n"
-        "  rule_density: how many black-letter rules appear per block\n"
-        "  checklist_structure: quality of step-by-step checklist format\n"
-        "  issue_triggers: how clear and specific the issue-spotting triggers are\n"
-        "  exception_coverage: how thoroughly exceptions and carve-outs are covered\n"
-        "  counterargument_coverage: quality of both-sides argument structure\n"
-        "  concision: is the outline tight and skimmable, not verbose\n\n"
+        "  rule_density: completeness of black-letter rule statements "
+        "(full rules with Restatement/case cites vs. one-line fragments)\n"
+        "  checklist_structure: quality of element-by-element structure "
+        "(Elements Checklist + Analysis sub-sections per element)\n"
+        "  issue_trigger_score: completeness of 'Spot the Issues' — are all claims and defenses listed?\n"
+        "  exception_coverage: how thoroughly exceptions and limiting doctrines are covered\n"
+        "  counterargument_coverage: quality of Key Facts For/Against per element (full sentences, both sides)\n"
+        "  depth_and_completeness: does EACH element have: full rule, key facts, exam_analysis paragraph, "
+        "and if_then_logic — all four are required for full score\n"
+        "  t14_format_compliance: does the outline follow T-14 standard sections — "
+        "Spot Issues → Claims/Defenses (per-element analysis) → Doctrinal Takeaways → "
+        "Case Map → Rule Statements → Application\n\n"
         "Then:\n"
-        "  must_revise: true if overall_score < 6.5 or any block has grounding 'fail'\n"
+        "  must_revise: true if overall_score < 7.0 OR any block is missing exam_analysis "
+        "OR any block is missing if_then_logic OR any block has grounding verdict 'fail'\n"
         "  revision_targets: list of concept_ids most needing improvement\n"
-        "  revision_instructions: 2-4 sentences of targeted guidance\n\n"
-        "Return JSON with: rule_density_score, checklist_structure_score, "
-        "issue_trigger_score, exception_coverage_score, counterargument_score, "
-        "concision_score, overall_score, must_revise, revision_targets, "
+        "  revision_instructions: 2-4 sentences of targeted guidance focused on DEPTH, "
+        "not brevity — specifically call out which elements are missing exam_analysis or if_then_logic\n\n"
+        "Return JSON with: rule_density_score, checklist_structure_score, issue_trigger_score, "
+        "exception_coverage_score, counterargument_score, depth_and_completeness_score, "
+        "t14_format_compliance_score, overall_score, must_revise, revision_targets, "
         "revision_instructions. Return only JSON."
     )
 
@@ -1669,19 +1852,20 @@ async def attack_outline_critic(state: AgentState) -> Dict:
             revision_targets.append(bid)
 
     overall_score = float(data.get("overall_score") or 7.0)
-    must_revise = bool(data.get("must_revise", overall_score < 6.5 or bool(failed_blocks)))
+    must_revise = bool(data.get("must_revise", overall_score < 7.0 or bool(failed_blocks)))
 
     critique: CritiqueResult = {
-        "rule_density_score":      float(data.get("rule_density_score", 7.0)),
-        "checklist_structure_score": float(data.get("checklist_structure_score", 7.0)),
-        "issue_trigger_score":     float(data.get("issue_trigger_score", 7.0)),
-        "exception_coverage_score": float(data.get("exception_coverage_score", 7.0)),
-        "counterargument_score":   float(data.get("counterargument_score", 7.0)),
-        "concision_score":         float(data.get("concision_score", 7.0)),
-        "overall_score":           overall_score,
-        "must_revise":             must_revise,
-        "revision_targets":        revision_targets[:6],
-        "revision_instructions":   data.get("revision_instructions", ""),
+        "rule_density_score":            float(data.get("rule_density_score", 7.0)),
+        "checklist_structure_score":     float(data.get("checklist_structure_score", 7.0)),
+        "issue_trigger_score":           float(data.get("issue_trigger_score", 7.0)),
+        "exception_coverage_score":      float(data.get("exception_coverage_score", 7.0)),
+        "counterargument_score":         float(data.get("counterargument_score", 7.0)),
+        "depth_and_completeness_score":  float(data.get("depth_and_completeness_score", 7.0)),
+        "t14_format_compliance_score":   float(data.get("t14_format_compliance_score", 7.0)),
+        "overall_score":                 overall_score,
+        "must_revise":                   must_revise,
+        "revision_targets":              revision_targets[:6],
+        "revision_instructions":         data.get("revision_instructions", ""),
     }
 
     await _try_save_artifact(
@@ -1777,35 +1961,46 @@ async def revision_agent(state: AgentState) -> Dict:
                 context = ""
 
         system = (
-            "You are a law professor revising a weak attack block. "
+            "You are a T-14 law professor revising a weak attack block. "
             "Revise ONLY what the critique flags. Preserve source-grounded claims. "
-            "Make the block more concise, rule-heavy, and decision-tree-like.\n\n"
-            "Return JSON in the same AttackBlock format:\n"
-            "  concept_id, title, trigger, attack_steps, "
-            "exceptions_or_limits, exam_traps, source_refs, revised (set to true)"
+            "Add depth, not brevity — the goal is T-14 standard completeness.\n\n"
+            "Return JSON in the full AttackBlock format:\n"
+            "  concept_id, title, big_exam_takeaway, claims_and_defenses, trigger,\n"
+            "  elements_checklist, attack_steps (each with: step, label, rule, "
+            "key_facts_for, key_facts_against, exam_analysis, if_then_logic, "
+            "ask, arguments_for, arguments_against, source_refs),\n"
+            "  exceptions_or_limits, exam_traps,\n"
+            "  exam_ready_rule_statement, one_paragraph_application,\n"
+            "  source_refs, revised (set to true)"
         )
 
         prompt = (
             f"Critique instructions: {instructions}\n\n"
             f"Block to revise:\n{json.dumps(dict(block), indent=2)}\n\n"
             f"Fresh supporting evidence:\n{context[:2000]}\n\n"
-            f"Revise this block to address the critique."
+            f"Revise this block to address the critique. Focus on adding depth: "
+            f"ensure every attack_step has exam_analysis and if_then_logic populated."
         )
 
-        raw = await _llm("worker_mid", prompt, system=system, max_tokens=2000,
+        raw = await _llm("worker_mid", prompt, system=system, max_tokens=8000,
                          _node="revision_agent")
         try:
             revised_data = _parse_json(raw)
             _dbg_artifact("revision_agent", revised_data)
             revised_block: AttackBlock = {
-                "concept_id":         block["concept_id"],
-                "title":              revised_data.get("title", block["title"]),
-                "trigger":            revised_data.get("trigger", block["trigger"]),
-                "attack_steps":       revised_data.get("attack_steps", block["attack_steps"]),
-                "exceptions_or_limits": revised_data.get("exceptions_or_limits", block["exceptions_or_limits"]),
-                "exam_traps":         revised_data.get("exam_traps", block["exam_traps"]),
-                "source_refs":        revised_data.get("source_refs", block["source_refs"]),
-                "revised":            True,
+                "concept_id":              block["concept_id"],
+                "title":                   revised_data.get("title", block["title"]),
+                "trigger":                 revised_data.get("trigger", block["trigger"]),
+                "attack_steps":            revised_data.get("attack_steps", block["attack_steps"]),
+                "exceptions_or_limits":    revised_data.get("exceptions_or_limits", block["exceptions_or_limits"]),
+                "exam_traps":              revised_data.get("exam_traps", block["exam_traps"]),
+                "source_refs":             revised_data.get("source_refs", block["source_refs"]),
+                "revised":                 True,
+                "big_exam_takeaway":       revised_data.get("big_exam_takeaway", block.get("big_exam_takeaway", "")),
+                "claims_and_defenses":     revised_data.get("claims_and_defenses", block.get("claims_and_defenses", [])),
+                "elements_checklist":      revised_data.get("elements_checklist", block.get("elements_checklist", [])),
+                "exam_ready_rule_statement": revised_data.get("exam_ready_rule_statement", block.get("exam_ready_rule_statement", "")),
+                "one_paragraph_application": revised_data.get("one_paragraph_application", block.get("one_paragraph_application", "")),
             }
             revised_map[target_id] = revised_block
         except Exception as exc:
@@ -1820,55 +2015,17 @@ async def revision_agent(state: AgentState) -> Dict:
     # Reconstruct the working block list preserving order
     updated_blocks = [revised_map.get(b["concept_id"], b) for b in attack_blocks]
 
-    # Re-assemble the outline with revised blocks
+    # Re-assemble the outline with revised blocks using the shared T-14 renderer
     ordered = _topological_order(updated_blocks, doctrine_graph)
     edge_map = {
         e.get("from_node", ""): e.get("transition_text", "")
         for e in doctrine_graph.get("edges", [])
     }
 
+    # Revision pass: re-render only the per-block sections (header/footer rebuilt by full assembler)
     sections: List[str] = []
-    for block in ordered:
-        cid = block["concept_id"]
-        title = block.get("title", cid)
-        trigger = block.get("trigger", "")
-        steps = block.get("attack_steps", [])
-        exceptions = block.get("exceptions_or_limits", [])
-        traps = block.get("exam_traps", [])
-        transition = edge_map.get(cid, "")
-
-        step_lines: List[str] = []
-        for s in steps:
-            step_num = s.get("step", "?")
-            label = s.get("label", "")
-            rule = s.get("rule", "")
-            asks = s.get("ask", [])
-            args_for = s.get("arguments_for", [])
-            args_against = s.get("arguments_against", [])
-
-            step_lines.append(f"  **{step_num}. {label}**")
-            if rule:
-                step_lines.append(f"  > *Rule:* {rule}")
-            for q in asks:
-                step_lines.append(f"  - [ ] {q}")
-            if args_for:
-                step_lines.append(f"  - *For:* " + "; ".join(args_for[:2]))
-            if args_against:
-                step_lines.append(f"  - *Against:* " + "; ".join(args_against[:2]))
-
-        exceptions_md = ("\n**Exceptions / Limits:**\n" + "\n".join(f"- {e}" for e in exceptions)) if exceptions else ""
-        traps_md = ("\n**Exam Traps:**\n" + "\n".join(f"- ⚠️ {t}" for t in traps)) if traps else ""
-        transition_md = f"\n*→ {transition}*" if transition else ""
-
-        block_md = (
-            f"## {title}\n\n"
-            f"**Trigger:** {trigger}\n\n"
-            + "\n".join(step_lines)
-            + exceptions_md
-            + traps_md
-            + transition_md
-        )
-        sections.append(block_md)
+    for i, block in enumerate(ordered):
+        sections.append(_render_block_md(block, edge_map, section_num=i + 2))
 
     revised_outline = "\n\n---\n\n".join(sections)
 
@@ -1920,26 +2077,40 @@ async def final_compressor_formatter(state: AgentState) -> Dict:
         }
 
     system = (
-        "You are a law-exam prep editor. Format the attack outline for student use. "
-        "Rules:\n"
-        "  - Do NOT add new legal substance — only polish formatting\n"
-        "  - Tighten wording; remove redundancy\n"
-        "  - Ensure consistent heading hierarchy (## for doctrine, ### for sub-doctrine)\n"
-        "  - Checklist items use '- [ ]' format\n"
-        "  - Rule statements are bold or blockquoted\n"
-        "  - Transition arrows use → symbol\n"
-        "  - Keep exam traps in ⚠️ callouts\n"
-        "  - Add a brief Table of Contents at the top linking to each ## section\n"
-        "  - Do not include raw JSON, code fences, or template artefacts\n"
+        "You are a law-exam prep editor standardising an attack outline to T-14 format. "
+        "You are NOT a compressor — do NOT remove any substantive content.\n\n"
+        "Your ONLY job is formatting polish:\n"
+        "  1. Add a Table of Contents at the top linking each ## section by anchor\n"
+        "  2. Enforce heading hierarchy:\n"
+        "       # for document title\n"
+        "       ## for Roman numeral major sections (## I. Spot the Issues, ## II. Claim...)\n"
+        "       ### for sub-sections (### A. Elements Checklist, ### B. Element-by-Element Analysis)\n"
+        "       #### for individual elements (#### 1. Offer, #### 2. Mutual Assent)\n"
+        "  3. Bold all key legal terms, doctrine names, case names, and Restatement citations\n"
+        "  4. Ensure all checklist items use '- [ ]' format\n"
+        "  5. Ensure all exam traps appear in ⚠️ callouts\n"
+        "  6. Ensure all If/Then logic uses → arrows\n"
+        "  7. Fix spacing, punctuation, and list indentation inconsistencies\n"
+        "  8. Do not include raw JSON, code fences, or template artefacts\n\n"
+        "ABSOLUTELY DO NOT:\n"
+        "  - Remove any sentences, paragraphs, or sections\n"
+        "  - Shorten rule statements\n"
+        "  - Summarise Key Facts, Exam Analysis, or If/Then Logic sections\n"
+        "  - Merge elements together\n"
+        "  - Remove the Doctrinal Takeaways table\n"
+        "  - Remove the Legal Case Map\n"
+        "  - Remove the Exam Spotting Checklist\n"
+        "  - Remove Exam-Ready Rule Statements\n"
+        "  - Remove the One-Paragraph Exam Application\n\n"
         "Return only the final Markdown — no explanation."
     )
 
     prompt = (
-        f"Attack outline to format:\n\n{assembled[:6000]}\n\n"
-        f"Format for exam-day student use."
+        f"Attack outline to standardise to T-14 format:\n\n{assembled[:8000]}\n\n"
+        f"Apply T-14 formatting polish. Preserve all substance."
     )
 
-    formatted = await _llm("worker_low", prompt, system=system, max_tokens=6000,
+    formatted = await _llm("worker_low", prompt, system=system, max_tokens=8000,
                            _node="final_compressor_formatter")
 
     # Append budget comment

@@ -142,6 +142,11 @@ class AttackStep(TypedDict):
     arguments_for: List[str]
     arguments_against: List[str]
     source_refs: List[str]      # chunk_ids
+    # T-14 depth fields (optional — gracefully absent from pre-upgrade blocks)
+    key_facts_for: NotRequired[List[str]]      # key facts supporting this element
+    key_facts_against: NotRequired[List[str]]  # key facts cutting against
+    exam_analysis: NotRequired[str]            # 2-3 sentence application paragraph
+    if_then_logic: NotRequired[List[str]]      # ["If X → Then Y", ...]
 
 
 class AttackBlock(TypedDict):
@@ -153,6 +158,12 @@ class AttackBlock(TypedDict):
     exam_traps: List[str]
     source_refs: List[str]      # chunk_ids
     revised: bool               # set True by revision_agent
+    # T-14 depth fields (optional — gracefully absent from pre-upgrade blocks)
+    big_exam_takeaway: NotRequired[str]           # 1-2 sentence doctrine overview
+    claims_and_defenses: NotRequired[List[str]]   # causes of action / defenses covered
+    elements_checklist: NotRequired[List[str]]    # flat list of all required elements
+    exam_ready_rule_statement: NotRequired[str]   # complete single-sentence rule for exam use
+    one_paragraph_application: NotRequired[str]   # model application paragraph
 
 
 # ── Grounding verification report per block ───────────────────────────────────
@@ -169,15 +180,16 @@ class VerificationReport(TypedDict):
 # ── Critic output ─────────────────────────────────────────────────────────────
 
 class CritiqueResult(TypedDict):
-    rule_density_score: float   # 0–10
+    rule_density_score: float             # 0–10
     checklist_structure_score: float
     issue_trigger_score: float
     exception_coverage_score: float
     counterargument_score: float
-    concision_score: float
+    depth_and_completeness_score: float   # replaces concision_score — rewards T-14 depth
+    t14_format_compliance_score: float    # rewards correct T-14 section structure
     overall_score: float
     must_revise: bool
-    revision_targets: List[str]  # concept_ids of blocks to revise
+    revision_targets: List[str]           # concept_ids of blocks to revise
     revision_instructions: str
 
 

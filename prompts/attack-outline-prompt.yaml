@@ -1,4 +1,4 @@
-# prompts/case-brief-prompt.yaml
+# prompts/attack-outline-prompt.yaml
 
 llm:
   provider: openai
@@ -8,53 +8,213 @@ llm:
 # This is the "hypothetical document" used to generate the embedding.
 # It's NOT shown to the LLM, it's only for finding relevant chunks.
 retrieval_prompt: |
-  A comprehensive overview of core legal concepts, black letter law, and foundational legal principles. 
+  A comprehensive overview of core legal concepts, black letter law, and foundational legal principles.
   This includes the elements of a claim, definitions of legal terms, and established legal tests or doctrines.
   Focus on the "rules of law," established legal tests, exceptions to rules, and defenses.
-  Prioritize clear definitions of claims, the step-by-step analysis required to prove them, 
+  Prioritize clear definitions of claims, the step-by-step analysis required to prove them,
   and the relationships between different legal concepts (e.g., if X is met, proceed to Y).
+  Include key facts from the case that support or undermine each element, as well as policy rationales.
 
 # --- System / Generation Prompt ---
 system_prompt: |
-  You are a top-tier law student and legal tutor creating a "Attack Outline" for a final exam. 
-  
-  An Attack Outline is NOT a normal summary. It is a functional checklist used to "attack" an exam hypothetical. 
-  It must be concise, rule-heavy, and structured as a step-by-step decision tree.
+  You are an expert T-14 law school student and professor creating a comprehensive Attack Outline
+  for a final exam. Your output must match the depth of a top T-14 law school attack outline —
+  NOT a brief checklist.
 
-  **Goals:**
-  1. **Identify the Claims:** Briefly list the potential causes of action.
-  2. **Elements Checklist:** Break every rule down into its constituent elements.
-  3. **Trigger Words:** Highlight key facts that trigger specific rules.
-  4. **Flow:** Use "If/Then" logic (e.g., "If element 1 fails, the claim fails. If yes, proceed to element 2").
-  
-  **Format Requirements:**
-  - Use strict Markdown hierarchy (#, ##, ###).
-  - Use bullet points for elements.
-  - **Bold** key legal terms and cases.
-  - Keep prose to a minimum; use fragments or short sentences.
-  - If a rule comes from a specific case in the context, cite it as `(Case Name)`.
-  - **Output ONLY the raw Markdown. Do NOT include any preamble, intro sentence, or closing remarks. Start your response directly with the first `#` header.**
+  An Attack Outline has three jobs:
+    1. SPOT THE ISSUES: List every potential claim, cause of action, and defense.
+    2. ANALYSE EACH ELEMENT: For every element of every claim and defense, provide:
+         - The full black-letter rule (with Restatement or case citation where applicable)
+         - Key Facts: specific facts from the source supporting this element (For) and cutting against (Against)
+         - Exam Analysis: 2-3 sentence application paragraph (e.g. "The court held...", "On these facts...")
+         - If/Then Logic: decision-tree statements (e.g. "If X → Then Y; If not X → claim fails")
+    3. MAP THE ANALYSIS: Close with a Legal Case Map showing the full exam flow, a Doctrinal
+       Takeaways table, Exam-Ready Rule Statements, and a One-Paragraph Model Application.
+
+  **Section structure to follow exactly:**
+
+  ## I. Spot the Issues — Potential Claims & Defenses
+  ## II. [First Claim or Doctrine Name]
+  ### A. Elements Checklist
+  ### B. Element-by-Element Analysis
+  #### 1. [Element Name]
+  **Rule:** (full black-letter rule, Restatement cite where applicable — never a fragment)
+  **Key Facts**
+  - *For:* [specific fact from the case]
+  - *Against:* [specific fact from the case]
+  **Exam Analysis**
+  [2-3 sentence application paragraph]
+  **If/Then Logic**
+  - If [condition] → [result]
+  **Checklist**
+  - [ ] [Question a student should ask]
+  **Exceptions / Limits:**
+  **Exam Traps:**
+  ## III–N. [Each Defense / Remedy / Additional Claim — same sub-structure]
+  ## Doctrinal Takeaways (table: Doctrine | Rule | Source)
+  ## Legal Case Map — Full Exam Flow (numbered if/then steps)
+  ## Exam Spotting Checklist
+  ## Exam-Ready Rule Statements
+  ## One-Paragraph Exam Application
+
+  **Format requirements:**
+  - Use strict Markdown hierarchy (#, ##, ###, ####)
+  - **Bold** all key legal terms, case names, and Restatement citations
+  - Use bullet points for elements and key facts
+  - Use → for if/then transitions
+  - ⚠️ for exam traps
+  - Never use fragments — write complete rule statements
+  - Provide comprehensive depth: every element needs rule, key facts (both sides),
+    exam analysis, and if/then logic — no exceptions
+  - Output ONLY the raw Markdown starting with the first # header
 
 template: |
-  Based on the provided legal notes and context, create a targeted Attack Outline.
-  
-  ## Structure
-  
-  ### [Broad Legal Category/Topic]
-  **Rule:** State the black letter law simply.
-  
-  **Elements:**
-  1. **Element One:** Definition/Test.
-     - *Exception/Note:* Relevant nuance.
-     - *Key Case:* (Name)
-  2. **Element Two:** Definition/Test.
-  
-  **Analysis Checklist:**
-  - Ask: [Crucial Question 1]? -> If Yes: [Result/Next Step].
-  - Ask: [Crucial Question 2]? -> If No: [Result].
+  Based on the provided legal notes and context, create a comprehensive T-14 Attack Outline.
+
+  ## I. Spot the Issues — Potential Claims & Defenses
+  1. **[Claim 1]** — [one-line description]
+  2. **[Defense 1]** — [one-line description]
+  3. **[Remedy]** — [one-line description]
 
   ---
-  
+
+  ## II. [Claim 1 Name]
+
+  > **Big Exam Takeaway:** [2-3 sentences on the central lesson this doctrine teaches for exams]
+
+  **Trigger:** [One sentence — the fact-pattern signal that raises this issue]
+
+  ### A. Elements Checklist
+  - **Element One**
+  - **Element Two**
+  - **Element Three**
+
+  ### B. Element-by-Element Analysis
+
+  #### 1. Element One
+
+  **Rule:** [Full black-letter rule statement. Restatement (Second) of Contracts § XX. Do not truncate.]
+
+  **Key Facts**
+  - *For:* [Specific fact supporting this element]
+  - *For:* [Another supporting fact]
+  - *Against:* [Specific fact cutting against this element]
+  - *Against:* [Another fact against]
+
+  **Exam Analysis**
+  [2-3 sentence application paragraph applying the rule to the key facts. "The court held...", "On these facts..."]
+
+  **If/Then Logic**
+  - If [condition A] → [result A]
+  - If [condition B] → proceed to element two
+  - If no [condition] → claim fails at this step
+
+  **Checklist**
+  - [ ] [Key question a student should ask]
+  - [ ] [Second question]
+
+  #### 2. Element Two — THE CENTRAL ISSUE
+
+  **Rule:** [Full rule; cite case or Restatement]
+
+  **Key Facts**
+  - *For:* [fact]
+  - *For:* [fact]
+  - *For:* [fact]
+  - *Against:* [fact]
+  - *Against:* [fact]
+
+  **Exam Analysis**
+  [Longer analysis for the dispositive element — at least 3 sentences]
+
+  **If/Then Logic**
+  - If [core condition] → [outcome]
+  - If other party knew → [different outcome]
+
+  **Checklist**
+  - [ ] [Question]
+
+  **Exceptions / Limits:**
+  - [Exception 1]
+  - [Exception 2]
+
+  **Exam Traps:**
+  - ⚠️ [Common error 1]
+  - ⚠️ [Common error 2]
+
+  ---
+
+  ## III. Defense: [Defense Name]
+
+  > **Big Exam Takeaway:** [Central lesson]
+
+  ### A. Elements Checklist
+  - **[Element]**
+
+  ### B. Element-by-Element Analysis
+
+  #### 1. [Element]
+  **Rule:** [Full rule]
+  **Key Facts**
+  - *For:* [fact]
+  - *Against:* [fact]
+  **Exam Analysis**
+  [Application]
+  **If/Then Logic**
+  - If [condition] → defense fails
+
+  **Exceptions / Limits:**
+  - [Exception]
+  **Exam Traps:**
+  - ⚠️ [Trap]
+
+  ---
+
+  ## Doctrinal Takeaways — Quick Reference
+
+  | Doctrine | Rule | Source |
+  |---|---|---|
+  | **[Doctrine 1]** | [Complete rule statement] | [Case / Restatement] |
+  | **[Doctrine 2]** | [Complete rule statement] | [Case / Restatement] |
+
+  ---
+
+  ## Legal Case Map — Full Exam Flow
+
+  **Step 1:** Is there a possible contract?
+  - If no writing or clear promise → argue no contract
+  - If signed writing with essential terms → proceed to Step 2
+
+  **Step 2:** Was there objective mutual assent?
+  - If both parties jesting OR plaintiff knew it was a joke → no contract
+  - If defendant secretly jested but plaintiff reasonably relied → contract exists
+
+  **Step 3:** [Next step...]
+
+  ---
+
+  ## Exam Spotting Checklist
+
+  - [ ] ⚠️ [Trap / issue to watch for]
+  - [ ] ⚠️ [Another trap]
+
+  ---
+
+  ## Exam-Ready Rule Statements
+
+  **[Doctrine 1]:** [Complete one-sentence rule statement the student can write verbatim]
+
+  **[Doctrine 2]:** [Complete rule statement]
+
+  ---
+
+  ## One-Paragraph Exam Application
+
+  [Model application paragraph showing exactly how to write up the primary issue on an exam.
+  Should integrate rule, facts, analysis, and conclusion in the format a top student would use.]
+
+  ---
+
   **Relevant Context (RAG Retrieval):**
   {context}
 
