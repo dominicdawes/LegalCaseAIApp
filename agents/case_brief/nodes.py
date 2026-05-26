@@ -50,6 +50,7 @@ from .state import (
     SourceProfile,
 )
 from .worker_config import _fetch_worker_model, model_costs
+from utils.llm_clients.anthropic_rate_limits import get_llm_semaphore
 
 logger = logging.getLogger(__name__)
 
@@ -81,6 +82,43 @@ RETRIEVAL_TARGETS = [
 ]
 
 
+# ── Rate-limit guard ──────────────────────────────────────────────────────────
+_LLM_RATE_LIMIT_RETRIES = 3
+_LLM_RATE_LIMIT_DELAY   = 60  # seconds (linear: 60, 120, 180 s)
+
+_DEEPSEEK_SEMAPHORE: Optional[asyncio.Semaphore] = None
+
+
+def _get_deepseek_semaphore() -> asyncio.Semaphore:
+    global _DEEPSEEK_SEMAPHORE
+    if _DEEPSEEK_SEMAPHORE is None:
+        _DEEPSEEK_SEMAPHORE = asyncio.Semaphore(10)
+    return _DEEPSEEK_SEMAPHORE
+
+
+# ── Debug helpers ─────────────────────────────────────────────────────────────
+
+def _node_start(name: str, state: Dict, **extras: Any) -> None:
+    job = (state.get("job_id") or "")[:8] or "no-job"
+    parts = " ".join(f"{k}={v}" for k, v in extras.items())
+    logger.info("▶ [%s] %s  %s", job, name, parts)
+
+
+def _node_done(name: str, state: Dict, **extras: Any) -> None:
+    job = (state.get("job_id") or "")[:8] or "no-job"
+    parts = " ".join(f"{k}={v}" for k, v in extras.items())
+    logger.info("✓ [%s] %s  %s", job, name, parts)
+
+
+def _node_warn(name: str, state: Dict, msg: str) -> None:
+    job = (state.get("job_id") or "")[:8] or "no-job"
+    logger.warning("⚠ [%s] %s  %s", job, name, msg)
+
+
+def _llm_call(name: str, worker_class: str, model_name: str, max_tokens: int) -> None:
+    logger.info("  🤖 [%s] LLM %s (%s) max_tokens=%d", name, worker_class, model_name, max_tokens)
+
+
 # ── Shared helpers ─────────────────────────────────────────────────────────────
 
 async def _llm(
@@ -89,19 +127,54 @@ async def _llm(
     system: str = "",
     max_tokens: int = 2048,
     provider: Optional[str] = None,
+    _node: str = "",
 ) -> str:
+    """Call the LLM with rate-limit protection and DeepSeek thinking-mode support."""
     from utils.llm_clients.llm_factory import LLMFactory
-    _provider, model_name = _fetch_worker_model(worker_class, provider)
+    _provider, model_name, thinking = _fetch_worker_model(worker_class, provider)
+    if _node:
+        _llm_call(_node, worker_class, model_name, max_tokens)
+
+    client_kwargs: Dict[str, Any] = {}
+    if thinking is not None:
+        client_kwargs["thinking"] = thinking
+
     client = LLMFactory.get_client_for(
         _provider, model_name,
         temperature=0.7, streaming=False, max_output_tokens=max_tokens,
+        **client_kwargs,
     )
-    if hasattr(client, "achat"):
-        return await client.achat(prompt, system_prompt=system or None)
-    chunks: List[str] = []
-    async for chunk in client.stream_chat(prompt, system_prompt=system or None):
-        chunks.append(chunk)
-    return "".join(chunks)
+
+    if _provider == "deepseek":
+        sem = _get_deepseek_semaphore()
+    else:
+        sem = await get_llm_semaphore()
+
+    async with sem:
+        for attempt in range(_LLM_RATE_LIMIT_RETRIES + 1):
+            try:
+                if hasattr(client, "achat"):
+                    return await client.achat(prompt, system_prompt=system or None)
+                chunks: List[str] = []
+                async for chunk in client.stream_chat(prompt, system_prompt=system or None):
+                    chunks.append(chunk)
+                return "".join(chunks)
+            except Exception as exc:
+                err = str(exc)
+                is_rate_limit = (
+                    "429" in err
+                    or "rate_limit" in err.lower()
+                    or "rate limit" in err.lower()
+                )
+                if is_rate_limit and attempt < _LLM_RATE_LIMIT_RETRIES:
+                    wait = _LLM_RATE_LIMIT_DELAY * (attempt + 1)
+                    logger.warning(
+                        "🚦 [%s] Rate limit hit (429) — waiting %ds before retry %d/%d",
+                        _node or worker_class, wait, attempt + 1, _LLM_RATE_LIMIT_RETRIES,
+                    )
+                    await asyncio.sleep(wait)
+                    continue
+                raise
 
 
 async def _try_save_artifact(
@@ -209,11 +282,25 @@ async def head_orchestrator(state: AgentState) -> Dict:
     list_sources_tool = next(t for t in tools if t.name == "list_sources")
     sources_json = await list_sources_tool.ainvoke({})
 
+    _node_start("head_orchestrator", state,
+                n_sources=len(state.get("source_ids", [])))
+
     system = (
-        "You are the workflow controller for a law-school case brief generation graph. "
-        "Determine the case brief mode, source scope, output length, model budget, "
-        "fanout plan, and revision policy. Do not write the brief.\n\n"
-        "Return JSON with keys:\n"
+        "You are the T-14 workflow controller for a law-school case brief generation graph.\n\n"
+        "PLANNING REQUIREMENTS:\n"
+        "1. Determine brief_mode based on source types: single_case = one primary opinion; "
+        "   multi_case = multiple opinions for doctrine comparison; "
+        "   casebook_excerpt = edited excerpt with professor notes; "
+        "   doctrine_packet = multiple sources on a single doctrine.\n"
+        "2. Set target_length based on brief complexity: "
+        "   'short' = < 5 sources or simple rule; "
+        "   'standard' = most cases; "
+        "   'long' = multi-issue cases, policy-heavy, or with significant dissents.\n"
+        "3. Set retrieval_depth = 'deep' if the source has a dissent, policy debate, "
+        "   or circuit split — these require extra retrieval probes.\n"
+        "4. Set revision_policy = 'strict' if the user asked for exam-ready or "
+        "   cold-call quality; 'standard' otherwise.\n"
+        "Do not write the brief. Return ONLY JSON with keys:\n"
         "  job_type: 'case_brief'\n"
         "  brief_mode: 'single_case' | 'multi_case' | 'casebook_excerpt' | 'doctrine_packet' | 'mixed_source'\n"
         "  source_ids: list of source UUIDs in scope\n"
@@ -221,15 +308,15 @@ async def head_orchestrator(state: AgentState) -> Dict:
         "  output_format: 'markdown'\n"
         "  stages: list of pipeline stage names\n"
         "  retrieval_depth: 'shallow' | 'standard' | 'deep'\n"
-        "  revision_policy: 'strict' | 'standard' | 'permissive'\n"
-        "Return only JSON."
+        "  revision_policy: 'strict' | 'standard' | 'permissive'"
     )
 
     raw = await _llm(
         "orchestrator",
         f"Sources available:\n{sources_json}\n\nUser request: {state['request']}",
         system=system,
-        max_tokens=512,
+        max_tokens=640,
+        _node="head_orchestrator",
     )
     try:
         job_plan = _parse_json(raw)
@@ -249,6 +336,10 @@ async def head_orchestrator(state: AgentState) -> Dict:
         state, "job_plan", job_plan, "orchestrator", "head_orchestrator", "job_plan",
         source_ids=state.get("source_ids"),
     )
+    _node_done("head_orchestrator", state,
+               brief_mode=job_plan.get("brief_mode", "?"),
+               target_length=job_plan.get("target_length", "?"),
+               retrieval_depth=job_plan.get("retrieval_depth", "?"))
     return {"job_plan": job_plan}
 
 
@@ -737,52 +828,95 @@ async def legal_artifact_extractor(state: Dict) -> Dict:
 
     SYSTEM_PROMPTS = {
         "facts_posture": (
-            "You are a case brief facts and posture specialist. "
-            "Separate procedural posture from merits. Separate material facts "
-            "from background facts.\n\n"
-            "Return JSON with:\n"
-            "  procedural_posture: {lower_court, current_stage, standard_or_frame, disposition_below, supporting_card_ids}\n"
+            "You are a T-14 law professor specialising in procedural posture and "
+            "material fact extraction.\n\n"
+            "PROCEDURAL POSTURE REQUIREMENTS:\n"
+            "- lower_court: name the specific lower court and what it held.\n"
+            "- current_stage: e.g., 'appeal to N.Y. Court of Appeals from Appellate Division'.\n"
+            "- standard_or_frame: the standard of review or procedural frame that controls "
+            "  analysis — e.g., 'de novo review of legal issues', 'Rule 12(b)(6) motion'.\n"
+            "- disposition_below: what the lower court actually did (granted/denied/reversed).\n\n"
+            "MATERIAL FACTS REQUIREMENTS:\n"
+            "- A fact is material if removing it would change the legal outcome.\n"
+            "- For each material fact: state the fact precisely, explain WHY it is material "
+            "  (which element it establishes or defeats), and cite the supporting card_ids.\n"
+            "- Background facts (narrative colour without legal significance) go in "
+            "  background_facts — max 5 items.\n"
+            "- List uncertainties where the record is ambiguous.\n"
+            "Return ONLY JSON:\n"
+            "  procedural_posture: {lower_court, current_stage, standard_or_frame, "
+            "disposition_below, supporting_card_ids}\n"
             "  material_facts: [{fact, why_material, supporting_card_ids}] (max 10)\n"
             "  background_facts: [str] (max 5)\n"
-            "  uncertainties: [str]\n"
-            "Return only JSON."
+            "  uncertainties: [str]"
         ),
         "issue_holding": (
-            "You are an issue and holding specialist. "
-            "Frame the issue as a legal question tied to material facts. "
-            "State the holding narrowly and distinguish it from the disposition.\n\n"
-            "Return JSON with:\n"
+            "You are a T-14 law professor specialising in issue formulation and holding "
+            "extraction.\n\n"
+            "ISSUE REQUIREMENTS:\n"
+            "- Format: 'Whether [legal standard] applies when [specific facts].' — "
+            "  NOT 'Whether the defendant was negligent' (too broad).\n"
+            "- The issue must be tied to the specific facts of this case, not the general doctrine.\n"
+            "- If there are multiple issues (rare), list the primary one.\n\n"
+            "HOLDING REQUIREMENTS:\n"
+            "- holding_narrow: answers the issue yes/no where possible, "
+            "  states the specific rule applied, and limits it to these facts.\n"
+            "- Do NOT conflate the holding with the disposition. Holding = legal rule. "
+            "  Disposition = what the court ordered (affirmed/reversed).\n"
+            "- confidence: 0.9+ if directly quoted; 0.7 if closely paraphrased; "
+            "  < 0.7 if uncertain.\n"
+            "Return ONLY JSON:\n"
             "  issue: 'Whether ...' string\n"
-            "  holding_narrow: string (answers the issue yes/no where possible)\n"
+            "  holding_narrow: string (answers the issue, states the rule, limits to these facts)\n"
             "  disposition: 'affirmed' | 'reversed' | 'remanded' | 'vacated' | 'modified' | 'other'\n"
             "  winner: 'plaintiff' | 'defendant' | 'appellant' | 'appellee' | 'unclear'\n"
             "  confidence: float 0.0-1.0\n"
-            "  supporting_card_ids: [str]\n"
-            "Return only JSON."
+            "  supporting_card_ids: [str]"
         ),
         "rule_reasoning": (
-            "You are a doctrine extraction agent. Separate black-letter rule from "
-            "application, reasoning, dicta, policy, and precedent.\n\n"
-            "Return JSON with:\n"
-            "  rule: {black_letter, test (list of steps), elements (list), "
-            "exceptions (list), limitations (list), supporting_card_ids}\n"
-            "  reasoning: [{type, text}] where type is one of:\n"
-            "    application | precedent | policy | textual | institutional | fairness | administrability\n"
-            "Return only JSON."
+            "You are a T-14 doctrine extraction specialist.\n\n"
+            "RULE EXTRACTION REQUIREMENTS:\n"
+            "- black_letter: the operative legal rule in reusable standalone form — "
+            "  state it without reference to this case by name.\n"
+            "- test: the multi-part test or balancing factors, each as a separate string.\n"
+            "- elements: the required elements a party must prove, each as a separate string.\n"
+            "- exceptions: factual or legal conditions that take a case outside the rule.\n"
+            "- limitations: scope restrictions — when the rule does NOT apply.\n\n"
+            "REASONING EXTRACTION REQUIREMENTS:\n"
+            "- Classify each reasoning step by type:\n"
+            "  application = applying the rule to facts; "
+            "  precedent = relying on prior cases; "
+            "  policy = invoking policy goals; "
+            "  textual = interpreting statutory/constitutional text; "
+            "  institutional = deferring to another body; "
+            "  fairness = invoking equitable considerations; "
+            "  administrability = choosing rules that are easier to apply.\n"
+            "- Each reasoning entry must have a specific text (not a summary).\n"
+            "Return ONLY JSON:\n"
+            "  rule: {black_letter, test: [str], elements: [str], "
+            "exceptions: [str], limitations: [str], supporting_card_ids: [str]}\n"
+            "  reasoning: [{type, text}]"
         ),
         "dissent": (
-            "You are a dissent and concurrence specialist. "
-            "Identify separate opinions and explain their doctrinal disagreement. "
-            "If no dissent or concurrence exists, return empty fields (has_dissent: false).\n\n"
-            "Return JSON with:\n"
+            "You are a T-14 law professor specialising in separate opinion analysis.\n\n"
+            "DISSENT EXTRACTION REQUIREMENTS:\n"
+            "- If has_dissent is false, return empty fields — do NOT invent a dissent.\n"
+            "- dissent_summary (2-3 sentences): what the dissent argues; "
+            "  specifically which element of the majority's analysis it rejects.\n"
+            "- alternative_rule: the rule the dissent would apply instead — "
+            "  state it in the same form as the majority's rule for easy comparison.\n"
+            "- key_disagreement: the single most important point of doctrinal disagreement "
+            "  (e.g., 'majority defines duty by geographic proximity; "
+            "  dissent defines it by foreseeability alone').\n"
+            "- The dissent is a HIGH-YIELD exam and cold-call source — extract it precisely.\n"
+            "Return ONLY JSON:\n"
             "  has_dissent: bool\n"
             "  has_concurrence: bool\n"
             "  dissent_summary: str\n"
             "  concurrence_summary: str\n"
             "  alternative_rule: str\n"
             "  key_disagreement: str\n"
-            "  supporting_card_ids: [str]\n"
-            "Return only JSON."
+            "  supporting_card_ids: [str]"
         ),
     }
 
@@ -865,21 +999,34 @@ async def doctrinal_synthesizer(state: AgentState) -> Dict:
         "elements": (rule_data.get("rule") or {}).get("elements", [])[:6],
     }
 
+    _node_start("doctrinal_synthesizer", state,
+                case=orientation.get("primary_case_name", "?")[:30])
+
     system = (
-        "You are a senior law tutor synthesising a case brief. Resolve conflicts, "
-        "distinguish narrow holding from broad rule, identify limits, and explain "
-        "why the case matters.\n\n"
-        "Return JSON with:\n"
-        "  doctrinal_role: 'introduces' | 'refines' | 'limits' | 'overrules' | 'applies' | 'distinguishes'\n"
-        "  narrow_holding: string (the specific answer to the case's issue)\n"
-        "  broad_rule: string (the general rule students should remember)\n"
-        "  rule_limits: [str] (situations where the rule does not apply)\n"
-        "  exam_triggers: [str] (fact patterns that call for this case)\n"
-        "  cold_call_traps: [str] (common mistakes professors catch students on)\n"
-        "  common_misreadings: [str] (overbroad applications to avoid)\n"
-        "  related_doctrines: [str] (adjacent concepts students should connect)\n"
-        "  pedagogical_note: string (1-2 sentences on why this case was assigned)\n"
-        "Return only JSON."
+        "You are a T-14 law tutor synthesising a case brief into a complete doctrinal "
+        "understanding.\n\n"
+        "SYNTHESIS REQUIREMENTS:\n"
+        "- doctrinal_role: how this case fits in the doctrine arc — "
+        "'introduces' (first case on this rule), 'refines' (narrows/clarifies), "
+        "'limits' (carves out exception), 'overrules' (changes prior rule), "
+        "'applies' (routine application), 'distinguishes' (draws a line).\n"
+        "- narrow_holding: the specific answer to the issue in these facts — "
+        "NOT a general rule statement.\n"
+        "- broad_rule: the general rule students should take away — "
+        "stated without reference to the case name.\n"
+        "- rule_limits: factual or doctrinal situations where the rule does NOT apply "
+        "— these become the basis for wrong MCQ distractors and cold-call traps.\n"
+        "- exam_triggers: specific fact patterns that should trigger citation of this case — "
+        "'use this case when [fact pattern]'.\n"
+        "- cold_call_traps: the 3-5 mistakes professors most often catch students on — "
+        "e.g., over-reading the holding, ignoring the procedural posture, "
+        "confusing dicta with the rule.\n"
+        "- common_misreadings: overbroad statements of the rule that are wrong — "
+        "state the misreading, then the correct formulation.\n"
+        "- related_doctrines: adjacent rules or cases students should connect to this one.\n"
+        "- pedagogical_note: 1-2 sentences on WHY this case was assigned and what "
+        "doctrinal move the professor wants students to learn.\n"
+        "Return ONLY JSON. No extra text."
     )
 
     prompt = (
@@ -897,7 +1044,8 @@ async def doctrinal_synthesizer(state: AgentState) -> Dict:
         f"Synthesise the doctrinal significance."
     )
 
-    raw = await _llm("worker_mid", prompt, system=system, max_tokens=1500)
+    raw = await _llm("worker_mid", prompt, system=system, max_tokens=2000,
+                     _node="doctrinal_synthesizer")
     try:
         data = _parse_json(raw)
     except Exception:
@@ -920,6 +1068,10 @@ async def doctrinal_synthesizer(state: AgentState) -> Dict:
         "worker_mid", "doctrinal_synthesizer", "doctrinal_synthesis",
         source_ids=state.get("source_ids"),
     )
+    _node_done("doctrinal_synthesizer", state,
+               doctrinal_role=synthesis.get("doctrinal_role", "?"),
+               n_triggers=len(synthesis.get("exam_triggers", [])),
+               n_traps=len(synthesis.get("cold_call_traps", [])))
     return {"doctrinal_synthesis": synthesis}
 
 
@@ -999,56 +1151,146 @@ def drafter_to_writers(state: AgentState) -> List[Send]:
 
 _SECTION_SYSTEMS = {
     "case_identity": (
-        "Write the case identity section using only supplied metadata and evidence. "
-        "Do not infer missing court, year, citation, or parties.\n"
-        "Include: full case name, court, year, citation (if available), parties, source type.\n"
-        "Return JSON: {section_id, title, draft_text, claims:[{claim,supporting_card_ids}], word_count, warnings}"
+        "You are a T-14 law professor writing the case identity section of a case brief.\n\n"
+        "STANDARDS:\n"
+        "- Use ONLY supplied metadata and evidence cards — do not infer missing fields.\n"
+        "- Include: full case name (both parties), court, year decided, citation (if available), "
+        "  parties' roles (plaintiff/defendant/appellant/appellee), and source document type.\n"
+        "- If citation is not in the evidence, omit it — do not fabricate.\n"
+        "- draft_text: 2-4 sentences, clean and precise.\n"
+        "Return JSON: {section_id, title, draft_text, claims:[{claim,supporting_card_ids}], "
+        "word_count, warnings}"
     ),
     "procedural_posture": (
-        "Explain how the case reached this court and what procedural frame controls analysis. "
-        "Distinguish lower-court result, current stage, standard/frame, and final disposition.\n"
-        "Return JSON: {section_id, title, draft_text, procedural_stage, standard_or_frame, claims, word_count, warnings}"
+        "You are a T-14 law professor writing the procedural posture section.\n\n"
+        "STANDARDS:\n"
+        "- State how the case reached this court: lower court name + what it held + "
+        "  who appealed + current stage.\n"
+        "- Identify the standard/frame that controls analysis "
+        "  (e.g., 'de novo review of legal issues', 'Rule 12(b)(6) pleading standard', "
+        "  'abuse of discretion').\n"
+        "- Note the final disposition (affirmed, reversed, remanded).\n"
+        "- The procedural frame is critical on exams — students who confuse the frame "
+        "  misapply the rule. Make it explicit.\n"
+        "Return JSON: {section_id, title, draft_text, procedural_stage, "
+        "standard_or_frame, claims, word_count, warnings}"
     ),
     "facts": (
-        "Write only legally material facts. Explain why each fact matters. "
-        "Avoid narrative bloat. Separate material from background facts.\n"
-        "Return JSON: {section_id, title, draft_text, material_facts:[{fact,why_material,supporting_card_ids}], omitted_background_facts, word_count, claims, warnings}"
+        "You are a T-14 law professor writing the material facts section.\n\n"
+        "STANDARDS:\n"
+        "- ONLY include facts the court actually relied on — removing a material fact "
+        "  should change the legal outcome.\n"
+        "- For each fact: state it precisely and explain WHY it matters "
+        "(which element it establishes, or which rule it triggers).\n"
+        "- Omit narrative background that does not affect the outcome — "
+        "  list omitted background facts briefly in omitted_background_facts.\n"
+        "- Do NOT characterise facts as good or bad — state them neutrally.\n"
+        "- draft_text: present tense, tight prose. Each sentence carries legal weight.\n"
+        "Return JSON: {section_id, title, draft_text, "
+        "material_facts:[{fact,why_material,supporting_card_ids}], "
+        "omitted_background_facts, word_count, claims, warnings}"
     ),
     "issue_holding": (
-        "Write the issue and holding so they mirror each other. "
-        "The issue must be a legal question tied to facts. "
-        "The holding must answer yes/no where possible and remain narrow.\n"
-        "Return JSON: {section_id, title, issue, holding, disposition, draft_text, claims, word_count}"
+        "You are a T-14 law professor writing the issue and holding section.\n\n"
+        "STANDARDS:\n"
+        "- Issue format: 'Whether [legal standard] applies when [specific facts from this case].' "
+        "— NOT a generic question about the doctrine.\n"
+        "- Issue and holding must mirror each other: the holding answers the issue "
+        "yes or no (where possible) and states the operative legal rule.\n"
+        "- holding_narrow: stays narrow to these facts — do not over-generalise to "
+        "create a rule that does not exist in the opinion.\n"
+        "- Distinguish holding from disposition: holding = rule of decision; "
+        "disposition = what the court ordered (affirmed/reversed).\n"
+        "Return JSON: {section_id, title, issue, holding, disposition, "
+        "draft_text, claims, word_count}"
     ),
     "rule": (
-        "Write the governing rule in reusable form. "
-        "Separate: general rule, operational test, elements, exceptions, and limitations.\n"
-        "Return JSON: {section_id, title, black_letter_rule, test, elements, exceptions, limitations, draft_text, claims, word_count}"
+        "You are a T-14 law professor writing the governing rule section.\n\n"
+        "STANDARDS:\n"
+        "- black_letter_rule: standalone restatement usable in a future case "
+        "without referring back to this case by name.\n"
+        "- test: the multi-factor test or elements, each on a separate line.\n"
+        "- exceptions: specific factual conditions that take a case outside the rule.\n"
+        "- limitations: scope restrictions — when and to whom the rule does not apply.\n"
+        "- The rule section is the most exam-tested section — be precise and reusable.\n"
+        "- Do NOT include reasoning or policy in the rule section; those go in 'reasoning'.\n"
+        "Return JSON: {section_id, title, black_letter_rule, test, elements, "
+        "exceptions, limitations, draft_text, claims, word_count}"
     ),
     "reasoning": (
-        "Explain how the court moved from facts to rule to holding. "
-        "Classify reasoning by type: application, precedent, policy, textual, institutional, fairness, administrability.\n"
-        "Return JSON: {section_id, title, reasoning_outline:[str], draft_text, word_count, warnings}"
+        "You are a T-14 law professor writing the reasoning section.\n\n"
+        "STANDARDS:\n"
+        "- Trace the logical path from facts → rule → holding.\n"
+        "- Classify each reasoning step: "
+        "application (rule → facts), precedent (prior cases), policy (goals served), "
+        "textual (statutory/constitutional language), institutional (deference), "
+        "fairness (equitable), administrability (workable rules).\n"
+        "- Identify the PRIMARY reasoning type — most courts use 1-2 dominant types.\n"
+        "- Do NOT summarise the facts again — assume the reader has read the facts section.\n"
+        "- If the court's reasoning is weak or questionable, note it briefly "
+        "  (this is what professors challenge on cold calls).\n"
+        "Return JSON: {section_id, title, reasoning_outline:[str], "
+        "draft_text, word_count, warnings}"
     ),
     "dissent": (
-        "Write separate-opinion analysis only if the evidence supports it. "
-        "Do not invent a dissent or concurrence. If none, return has_section:false with empty draft_text.\n"
-        "Return JSON: {section_id, title, has_section, draft_text, majority_vs_dissent:{majority_rule,dissent_rule,core_disagreement}, word_count, warnings}"
+        "You are a T-14 law professor writing the dissent section.\n\n"
+        "STANDARDS:\n"
+        "- Write this section ONLY if the evidence cards contain a dissent or concurrence. "
+        "  If none exists, return has_section: false with empty draft_text.\n"
+        "- majority_rule: state the majority's operative rule in one sentence.\n"
+        "- dissent_rule: state the dissent's alternative rule in one sentence "
+        "  (in the same structure as the majority rule for easy comparison).\n"
+        "- core_disagreement: one sentence on WHERE the majority and dissent part ways "
+        "  (e.g., 'Majority defines duty by geographic proximity; dissent "
+        "  by foreseeability alone').\n"
+        "- The dissent is HIGH-YIELD for exams and cold calls — extract it carefully.\n"
+        "Return JSON: {section_id, title, has_section, draft_text, "
+        "majority_vs_dissent:{majority_rule,dissent_rule,core_disagreement}, "
+        "word_count, warnings}"
     ),
     "pedagogy": (
-        "Explain why this case was likely assigned and what doctrinal move students should learn. "
-        "Reference casebook context or lecture notes where available.\n"
-        "Return JSON: {section_id, title, why_assigned, doctrinal_role, common_misreadings, draft_text, word_count}"
+        "You are a T-14 law professor writing the pedagogical note section.\n\n"
+        "STANDARDS:\n"
+        "- Answer WHY this case was assigned: what doctrinal move does the professor "
+        "  want students to learn from it?\n"
+        "- Identify the doctrinal_role: introduces / refines / limits / "
+        "overrules / applies / distinguishes.\n"
+        "- List common_misreadings: the overbroad or under-read versions of the rule "
+        "  students typically fall into — these are what professors test on exams.\n"
+        "- Reference casebook context or lecture note context where available in the evidence.\n"
+        "Return JSON: {section_id, title, why_assigned, doctrinal_role, "
+        "common_misreadings, draft_text, word_count}"
     ),
     "exam_translation": (
-        "Translate the case into exam triggers, attack-outline use, cold-call angles, and limits. "
-        "Do not overstate the doctrine.\n"
-        "Return JSON: {section_id, title, use_this_case_when, do_not_overread_as, exam_hypo_triggers, cold_call_questions, draft_text, word_count}"
+        "You are a T-14 law professor writing the exam translation section.\n\n"
+        "STANDARDS:\n"
+        "- use_this_case_when: specific fact triggers (at least 3) — "
+        "'Use this case when the facts show [X]'.\n"
+        "- do_not_overread_as: the overbroad statement students write on exams "
+        "  (at least 2 examples) — 'Do NOT write that the rule applies whenever [Y]; "
+        "  it is limited to [Z]'.\n"
+        "- exam_hypo_triggers: concrete hypothetical fact patterns that should "
+        "  trigger this case (at least 3).\n"
+        "- cold_call_questions: the 2-3 questions a professor would ask based on "
+        "  this case.\n"
+        "- Do NOT overstate the doctrine — specificity beats breadth.\n"
+        "Return JSON: {section_id, title, use_this_case_when, do_not_overread_as, "
+        "exam_hypo_triggers, cold_call_questions, draft_text, word_count}"
     ),
     "cold_call": (
-        "Produce the cold-call survival guide for this case. "
-        "List the 3-5 questions a professor is most likely to ask, with model answers.\n"
-        "Return JSON: {section_id, title, questions:[{question,model_answer,why_asked}], draft_text, word_count}"
+        "You are a T-14 law professor writing the cold-call survival guide section.\n\n"
+        "STANDARDS:\n"
+        "- List 3-5 questions a professor is most likely to ask about this case.\n"
+        "- For each question:\n"
+        "  question: the exact professor-voice question (e.g., 'What was the holding?', "
+        "  'Why does it matter that plaintiff was outside the zone of danger?', "
+        "  'What would the dissent say about this hypothetical?')\n"
+        "  model_answer: a 2-4 sentence model answer that would survive a cold call "
+        "  (Because/Unless/But/Therefore structure where appropriate).\n"
+        "  why_asked: one sentence on WHY this question is a professor favourite — "
+        "  what misconception or doctrinal nuance it tests.\n"
+        "Return JSON: {section_id, title, questions:[{question,model_answer,why_asked}], "
+        "draft_text, word_count}"
     ),
 }
 
@@ -1508,31 +1750,44 @@ async def critic(state: AgentState) -> Dict:
     failing_sections = [r["section_id"] for r in grounding_reports if not r["grounding_pass"]]
     excerpt = brief_text[:4500]
 
+    _node_start("critic", state,
+                n_sections=len(state.get("final_sections") or state.get("raw_sections") or []),
+                n_failing=len(failing_sections))
+
     system = (
-        "You are a demanding law professor. Determine whether the brief would survive "
-        "a cold call and help on an exam.\n\n"
-        "Score each dimension 0.0-10.0:\n"
-        "  accuracy: factual and legal correctness\n"
-        "  briefing_quality: issue precision, holding narrowness, rule usability\n"
-        "  exam_usefulness: exam-trigger clarity, do-not-overread guidance\n"
-        "  citation_discipline: source grounding and citation traceability\n\n"
-        "Then:\n"
-        "  quality_pass: true if all scores ≥ 6.5 and no failed grounding sections\n"
-        "  critique: list of specific issues found\n"
-        "  revise: true if quality_pass is false\n"
-        "  sections_to_revise: list of section_ids most needing improvement\n"
-        "  revision_instructions: 2-4 sentences of targeted guidance\n\n"
-        "Return JSON only."
+        "You are a T-14 law professor performing a demanding critique of a student "
+        "case brief to determine if it would survive a cold call and help on an exam.\n\n"
+        "SCORING CRITERIA (0.0–10.0 each):\n"
+        "  accuracy: Are all factual and legal claims correct? "
+        "(0 = materially wrong; 10 = flawless)\n"
+        "  briefing_quality: Is the issue tied to specific facts? Is the holding narrow? "
+        "Is the rule reusable standalone? (0 = fails all; 10 = all excellent)\n"
+        "  exam_usefulness: Are exam triggers specific? Is do-not-overread guidance present? "
+        "Would a student know when to use this case? (0 = useless; 10 = exam-ready)\n"
+        "  citation_discipline: Is every claim traced to source evidence? "
+        "Are there unsupported assertions? (0 = hallucinated; 10 = fully grounded)\n\n"
+        "PASS THRESHOLD: all scores >= 6.5 AND no failed grounding sections.\n"
+        "CRITIQUE: list specific issues — name the section_id and the problem. "
+        "Generic praise or criticism ('the brief is good overall') fails the critique standard.\n"
+        "REVISION INSTRUCTIONS: 2-4 targeted sentences on what to fix and how.\n\n"
+        "Return ONLY JSON:\n"
+        "  quality_pass: bool\n"
+        "  scores: {accuracy, briefing_quality, exam_usefulness, citation_discipline}\n"
+        "  critique: [str] (specific per-section issues)\n"
+        "  revise: bool\n"
+        "  sections_to_revise: [str] (section_ids)\n"
+        "  revision_instructions: str"
     )
 
     prompt = (
         f"Case brief excerpt:\n{excerpt}\n\n"
         f"Sections with grounding failures: {failing_sections}\n"
         f"Coherence issues: {coherence_edit.get('contradictions_found', [])}\n\n"
-        f"Critique this brief as a demanding law professor."
+        f"Critique this brief."
     )
 
-    raw = await _llm("orchestrator", prompt, system=system, max_tokens=1200)
+    raw = await _llm("orchestrator", prompt, system=system, max_tokens=1500,
+                     _node="critic")
     try:
         data = _parse_json(raw)
     except Exception:
@@ -1567,6 +1822,10 @@ async def critic(state: AgentState) -> Dict:
         "orchestrator", "critic", "brief_critique",
         source_ids=state.get("source_ids"),
     )
+    _node_done("critic", state,
+               quality_pass=critique_result["quality_pass"],
+               revise=critique_result["revise"],
+               n_targets=len(critique_result["sections_to_revise"]))
     return {"critique": critique_result}
 
 
@@ -1696,19 +1955,28 @@ async def final_formatter(state: AgentState) -> Dict:
     if not brief_text:
         return {"final_output": ""}
 
+    _node_start("final_formatter", state,
+                n_sections=len(state.get("final_sections") or []),
+                revision_count=state.get("revision_count", 0))
+
     system = (
-        "You are the final formatting agent for a law-school case brief. "
-        "Do not perform new legal reasoning. Format verified content into clean markdown.\n\n"
-        "Rules:\n"
-        "  - Ensure consistent heading hierarchy (# for title, ## for sections, ### for subsections)\n"
-        "  - Bold the rule statement and holding in each section\n"
-        "  - Issue is formatted 'Whether ...' on its own line\n"
-        "  - Holding answers the issue directly on the next line\n"
-        "  - Exam triggers in a bulleted list under exam_translation\n"
-        "  - Cold-call questions numbered\n"
-        "  - Do not include raw JSON, code fences, or template artifacts\n"
-        "  - Preserve all existing content; clean formatting only\n"
-        "Return only the final Markdown — no explanation."
+        "You are the final formatting agent for a T-14 law-school case brief. "
+        "Do NOT perform new legal reasoning. Format verified content into clean, "
+        "student-ready markdown.\n\n"
+        "FORMATTING RULES:\n"
+        "  - Heading hierarchy: # for case title, ## for section headers, "
+        "### for subsection labels.\n"
+        "  - **Bold** the black-letter rule statement and the holding.\n"
+        "  - Issue: 'Whether ...' on its own paragraph line.\n"
+        "  - Holding: answers the issue on the very next line, also bolded.\n"
+        "  - Rule elements: bulleted list, one element per bullet.\n"
+        "  - Exam triggers: bulleted list under the Exam Translation section.\n"
+        "  - Cold-call questions: numbered list with model answer in a blockquote "
+        "(> Model Answer: ...) below each question.\n"
+        "  - ⚠️ Warnings (overbroad language, unsupported claims): prefix with '⚠️ '.\n"
+        "  - Do NOT include raw JSON, code fences, or template artifacts.\n"
+        "  - Preserve ALL existing content — clean formatting only, no new legal analysis.\n"
+        "Return ONLY the final Markdown. No explanation."
     )
 
     prompt = (
@@ -1716,7 +1984,8 @@ async def final_formatter(state: AgentState) -> Dict:
         f"Format for student use."
     )
 
-    formatted = await _llm("worker_low", prompt, system=system, max_tokens=7000)
+    formatted = await _llm("worker_low", prompt, system=system, max_tokens=7000,
+                           _node="final_formatter")
 
     final_sections = state.get("final_sections") or state.get("raw_sections") or []
     total_words    = sum(s.get("word_count", 0) for s in final_sections)
@@ -1736,6 +2005,8 @@ async def final_formatter(state: AgentState) -> Dict:
         "worker_low", "final_formatter", "final_output",
         source_ids=state.get("source_ids"),
     )
+    _node_done("final_formatter", state,
+               total_words=total_words, est_pages=est_pages)
     return {"final_output": final}
 
 

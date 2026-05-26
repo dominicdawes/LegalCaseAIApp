@@ -34,6 +34,7 @@ from .state import (
     VerifiedQuestion,
 )
 from .worker_config import _fetch_worker_model, model_costs
+from utils.llm_clients.anthropic_rate_limits import get_llm_semaphore
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +57,43 @@ Style constraints:
 """
 
 
+# ── Rate-limit guard ──────────────────────────────────────────────────────────
+_LLM_RATE_LIMIT_RETRIES = 3
+_LLM_RATE_LIMIT_DELAY   = 60  # seconds (linear: 60, 120, 180 s)
+
+_DEEPSEEK_SEMAPHORE: Optional[asyncio.Semaphore] = None
+
+
+def _get_deepseek_semaphore() -> asyncio.Semaphore:
+    global _DEEPSEEK_SEMAPHORE
+    if _DEEPSEEK_SEMAPHORE is None:
+        _DEEPSEEK_SEMAPHORE = asyncio.Semaphore(10)
+    return _DEEPSEEK_SEMAPHORE
+
+
+# ── Debug helpers ─────────────────────────────────────────────────────────────
+
+def _node_start(name: str, state: Dict, **extras: Any) -> None:
+    job = (state.get("job_id") or "")[:8] or "no-job"
+    parts = " ".join(f"{k}={v}" for k, v in extras.items())
+    logger.info("▶ [%s] %s  %s", job, name, parts)
+
+
+def _node_done(name: str, state: Dict, **extras: Any) -> None:
+    job = (state.get("job_id") or "")[:8] or "no-job"
+    parts = " ".join(f"{k}={v}" for k, v in extras.items())
+    logger.info("✓ [%s] %s  %s", job, name, parts)
+
+
+def _node_warn(name: str, state: Dict, msg: str) -> None:
+    job = (state.get("job_id") or "")[:8] or "no-job"
+    logger.warning("⚠ [%s] %s  %s", job, name, msg)
+
+
+def _llm_call(name: str, worker_class: str, model_name: str, max_tokens: int) -> None:
+    logger.info("  🤖 [%s] LLM %s (%s) max_tokens=%d", name, worker_class, model_name, max_tokens)
+
+
 # ── LLM call via LLMFactory ───────────────────────────────────────────────────
 
 async def _llm(
@@ -64,24 +102,60 @@ async def _llm(
     system: str = "",
     max_tokens: int = 2048,
     provider: Optional[str] = None,
+    _node: str = "",
 ) -> str:
-    """
-    Route an LLM call through LLMFactory using the worker-class abstraction.
-    Falls back to draining stream_chat if the client has no achat() method.
+    """Route an LLM call through LLMFactory with rate-limit protection and
+    DeepSeek thinking-mode support.
+
+    Acquires a dynamic semaphore before each call to cap concurrency within
+    the org's token-per-minute budget. On 429, retries up to
+    _LLM_RATE_LIMIT_RETRIES times with linear back-off.
     """
     from utils.llm_clients.llm_factory import LLMFactory
-    _provider, model_name = _fetch_worker_model(worker_class, provider)
+    _provider, model_name, thinking = _fetch_worker_model(worker_class, provider)
+    if _node:
+        _llm_call(_node, worker_class, model_name, max_tokens)
+
+    client_kwargs: Dict[str, Any] = {}
+    if thinking is not None:
+        client_kwargs["thinking"] = thinking
+
     client = LLMFactory.get_client_for(
         _provider, model_name,
         temperature=0.7, streaming=False, max_output_tokens=max_tokens,
+        **client_kwargs,
     )
-    if hasattr(client, "achat"):
-        return await client.achat(prompt, system_prompt=system or None)
-    # Fallback: collect tokens from the async streaming generator
-    chunks: List[str] = []
-    async for chunk in client.stream_chat(prompt, system_prompt=system or None):
-        chunks.append(chunk)
-    return "".join(chunks)
+
+    if _provider == "deepseek":
+        sem = _get_deepseek_semaphore()
+    else:
+        sem = await get_llm_semaphore()
+
+    async with sem:
+        for attempt in range(_LLM_RATE_LIMIT_RETRIES + 1):
+            try:
+                if hasattr(client, "achat"):
+                    return await client.achat(prompt, system_prompt=system or None)
+                chunks: List[str] = []
+                async for chunk in client.stream_chat(prompt, system_prompt=system or None):
+                    chunks.append(chunk)
+                return "".join(chunks)
+            except Exception as exc:
+                err = str(exc)
+                is_rate_limit = (
+                    "429" in err
+                    or "rate_limit" in err.lower()
+                    or "rate limit" in err.lower()
+                )
+                if is_rate_limit and attempt < _LLM_RATE_LIMIT_RETRIES:
+                    wait = _LLM_RATE_LIMIT_DELAY * (attempt + 1)
+                    logger.warning(
+                        "🚦 [%s] Rate limit hit (429) — waiting %ds before retry %d/%d",
+                        _node or worker_class, wait, attempt + 1, _LLM_RATE_LIMIT_RETRIES,
+                    )
+                    await asyncio.sleep(wait)
+                    continue
+                raise
 
 
 async def _try_save_artifact(
@@ -180,19 +254,32 @@ async def planner(state: AgentState) -> Dict:
     list_sources_tool = next(t for t in tools if t.name == "list_sources")
     sources_json = await list_sources_tool.ainvoke({})
 
+    _node_start("planner", state, n_questions=state.get("n_questions", "?"))
+
     system = (
-        "You are a law professor designing an exam. "
-        "Analyse the available documents and write a 3-5 sentence strategy "
-        "for generating {n} exam questions. Focus on identifying the richest "
-        "legal issues across the sources."
+        "You are a T-14 law professor designing a rigorous take-home or in-class "
+        "exam.\n\n"
+        "PLANNING REQUIREMENTS:\n"
+        "1. Identify the {n} richest legal issues across all source documents — "
+        "   prioritise issues with multi-party conflicts, competing defences, "
+        "   or factual ambiguity that forces legal analysis.\n"
+        "2. Note any documents with dissenting opinions, policy debates, or "
+        "   multi-factor tests — these generate the best exam material.\n"
+        "3. Flag potential issue overlap between documents so the clusterer "
+        "   can deduplicate.\n"
+        "4. Recommend question difficulty distribution "
+        "(e.g., '2 straightforward application, 2 nuanced analysis').\n"
+        "Write a 4-6 sentence strategy. Be specific — name doctrines and sources."
     ).format(n=state["n_questions"])
 
     plan = await _llm(
         "worker_mid",
         f"Documents available:\n{sources_json}\n\nUser request: {state['request']}",
         system=system,
-        max_tokens=512,
+        max_tokens=640,
+        _node="planner",
     )
+    _node_done("planner", state, n_questions=state.get("n_questions", "?"))
     return {"plan": plan}
 
 
@@ -310,21 +397,29 @@ async def concept_synthesizer(state: AgentState) -> Dict:
         for p in profiles
     ]
 
+    _node_start("concept_synthesizer", state,
+                n_profiles=len(profiles), n_shared=len(shared))
+
     prompt = (
-        f"You are a law professor identifying conceptual throughlines across "
+        f"You are a T-14 law professor identifying cross-document exam themes across "
         f"{len(profiles)} legal documents.\n\n"
         f"Document summaries:\n{json.dumps(profiles_brief, indent=2)}\n\n"
         f"Cross-document concept evidence:\n{json.dumps(cross_results, indent=2)}\n\n"
-        f"Identify 3-5 conceptual throughlines: legal concepts, doctrines, or themes "
-        f"that span multiple documents and would make strong exam question material.\n\n"
-        f"For each throughline return:\n"
-        f'  "concept":    the concept or doctrine name\n'
-        f'  "summary":    2-3 sentences on how the documents relate to or develop it\n'
-        f'  "source_ids": list of document UUIDs where this concept appears\n\n'
+        f"SYNTHESIS REQUIREMENTS:\n"
+        f"- Identify 3-5 conceptual throughlines that appear in 2+ documents and "
+        f"  would make strong exam question material.\n"
+        f"- For each throughline:\n"
+        f'  "concept":    the doctrine or rule name\n'
+        f'  "summary":    2-3 sentences on how the documents relate to, develop, or '
+        f"  conflict on this doctrine — this is what the exam can probe.\n"
+        f'  "source_ids": list of document UUIDs where this concept appears\n'
+        f'  "exam_angle": one sentence on what aspect would make a strong exam question '
+        f"  (e.g., 'tension between the majority rule in Doc A and the minority rule "
+        f"  in Doc B creates a natural call of the question').\n\n"
         f"Return a JSON array only. No extra text."
     )
 
-    raw = await _llm("worker_mid", prompt, max_tokens=1024)
+    raw = await _llm("worker_mid", prompt, max_tokens=1280)
     try:
         throughlines = _parse_json(raw)
     except Exception:
@@ -340,6 +435,8 @@ async def concept_synthesizer(state: AgentState) -> Dict:
         artifact_type="concept_synthesis",
         source_ids=state.get("source_ids"),
     )
+    _node_done("concept_synthesizer", state,
+               n_throughlines=len(throughlines), n_shared=len(shared))
     return {"concept_synthesis": synthesis}
 
 
@@ -362,15 +459,24 @@ async def issue_clusterer(state: AgentState) -> Dict:
         if synthesis else ""
     )
 
+    _node_start("issue_clusterer", state, n=n)
+
     prompt = (
-        f"You are a law professor. Given the source document profiles below "
-        f"and the exam request, identify exactly {n} high-quality legal issues "
-        f"suitable for exam fact-patterns.\n\n"
-        f"Prioritise issues that appear in the cross-document synthesis where available.\n\n"
-        f"For each issue output a JSON object with:\n"
+        f"You are a T-14 law professor clustering exactly {n} exam-worthy legal "
+        f"issues from the source documents below.\n\n"
+        f"CLUSTERING REQUIREMENTS:\n"
+        f"- Select issues that generate genuine legal analysis — not trivial recall.\n"
+        f"- Prefer issues with: multi-party liability, competing doctrines, "
+        f"  factual ambiguity that activates the rule, or dissent/minority rule tension.\n"
+        f"- No duplicate issues (e.g., don't create two questions testing the same "
+        f"  element of the same rule).\n"
+        f"- Prioritise throughlines from the cross-document synthesis where available.\n"
+        f"- issue_label: format as 'Doctrine — specific sub-issue' "
+        f"  (e.g., 'Negligence — duty to foreseeable plaintiff').\n\n"
+        f"For each issue return:\n"
         f'  "issue_label":   short label (e.g. "Negligence — proximate cause")\n'
         f'  "source_ids":    list of source UUIDs where material exists\n'
-        f'  "section_hints": list of section_path hints to retrieve\n'
+        f'  "section_hints": list of section/topic hints for retrieval\n'
         f'  "priority":      1 (high) | 2 (medium) | 3 (low)\n\n'
         f"Return a JSON array of exactly {n} objects. No extra text.\n\n"
         f"Source profiles:\n{profiles_text}"
@@ -379,7 +485,7 @@ async def issue_clusterer(state: AgentState) -> Dict:
         f"Plan: {state.get('plan', '')}"
     )
 
-    raw = await _llm("worker_mid", prompt, max_tokens=1024)
+    raw = await _llm("worker_mid", prompt, max_tokens=1280)
     try:
         clusters: List[IssueCluster] = _parse_json(raw)
     except Exception:
@@ -392,6 +498,7 @@ async def issue_clusterer(state: AgentState) -> Dict:
             }
             for i, p in enumerate((profiles or [])[:n])
         ]
+    _node_done("issue_clusterer", state, n_clusters=len(clusters[:n]))
     return {"chosen_issues": clusters[:n]}
 
 
@@ -471,16 +578,33 @@ async def question_drafter(state: Dict) -> Dict:
         for c in bundle["chunks"][:15]
     )
 
+    _node_start("question_drafter", state, issue=bundle["issue_label"][:40])
+
     system = (
-        "You are an expert law professor. Draft a single, realistic fact-pattern "
-        "hypothetical exam question for the issue provided. The question must:\n"
-        "- Be a multi-character narrative with chronological events\n"
-        "- Embed the legal issue naturally without naming it explicitly\n"
-        "- End with a clear 'Call of the Question' in bold\n"
-        "- Be based ONLY on the provided legal context\n"
-        "Return JSON with keys: fact_pattern (str), call_of_question (str), "
-        "chunk_ids_used (list of chunk_id UUID strings from the [chunk_id:...] markers above — "
-        "copy only the UUID, not the page number)"
+        "You are a T-14 law professor drafting a bar-caliber exam question.\n\n"
+        "FACT PATTERN STANDARDS:\n"
+        "- Multi-character narrative (2-5 named parties) with chronological events.\n"
+        "- Embed the legal issue NATURALLY — do NOT name the doctrine explicitly in the "
+        "  fact pattern (do not write 'this is a negligence case'). The student must "
+        "  identify the issue from the facts.\n"
+        "- Include enough legally operative facts to resolve all major sub-issues in the "
+        "  answer key — missing facts create unanswerable questions.\n"
+        "- Add at least one fact that activates a defence or complication, and one fact "
+        "  that creates ambiguity requiring analysis (not a fact with an obvious result).\n"
+        "- Base the facts ONLY on the provided legal context — do not import facts from "
+        "  other doctrines or real-world cases.\n"
+        "- Write in present tense, plain English, smooth narrative prose. "
+        "  No JSON fragments or legal jargon in the story.\n\n"
+        "CALL OF THE QUESTION STANDARDS:\n"
+        "- Open-ended: tells the student what to analyse WITHOUT giving away the issue.\n"
+        "- Examples: 'Discuss all potential claims and defences available to each party.'; "
+        "  'Analyse [Party A]'s potential liability and [Party B]'s best defences.'\n"
+        "- Do NOT ask 'Was there negligence?' — that names the issue.\n\n"
+        "Return ONLY JSON with keys:\n"
+        "  fact_pattern (str): the fact pattern narrative\n"
+        "  call_of_question (str): the call of the question\n"
+        "  chunk_ids_used (list of str): chunk_id UUID strings from [chunk_id:...] markers "
+        "(copy only the UUID, not the page number)"
     )
 
     prompt = (
@@ -489,7 +613,8 @@ async def question_drafter(state: Dict) -> Dict:
         f"Draft the fact-pattern hypothetical."
     )
 
-    raw = await _llm("orchestrator", prompt, system=system, max_tokens=1500)
+    raw = await _llm("orchestrator", prompt, system=system, max_tokens=2000,
+                     _node="question_drafter")
     try:
         data = _parse_json(raw)
     except Exception:
@@ -507,6 +632,7 @@ async def question_drafter(state: Dict) -> Dict:
         "answer_key":      "",
         "chunk_ids_used":  data.get("chunk_ids_used", [c.get("id", "") for c in bundle["chunks"][:10]]),
     }
+    _node_done("question_drafter", state, issue=bundle["issue_label"][:40])
     return {"draft_questions": [draft]}
 
 
@@ -542,11 +668,29 @@ async def answer_key_builder(state: Dict) -> Dict:
         c.get("content", "") for c in bundle["chunks"][:15]
     )
 
+    _node_start("answer_key_builder", state,
+                issue=draft.get("issue_label", "?")[:40])
+
     system = (
-        "You are an expert law professor writing the model answer key for an exam question. "
-        "Produce a detailed IRAC analysis covering all major issues in the fact pattern. "
-        "For each issue: state the Issue, Rule (from the provided materials), Application "
-        "(both sides), and Conclusion. Include any defences raised."
+        "You are a T-14 law professor writing the model answer key for an exam question.\n\n"
+        "ANSWER KEY STANDARDS:\n"
+        "- Write a full IRAC analysis for EVERY major issue in the fact pattern.\n"
+        "- Issue: one sentence framing the precise legal question for this sub-issue. "
+        "  Format: 'Whether [party] is liable for [claim] because [key fact].' \n"
+        "- Rule: state the applicable rule from the source materials. "
+        "  Name the doctrine and, if available, the case or statute. "
+        "  Include ALL elements the rule requires.\n"
+        "- Application: argue BOTH sides — state the best argument for plaintiff/prosecution "
+        "  AND the best argument for defendant. Address any affirmative defences raised. "
+        "  Do NOT reach a conclusion until you have analysed both sides.\n"
+        "- Conclusion: one sentence stating the most likely result and why.\n\n"
+        "COMPLETENESS REQUIREMENT:\n"
+        "- Cover ALL major issues raised by the facts — missing a sub-issue is a "
+        "  model-answer failure.\n"
+        "- Include: primary claim, all defences, any counterclaims or cross-claims "
+        "  suggested by the facts.\n"
+        "- Do NOT import doctrine not supported by the provided legal context.\n\n"
+        "FORMAT: Plain English, one IRAC block per issue, blank line between blocks."
     )
 
     prompt = (
@@ -556,10 +700,13 @@ async def answer_key_builder(state: Dict) -> Dict:
         f"Write the detailed Answer Key & Analysis."
     )
 
-    answer_key = await _llm("orchestrator", prompt, system=system, max_tokens=2500)
+    answer_key = await _llm("orchestrator", prompt, system=system, max_tokens=3000,
+                            _node="answer_key_builder")
 
     updated_draft = dict(draft)
     updated_draft["answer_key"] = answer_key
+    _node_done("answer_key_builder", state,
+               issue=draft.get("issue_label", "?")[:40])
     return {"draft_questions": [updated_draft]}
 
 
@@ -677,20 +824,36 @@ async def critic(state: AgentState) -> Dict:
         for q in questions
     )
 
-    prompt = (
-        f"You are a senior law professor reviewing {n} exam questions. "
-        f"For each question, identify if it:\n"
-        f"  - Has a clear, non-ambiguous call of the question\n"
-        f"  - Is appropriately complex (not too simple)\n"
-        f"  - Has a grounding_verdict of 'fail' (must be revised)\n\n"
-        f"Return a JSON array of objects with:\n"
-        f'  "question_index": int\n'
-        f'  "needs_revision": bool\n'
-        f'  "critique":       one-sentence note\n\n'
-        f"Questions:\n{questions_text}\n\nReturn only JSON array, no extra text."
+    _node_start("critic", state, n_questions=n)
+
+    system = (
+        "You are a T-14 law professor performing a rigorous critique of draft exam "
+        "questions before final publication.\n\n"
+        "EVALUATION CRITERIA per question:\n"
+        "1. call_clarity: Is the call of the question open-ended WITHOUT naming the issue? "
+        "   (FAIL: 'Was there negligence?'; PASS: 'Discuss all claims and defences.')\n"
+        "2. fact_completeness: Does the fact pattern include enough operative facts to "
+        "   resolve all sub-issues? (FAIL: missing facts that the answer key requires)\n"
+        "3. appropriate_complexity: Does the question require genuine legal analysis, "
+        "   not just rule recall? (FAIL: answer obvious without reading facts)\n"
+        "4. no_issue_duplication: Is this issue meaningfully distinct from other "
+        "   questions in the exam? (FAIL: same rule tested twice identically)\n"
+        "5. grounding: If grounding_verdict is 'fail', the question MUST be flagged.\n\n"
+        "Return ONLY a JSON array, no extra text."
     )
 
-    raw = await _llm("worker_low", prompt, max_tokens=1024)
+    prompt = (
+        f"Review {n} exam questions.\n\n"
+        f"Questions:\n{questions_text}\n\n"
+        f"For each question return:\n"
+        f'  "question_index": int\n'
+        f'  "needs_revision": bool\n'
+        f'  "critique": one specific sentence naming the problem (if any)\n'
+        f"Return only JSON array."
+    )
+
+    raw = await _llm("worker_low", prompt, system=system, max_tokens=1280,
+                     _node="critic")
     try:
         critiques = _parse_json(raw)
     except Exception:
@@ -709,6 +872,8 @@ async def critic(state: AgentState) -> Dict:
         else:
             updated.append(q)
 
+    n_flagged = sum(1 for q in updated if q.get("grounding_verdict") == "fail")
+    _node_done("critic", state, n_questions=n, n_flagged=n_flagged)
     return {"verified_questions": updated}
 
 
@@ -740,6 +905,11 @@ async def reviser(state: AgentState) -> Dict:
     project_id = state["project_id"]
     use_voyage = state.get("use_voyage", False)
 
+    n_failing = sum(1 for q in questions if q["grounding_verdict"] == "fail")
+    _node_start("reviser", state,
+                revision_pass=(state.get("revision_count") or 0) + 1,
+                n_failing=n_failing)
+
     revised = list(questions)
     for i, q in enumerate(revised):
         if q["grounding_verdict"] != "fail":
@@ -759,23 +929,37 @@ async def reviser(state: AgentState) -> Dict:
         evidence = json.loads(evidence_json)
         context  = "\n\n".join(c.get("content", "") for c in evidence[:10])
 
+        system = (
+            "You are a T-14 law professor performing surgical revision of an exam "
+            "question that failed grounding verification.\n\n"
+            "REVISION STANDARDS:\n"
+            "1. Identify which claims in the fact pattern are NOT supported by the "
+            "   provided evidence.\n"
+            "2. Replace unsupported claims with facts that ARE present in the evidence.\n"
+            "3. Preserve the legal issue — do not change what doctrine the question tests.\n"
+            "4. Preserve the call of the question exactly.\n"
+            "5. The revised fact pattern must still read as smooth narrative prose.\n"
+            "Return ONLY the revised fact_pattern text. No explanation."
+        )
+
         prompt = (
-            f"The following exam question failed grounding verification.\n"
+            f"Question failed grounding verification.\n"
             f"Critique: {q['grounding_notes']}\n\n"
             f"Original fact pattern:\n{q['fact_pattern']}\n\n"
             f"Supporting evidence from documents:\n{context}\n\n"
-            f"Revise the fact pattern so all claims are supported by the evidence. "
-            f"Keep the same legal issue and call of the question. "
-            f"Return only the revised fact_pattern text."
+            f"Revise the fact pattern."
         )
 
-        revised_fp = await _llm("worker_mid", prompt, max_tokens=1200)
+        revised_fp = await _llm("worker_mid", prompt, system=system, max_tokens=1500,
+                                _node="reviser")
         updated_q  = dict(q)
         updated_q["fact_pattern"]      = revised_fp
         updated_q["grounding_verdict"] = "warn"
         updated_q["revised"]           = True
         revised[i] = updated_q
 
+    n_revised = sum(1 for q in revised if q.get("revised"))
+    _node_done("reviser", state, n_revised=n_revised)
     return {
         "verified_questions": revised,
         "revision_count": (state.get("revision_count") or 0) + 1,
@@ -806,26 +990,36 @@ async def final_drafter(state: AgentState) -> Dict:
     if not questions:
         return {}
 
+    _node_start("final_drafter", state, n_questions=len(questions))
+
     system = (
-        "You are a senior legal examinations editor. Your task is to polish one "
-        "law exam question and its answer key as a final editorial review.\n\n"
-        "Output format requirements:\n"
-        "  Fact pattern — realistic multi-character narrative, chronological, "
-        "no explicit legal labels embedded in the text.\n"
-        "  Call of the Question — clear, open-ended prompt that tells the student "
-        "what to analyse (e.g. 'Discuss all potential tort claims...').\n"
-        "  Answer key — IRAC structure per sub-issue:\n"
-        "    Issue:       one sentence identifying the precise legal question\n"
-        "    Rule:        applicable rule/standard; cite source materials by name\n"
-        "    Application: apply rule to facts; argue BOTH sides; address counterarguments\n"
-        "    Conclusion:  clear, practical outcome — one sentence\n\n"
-        "Additional constraints:\n"
-        "  - Plain legal English; define technical terms on first use\n"
-        "  - Consistent party names throughout (pick one label per party and keep it)\n"
-        "  - One major IRAC block per paragraph; blank line between blocks\n"
-        "  - No raw JSON, code fences, or formatting artefacts in the fact pattern\n"
-        "  - Markdown headers: ## Question N / **Call of the Question** / "
-        "### Answer Key — Question N\n\n"
+        "You are a T-14 law school examinations editor performing final editorial "
+        "polish on one exam question and its model answer.\n\n"
+        "EDITORIAL STANDARDS:\n"
+        "FACT PATTERN:\n"
+        "  - Smooth, realistic multi-character narrative (2-5 named parties), "
+        "chronological, plain English.\n"
+        "  - No explicit legal labels in the story ('negligence', 'breach of duty', "
+        "'consideration') — the student must identify issues from facts.\n"
+        "  - Remove any JSON fragments, code fences, or template artefacts.\n"
+        "  - Consistent party names throughout — pick ONE label per party at introduction "
+        "and use it exclusively.\n"
+        "  - Every fact needed to resolve the call must be present; remove irrelevant "
+        "narrative detail.\n\n"
+        "CALL OF THE QUESTION:\n"
+        "  - Open-ended, not issue-naming (FAIL: 'Was D negligent?'; "
+        "PASS: 'Discuss D's liability and P's potential claims.').\n"
+        "  - Phrased in bold in the final Markdown.\n\n"
+        "ANSWER KEY (IRAC per sub-issue):\n"
+        "  Issue:       'Whether [party] is liable for [claim] because [operative fact].'\n"
+        "  Rule:        Full rule statement; cite doctrine and, if available, case/statute.\n"
+        "  Application: Both-sides analysis; address all defences; no premature conclusions.\n"
+        "  Conclusion:  One sentence; practical result.\n"
+        "  - One IRAC block per paragraph; blank line between blocks.\n"
+        "  - Cover ALL major issues; do not add issues not supported by the facts.\n\n"
+        "Return ONLY JSON with keys: "
+        "fact_pattern (str), call_of_question (str), answer_key (str).\n"
+        "No extra text, no markdown code fences.\n\n"
         f"{_IRAC_STYLE_GUIDE}"
     )
 
@@ -872,6 +1066,7 @@ async def final_drafter(state: AgentState) -> Dict:
         artifact_type="polished_questions",
         source_ids=state.get("source_ids"),
     )
+    _node_done("final_drafter", state, n_polished=len(polished))
     return {"verified_questions": polished}
 
 
@@ -891,6 +1086,8 @@ async def assembler(state: AgentState) -> Dict:
         state.get("verified_questions") or [],
         key=lambda q: q["question_index"],
     )
+
+    _node_start("assembler", state, n_questions=len(questions))
 
     sections    = []
     answer_keys = []
@@ -938,6 +1135,7 @@ async def assembler(state: AgentState) -> Dict:
         node_name="assembler",
         artifact_type="final_output",
     )
+    _node_done("assembler", state, n_questions=len(questions))
     return {"final_output": final}
 
 

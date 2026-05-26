@@ -48,8 +48,45 @@ from .state import (
     FlashcardSourceProfile,
 )
 from .worker_config import _fetch_worker_model, model_costs
+from utils.llm_clients.anthropic_rate_limits import get_llm_semaphore
 
 logger = logging.getLogger(__name__)
+
+# ── Rate-limit guard ──────────────────────────────────────────────────────────
+_LLM_RATE_LIMIT_RETRIES = 3
+_LLM_RATE_LIMIT_DELAY   = 60  # seconds (linear: 60, 120, 180 s)
+
+_DEEPSEEK_SEMAPHORE: Optional[asyncio.Semaphore] = None
+
+
+def _get_deepseek_semaphore() -> asyncio.Semaphore:
+    global _DEEPSEEK_SEMAPHORE
+    if _DEEPSEEK_SEMAPHORE is None:
+        _DEEPSEEK_SEMAPHORE = asyncio.Semaphore(10)
+    return _DEEPSEEK_SEMAPHORE
+
+
+# ── Debug helpers ─────────────────────────────────────────────────────────────
+
+def _node_start(name: str, state: Dict, **extras: Any) -> None:
+    job = (state.get("job_id") or "")[:8] or "no-job"
+    parts = " ".join(f"{k}={v}" for k, v in extras.items())
+    logger.info("▶ [%s] %s  %s", job, name, parts)
+
+
+def _node_done(name: str, state: Dict, **extras: Any) -> None:
+    job = (state.get("job_id") or "")[:8] or "no-job"
+    parts = " ".join(f"{k}={v}" for k, v in extras.items())
+    logger.info("✓ [%s] %s  %s", job, name, parts)
+
+
+def _node_warn(name: str, state: Dict, msg: str) -> None:
+    job = (state.get("job_id") or "")[:8] or "no-job"
+    logger.warning("⚠ [%s] %s  %s", job, name, msg)
+
+
+def _llm_call(name: str, worker_class: str, model_name: str, max_tokens: int) -> None:
+    logger.info("  🤖 [%s] LLM %s (%s) max_tokens=%d", name, worker_class, model_name, max_tokens)
 
 
 # ── Shared helpers ─────────────────────────────────────────────────────────────
@@ -60,19 +97,54 @@ async def _llm(
     system: str = "",
     max_tokens: int = 2048,
     provider: Optional[str] = None,
+    _node: str = "",
 ) -> str:
+    """Call the LLM with rate-limit protection and DeepSeek thinking-mode support."""
     from utils.llm_clients.llm_factory import LLMFactory
-    _provider, model_name = _fetch_worker_model(worker_class, provider)
+    _provider, model_name, thinking = _fetch_worker_model(worker_class, provider)
+    if _node:
+        _llm_call(_node, worker_class, model_name, max_tokens)
+
+    client_kwargs: Dict[str, Any] = {}
+    if thinking is not None:
+        client_kwargs["thinking"] = thinking
+
     client = LLMFactory.get_client_for(
         _provider, model_name,
         temperature=0.7, streaming=False, max_output_tokens=max_tokens,
+        **client_kwargs,
     )
-    if hasattr(client, "achat"):
-        return await client.achat(prompt, system_prompt=system or None)
-    chunks: List[str] = []
-    async for chunk in client.stream_chat(prompt, system_prompt=system or None):
-        chunks.append(chunk)
-    return "".join(chunks)
+
+    if _provider == "deepseek":
+        sem = _get_deepseek_semaphore()
+    else:
+        sem = await get_llm_semaphore()
+
+    async with sem:
+        for attempt in range(_LLM_RATE_LIMIT_RETRIES + 1):
+            try:
+                if hasattr(client, "achat"):
+                    return await client.achat(prompt, system_prompt=system or None)
+                chunks: List[str] = []
+                async for chunk in client.stream_chat(prompt, system_prompt=system or None):
+                    chunks.append(chunk)
+                return "".join(chunks)
+            except Exception as exc:
+                err = str(exc)
+                is_rate_limit = (
+                    "429" in err
+                    or "rate_limit" in err.lower()
+                    or "rate limit" in err.lower()
+                )
+                if is_rate_limit and attempt < _LLM_RATE_LIMIT_RETRIES:
+                    wait = _LLM_RATE_LIMIT_DELAY * (attempt + 1)
+                    logger.warning(
+                        "🚦 [%s] Rate limit hit (429) — waiting %ds before retry %d/%d",
+                        _node or worker_class, wait, attempt + 1, _LLM_RATE_LIMIT_RETRIES,
+                    )
+                    await asyncio.sleep(wait)
+                    continue
+                raise
 
 
 def _parse_json(raw: str) -> Any:
@@ -170,17 +242,32 @@ async def head_orchestrator(state: AgentState) -> Dict:
     batch_size = min(max(state.get("batch_size") or 5, 1), 10)
     num_batches = math.ceil(num_cards / batch_size)
 
+    _node_start("head_orchestrator", state,
+                num_cards=num_cards, num_batches=num_batches)
+
     system = (
-        "You are a law professor designing a flashcard deck. "
-        "Read the available documents and confirm the deck scope in one sentence."
+        "You are a T-14 law professor designing a rigorous flashcard deck.\n\n"
+        "PLANNING REQUIREMENTS:\n"
+        "1. Survey the documents and identify the primary doctrinal areas covered.\n"
+        "2. Flag any documents with multi-element tests, definitional disputes, or "
+        "   policy debates — these yield the best card material.\n"
+        "3. Note any case opinions with dissents — dissent reasoning is high-yield "
+        "   for comparison and contrast cards.\n"
+        "4. Confirm scope in 2-3 sentences: doctrinal coverage, recommended card type "
+        "   mix, and any limitations of the source material.\n"
+        "Respond with your 2-3 sentence scope confirmation only."
     )
     await _llm(
         "worker_mid",
         f"Documents: {sources_json}\nRequest: {state.get('request', '')}\n"
         f"Deck: {num_cards} flashcards, batch size {batch_size}.",
         system=system,
-        max_tokens=128,
+        max_tokens=256,
+        _node="head_orchestrator",
     )
+
+    _node_done("head_orchestrator", state,
+               num_cards=num_cards, num_batches=num_batches)
 
     return {
         "num_cards": num_cards,
@@ -368,16 +455,28 @@ async def concept_extractor(state: AgentState) -> Dict:
         for p in profiles
     ]
 
+    _node_start("concept_extractor", state,
+                n_profiles=len(profiles), n_probes=len(PROBE_MAP))
+
     system = (
-        "You are a law professor extracting atomic study targets for a flashcard deck. "
-        "Return ONLY a JSON object with these keys:\n"
-        "  cases:              [{case_name, source_id, holding, rule, trigger_fact, procedural_posture}]\n"
-        "  definitions:        [{term, definition}]\n"
-        "  rule_element_sets:  [{rule_name, elements: [str]}]\n"
-        "  exceptions:         [{rule, exception, context}]\n"
-        "  policy_points:      [{doctrine, policy_rationale}]\n"
-        "  burden_assignments: [{who, burden, standard, context}]\n"
-        "Base all entries strictly on the provided source material."
+        "You are a T-14 law professor extracting atomic study targets for a flashcard deck.\n\n"
+        "EXTRACTION REQUIREMENTS:\n"
+        "- cases: For each case extract: case_name, source_id, holding (one sentence), "
+        "  rule (standalone restatement), trigger_fact (the fact that drove the outcome), "
+        "  procedural_posture. Extract every case mentioned; do not summarise multiple into one.\n"
+        "- definitions: For every defined legal term, extract the precise formulation used "
+        "  in the source. Prefer the court's or statute's exact language.\n"
+        "- rule_element_sets: For multi-part tests (e.g. duty, breach, causation, damages) "
+        "  list each element as a separate string. Every Restatement section or multi-factor "
+        "  test should have its own entry.\n"
+        "- exceptions: For each exception or carve-out, state the base rule, the exception, "
+        "  and the specific factual context that triggers it.\n"
+        "- policy_points: For each policy rationale, name the doctrine and the policy goal. "
+        "  These become high-yield policy/rationale flashcards.\n"
+        "- burden_assignments: State precisely who bears each burden, under which standard, "
+        "  and in which context (summary judgment vs. trial, etc.).\n"
+        "Base ALL entries strictly on the provided source material. "
+        "Return ONLY the JSON object. No extra text."
     )
 
     prompt = (
@@ -391,7 +490,8 @@ async def concept_extractor(state: AgentState) -> Dict:
         + "\n\nExtract the concept inventory."
     )
 
-    raw = await _llm("orchestrator", prompt, system=system, max_tokens=2500)
+    raw = await _llm("orchestrator", prompt, system=system, max_tokens=3000,
+                     _node="concept_extractor")
     try:
         inventory = _parse_json(raw)
     except Exception:
@@ -434,6 +534,10 @@ async def concept_extractor(state: AgentState) -> Dict:
         artifact_type="concept_inventory",
         source_ids=source_ids,
     )
+    _node_done("concept_extractor", state,
+               n_cases=len(inventory.get("cases", [])),
+               n_definitions=len(inventory.get("definitions", [])),
+               n_rule_sets=len(inventory.get("rule_element_sets", [])))
     return {
         "concept_inventory": inventory_str,
         "concept_synthesis": synthesis_str,
@@ -477,24 +581,33 @@ async def card_blueprint_planner(state: AgentState) -> Dict:
     ]
     source_ids_available = [p["source_id"] for p in profiles]
 
+    _node_start("card_blueprint_planner", state,
+                num_cards=num_cards, n_cases=len(cases_brief))
+
     prompt = (
-        f"You are a law professor creating a flashcard blueprint.\n\n"
+        f"You are a T-14 law professor creating a rigorous flashcard deck blueprint.\n\n"
         f"Total cards needed: {num_cards}\n"
         f"Batch size: {batch_size}\n\n"
         f"Available cases:\n{json.dumps(cases_brief, indent=2)}\n\n"
-        f"Concept synthesis:\n{synthesis_str[:600]}\n\n"
-        f"Available card types: {FLASHCARD_CARD_TYPES[:20]} ... (full list has {len(FLASHCARD_CARD_TYPES)} types)\n\n"
-        f"Create exactly {num_cards} card specs as a JSON array. Each spec must have:\n"
+        f"Concept synthesis:\n{synthesis_str[:700]}\n\n"
+        f"Available card types: {FLASHCARD_CARD_TYPES[:20]} ... "
+        f"(full list has {len(FLASHCARD_CARD_TYPES)} types)\n\n"
+        f"BLUEPRINT REQUIREMENTS:\n"
+        f"- Create exactly {num_cards} card specs as a JSON array.\n"
+        f"- Each spec must have:\n"
         f'  "spec_index":  int (0-based global index)\n'
         f'  "card_type":   one from the card type list\n'
         f'  "source_ids":  [list of source_id UUIDs from available sources]\n'
-        f'  "case_names":  [list of case names to draw from; empty list if not case-based]\n'
-        f'  "topic":       specific concept/rule/case for this card (one sentence)\n'
+        f'  "case_names":  [list of case names; empty list if not case-based]\n'
+        f'  "topic":       specific doctrinal point for this card (one precise sentence)\n'
         f'  "difficulty":  "recall" | "application" | "analysis"\n\n'
-        f"Enforce:\n"
-        f"- No more than {max(3, num_cards // 6)} specs share the same card_type\n"
-        f"- ~40%% recall types, ~35%% application types, ~25%% mapping/extraction types\n"
-        f"- Each identified case used in at least 1 card\n"
+        f"ALLOCATION RULES:\n"
+        f"- No more than {max(3, num_cards // 6)} specs may share the same card_type.\n"
+        f"- Difficulty distribution: ~40% recall, ~35% application, ~25% analysis.\n"
+        f"- Every identified case must appear in at least 1 card.\n"
+        f"- Prioritise: rule_element_sets → ELEMENTS cards; exceptions → EXCEPTION cards; "
+        f"  dissent reasoning → DISSENT_VS_MAJORITY cards; policy_points → POLICY cards.\n"
+        f"- Ensure at least 20% of cards are application or analysis difficulty.\n"
         f"Return ONLY the JSON array of {num_cards} specs. No extra text."
     )
 
@@ -541,6 +654,8 @@ async def card_blueprint_planner(state: AgentState) -> Dict:
         artifact_type="blueprint",
         source_ids=state.get("source_ids"),
     )
+    _node_done("card_blueprint_planner", state,
+               num_batches=len(batch_specs), total_specs=len(all_specs))
     return {
         "batch_specs": batch_specs,
         "num_batches": len(batch_specs),
@@ -609,17 +724,35 @@ async def flashcard_drafter(state: AgentState) -> Dict:
             )
 
         system = (
-            "You are an expert law professor creating a single flashcard.\n"
-            "Rules:\n"
-            "  - ONE learning target per card (atomic)\n"
-            "  - Front: a clear, concise question or prompt (max 40 words)\n"
-            "  - Back: a precise, complete answer (max 80 words for recall; up to 120 for analysis)\n"
-            "  - Hint: one short memory-aid sentence (optional; empty string if not useful)\n"
-            "  - Strictly grounded in the provided source material\n"
+            "You are a T-14 law professor creating a single bar-caliber flashcard.\n\n"
+            "FRONT (QUESTION) STANDARDS:\n"
+            "- ONE learning target per card — atomic, not compound.\n"
+            "- State the prompt as a direct question or cloze (fill-in) statement.\n"
+            "- Max 40 words. Do NOT include the answer in the front.\n"
+            "- For RULE cards: 'What is the rule from [Case]?' or "
+            "  'State the [doctrine] test.'\n"
+            "- For ELEMENT cards: 'List the elements of [rule].' or "
+            "  'What must a plaintiff show to establish [claim]?'\n"
+            "- For EXCEPTION cards: 'What is the exception to [rule]?' — "
+            "  include the limiting condition in the front.\n"
+            "- For CASE_HOLDING cards: 'What did the court hold in [Case]?' — "
+            "  name the specific issue.\n"
+            "- For POLICY cards: 'What policy rationale supports [doctrine]?'\n"
+            "- For APPLICATION cards: present a 2-3 sentence fact pattern and ask "
+            "  'What result?' or 'Which rule applies?'\n\n"
+            "BACK (ANSWER) STANDARDS:\n"
+            "- Precise, complete, self-contained — a student can study from the back alone.\n"
+            "- For recall: max 80 words; one focused answer.\n"
+            "- For application/analysis: up to 120 words; include the rule + application.\n"
+            "- Do NOT add wrong answers or distractors — just the correct answer.\n"
+            "- If there is a key limiting condition (the 'unless'), state it.\n\n"
+            "HINT STANDARDS:\n"
+            "- One memory-aid sentence that points to the key concept WITHOUT revealing the answer.\n"
+            "- Leave empty ('') if not useful for this card type.\n\n"
             "Return ONLY a JSON object with keys:\n"
-            '  "front_content": str\n'
-            '  "back_content":  str\n'
-            '  "hint":          str\n'
+            '  "front_content": str (max 40 words)\n'
+            '  "back_content":  str (max 120 words)\n'
+            '  "hint":          str (empty string if not applicable)\n'
             '  "source_refs":   [chunk_id UUID strings from [chunk_id:...] markers]\n'
         )
 
@@ -634,7 +767,8 @@ async def flashcard_drafter(state: AgentState) -> Dict:
             "Draft the flashcard."
         )
 
-        raw = await _llm("orchestrator", prompt, system=system, max_tokens=600)
+        raw = await _llm("orchestrator", prompt, system=system, max_tokens=800,
+                         _node="flashcard_drafter")
         try:
             data = _parse_json(raw)
         except Exception:
@@ -709,18 +843,29 @@ async def answer_backside_enricher(state: AgentState) -> Dict:
         for d in drafts
     ]
 
+    _node_start("answer_backside_enricher", state,
+                n_drafts=len(drafts))
+
     system = (
-        "You are a law professor enriching flashcard back sides. "
-        "For each card:\n"
-        "  1. Rewrite back_content to be concise and self-contained (no assumed context)\n"
-        "  2. Add a one-sentence exam_use_note if the card type is application or analysis\n"
-        "     (e.g. 'On an exam, spot this when the facts show...')\n"
-        "  3. Keep the answer atomic — one concept only\n"
-        "  4. Do NOT add MCQ-style wrong answers or traps — just the correct answer\n\n"
+        "You are a T-14 law professor enriching flashcard back sides to bar-exam caliber.\n\n"
+        "ENRICHMENT STANDARDS:\n"
+        "For EVERY card:\n"
+        "1. Rewrite back_content to be self-contained — a student studying from the back "
+        "   alone should get the full answer without needing the front or source text.\n"
+        "2. Structure: (a) the direct answer to the question; (b) the operative legal rule "
+        "   or formulation; (c) any critical limiting conditions (the 'unless/but').\n"
+        "3. Keep the answer atomic — one concept per card, max 120 words.\n"
+        "4. Do NOT add MCQ-style wrong answers or distractors.\n\n"
+        "For APPLICATION and ANALYSIS cards also add:\n"
+        "  exam_use_note: one sentence explaining when to deploy this rule on an exam "
+        "  (e.g. 'Spot this when the facts show a plaintiff injured outside the zone of "
+        "  danger but claims emotional distress').\n\n"
+        "For RECALL and DEFINITION cards:\n"
+        "  exam_use_note: empty string.\n\n"
         "Return a JSON array — one object per card — with:\n"
         '  "spec_index":    int\n'
-        '  "back_content":  str (enriched answer, max 120 words)\n'
-        '  "exam_use_note": str (empty string if not applicable)\n'
+        '  "back_content":  str (max 120 words)\n'
+        '  "exam_use_note": str (one sentence or empty string)\n'
         "No extra text."
     )
 
@@ -729,7 +874,8 @@ async def answer_backside_enricher(state: AgentState) -> Dict:
         f"{json.dumps(batch_payload, indent=2)}"
     )
 
-    raw = await _llm("worker_mid", prompt, system=system, max_tokens=2000)
+    raw = await _llm("worker_mid", prompt, system=system, max_tokens=2500,
+                     _node="answer_backside_enricher")
     try:
         enriched_batch = _parse_json(raw)
         if not isinstance(enriched_batch, list):
@@ -753,6 +899,8 @@ async def answer_backside_enricher(state: AgentState) -> Dict:
 
         updated_drafts.append({**draft, "back_content": new_back})
 
+    _node_done("answer_backside_enricher", state,
+               n_enriched=len(updated_drafts))
     return {"current_batch_drafts": updated_drafts}
 
 
@@ -803,21 +951,34 @@ async def local_card_critic(state: AgentState) -> Dict:
         for d in drafts
     ]
 
+    _node_start("local_card_critic", state,
+                batch_idx=batch_idx, n_cards=len(drafts))
+
     system = (
-        "You are a senior law professor evaluating a batch of flashcards. "
-        "Score each dimension 0.0–1.0:\n"
-        "  vagueness:       are fronts specific and unambiguous? (1.0 = all specific)\n"
-        "  uniqueness:      do cards cover distinct concepts, no duplicates? (1.0 = fully distinct)\n"
-        "  source_support:  are answers grounded, not hallucinated? (1.0 = fully grounded)\n"
-        "  atomic_focus:    does each card test exactly one learning target? (1.0 = fully atomic)\n"
-        "  answer_quality:  are backsides concise, accurate, self-contained? (1.0 = excellent)\n\n"
-        "Batch PASSES if all scores >= 0.70.\n\n"
+        "You are a T-14 law school curriculum director performing pedagogical QA on a "
+        "batch of flashcards.\n\n"
+        "EVALUATION CRITERIA (score each 0.0–1.0):\n"
+        "  vagueness: Are fronts specific and unambiguous? A vague front like 'What is "
+        "  negligence?' fails; 'What is the duty element of negligence under the "
+        "  reasonable person standard?' passes. (1.0 = all fronts precise)\n"
+        "  uniqueness: Do cards cover distinct concepts with no near-duplicate content? "
+        "  Same rule tested two different ways is fine; same rule stated identically is not. "
+        "(1.0 = fully distinct)\n"
+        "  source_support: Are back answers grounded in the provided material, not "
+        "  hallucinated from general knowledge? (1.0 = fully grounded)\n"
+        "  atomic_focus: Does each card test exactly ONE learning target? "
+        "  A card combining rule + exception + policy in one back fails atomic. "
+        "(1.0 = fully atomic)\n"
+        "  answer_quality: Are backs concise, accurate, and self-contained? "
+        "  Does each back answer the specific question on the front? (1.0 = excellent)\n\n"
+        "PASS THRESHOLD: all scores >= 0.70.\n"
+        "REVISION INSTRUCTIONS must be specific: name the spec_index and the exact fix.\n\n"
         "Return a JSON object:\n"
         '  "passes": bool\n'
         '  "scores": {"vagueness": f, "uniqueness": f, "source_support": f, '
         '"atomic_focus": f, "answer_quality": f}\n'
-        '  "rejection_reasons": [str, ...]\n'
-        '  "revision_instructions": [str, ...]\n'
+        '  "rejection_reasons": [str, ...] (empty if passes)\n'
+        '  "revision_instructions": [str, ...] (specific fixes per failing card)\n'
         '  "card_verdicts": [{"spec_index": int, "passes": bool, "reason": str}, ...]\n'
         "No extra text."
     )
@@ -835,7 +996,8 @@ async def local_card_critic(state: AgentState) -> Dict:
         "Evaluate the batch."
     )
 
-    raw = await _llm("worker_mid", prompt, system=system, max_tokens=1500)
+    raw = await _llm("worker_mid", prompt, system=system, max_tokens=2000,
+                     _node="local_card_critic")
     try:
         result = _parse_json(raw)
         if not isinstance(result, dict):
@@ -857,6 +1019,10 @@ async def local_card_critic(state: AgentState) -> Dict:
         "revision_instructions": result.get("revision_instructions", []),
         "card_verdicts": result.get("card_verdicts", []),
     }
+    _node_done("local_card_critic", state,
+               batch_idx=batch_idx,
+               passes=batch_eval["passes"],
+               n_verdicts=len(batch_eval["card_verdicts"]))
     return {"current_batch_eval": batch_eval}
 
 
@@ -912,11 +1078,26 @@ async def card_repair_agent(state: AgentState) -> Dict:
     if not failing_drafts:
         return {"batch_revision_count": revision_count + 1}
 
+    _node_start("card_repair_agent", state,
+                batch_idx=state.get("current_batch_index", 0),
+                revision_count=revision_count,
+                n_failing=len(failing_indices))
+
     system = (
-        "You are a law professor repairing flashcards that failed quality review. "
-        "Fix ONLY the specific issues listed. Preserve the card_type and topic. "
-        "For each failing card return the corrected JSON with the same spec_index. "
-        "Return a JSON array of the repaired cards only."
+        "You are a T-14 law professor performing surgical repair of flashcards that "
+        "failed pedagogical QA.\n\n"
+        "REPAIR STANDARDS:\n"
+        "1. Fix ONLY the specific issues listed — do not rewrite passing cards.\n"
+        "2. Preserve card_type, topic, and spec_index exactly.\n"
+        "3. If vagueness failure: rewrite the front to name the specific rule, case, "
+        "   or element being tested. Avoid overly broad fronts.\n"
+        "4. If atomic_focus failure: split the card if it covers two concepts, OR remove "
+        "   the secondary concept from the back and keep only the primary answer.\n"
+        "5. If source_support failure: remove any content not in the source material and "
+        "   replace with a question about what IS documented.\n"
+        "6. If answer_quality failure: rewrite the back to be self-contained, precise, "
+        "   and capped at 120 words.\n"
+        "Return a JSON array of the repaired cards only (same structure as input)."
     )
 
     failing_payload = [
@@ -937,7 +1118,8 @@ async def card_repair_agent(state: AgentState) -> Dict:
         "Return the repaired cards as a JSON array with the same spec_index values."
     )
 
-    raw = await _llm("orchestrator", prompt, system=system, max_tokens=2000)
+    raw = await _llm("orchestrator", prompt, system=system, max_tokens=2500,
+                     _node="card_repair_agent")
     try:
         repaired_list = _parse_json(raw)
         if not isinstance(repaired_list, list):
@@ -960,6 +1142,9 @@ async def card_repair_agent(state: AgentState) -> Dict:
             updated_drafts.append(draft)
 
     updated_drafts.sort(key=lambda d: d["spec_index"])
+    _node_done("card_repair_agent", state,
+               n_repaired=len(repaired_map), n_total=len(updated_drafts),
+               repair_pass=revision_count + 1)
     return {
         "current_batch_drafts": updated_drafts,
         "batch_revision_count": revision_count + 1,
@@ -1140,30 +1325,44 @@ async def global_deck_critic(state: AgentState) -> Dict:
     except Exception:
         coverage = {}
 
+    _node_start("global_deck_critic", state,
+                accepted=accepted_count, target=num_cards, rejected=rejected_count)
+
+    system = (
+        "You are a T-14 law school curriculum director performing a final audit of a "
+        "completed flashcard deck.\n\n"
+        "AUDIT STANDARDS:\n"
+        "- type_diversity: flag any card type that exceeds 40% of the deck — "
+        "  name the over-represented type and the under-represented types.\n"
+        "- duplicates: scan card front signatures for near-identical fronts. "
+        "  Same rule stated two different ways is fine; same rule + same question wording "
+        "  is a duplicate.\n"
+        "- coverage_gaps: identify flashcard-worthy material (rule_element_sets, exceptions, "
+        "  policy_points, dissent reasoning) with NO card in the deck.\n"
+        "- count_ok: flag if accepted_count falls more than 15% below the target.\n"
+        "- overall_score: weight answer_quality and atomic_focus most heavily.\n"
+        "Return ONLY the JSON object. No extra text."
+    )
+
     prompt = (
-        f"You are a senior law professor reviewing a {accepted_count}-card flashcard deck "
+        f"Audit a {accepted_count}-card flashcard deck "
         f"(target: {num_cards}, rejected: {rejected_count}).\n\n"
         f"Card type coverage:\n{json.dumps(coverage, indent=2)}\n\n"
         "Card front signatures (first 40 chars):\n"
         + "\n".join(f"- {s}" for s in sigs[:60])
         + "\n\n"
-        "Evaluate:\n"
-        "1. type_diversity: any card type over-represented (>40% of deck)?\n"
-        "2. duplicates: any suspiciously similar fronts?\n"
-        "3. coverage_gaps: which flashcard-specific or high-yield types are missing?\n"
-        "4. count_ok: does accepted_count match or exceed the target?\n"
-        "5. overall_score: 0.0–1.0\n\n"
-        "Return a JSON object:\n"
-        '  "overall_score": float\n'
+        "Return:\n"
+        '  "overall_score": float (0.0–1.0)\n'
         '  "type_diversity_ok": bool\n'
-        '  "duplicates_found": [str, ...]\n'
-        '  "coverage_gaps": [str, ...]\n'
+        '  "duplicates_found": [str, ...] (signatures of near-duplicate pairs)\n'
+        '  "coverage_gaps": [str, ...] (card types or doctrinal areas missing)\n'
         '  "count_ok": bool\n'
-        '  "summary": str (2-3 sentences)\n'
+        '  "summary": str (2-3 sentences on deck quality and major concerns)\n'
         "No extra text."
     )
 
-    raw = await _llm("worker_low", prompt, max_tokens=800)
+    raw = await _llm("worker_low", prompt, system=system, max_tokens=1200,
+                     _node="global_deck_critic")
     try:
         report = _parse_json(raw)
         report_str = json.dumps(report)
@@ -1185,6 +1384,7 @@ async def global_deck_critic(state: AgentState) -> Dict:
         node_name="global_deck_critic",
         artifact_type="deck_report",
     )
+    _node_done("global_deck_critic", state, accepted=accepted_count)
     return {"global_deck_report": report_str}
 
 
@@ -1218,6 +1418,9 @@ async def deterministic_formatter_persister(state: AgentState) -> Dict:
     num_cards_requested = state.get("num_cards") or 10
     source_ids = state.get("source_ids") or []
     is_essential = state.get("is_essential") or False
+
+    _node_start("deterministic_formatter_persister", state,
+                n_accepted=len(accepted_ids))
 
     try:
         coverage = json.loads(coverage_raw)
@@ -1310,6 +1513,8 @@ async def deterministic_formatter_persister(state: AgentState) -> Dict:
         artifact_type="final_output",
     )
 
+    _node_done("deterministic_formatter_persister", state,
+               n_cards=len(accepted_ids))
     return {
         "persisted_card_ids": accepted_ids,
         "final_output": markdown,

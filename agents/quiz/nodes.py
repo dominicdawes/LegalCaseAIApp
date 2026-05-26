@@ -54,8 +54,45 @@ from .state import (
     QuizSourceProfile,
 )
 from .worker_config import _fetch_worker_model, model_costs
+from utils.llm_clients.anthropic_rate_limits import get_llm_semaphore
 
 logger = logging.getLogger(__name__)
+
+# ── Rate-limit guard ──────────────────────────────────────────────────────────
+_LLM_RATE_LIMIT_RETRIES = 3
+_LLM_RATE_LIMIT_DELAY   = 60  # seconds (linear: 60, 120, 180 s)
+
+_DEEPSEEK_SEMAPHORE: Optional[asyncio.Semaphore] = None
+
+
+def _get_deepseek_semaphore() -> asyncio.Semaphore:
+    global _DEEPSEEK_SEMAPHORE
+    if _DEEPSEEK_SEMAPHORE is None:
+        _DEEPSEEK_SEMAPHORE = asyncio.Semaphore(10)
+    return _DEEPSEEK_SEMAPHORE
+
+
+# ── Debug helpers ─────────────────────────────────────────────────────────────
+
+def _node_start(name: str, state: Dict, **extras: Any) -> None:
+    job = (state.get("job_id") or "")[:8] or "no-job"
+    parts = " ".join(f"{k}={v}" for k, v in extras.items())
+    logger.info("▶ [%s] %s  %s", job, name, parts)
+
+
+def _node_done(name: str, state: Dict, **extras: Any) -> None:
+    job = (state.get("job_id") or "")[:8] or "no-job"
+    parts = " ".join(f"{k}={v}" for k, v in extras.items())
+    logger.info("✓ [%s] %s  %s", job, name, parts)
+
+
+def _node_warn(name: str, state: Dict, msg: str) -> None:
+    job = (state.get("job_id") or "")[:8] or "no-job"
+    logger.warning("⚠ [%s] %s  %s", job, name, msg)
+
+
+def _llm_call(name: str, worker_class: str, model_name: str, max_tokens: int) -> None:
+    logger.info("  🤖 [%s] LLM %s (%s) max_tokens=%d", name, worker_class, model_name, max_tokens)
 
 
 # ── Shared helpers ─────────────────────────────────────────────────────────────
@@ -66,19 +103,54 @@ async def _llm(
     system: str = "",
     max_tokens: int = 2048,
     provider: Optional[str] = None,
+    _node: str = "",
 ) -> str:
+    """Call the LLM with rate-limit protection and DeepSeek thinking-mode support."""
     from utils.llm_clients.llm_factory import LLMFactory
-    _provider, model_name = _fetch_worker_model(worker_class, provider)
+    _provider, model_name, thinking = _fetch_worker_model(worker_class, provider)
+    if _node:
+        _llm_call(_node, worker_class, model_name, max_tokens)
+
+    client_kwargs: Dict[str, Any] = {}
+    if thinking is not None:
+        client_kwargs["thinking"] = thinking
+
     client = LLMFactory.get_client_for(
         _provider, model_name,
         temperature=0.7, streaming=False, max_output_tokens=max_tokens,
+        **client_kwargs,
     )
-    if hasattr(client, "achat"):
-        return await client.achat(prompt, system_prompt=system or None)
-    chunks: List[str] = []
-    async for chunk in client.stream_chat(prompt, system_prompt=system or None):
-        chunks.append(chunk)
-    return "".join(chunks)
+
+    if _provider == "deepseek":
+        sem = _get_deepseek_semaphore()
+    else:
+        sem = await get_llm_semaphore()
+
+    async with sem:
+        for attempt in range(_LLM_RATE_LIMIT_RETRIES + 1):
+            try:
+                if hasattr(client, "achat"):
+                    return await client.achat(prompt, system_prompt=system or None)
+                chunks: List[str] = []
+                async for chunk in client.stream_chat(prompt, system_prompt=system or None):
+                    chunks.append(chunk)
+                return "".join(chunks)
+            except Exception as exc:
+                err = str(exc)
+                is_rate_limit = (
+                    "429" in err
+                    or "rate_limit" in err.lower()
+                    or "rate limit" in err.lower()
+                )
+                if is_rate_limit and attempt < _LLM_RATE_LIMIT_RETRIES:
+                    wait = _LLM_RATE_LIMIT_DELAY * (attempt + 1)
+                    logger.warning(
+                        "🚦 [%s] Rate limit hit (429) — waiting %ds before retry %d/%d",
+                        _node or worker_class, wait, attempt + 1, _LLM_RATE_LIMIT_RETRIES,
+                    )
+                    await asyncio.sleep(wait)
+                    continue
+                raise
 
 
 def _parse_json(raw: str) -> Any:
@@ -170,17 +242,34 @@ async def head_orchestrator(state: AgentState) -> Dict:
     if quiz_mode not in QUIZ_MODES:
         quiz_mode = "mixed"
 
+    _node_start("head_orchestrator", state,
+                num_questions=num_questions, quiz_mode=quiz_mode)
+
     system = (
-        "You are a law professor designing a multiple-choice quiz. "
-        "Read the available documents and confirm the quiz scope in one sentence."
+        "You are a T-14 law professor designing a rigorous multiple-choice quiz.\n\n"
+        "PLANNING REQUIREMENTS:\n"
+        "1. Identify the doctrinal areas covered across all documents.\n"
+        "2. Select quiz_mode-appropriate question types: recall tests element definitions; "
+        "   application tests rule-to-fact fit; exam-style tests nuanced distinctions "
+        "   and competing doctrines.\n"
+        "3. Flag any documents with dissents, circuit splits, or evolving standards — "
+        "   these are high-yield distractor sources.\n"
+        "4. Confirm scope in 2-3 sentences: topic coverage, estimated question distribution, "
+        "   and any gaps or pedagogical concerns.\n"
+        "Respond with your 2-3 sentence scope confirmation only."
     )
     await _llm(
         "worker_mid",
         f"Documents: {sources_json}\nRequest: {state.get('request', '')}\n"
         f"Quiz: {num_questions} questions, mode: {quiz_mode}.",
         system=system,
-        max_tokens=128,
+        max_tokens=256,
+        _node="head_orchestrator",
     )
+
+    _node_done("head_orchestrator", state,
+               num_questions=num_questions, quiz_mode=quiz_mode,
+               num_batches=num_batches)
 
     return {
         "batch_size": batch_size,
@@ -342,17 +431,31 @@ async def case_rule_extractor(state: AgentState) -> Dict:
             return None
 
         system = (
-            "You are a law professor extracting structured case information. "
-            "Return ONLY a JSON object with these exact keys: "
-            "procedural_posture, facts, legally_relevant_facts (array of strings), "
-            "issue, holding, rule, reasoning, dicta, dissent, policy. "
-            "Base every field strictly on the provided text."
+            "You are a T-14 law professor performing structured case extraction.\n\n"
+            "EXTRACTION REQUIREMENTS:\n"
+            "- procedural_posture: court level, prior holdings, and what is being reviewed.\n"
+            "- facts: key factual background (2-4 sentences); include only facts the court "
+            "  actually relied on in reaching its decision.\n"
+            "- legally_relevant_facts: array of 4-8 individual facts that drove the legal "
+            "  outcome (e.g., 'defendant owed a duty as a common carrier'; "
+            "  'plaintiff was a foreseeable plaintiff'). These feed distractor construction.\n"
+            "- issue: the precise legal question decided — phrase it as a yes/no question.\n"
+            "- holding: the court's direct answer to the issue, including the rule of decision.\n"
+            "- rule: the operative legal rule or test, written as a standalone statement "
+            "  usable in a future case without referring back to this case by name.\n"
+            "- reasoning: the analytical steps used to reach the holding (2-3 sentences).\n"
+            "- dicta: any statements that go beyond what was necessary to decide the issue.\n"
+            "- dissent: the dissent's core objection (if any) — a high-yield distractor source.\n"
+            "- policy: the underlying policy rationale(s) the court cited or relied on.\n"
+            "Base EVERY field strictly on the provided text. "
+            "Return ONLY the JSON object. No extra text."
         )
         prompt = (
             f"Case: {case_name}\n\nSource text:\n{context[:4000]}\n\n"
             "Extract the structured case information."
         )
-        raw = await _llm("orchestrator", prompt, system=system, max_tokens=1800)
+        raw = await _llm("orchestrator", prompt, system=system, max_tokens=2500,
+                         _node="case_rule_extractor")
         try:
             data = _parse_json(raw)
         except Exception:
@@ -423,20 +526,31 @@ async def cross_doc_concepts_synthesis(state: AgentState) -> Dict:
     for p in profiles:
         all_concepts.extend(p.get("key_concepts", [])[:8])
 
+    _node_start("cross_doc_concepts_synthesis", state,
+                n_extracts=len(extracts), n_profiles=len(profiles))
+
     prompt = (
-        "You are a law professor identifying teaching priorities for a quiz.\n\n"
+        "You are a T-14 law professor preparing teaching priorities for a rigorous MCQ quiz.\n\n"
         f"Cases:\n{json.dumps(cases_brief, indent=2)}\n\n"
         f"Key concepts across sources: {all_concepts[:20]}\n\n"
-        "Identify:\n"
-        "1. doctrine_clusters: 3-5 doctrinal clusters (each with a name, cases involved, and core rule)\n"
-        "2. confusable_concepts: pairs or groups of concepts students commonly confuse\n"
-        "3. common_traps: 3-5 common misconceptions or overbroad readings students make\n"
-        "4. high_yield_areas: 3-5 areas most likely to appear on exams\n\n"
-        "Return a JSON object with keys: doctrine_clusters, confusable_concepts, "
+        "SYNTHESIS REQUIREMENTS:\n"
+        "1. doctrine_clusters: 3-5 clusters, each with:\n"
+        "   - name: the doctrinal area\n"
+        "   - cases: list of case names in the cluster\n"
+        "   - core_rule: the rule that links them\n"
+        "   - internal_tension: any intra-cluster split or doctrinal evolution to exploit\n"
+        "2. confusable_concepts: pairs or groups students routinely mix up — include WHY "
+        "   they confuse them (similar names, overlapping elements, same outcome for "
+        "   different reasons, etc.).\n"
+        "3. common_traps: 3-5 overbroad readings, mis-stated rules, or scope errors "
+        "   students make. These map directly to distractor answer choices.\n"
+        "4. high_yield_areas: 3-5 doctrinal areas most heavily tested on bar exams and "
+        "   law school finals — prioritise these for harder questions.\n\n"
+        "Return ONLY a JSON object with keys: doctrine_clusters, confusable_concepts, "
         "common_traps, high_yield_areas. No extra text."
     )
 
-    raw = await _llm("worker_mid", prompt, max_tokens=1500)
+    raw = await _llm("worker_mid", prompt, max_tokens=2000)
     try:
         synthesis_data = _parse_json(raw)
     except Exception:
@@ -446,6 +560,10 @@ async def cross_doc_concepts_synthesis(state: AgentState) -> Dict:
             "common_traps": [],
             "high_yield_areas": [],
         }
+
+    _node_done("cross_doc_concepts_synthesis", state,
+               n_clusters=len(synthesis_data.get("doctrine_clusters", [])),
+               n_traps=len(synthesis_data.get("common_traps", [])))
 
     synthesis_str = json.dumps(synthesis_data)
     await _try_save_artifact(
@@ -499,28 +617,36 @@ async def quiz_blueprint_planner(state: AgentState) -> Dict:
     ]
     source_ids = [p["source_id"] for p in profiles]
 
+    _node_start("quiz_blueprint_planner", state,
+                num_questions=num_questions, quiz_mode=quiz_mode)
+
     prompt = (
-        f"You are a law professor creating a quiz blueprint.\n\n"
+        f"You are a T-14 law professor creating a rigorous quiz blueprint.\n\n"
         f"Total questions needed: {num_questions}\n"
         f"Batch size: {batch_size}\n"
         f"Quiz mode: {quiz_mode}\n"
         f"Target difficulty: {target_difficulty}\n\n"
         f"Available cases:\n{json.dumps(cases_brief, indent=2)}\n\n"
-        f"Concept synthesis:\n{synthesis_str[:1000]}\n\n"
+        f"Concept synthesis (doctrine clusters, traps):\n{synthesis_str[:1200]}\n\n"
         f"Available distractor types: {DISTRACTOR_TYPES}\n\n"
-        f"Create exactly {num_questions} question specs as a JSON array. "
-        f"Each spec must have:\n"
+        f"BLUEPRINT REQUIREMENTS:\n"
+        f"- Create exactly {num_questions} question specs as a JSON array.\n"
+        f"- Each spec must have:\n"
         f'  "spec_index": int (0-based global index)\n'
         f'  "question_type": one of {MC_QUESTION_TYPES[:8]}... (use full variety)\n'
         f'  "source_ids": [list of source_id UUIDs from available sources]\n'
         f'  "case_names": [list of case names to draw from]\n'
-        f'  "topic": specific topic or concept for this question (one sentence)\n'
+        f'  "topic": specific doctrinal point for this question (one precise sentence)\n'
         f'  "difficulty": "recall" | "application" | "analysis"\n'
         f'  "distractor_types": [exactly 3 distractor type tags for the wrong answers]\n\n'
-        f"Ensure:\n"
-        f"- No more than 3 specs share the same question_type\n"
-        f"- Difficulty distribution: ~30% recall, ~40% application, ~30% analysis\n"
-        f"- Each case is used in at least 1 question\n"
+        f"ALLOCATION RULES:\n"
+        f"- No more than 3 specs share the same question_type.\n"
+        f"- Difficulty distribution: ~30% recall, ~40% application, ~30% analysis.\n"
+        f"- Each identified case must appear in at least 1 question.\n"
+        f"- Prioritise high_yield_areas and common_traps from the concept synthesis.\n"
+        f"- Assign distractor_types that match the common_traps for that topic "
+        f"  (overbroad_rule → where rule-scope confusion is the trap; "
+        f"  wrong_case_applied → where students mix up two similar cases).\n"
         f"Return ONLY the JSON array of {num_questions} specs. No extra text."
     )
 
@@ -568,6 +694,8 @@ async def quiz_blueprint_planner(state: AgentState) -> Dict:
         artifact_type="blueprint",
         source_ids=state.get("source_ids"),
     )
+    _node_done("quiz_blueprint_planner", state,
+               num_batches=len(batch_specs), total_specs=len(all_specs))
     return {
         "batch_specs": batch_specs,
         "num_batches": len(batch_specs),
@@ -635,13 +763,38 @@ async def question_drafter(state: AgentState) -> Dict:
             )
 
         system = (
-            "You are an expert law professor creating a multiple-choice quiz question. "
-            "Generate exactly ONE question with ONE correct answer and THREE wrong answers. "
-            "The question must be grounded strictly in the provided legal text. "
+            "You are a T-14 law professor writing a bar-caliber multiple-choice question.\n\n"
+            "MCQ STEM CONSTRUCTION STANDARDS:\n"
+            "- Stems must present a complete legal scenario or doctrinal question — "
+            "  never a fill-in-the-blank or 'which of the following' without context.\n"
+            "- For APPLICATION questions: present a concrete fact pattern (2-5 sentences) "
+            "  ending with a specific legal question (e.g., 'Is D liable for negligence?').\n"
+            "- For RECALL questions: test the precise scope and limits of a rule, not "
+            "  just its name or label.\n"
+            "- For ANALYSIS questions: present two competing doctrines or arguments and "
+            "  ask which analysis is correct given the facts.\n"
+            "- Stems must be self-contained: a well-prepared student can answer from "
+            "  the stem alone without re-reading the source.\n"
+            "- Maximum 120 words for the stem.\n\n"
+            "CORRECT ANSWER STANDARDS:\n"
+            "- Must be unambiguously correct — no 'best answer' hedging.\n"
+            "- State the rule + its application to the facts, or the precise doctrinal "
+            "  formulation that distinguishes it from the distractors.\n"
+            "- Avoid 'all of the above' or 'none of the above'.\n\n"
+            "WRONG ANSWER (DISTRACTOR) STANDARDS:\n"
+            "- Each wrong answer must exploit a specific student misconception from the "
+            "  distractor_types list.\n"
+            "- Wrong answers must be plausible to a student who partially understands the "
+            "  doctrine — if a zero-effort student can eliminate them, they fail QA.\n"
+            "- Make distractors parallel in structure and length to the correct answer.\n\n"
+            "HINT STANDARDS:\n"
+            "- One sentence that points to the key legal concept without naming the answer.\n"
+            "- Should redirect a confused student toward the right framework, not the "
+            "  right answer.\n\n"
             "Return ONLY a JSON object with keys:\n"
-            '  "question_stem": str (concise, max 120 words)\n'
-            '  "hint": str (one sentence; guides without revealing the answer)\n'
-            '  "correct_answer": str (the correct choice text)\n'
+            '  "question_stem": str (max 120 words)\n'
+            '  "hint": str (one sentence; key issue without revealing the answer)\n'
+            '  "correct_answer": str (full sentence stating rule/application)\n'
             '  "wrong_answers": [str, str, str] (exactly 3 plausible wrong choices)\n'
             '  "source_refs": [str, ...] (chunk_id UUIDs from [chunk_id:...] markers)\n'
         )
@@ -657,7 +810,8 @@ async def question_drafter(state: AgentState) -> Dict:
             "Draft the multiple-choice question."
         )
 
-        raw = await _llm("orchestrator", prompt, system=system, max_tokens=900)
+        raw = await _llm("orchestrator", prompt, system=system, max_tokens=1500,
+                         _node="question_drafter")
         try:
             data = _parse_json(raw)
         except Exception:
@@ -768,12 +922,28 @@ async def false_trap_red_herring_generator(state: AgentState) -> Dict:
             ],
         })
 
+    _node_start("false_trap_red_herring_generator", state,
+                n_drafts=len(drafts))
+
     system = (
-        "You are a law professor enriching multiple-choice quiz distractors. "
-        "For each question in the batch, enrich every answer:\n"
-        "  - Wrong answers: assign distractor_type (from the taxonomy) and write "
-        "    feedback explaining (a) why a student might pick this, and (b) why it is wrong.\n"
-        "  - Correct answer: write feedback explaining why it is the correct answer.\n\n"
+        "You are a T-14 law professor enriching multiple-choice quiz distractors with "
+        "pedagogically precise labels and explanatory feedback.\n\n"
+        "DISTRACTOR ENRICHMENT STANDARDS:\n"
+        "For WRONG answers:\n"
+        "  1. distractor_type: select the single most accurate type from the taxonomy. "
+        "     Prefer specific types (e.g., 'overbroad_rule', 'wrong_case_applied') over "
+        "     generic ones (e.g., 'plausible_wrong').\n"
+        "  2. feedback (2-3 sentences):\n"
+        "     (a) Name the misconception — 'A student who selects this likely believes [X]';\n"
+        "     (b) Explain the precise error — which element is wrong, which case is "
+        "         misapplied, or how the rule scope was mis-stated;\n"
+        "     (c) Correct the misconception in one direct sentence.\n\n"
+        "For the CORRECT answer:\n"
+        "  1. distractor_type: use 'correct_answer'\n"
+        "  2. feedback (2-3 sentences):\n"
+        "     (a) State why this answer is right — which rule applies and why;\n"
+        "     (b) Name the case or doctrine it derives from;\n"
+        "     (c) Note any limiting conditions or scope restrictions (the 'unless/but').\n\n"
         f"Available distractor_type values: {DISTRACTOR_TYPES}\n\n"
         "Return a JSON array — one object per question — each with:\n"
         '  "spec_index": int\n'
@@ -789,7 +959,8 @@ async def false_trap_red_herring_generator(state: AgentState) -> Dict:
         f"{json.dumps(batch_payload, indent=2)}"
     )
 
-    raw = await _llm("orchestrator", prompt, system=system, max_tokens=2500)
+    raw = await _llm("orchestrator", prompt, system=system, max_tokens=3500,
+                     _node="false_trap_red_herring_generator")
     try:
         enriched_batch = _parse_json(raw)
         if not isinstance(enriched_batch, list):
@@ -819,6 +990,8 @@ async def false_trap_red_herring_generator(state: AgentState) -> Dict:
 
         updated_drafts.append({**draft, "answers": new_answers})
 
+    _node_done("false_trap_red_herring_generator", state,
+               n_enriched=len(updated_drafts))
     return {"current_batch_drafts": updated_drafts}
 
 
@@ -870,21 +1043,36 @@ async def question_evaluator(state: AgentState) -> Dict:
         for d in drafts
     ]
 
+    _node_start("question_evaluator", state,
+                batch_idx=batch_idx, n_questions=len(drafts))
+
     system = (
-        "You are a senior law professor evaluating a batch of multiple-choice quiz questions. "
-        "Score each criterion 0.0–1.0:\n"
-        "  source_grounding      — are answers grounded, not hallucinated?\n"
-        "  single_correct_answer — is there exactly one unambiguous correct answer?\n"
-        "  distractor_quality    — are wrong answers plausible with real misconceptions?\n"
-        "  question_type_diversity — does the batch cover diverse cognitive demands?\n"
-        "  difficulty_match      — does difficulty match the target level?\n\n"
-        "The batch PASSES if all scores >= 0.70 and no per-question critical failures.\n\n"
+        "You are a T-14 law school exam committee member performing pedagogical QA on "
+        "a batch of multiple-choice questions.\n\n"
+        "EVALUATION CRITERIA (score each 0.0–1.0):\n"
+        "  source_grounding: Are all factual claims in the stem and correct answer "
+        "actually grounded in the source material? "
+        "(0.0 = hallucinated; 1.0 = directly quoted or closely paraphrased)\n"
+        "  single_correct_answer: Is there exactly one unambiguously correct answer? "
+        "(0.0 = multiple defensible answers or answer key error; 1.0 = uniquely correct)\n"
+        "  distractor_quality: Are wrong answers genuinely plausible misconceptions? "
+        "(0.0 = obviously wrong; 1.0 = every distractor exploits a documented student error)\n"
+        "  question_type_diversity: Does the batch span different cognitive demands "
+        "(recall, application, analysis)? "
+        "(0.0 = all same type; 1.0 = well-distributed across types)\n"
+        "  difficulty_match: Does each question match the target difficulty level? "
+        "(0.0 = far off target; 1.0 = correctly calibrated)\n\n"
+        "PASS THRESHOLD: all criterion scores >= 0.70 AND no per-question critical failures.\n"
+        "CRITICAL FAILURE (automatic fail): ambiguous correct answer, answer key error, "
+        "or direct factual contradiction of the source material.\n\n"
+        "REVISION INSTRUCTIONS must be specific and actionable — name which spec_index "
+        "has the problem and exactly what to fix.\n\n"
         "Return a JSON object:\n"
         '  "passes": bool\n'
         '  "scores": {"source_grounding": f, "single_correct_answer": f, '
         '"distractor_quality": f, "question_type_diversity": f, "difficulty_match": f}\n'
-        '  "rejection_reasons": [str, ...]\n'
-        '  "revision_instructions": [str, ...]\n'
+        '  "rejection_reasons": [str, ...] (empty if passes)\n'
+        '  "revision_instructions": [str, ...] (specific fixes for each failing criterion)\n'
         '  "question_verdicts": [{"spec_index": int, "passes": bool, "reason": str}, ...]\n'
         "No extra text."
     )
@@ -896,7 +1084,8 @@ async def question_evaluator(state: AgentState) -> Dict:
         "Evaluate the batch."
     )
 
-    raw = await _llm("worker_mid", prompt, system=system, max_tokens=1500)
+    raw = await _llm("worker_mid", prompt, system=system, max_tokens=2000,
+                     _node="question_evaluator")
     try:
         result = _parse_json(raw)
         if not isinstance(result, dict):
@@ -918,6 +1107,10 @@ async def question_evaluator(state: AgentState) -> Dict:
         "revision_instructions": result.get("revision_instructions", []),
         "question_verdicts": result.get("question_verdicts", []),
     }
+    _node_done("question_evaluator", state,
+               batch_idx=batch_idx,
+               passes=batch_eval["passes"],
+               n_verdicts=len(batch_eval["question_verdicts"]))
     return {"current_batch_eval": batch_eval}
 
 
@@ -974,12 +1167,26 @@ async def reviser(state: AgentState) -> Dict:
     if not failing_drafts:
         return {"batch_revision_count": revision_count + 1}
 
+    _node_start("reviser", state,
+                batch_idx=state.get("current_batch_index", 0),
+                revision_count=revision_count,
+                n_failing=len(failing_indices))
+
     system = (
-        "You are a law professor revising multiple-choice quiz questions that failed QA. "
-        "Fix ONLY the specific issues listed in the revision instructions. "
-        "Preserve the question_type and topic. "
-        "For each question return the updated JSON with the same keys as the input. "
-        "Return a JSON array of the revised questions only."
+        "You are a T-14 law professor performing surgical revision of MCQ questions "
+        "that failed pedagogical QA.\n\n"
+        "REVISION STANDARDS:\n"
+        "1. Fix ONLY the specific issues in the revision instructions — do not rewrite "
+        "   questions that already pass.\n"
+        "2. Preserve the question_type, topic, and spec_index exactly as given.\n"
+        "3. If the issue is an ambiguous correct answer: rewrite the stem to eliminate "
+        "   ambiguity, or replace the offending distractor with a clearly inferior choice.\n"
+        "4. If the issue is weak distractors: replace with choices that exploit real "
+        "   misconceptions (overbroad_rule, scope_error, wrong_case_applied).\n"
+        "5. If the issue is source grounding: remove any claims not in the source text; "
+        "   replace with a question testing what IS documented.\n"
+        "6. Each revised question must score >= 0.70 on all evaluation criteria.\n"
+        "Return a JSON array of the revised questions only (same JSON structure as input)."
     )
 
     failing_payload = [
@@ -1000,7 +1207,8 @@ async def reviser(state: AgentState) -> Dict:
         "Return the revised questions as a JSON array with the same spec_index values."
     )
 
-    raw = await _llm("orchestrator", prompt, system=system, max_tokens=2500)
+    raw = await _llm("orchestrator", prompt, system=system, max_tokens=3000,
+                     _node="reviser")
     try:
         revised_list = _parse_json(raw)
         if not isinstance(revised_list, list):
@@ -1023,6 +1231,9 @@ async def reviser(state: AgentState) -> Dict:
             updated_drafts.append(draft)
 
     updated_drafts.sort(key=lambda d: d["spec_index"])
+    _node_done("reviser", state,
+               n_revised=len(revised_map), n_total=len(updated_drafts),
+               revision_pass=revision_count + 1)
     return {
         "current_batch_drafts": updated_drafts,
         "batch_revision_count": revision_count + 1,
@@ -1262,28 +1473,42 @@ async def critic(state: AgentState) -> Dict:
     num_questions = state.get("num_questions") or 10
     rejected_count = len(state.get("rejected_question_metadata") or [])
 
+    _node_start("critic", state,
+                accepted=accepted_count, target=num_questions, rejected=rejected_count)
+
+    system = (
+        "You are a T-14 law school assessment director performing a final diversity "
+        "and coverage audit of a completed MCQ quiz.\n\n"
+        "AUDIT STANDARDS:\n"
+        "- Type diversity: no single question type should exceed 40% of the quiz. "
+        "  Flag overrepresented types AND underrepresented types.\n"
+        "- Duplicate detection: scan question signatures for near-identical stems. "
+        "  Same fact pattern + different call of the question counts as a near-duplicate.\n"
+        "- Coverage gaps: identify doctrinal areas that have NO question — these are "
+        "  curriculum coverage failures that weaken the quiz's teaching value.\n"
+        "- Overall quality: weight single_correct_answer and distractor_quality most heavily "
+        "  in the overall_score.\n"
+        "Return ONLY the JSON object. No extra text."
+    )
+
     prompt = (
-        f"You are a senior law professor reviewing a {accepted_count}-question quiz "
+        f"Audit a {accepted_count}-question quiz "
         f"(target: {num_questions}, rejected: {rejected_count}).\n\n"
         f"Question type coverage:\n{json.dumps(coverage, indent=2)}\n\n"
         f"Question signatures (first 40 chars of each stem):\n"
         + "\n".join(f"- {s}" for s in sigs[:50])
         + "\n\n"
-        "Evaluate:\n"
-        "1. Type diversity: are too many questions from the same type?\n"
-        "2. Duplicate detection: any suspiciously similar stems?\n"
-        "3. Coverage gaps: which question types are under-represented?\n"
-        "4. Overall quality score (0.0-1.0)\n\n"
-        "Return a JSON object:\n"
-        '  "overall_score": float\n'
+        "Evaluate and return:\n"
+        '  "overall_score": float (0.0–1.0)\n'
         '  "type_diversity_ok": bool\n'
-        '  "duplicates_found": [str, ...]\n'
-        '  "coverage_gaps": [str, ...]\n'
-        '  "summary": str (2-3 sentences)\n'
+        '  "duplicates_found": [str, ...] (signatures of any near-duplicate pairs)\n'
+        '  "coverage_gaps": [str, ...] (question types or doctrinal areas with no coverage)\n'
+        '  "summary": str (2-3 sentences on overall quiz quality and any major concerns)\n'
         "No extra text."
     )
 
-    raw = await _llm("worker_low", prompt, max_tokens=800)
+    raw = await _llm("worker_low", prompt, system=system, max_tokens=1200,
+                     _node="critic")
     try:
         report = _parse_json(raw)
         report_str = json.dumps(report)
@@ -1304,6 +1529,7 @@ async def critic(state: AgentState) -> Dict:
         node_name="critic",
         artifact_type="critic_report",
     )
+    _node_done("critic", state, accepted=accepted_count)
     return {"critic_report": report_str}
 
 
@@ -1329,6 +1555,9 @@ async def final_formatter(state: AgentState) -> Dict:
     job_id = (state.get("job_id") or "").strip()
     num_questions = state.get("num_questions") or 10
     quiz_mode = state.get("quiz_mode") or "mixed"
+
+    _node_start("final_formatter", state,
+                n_accepted=len(accepted_ids), quiz_mode=quiz_mode)
 
     try:
         coverage = json.loads(coverage_raw)
@@ -1400,6 +1629,8 @@ async def final_formatter(state: AgentState) -> Dict:
         artifact_type="final_output",
     )
 
+    _node_done("final_formatter", state,
+               n_questions=len(accepted_ids), quiz_mode=quiz_mode)
     return {
         "persisted_question_ids": accepted_ids,
         "final_output": markdown,

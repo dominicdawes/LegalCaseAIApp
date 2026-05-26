@@ -64,6 +64,7 @@ from .constants import (
     SEED_THEMES,
 )
 from .worker_config import _fetch_worker_model, model_costs
+from utils.llm_clients.anthropic_rate_limits import get_llm_semaphore
 
 logger = logging.getLogger(__name__)
 
@@ -78,6 +79,52 @@ DEPTH_MAP = {
     "F": "deep", "G": "deep", "H": "deep", "I": "deep",
 }
 
+# ── Rate-limit guard ──────────────────────────────────────────────────────────
+# The semaphore is DYNAMIC — sized from the org's actual Anthropic tier by
+# utils/llm_clients/anthropic_rate_limits.py (hourly heartbeat probe).
+# These constants control the 429-retry loop that fires when the semaphore alone
+# isn't enough (e.g. burst of parallel calls that exceeds the minute token bucket).
+_LLM_RATE_LIMIT_RETRIES = 3   # additional attempts after the first 429
+_LLM_RATE_LIMIT_DELAY   = 60  # seconds to wait before each retry (linear: 60, 120, 180 s)
+
+# DeepSeek has much higher RPM than Anthropic Tier 1 — allow up to 10 concurrent
+# calls instead of the 2 returned by the Anthropic-probe semaphore.
+_DEEPSEEK_SEMAPHORE: Optional[asyncio.Semaphore] = None
+
+
+def _get_deepseek_semaphore() -> asyncio.Semaphore:
+    """Return (creating if needed) the per-loop DeepSeek concurrency semaphore."""
+    global _DEEPSEEK_SEMAPHORE
+    if _DEEPSEEK_SEMAPHORE is None:
+        _DEEPSEEK_SEMAPHORE = asyncio.Semaphore(10)
+    return _DEEPSEEK_SEMAPHORE
+
+
+# ── Debug helpers ─────────────────────────────────────────────────────────────
+
+def _node_start(name: str, state: Dict, **extras: Any) -> None:
+    """Log node entry with job context and any caller-supplied key/value pairs."""
+    job = (state.get("job_id") or "")[:8] or "no-job"
+    parts = " ".join(f"{k}={v}" for k, v in extras.items())
+    logger.info("▶ [%s] %s  %s", job, name, parts)
+
+
+def _node_done(name: str, state: Dict, **extras: Any) -> None:
+    """Log node completion with result summary."""
+    job = (state.get("job_id") or "")[:8] or "no-job"
+    parts = " ".join(f"{k}={v}" for k, v in extras.items())
+    logger.info("✓ [%s] %s  %s", job, name, parts)
+
+
+def _node_warn(name: str, state: Dict, msg: str) -> None:
+    """Log a non-fatal warning inside a node."""
+    job = (state.get("job_id") or "")[:8] or "no-job"
+    logger.warning("⚠ [%s] %s  %s", job, name, msg)
+
+
+def _llm_call(name: str, worker_class: str, model_name: str, max_tokens: int) -> None:
+    logger.info("  🤖 [%s] LLM %s (%s) max_tokens=%d", name, worker_class, model_name, max_tokens)
+
 
 # ── Shared helpers ─────────────────────────────────────────────────────────────
 
@@ -87,19 +134,63 @@ async def _llm(
     system: str = "",
     max_tokens: int = 2048,
     provider: Optional[str] = None,
+    _node: str = "",
 ) -> str:
+    """Call the LLM with rate-limit protection.
+
+    Acquires a dynamic semaphore (sized to the org's Anthropic tier via
+    utils/llm_clients/anthropic_rate_limits.py) before each call, capping
+    concurrency to keep total output token throughput within the org's
+    tokens-per-minute limit.
+
+    On a 429 RateLimitError, waits _LLM_RATE_LIMIT_DELAY seconds and retries
+    up to _LLM_RATE_LIMIT_RETRIES times before re-raising.
+    """
     from utils.llm_clients.llm_factory import LLMFactory
-    _provider, model_name = _fetch_worker_model(worker_class, provider)
+    _provider, model_name, thinking = _fetch_worker_model(worker_class, provider)
+    if _node:
+        _llm_call(_node, worker_class, model_name, max_tokens)
+
+    client_kwargs: Dict[str, Any] = {}
+    if thinking is not None:
+        client_kwargs["thinking"] = thinking
+
     client = LLMFactory.get_client_for(
         _provider, model_name,
         temperature=0.7, streaming=False, max_output_tokens=max_tokens,
+        **client_kwargs,
     )
-    if hasattr(client, "achat"):
-        return await client.achat(prompt, system_prompt=system or None)
-    chunks: List[str] = []
-    async for chunk in client.stream_chat(prompt, system_prompt=system or None):
-        chunks.append(chunk)
-    return "".join(chunks)
+
+    if _provider == "deepseek":
+        sem = _get_deepseek_semaphore()
+    else:
+        sem = await get_llm_semaphore()
+
+    async with sem:
+        for attempt in range(_LLM_RATE_LIMIT_RETRIES + 1):
+            try:
+                if hasattr(client, "achat"):
+                    return await client.achat(prompt, system_prompt=system or None)
+                chunks: List[str] = []
+                async for chunk in client.stream_chat(prompt, system_prompt=system or None):
+                    chunks.append(chunk)
+                return "".join(chunks)
+            except Exception as exc:
+                err = str(exc)
+                is_rate_limit = (
+                    "429" in err
+                    or "rate_limit" in err.lower()
+                    or "rate limit" in err.lower()
+                )
+                if is_rate_limit and attempt < _LLM_RATE_LIMIT_RETRIES:
+                    wait = _LLM_RATE_LIMIT_DELAY * (attempt + 1)  # 60, 120, 180 s
+                    logger.warning(
+                        "🚦 [%s] Rate limit hit (429) — waiting %ds before retry %d/%d",
+                        _node or worker_class, wait, attempt + 1, _LLM_RATE_LIMIT_RETRIES,
+                    )
+                    await asyncio.sleep(wait)
+                    continue
+                raise
 
 
 async def _try_save_artifact(
@@ -186,6 +277,10 @@ async def head_orchestrator(state: AgentState) -> Dict:
     from agents.tools.base import make_tools
     from agents.tools.registry import COLD_CALL_PLANNER_TOOLS
 
+    _node_start("head_orchestrator", state,
+                n_sources=len(state.get("source_ids") or []),
+                request=repr(state.get("request", "")[:80]))
+
     tools = make_tools(
         state["project_id"],
         source_ids=state["source_ids"],
@@ -194,19 +289,28 @@ async def head_orchestrator(state: AgentState) -> Dict:
     )
     list_sources_tool = next(t for t in tools if t.name == "list_sources")
     sources_json = await list_sources_tool.ainvoke({})
+    logger.info("  📋 [head_orchestrator] list_sources → %d chars", len(sources_json))
 
     system = (
-        "You are the workflow controller for a law-school cold-call generation pipeline. "
-        "Plan how many question sequences to produce, which cases to prioritise, "
-        "and which difficulty calibration to use.\n\n"
+        "You are the orchestrator for a T-14 law-school cold-call question generation pipeline. "
+        "Your job is to plan the construction of a complete Socratic question set that matches "
+        "the depth and rigor of a T-14 classroom — covering legally relevant facts, rule extraction, "
+        "holding vs. dicta, fact-change hypotheticals, rule boundary testing, counterarguments, "
+        "and policy analysis.\n\n"
+        "Given the available source documents, create a job plan that identifies:\n"
+        "(1) the primary cases and doctrines present,\n"
+        "(2) the course context and difficulty tier,\n"
+        "(3) whether multi-case comparison threads are warranted,\n"
+        "(4) the optimal depth and coverage mode.\n\n"
         "Return JSON with keys:\n"
         "  job_type: 'cold_call'\n"
         "  source_ids: list of source UUIDs in scope\n"
         "  requested_sequence_count: int\n"
         "  target_difficulty: 'law_1l' | 'day_one_t14' | 'advanced'\n"
-        "  course_context: string (e.g. 'Torts', 'Contracts', 'Civil Procedure')\n"
+        "  course_context: string (e.g. 'Torts / Negligence', 'Contracts / Formation')\n"
         "  coverage_mode: 'single_case' | 'multi_case' | 'doctrine_survey'\n"
         "  retrieval_depth: 'standard' | 'deep'\n"
+        "  expected_cases: list of case names visible in the sources\n"
         "Return only JSON."
     )
 
@@ -216,11 +320,14 @@ async def head_orchestrator(state: AgentState) -> Dict:
         f"Requested sequences: {state.get('requested_sequence_count', 5)}\n"
         f"Target difficulty: {state.get('target_difficulty', 'day_one_t14')}",
         system=system,
-        max_tokens=512,
+        max_tokens=800,
+        _node="head_orchestrator",
     )
     try:
         job_plan = _parse_json(raw)
-    except Exception:
+    except Exception as exc:
+        _check_token_limit(exc, "head_orchestrator", state)
+        _node_warn("head_orchestrator", state, f"JSON parse failed ({exc}) — using default plan")
         job_plan = {
             "job_type": "cold_call",
             "source_ids": state["source_ids"],
@@ -228,13 +335,18 @@ async def head_orchestrator(state: AgentState) -> Dict:
             "target_difficulty": state.get("target_difficulty", "day_one_t14"),
             "course_context": "",
             "coverage_mode": "single_case",
-            "retrieval_depth": "standard",
+            "retrieval_depth": "deep",
+            "expected_cases": [],
         }
 
     await _try_save_artifact(
         state, "job_plan", job_plan, "orchestrator", "head_orchestrator", "job_plan",
         source_ids=state.get("source_ids"),
     )
+    _node_done("head_orchestrator", state,
+               mode=job_plan.get("coverage_mode"),
+               difficulty=job_plan.get("target_difficulty"),
+               context=job_plan.get("course_context"))
     return {"job_plan": job_plan}
 
 
@@ -482,22 +594,44 @@ async def case_rule_extractor(state: Dict) -> Dict:
         for c in all_chunks[:25]
     )
 
+    _node_start("case_rule_extractor", state,
+                case=case_name[:40], source_ids=[s[:8] for s in source_ids[:3]])
+
     system = (
-        "You are extracting a complete structured case brief for cold-call generation.\n\n"
+        "You are a T-14 law professor extracting a complete structured case analysis for "
+        "cold-call question generation. Your extraction must be thorough enough to support "
+        "8-deep Socratic questioning — from direct fact comprehension through rule boundary "
+        "testing and policy analysis.\n\n"
+        "T-14 EXTRACTION REQUIREMENTS:\n"
+        "• legally_relevant_facts: identify ONLY the facts the court's rule actually hinges on "
+        "(not background narrative); these become the FACT_CHANGE_HYPO targets\n"
+        "• rule.elements: list ALL required elements in the order courts apply them\n"
+        "• rule.exceptions: list every exception, carve-out, and limiting doctrine\n"
+        "• reasoning: each step must be a distinct analytical move the court made, "
+        "not a summary\n"
+        "• dicta: flag statements about what the rule IS NOT or future cases\n"
+        "• policy_concerns: name the specific policy values at stake "
+        "(efficiency, fairness, administrability, notice, etc.)\n\n"
         "Return JSON with:\n"
         "  case_name: str\n"
         "  court: str\n"
         "  year: str\n"
         "  procedural_posture: str\n"
         "  facts: [str] (all relevant facts, max 8)\n"
-        "  legally_relevant_facts: [str] (only the facts the court's rule hinges on, max 5)\n"
-        "  issue: 'Whether ...' string\n"
-        "  holding: str (narrow answer to the issue)\n"
-        "  rule: {rule_statement, elements:[str], exceptions:[str], burdens:[str], rule_type: categorical|balancing|element_based|factor_based}\n"
-        "  reasoning: [str] (distinct logical steps the court took, max 6)\n"
+        "  legally_relevant_facts: [str] (ONLY facts the rule's outcome hinges on, max 5)\n"
+        "  issue: 'Whether ...' string (narrow, precise)\n"
+        "  holding: str (narrow answer to the issue, one sentence)\n"
+        "  rule: {\n"
+        "    rule_statement: str (full black-letter rule — not a fragment),\n"
+        "    elements: [str] (ALL required elements in order),\n"
+        "    exceptions: [str] (ALL exceptions and carve-outs),\n"
+        "    burdens: [str] (who bears each burden),\n"
+        "    rule_type: categorical|balancing|element_based|factor_based\n"
+        "  }\n"
+        "  reasoning: [str] (distinct analytical steps, max 6)\n"
         "  dicta: [str] (statements not necessary to the holding, max 3)\n"
-        "  dissent: str (dissent summary, '' if none)\n"
-        "  policy_concerns: [str] (policy rationales evident in the opinion, max 4)\n"
+        "  dissent: str (dissent summary with its core objection, '' if none)\n"
+        "  policy_concerns: [str] (policy rationales with the specific values at stake, max 4)\n"
         "  source_refs: [str] (chunk_ids from context)\n"
         "Return only JSON."
     )
@@ -506,11 +640,14 @@ async def case_rule_extractor(state: Dict) -> Dict:
         "orchestrator",
         f"Case to extract: {case_name}\n\nSource context:\n{context}\n\nExtract the full case/rule object.",
         system=system,
-        max_tokens=2500,
+        max_tokens=3000,
+        _node="case_rule_extractor",
     )
     try:
         data = _parse_json(raw)
-    except Exception:
+    except Exception as exc:
+        _check_token_limit(exc, "case_rule_extractor", state)
+        _node_warn("case_rule_extractor", state, f"JSON parse failed ({exc}) — using empty dict")
         data = {}
 
     obj: CaseRuleObject = {
@@ -543,6 +680,10 @@ async def case_rule_extractor(state: Dict) -> Dict:
         "orchestrator", "case_rule_extractor", "case_rule_object",
         source_ids=source_ids,
     )
+    _node_done("case_rule_extractor", state,
+               case=obj.get("case_name", "")[:40],
+               n_elements=len((obj.get("rule") or {}).get("elements", [])),
+               n_facts=len(obj.get("legally_relevant_facts", [])))
     return {"case_rule_objects": [obj]}
 
 
@@ -805,10 +946,22 @@ async def cold_call_seed_generator(state: Dict) -> Dict:
     }
     n_seeds = max(requested, SEEDS_PER_CASE_MULTIPLIER * max(1, requested // max(1, len(state.get("case_rule_objects") or [1]))))
 
+    _node_start("cold_call_seed_generator", state,
+                case=case_obj.get("case_name", "")[:40], n_seeds=n_seeds)
+
     system = (
-        "You are generating diverse cold-call seed questions for a law school class. "
-        "Each seed is the OPENING QUESTION of a Socratic thread. Seeds must cover "
-        "different angles so threads do not overlap.\n\n"
+        "You are a T-14 law professor generating diverse cold-call seed questions. "
+        "Each seed is the OPENING QUESTION of a Socratic thread — it must be concrete, "
+        "anchored to the specific case, and designed to reveal a student's depth of "
+        "preparation at the targeted difficulty level.\n\n"
+        "T-14 SEED REQUIREMENTS:\n"
+        "• Each seed must target a DIFFERENT angle so the resulting threads do not overlap\n"
+        "• Early seeds: test direct case comprehension (facts, posture, holding)\n"
+        "• Middle seeds: test rule application (elements, exceptions, fact probes)\n"
+        "• Deep seeds: test analysis (rule boundary, policy, compare/distinguish, hypos)\n"
+        "• Questions must name specific case facts — never generic ('What is the rule?')\n"
+        "• The question must be phrased as a professor would ask it in class, "
+        "not as a textbook prompt\n\n"
         "Required seed themes (cover as many as requested count allows):\n"
         f"  {json.dumps(SEED_THEMES)}\n\n"
         "Question type bank (early/middle/deep):\n"
@@ -817,8 +970,9 @@ async def cold_call_seed_generator(state: Dict) -> Dict:
         "  seed_id: 'seed_NNN'\n"
         "  sequence_theme: one of the required themes\n"
         "  question_type: from the question type bank\n"
-        "  question: the opening question text (concrete, tied to this case)\n"
-        "  target_skill: what the professor is testing\n"
+        "  question: the opening question text (concrete, case-specific, professor-voiced)\n"
+        "  target_skill: what this question tests (e.g. 'holding identification', "
+        "'rule boundary', 'policy analysis')\n"
         "  difficulty: 'early' | 'middle' | 'deep'\n"
         "Return only the JSON array."
     )
@@ -832,7 +986,7 @@ async def cold_call_seed_generator(state: Dict) -> Dict:
         f"Policy concerns: {json.dumps(case_obj.get('policy_concerns', []))}\n"
     )
 
-    raw = await _llm("orchestrator", f"{case_ctx}\n\nGenerate {n_seeds} diverse seeds.", system=system, max_tokens=3000)
+    raw = await _llm("orchestrator", f"{case_ctx}\n\nGenerate {n_seeds} diverse seeds.", system=system, max_tokens=3000, _node="cold_call_seed_generator")
     try:
         seeds_raw = _parse_json(raw)
         if not isinstance(seeds_raw, list):
@@ -860,6 +1014,8 @@ async def cold_call_seed_generator(state: Dict) -> Dict:
         "orchestrator", "cold_call_seed_generator", "seeds",
         source_ids=state.get("source_ids"),
     )
+    _node_done("cold_call_seed_generator", state,
+               case_id=case_id[:8], n_seeds=len(seeds))
     return {"seeds": seeds}
 
 
@@ -1026,30 +1182,42 @@ async def socratic_thread_builder(state: Dict) -> Dict:
         None,
     )
 
+    _node_start("socratic_thread_builder", state,
+                seed_id=seed.get("seed_id", "?"), case_id=case_id[:8],
+                theme=seed.get("sequence_theme", "?"))
+
     system = (
-        "You are building a Socratic cold-call question sequence for a law school class.\n"
-        "The sequence must escalate in difficulty across exactly 8 parts (A through H):\n"
-        "  A: Direct comprehension (LEGALLY_RELEVANT_FACTS or CASE_FACTS)\n"
-        "  B: Reasoning chain (REASONING_CHAIN)\n"
-        "  C: Legally relevant fact probe or posture (LEGALLY_RELEVANT_FACTS or PROCEDURAL_POSTURE)\n"
-        "  D: Holding vs. dicta (HOLDING_VS_DICTA)\n"
-        "  E: Fact-change hypothetical (FACT_CHANGE_HYPO) — change ONE key fact\n"
-        "  F: Rule boundary (RULE_BOUNDARY) — where does the rule stop?\n"
-        "  G: Counterargument / losing side (COUNTERARGUMENT)\n"
-        "  H: Policy or exam application (POLICY_ANALYSIS or EXAM_APPLICATION)\n\n"
-        "Rules:\n"
-        "  - Each question must logically build on the prior\n"
-        "  - Question E must name the specific fact being changed\n"
-        "  - Question G must argue the losing side\n"
-        "  - Questions must be anchored to the specific case, not generic\n\n"
+        "You are a T-14 law professor building a Socratic cold-call question sequence. "
+        "The sequence must escalate methodically — each question should be harder to answer "
+        "than the one before, and should build on what a strong student would have said.\n\n"
+        "T-14 DEPTH STRUCTURE — 8 questions (A through H):\n"
+        "  A: Direct comprehension — 'What are the legally relevant facts?' "
+        "(Do not ask for a conclusion; ask for facts only)\n"
+        "  B: Reasoning chain — 'Why did the court reach that conclusion?' "
+        "(Ask for the court's analytical steps, not just the holding)\n"
+        "  C: Legally relevant fact probe — 'Which of those facts actually mattered to the rule?' "
+        "(Force the student to distinguish material from background facts)\n"
+        "  D: Holding vs. dicta — 'Was that statement necessary to the holding?' "
+        "(Test whether the student understands the scope of the precedent)\n"
+        "  E: Fact-change hypothetical — 'What if [specific key fact] had been different — "
+        "would the result change?' (Name the exact fact being changed)\n"
+        "  F: Rule boundary — 'Where does the rule stop? Give me a case where it wouldn't apply.'\n"
+        "  G: Counterargument / losing side — 'What is the best argument for the losing party?'\n"
+        "  H: Policy or exam application — 'What policy value does this rule serve?' "
+        "or 'How would you argue this issue on an exam?'\n\n"
+        "T-14 QUESTION STANDARDS:\n"
+        "• Each question must be phrased as a professor would ask it aloud in class\n"
+        "• Each question must reference specific case facts — never generic\n"
+        "• Each question must logically follow from the prior (do not reset context)\n"
+        "• expected_answer_shape: describe what an A student would say in 2-3 sentences\n\n"
         "Return a JSON array of exactly 8 question objects. Each:\n"
         "  question_id: '1A' through '1H'\n"
         "  question_index: 1-8\n"
         "  question_type: the type tag (e.g. LEGALLY_RELEVANT_FACTS)\n"
         "  depth_position: 'early' | 'middle' | 'deep'\n"
-        "  question_text: str (the actual question)\n"
+        "  question_text: str (the professor's actual spoken question)\n"
         "  target_skill: str (what this question tests)\n"
-        "  expected_answer_shape: str (2-3 sentence description of a strong answer)\n"
+        "  expected_answer_shape: str (what an A student says, 2-3 sentences)\n"
         "  source_refs: [] (leave empty; filled by grounder)\n"
         "  metadata: {}\n"
         "Return only the JSON array."
@@ -1088,6 +1256,7 @@ async def socratic_thread_builder(state: Dict) -> Dict:
         f"{case_ctx}{seed_ctx}\nBuild the 8-question Socratic thread.",
         system=system,
         max_tokens=4000,
+        _node="socratic_thread_builder",
     )
     try:
         questions_raw = _parse_json(raw)
@@ -1143,6 +1312,9 @@ async def socratic_thread_builder(state: Dict) -> Dict:
         "orchestrator", "socratic_thread_builder", "question_sequence",
         source_ids=state.get("source_ids"),
     )
+    _node_done("socratic_thread_builder", state,
+               seq_id=seq_id[:16], n_questions=len(questions),
+               theme=seed.get("sequence_theme", "?"))
     return {"socratic_sequences": [sequence]}
 
 
@@ -1207,18 +1379,34 @@ async def socratic_answer_agent(state: Dict) -> Dict:
         indent=2,
     )
 
+    _node_start("socratic_answer_agent", state,
+                seq_id=sequence.get("sequence_id", "?")[:16],
+                case_id=case_id[:8])
+
     system = (
-        "You are a law professor generating model answers for Socratic cold-call questions. "
-        "Use the Because / Unless / But / Therefore framework for the model_answer.\n\n"
-        "Format:\n"
-        "  model_answer: 'The [party] probably [wins/loses]. Because [rule application]. "
-        "Unless [exception or counter-fact]. But [key limitation]. Therefore [conclusion].'\n"
-        "  strong_answer: what an A student would say (more precise, more nuanced)\n"
-        "  common_weak_answer: what a typical unprepared student says (vague, overbroad)\n"
-        "  professor_follow_up_trap: the trick question the professor asks after a good answer\n"
-        "  recovery_phrase: what to say if the student blanks (rule-focused recovery)\n\n"
+        "You are a T-14 law professor generating model Socratic answers for cold-call questions. "
+        "Your answers must match T-14 caliber — precise rule statements, case-specific "
+        "application, and acknowledgment of the best counterarguments.\n\n"
+        "ANSWER FORMAT (Because / Unless / But / Therefore):\n"
+        "  model_answer: 'The [party] probably [wins/loses] on [issue]. "
+        "Because [precise rule application to specific facts]. "
+        "Unless [key exception or competing fact]. "
+        "But [the most important limiting doctrine or counterweight]. "
+        "Therefore [one-sentence conclusion with confidence level].'\n\n"
+        "T-14 ANSWER STANDARDS:\n"
+        "• model_answer: must cite the specific rule elements and apply them to the named facts; "
+        "do NOT use generic statements like 'the rule applies here'\n"
+        "• strong_answer: what an A student says — more precise, acknowledges exceptions, "
+        "names the legally relevant fact; 3-4 sentences minimum\n"
+        "• common_weak_answer: the surface-level answer an unprepared student gives — "
+        "usually correct conclusion but missing the rule mechanics\n"
+        "• professor_follow_up_trap: the NEXT question a professor asks after a strong answer "
+        "to probe for deeper understanding (e.g. 'What if the plaintiff had been warned?')\n"
+        "• recovery_phrase: a rule-focused sentence the student can say if they blank "
+        "(not just 'I need more time'; it must move the analysis forward)\n\n"
         "Return a JSON array where each object corresponds to one question_id:\n"
-        "  [{question_id, model_answer, strong_answer, common_weak_answer, professor_follow_up_trap, recovery_phrase}]\n"
+        "  [{question_id, model_answer, strong_answer, common_weak_answer, "
+        "professor_follow_up_trap, recovery_phrase}]\n"
         "Return only the JSON array."
     )
 
@@ -1236,7 +1424,8 @@ async def socratic_answer_agent(state: Dict) -> Dict:
         f"Questions to answer:\n{questions_ctx}\n\n"
         f"Generate Socratic answers for each question.",
         system=system,
-        max_tokens=5000,
+        max_tokens=6000,
+        _node="socratic_answer_agent",
     )
     try:
         answers_raw = _parse_json(raw)
@@ -1268,6 +1457,8 @@ async def socratic_answer_agent(state: Dict) -> Dict:
         "orchestrator", "socratic_answer_agent", "answer_sequence",
         source_ids=state.get("source_ids"),
     )
+    _node_done("socratic_answer_agent", state,
+               seq_id=seq_id[:16], n_answers=len(answers))
     return {"answer_sequences": [answer_seq]}
 
 
