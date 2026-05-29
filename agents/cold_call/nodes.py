@@ -86,6 +86,7 @@ DEPTH_MAP = {
 # isn't enough (e.g. burst of parallel calls that exceeds the minute token bucket).
 _LLM_RATE_LIMIT_RETRIES = 3   # additional attempts after the first 429
 _LLM_RATE_LIMIT_DELAY   = 60  # seconds to wait before each retry (linear: 60, 120, 180 s)
+_LLM_CALL_TIMEOUT       = 180  # seconds before a hung LLM call is aborted
 
 # DeepSeek has much higher RPM than Anthropic Tier 1 — allow up to 10 concurrent
 # calls instead of the 2 returned by the Anthropic-probe semaphore.
@@ -170,11 +171,23 @@ async def _llm(
         for attempt in range(_LLM_RATE_LIMIT_RETRIES + 1):
             try:
                 if hasattr(client, "achat"):
-                    return await client.achat(prompt, system_prompt=system or None)
-                chunks: List[str] = []
-                async for chunk in client.stream_chat(prompt, system_prompt=system or None):
-                    chunks.append(chunk)
-                return "".join(chunks)
+                    return await asyncio.wait_for(
+                        client.achat(prompt, system_prompt=system or None),
+                        timeout=_LLM_CALL_TIMEOUT,
+                    )
+                async def _stream() -> str:
+                    chunks: List[str] = []
+                    async for chunk in client.stream_chat(prompt, system_prompt=system or None):
+                        chunks.append(chunk)
+                    return "".join(chunks)
+                return await asyncio.wait_for(_stream(), timeout=_LLM_CALL_TIMEOUT)
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "⏱️ [%s] LLM call timed out after %ds (attempt %d/%d)",
+                    _node or worker_class, _LLM_CALL_TIMEOUT,
+                    attempt + 1, _LLM_RATE_LIMIT_RETRIES + 1,
+                )
+                raise
             except Exception as exc:
                 err = str(exc)
                 is_rate_limit = (

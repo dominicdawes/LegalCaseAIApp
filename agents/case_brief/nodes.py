@@ -84,7 +84,8 @@ RETRIEVAL_TARGETS = [
 
 # ── Rate-limit guard ──────────────────────────────────────────────────────────
 _LLM_RATE_LIMIT_RETRIES = 3
-_LLM_RATE_LIMIT_DELAY   = 60  # seconds (linear: 60, 120, 180 s)
+_LLM_RATE_LIMIT_DELAY   = 60   # seconds (linear: 60, 120, 180 s)
+_LLM_CALL_TIMEOUT       = 180  # seconds before a hung LLM call is aborted
 
 _DEEPSEEK_SEMAPHORE: Optional[asyncio.Semaphore] = None
 
@@ -154,11 +155,23 @@ async def _llm(
         for attempt in range(_LLM_RATE_LIMIT_RETRIES + 1):
             try:
                 if hasattr(client, "achat"):
-                    return await client.achat(prompt, system_prompt=system or None)
-                chunks: List[str] = []
-                async for chunk in client.stream_chat(prompt, system_prompt=system or None):
-                    chunks.append(chunk)
-                return "".join(chunks)
+                    return await asyncio.wait_for(
+                        client.achat(prompt, system_prompt=system or None),
+                        timeout=_LLM_CALL_TIMEOUT,
+                    )
+                async def _stream() -> str:
+                    chunks: List[str] = []
+                    async for chunk in client.stream_chat(prompt, system_prompt=system or None):
+                        chunks.append(chunk)
+                    return "".join(chunks)
+                return await asyncio.wait_for(_stream(), timeout=_LLM_CALL_TIMEOUT)
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "⏱️ [%s] LLM call timed out after %ds (attempt %d/%d)",
+                    _node or worker_class, _LLM_CALL_TIMEOUT,
+                    attempt + 1, _LLM_RATE_LIMIT_RETRIES + 1,
+                )
+                raise
             except Exception as exc:
                 err = str(exc)
                 is_rate_limit = (
@@ -554,7 +567,10 @@ async def retrieval_planner(state: AgentState) -> Dict:
         "  source_filters: list of source UUIDs to restrict to\n"
         "  max_chunks: int (8-20)\n"
         "  priority: 'high' | 'medium' | 'low'\n"
-        "Produce a plan for ALL targets. Return only the JSON array."
+        "Produce a plan for ALL targets. "
+        "**IMPORTANT**: keep the total JSON response under 4 000 tokens "
+        "(~440 tokens per target). Use terse keyword phrases — not prose sentences — "
+        "for queries and patterns. Return only the JSON array."
     )
 
     prompt = (
@@ -566,7 +582,7 @@ async def retrieval_planner(state: AgentState) -> Dict:
         f"Generate retrieval plans for all brief artifacts."
     )
 
-    raw = await _llm("orchestrator", prompt, system=system, max_tokens=3000)
+    raw = await _llm("orchestrator", prompt, system=system, max_tokens=5000)
     try:
         plans: List[RetrievalPlan] = _parse_json(raw)
         if not isinstance(plans, list):

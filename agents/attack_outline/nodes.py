@@ -600,7 +600,10 @@ async def retrieval_planner(state: AgentState) -> Dict:
         "    vector_queries: 1-2 semantic queries as full sentences\n"
         "    regex_patterns: 0-3 regex patterns for mandatory terms\n"
         "  section_filters: list of section_ids to prioritise\n\n"
-        "Produce plans for ALL topics. Return a JSON array — no other text."
+        "Produce plans for ALL topics. "
+        "**IMPORTANT**: keep the total JSON response under 8 000 tokens "
+        "(~800 tokens per topic). Use terse keyword phrases — not prose sentences — "
+        "for queries and patterns. Return a JSON array — no other text."
     )
 
     # Option E: send only priority-1 topics to the planner to avoid spending
