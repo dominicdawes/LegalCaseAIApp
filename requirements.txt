@@ -46,7 +46,8 @@ tiktoken==0.7.0
 google-cloud-aiplatform==1.56.0
 
 # LangChain (imported by chat_tasks, note_tasks, prompt_utils)
-langchain==0.2.5
-langchain-community==0.2.5
-langchain-openai==0.1.8
+langchain>=0.3.0
+langchain-community>=0.3.0
+langchain-openai>=0.2.0
+langchain-text-splitters>=0.3.0
 promptic
