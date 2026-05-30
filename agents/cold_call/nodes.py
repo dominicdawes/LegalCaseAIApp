@@ -152,6 +152,10 @@ async def _llm(
     if _node:
         _llm_call(_node, worker_class, model_name, max_tokens)
 
+    # Auto-append token budget soft limit to every system prompt that doesn't already have one
+    if system and "IMPORTANT" not in system:
+        system = system + f"\n\n**IMPORTANT**: keep your response under {max_tokens} tokens."
+
     client_kwargs: Dict[str, Any] = {}
     if thinking is not None:
         client_kwargs["thinking"] = thinking

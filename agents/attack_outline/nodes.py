@@ -143,6 +143,10 @@ async def _llm(
     if _node:
         _llm_call(_node, worker_class, model_name, max_tokens)
 
+    # Auto-append token budget soft limit to every system prompt that doesn't already have one
+    if system and "IMPORTANT" not in system:
+        system = system + f"\n\n**IMPORTANT**: keep your response under {max_tokens} tokens."
+
     # Pass thinking=True/False for DeepSeek (None for other providers = no-op).
     # DeepSeekClient translates this to extra_body={"thinking": {"type": ...}}
     # which is the correct V4 API format (April 2026+).

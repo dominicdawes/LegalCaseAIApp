@@ -136,6 +136,10 @@ async def _llm(
     if _node:
         _llm_call(_node, worker_class, model_name, max_tokens)
 
+    # Auto-append token budget soft limit to every system prompt that doesn't already have one
+    if system and "IMPORTANT" not in system:
+        system = system + f"\n\n**IMPORTANT**: keep your response under {max_tokens} tokens."
+
     client_kwargs: Dict[str, Any] = {}
     if thinking is not None:
         client_kwargs["thinking"] = thinking
@@ -739,6 +743,7 @@ async def evidence_card_builder(state: Dict) -> Dict:
         for c in chunks[:20]
     )
 
+    max_tokens = 3000
     system = (
         "You are an evidence card builder for a law-school case brief. "
         "Convert retrieved chunks into concise, grounded evidence cards. "
@@ -751,7 +756,9 @@ async def evidence_card_builder(state: Dict) -> Dict:
         "  page_range: page number(s) string\n"
         "  quote: verbatim 1-3 sentence quote or tight paraphrase\n"
         "  confidence: float 0.0-1.0\n"
-        "Extract ALL evidence cards present. Return only the JSON array."
+        f"Extract ALL evidence cards present. Return only the JSON array. "
+        f"**IMPORTANT**: keep your total response under {max_tokens} tokens — "
+        f"use tight quotes (1-2 sentences max) and omit any explanation outside the JSON array."
     )
 
     prompt = (
@@ -760,7 +767,7 @@ async def evidence_card_builder(state: Dict) -> Dict:
         f"Build evidence cards."
     )
 
-    raw = await _llm("worker_low", prompt, system=system, max_tokens=2500)
+    raw = await _llm("worker_low", prompt, system=system, max_tokens=max_tokens)
     try:
         cards_raw = _parse_json(raw)
         if not isinstance(cards_raw, list):
@@ -1175,7 +1182,7 @@ _SECTION_SYSTEMS = {
         "- If citation is not in the evidence, omit it — do not fabricate.\n"
         "- draft_text: 2-4 sentences, clean and precise.\n"
         "Return JSON: {section_id, title, draft_text, claims:[{claim,supporting_card_ids}], "
-        "word_count, warnings}"
+        "word_count, warnings:[str]}"
     ),
     "procedural_posture": (
         "You are a T-14 law professor writing the procedural posture section.\n\n"
@@ -1189,7 +1196,7 @@ _SECTION_SYSTEMS = {
         "- The procedural frame is critical on exams — students who confuse the frame "
         "  misapply the rule. Make it explicit.\n"
         "Return JSON: {section_id, title, draft_text, procedural_stage, "
-        "standard_or_frame, claims, word_count, warnings}"
+        "standard_or_frame, claims, word_count, warnings:[str]}"
     ),
     "facts": (
         "You are a T-14 law professor writing the material facts section.\n\n"
@@ -1204,7 +1211,7 @@ _SECTION_SYSTEMS = {
         "- draft_text: present tense, tight prose. Each sentence carries legal weight.\n"
         "Return JSON: {section_id, title, draft_text, "
         "material_facts:[{fact,why_material,supporting_card_ids}], "
-        "omitted_background_facts, word_count, claims, warnings}"
+        "omitted_background_facts, word_count, claims, warnings:[str]}"
     ),
     "issue_holding": (
         "You are a T-14 law professor writing the issue and holding section.\n\n"
@@ -1246,7 +1253,7 @@ _SECTION_SYSTEMS = {
         "- If the court's reasoning is weak or questionable, note it briefly "
         "  (this is what professors challenge on cold calls).\n"
         "Return JSON: {section_id, title, reasoning_outline:[str], "
-        "draft_text, word_count, warnings}"
+        "draft_text, word_count, warnings:[str]}"
     ),
     "dissent": (
         "You are a T-14 law professor writing the dissent section.\n\n"
@@ -1262,7 +1269,7 @@ _SECTION_SYSTEMS = {
         "- The dissent is HIGH-YIELD for exams and cold calls — extract it carefully.\n"
         "Return JSON: {section_id, title, has_section, draft_text, "
         "majority_vs_dissent:{majority_rule,dissent_rule,core_disagreement}, "
-        "word_count, warnings}"
+        "word_count, warnings:[str]}"
     ),
     "pedagogy": (
         "You are a T-14 law professor writing the pedagogical note section.\n\n"
@@ -1587,7 +1594,7 @@ async def section_reviser(state: AgentState) -> Dict:
             "You are a legal section reviser. Revise ONLY what the grounding report flags. "
             "Do not add unsupported claims. Do not rewrite clean sections.\n\n"
             "Return JSON: {section_id, title, draft_text, claims:[{claim,supporting_card_ids}], "
-            "word_count, warnings, changes_made:[str]}"
+            "word_count, warnings:[str], changes_made:[str]}"
         )
 
         prompt = (
@@ -1604,13 +1611,18 @@ async def section_reviser(state: AgentState) -> Dict:
         except Exception:
             data = {}
 
+        # Normalize warnings — LLM occasionally returns a bare string instead of [str]
+        _prior_warnings = section.get("warnings", [])
+        if isinstance(_prior_warnings, str):
+            _prior_warnings = [_prior_warnings] if _prior_warnings else []
+
         revised: SectionDraft = {
             "section_id": sid,
             "title":      data.get("title", section["title"]),
             "draft_text": data.get("draft_text", section["draft_text"]),
             "claims":     data.get("claims", section["claims"]),
             "word_count": data.get("word_count", section["word_count"]),
-            "warnings":   section["warnings"] + ["[revised by section_reviser]"],
+            "warnings":   _prior_warnings + ["[revised by section_reviser]"],
         }
 
         await _try_save_artifact(
@@ -1912,7 +1924,7 @@ async def brief_revision_agent(state: AgentState) -> Dict:
             "You are a law professor revising a weak brief section. "
             "Revise ONLY what the critique flags. Do not add unsupported claims.\n\n"
             "Return JSON: {section_id, title, draft_text, claims:[{claim,supporting_card_ids}], "
-            "word_count, warnings}"
+            "word_count, warnings:[str]}"
         )
 
         prompt = (

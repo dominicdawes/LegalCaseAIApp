@@ -37,9 +37,17 @@ from celery.exceptions import MaxRetriesExceededError
 from celery.utils.log import get_task_logger
 try:
     from anthropic import NotFoundError as AnthropicNotFoundError, AuthenticationError as AnthropicAuthError
-    _PERMANENT_LLM_ERRORS = (AnthropicNotFoundError, AnthropicAuthError, ModuleNotFoundError, ImportError, SyntaxError)
+    _PERMANENT_LLM_ERRORS = (
+        AnthropicNotFoundError, AnthropicAuthError,
+        ModuleNotFoundError, ImportError, SyntaxError,
+        # Python code bugs — retrying will never fix these:
+        TypeError, AttributeError, NameError, KeyError, IndexError,
+    )
 except ImportError:
-    _PERMANENT_LLM_ERRORS = (ModuleNotFoundError, ImportError, SyntaxError)
+    _PERMANENT_LLM_ERRORS = (
+        ModuleNotFoundError, ImportError, SyntaxError,
+        TypeError, AttributeError, NameError, KeyError, IndexError,
+    )
 
 # ===== MACHINE LEARNING & TEXT PROCESSING =====  
 import tiktoken
@@ -89,7 +97,7 @@ NOTES_QUEUE = 'notes'
 # ——— Configuration & Constants ————————————————————————————————————————————————————
 
 # Performance, Retries & Batching
-MAX_RETRIES = 5
+MAX_RETRIES = 2  # Reduced from 5 — agent runs take 20+ min each; 2 retries = 3 total attempts max
 RETRY_BACKOFF_MULTIPLIER = 2
 DEFAULT_RETRY_DELAY = 5
 RATE_LIMIT = '150/m'
