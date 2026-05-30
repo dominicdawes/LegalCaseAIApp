@@ -5,21 +5,18 @@ All nodes for the case-brief LangGraph agent.
 Node index (in execution order):
   1.  head_orchestrator            — orchestrator; plans brief mode, scope, budget
   2.  source_profiler              — worker_mid; per-source profile (parallel Send)
-  3.  corpus_orientation_synthesizer — worker_mid; identifies primary case, source roles
-  4.  retrieval_planner            — orchestrator; artifact-specific retrieval probes
-  5.  planned_retriever            — tool_only; executes + reranks per target (parallel Send)
-  6.  evidence_card_builder        — worker_low; converts chunks → evidence cards (parallel Send)
-  7.  legal_artifact_extractor     — worker_mid; extracts typed artifact per extractor_type (parallel ×4)
-  8.  doctrinal_synthesizer        — worker_mid; resolves holding, rule, limits, exam triggers
-  9.  brief_drafter                — orchestrator; creates drafting manifest
-  10. section_writer               — worker_mid; writes one section per section_type (parallel ×10)
-  11. section_grounder             — worker_mid; verifies each section against evidence cards (parallel)
-  12. section_reviser              — worker_mid; revises all failed sections in one pass (sequential)
-  13. brief_assembler              — worker_low; merges final sections in manifest order
-  14. global_coherence_editor      — worker_mid; checks consistency, harmonises terminology
-  15. critic                       — orchestrator; scores brief, issues revision targets
-  16. brief_revision_agent         — worker_mid; targeted revision of flagged sections, re-assembles
-  17. final_formatter              — worker_low; final polish and export formatting
+  3.  retrieval_planner            — orchestrator; inlines corpus orientation, generates retrieval probes
+  4.  planned_retriever            — tool_only; executes + reranks per target (parallel Send)
+  5.  evidence_card_builder        — worker_low; converts chunks → evidence cards (parallel Send)
+  6.  legal_artifact_extractor     — worker_mid; extracts typed artifact per extractor_type (parallel ×4)
+  7.  doctrinal_synthesizer        — worker_mid; resolves holding, rule, limits, exam triggers
+  8.  brief_drafter                — orchestrator; creates drafting manifest
+  9.  section_writer               — worker_mid; writes one section per section_type (parallel ×10)
+  10. section_grounder             — worker_mid; verifies each section against evidence cards (parallel)
+  11. brief_assembler              — worker_low; merges sections in manifest order (raw_sections fallback)
+  12. critic                       — orchestrator; scores brief, issues revision targets
+  13. brief_revision_agent         — worker_mid; targeted revision of flagged sections, re-assembles
+  14. final_formatter              — worker_mid; synthesis into 16-section standard template
 
 Fan-out routing helpers (not nodes):
   head_orchestrator_to_profiler, retrieval_planner_to_retriever,
@@ -54,7 +51,7 @@ from utils.llm_clients.anthropic_rate_limits import get_llm_semaphore
 
 logger = logging.getLogger(__name__)
 
-MAX_REVISIONS = 2
+MAX_REVISIONS = 3
 
 SECTION_TYPES = [
     "case_identity",
@@ -452,17 +449,19 @@ source_profiler.default_worker_class = "worker_mid"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 3. corpus_orientation_synthesizer
+# 3. retrieval_planner
 # ─────────────────────────────────────────────────────────────────────────────
 
-async def corpus_orientation_synthesizer(state: AgentState) -> Dict:
+async def retrieval_planner(state: AgentState) -> Dict:
     """
-    Merges all source profiles into a single understanding of the packet.
-    Identifies primary case, supporting materials, source roles, and brief scope.
+    Inlines corpus orientation synthesis, then generates artifact-specific retrieval
+    probes for every brief section. Absorbs corpus_orientation_synthesizer to eliminate
+    a serial LLM round-trip between source_profiler fan-out and retrieval planning.
     """
     profiles = state.get("source_profiles") or []
     job_plan = state.get("job_plan") or {}
 
+    # ── Inline corpus orientation (was corpus_orientation_synthesizer) ──────────
     profiles_brief = [
         {
             "source_id": p["source_id"],
@@ -476,7 +475,7 @@ async def corpus_orientation_synthesizer(state: AgentState) -> Dict:
         for p in profiles
     ]
 
-    system = (
+    orient_system = (
         "You are a corpus orientation agent. Given profiles of multiple source documents, "
         "decide what the student is actually trying to brief and how the sources relate.\n\n"
         "Return JSON with:\n"
@@ -490,21 +489,20 @@ async def corpus_orientation_synthesizer(state: AgentState) -> Dict:
         "Return only JSON."
     )
 
-    prompt = (
+    orient_prompt = (
         f"Source profiles:\n{json.dumps(profiles_brief, indent=2)}\n\n"
         f"Brief mode from plan: {job_plan.get('brief_mode', 'single_case')}\n"
         f"User request: {state['request']}\n\n"
         f"Identify the primary case and how the sources relate."
     )
 
-    raw = await _llm("worker_mid", prompt, system=system, max_tokens=768)
+    orient_raw = await _llm("worker_mid", orient_prompt, system=orient_system, max_tokens=768)
     try:
-        data = _parse_json(raw)
+        orient_data = _parse_json(orient_raw)
     except Exception:
-        data = {}
+        orient_data = {}
 
-    # Fallback: pick the highest-confidence full_case_opinion or the first source
-    primary_id = data.get("primary_case_source_id", "")
+    primary_id = orient_data.get("primary_case_source_id", "")
     if not primary_id and profiles:
         opinions = [p for p in profiles if p["doc_type_guess"] == "full_case_opinion"]
         primary_id = (opinions[0] if opinions else profiles[0])["source_id"]
@@ -512,42 +510,17 @@ async def corpus_orientation_synthesizer(state: AgentState) -> Dict:
     orientation: CorpusOrientation = {
         "primary_case_source_id": primary_id,
         "supporting_source_ids": [
-            s for s in (data.get("supporting_source_ids") or []) if s != primary_id
+            s for s in (orient_data.get("supporting_source_ids") or []) if s != primary_id
         ],
-        "case_brief_scope": data.get("case_brief_scope", "single_case"),
-        "source_roles": data.get("source_roles", [
+        "case_brief_scope": orient_data.get("case_brief_scope", "single_case"),
+        "source_roles": orient_data.get("source_roles", [
             {"source_id": p["source_id"], "role": p["doc_type_guess"]} for p in profiles
         ]),
-        "primary_case_name": data.get("primary_case_name", ""),
-        "briefing_notes": data.get("briefing_notes", ""),
+        "primary_case_name": orient_data.get("primary_case_name", ""),
+        "briefing_notes": orient_data.get("briefing_notes", ""),
     }
+    # ─────────────────────────────────────────────────────────────────────────
 
-    await _try_save_artifact(
-        state, "corpus_orientation", dict(orientation),
-        "worker_mid", "corpus_orientation_synthesizer", "corpus_orientation",
-        source_ids=state.get("source_ids"),
-    )
-    return {"corpus_orientation": orientation}
-
-
-corpus_orientation_synthesizer.default_worker_class = "worker_mid"
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 4. retrieval_planner
-# ─────────────────────────────────────────────────────────────────────────────
-
-async def retrieval_planner(state: AgentState) -> Dict:
-    """
-    Creates artifact-specific retrieval probes for every brief section.
-    Generates BM25 queries, vector queries, regex patterns, and section filters
-    per target: case_identity, posture, facts, issue, holding, rule, reasoning, dissent, pedagogy.
-    """
-    profiles = state.get("source_profiles") or []
-    orientation = state.get("corpus_orientation") or {}
-    job_plan = state.get("job_plan") or {}
-
-    primary_id = orientation.get("primary_case_source_id", "")
     primary_profile = next((p for p in profiles if p["source_id"] == primary_id), profiles[0] if profiles else {})
 
     section_index: Dict[str, List[str]] = {}
@@ -611,7 +584,7 @@ async def retrieval_planner(state: AgentState) -> Dict:
         "orchestrator", "retrieval_planner", "retrieval_plan",
         source_ids=state.get("source_ids"),
     )
-    return {"retrieval_plans": plans}
+    return {"retrieval_plans": plans, "corpus_orientation": orientation}
 
 
 retrieval_planner.default_worker_class = "orchestrator"
@@ -1558,89 +1531,7 @@ section_grounder.default_worker_class = "worker_mid"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 12. section_reviser  (sequential — one pass for all failed sections)
-# ─────────────────────────────────────────────────────────────────────────────
-
-async def section_reviser(state: AgentState) -> Dict:
-    """
-    Revise all sections that failed grounding in one sequential pass.
-    Passing sections are carried forward unchanged.
-    Produces final_sections: the authoritative merged section list.
-    """
-    raw_sections   = state.get("raw_sections") or []
-    grounding_reports = state.get("grounding_reports") or []
-    evidence_cards = state.get("evidence_cards") or []
-    artifacts      = state.get("extracted_artifacts") or []
-    orientation    = state.get("corpus_orientation") or {}
-
-    # Index reports by section_id
-    report_by_id = {r["section_id"]: r for r in grounding_reports}
-    failed_ids   = {r["section_id"] for r in grounding_reports if not r["grounding_pass"]}
-
-    final: List[SectionDraft] = []
-
-    for section in raw_sections:
-        sid = section["section_id"]
-        if sid not in failed_ids:
-            final.append(section)
-            continue
-
-        report = report_by_id.get(sid, {})
-        required_fixes = report.get("required_fixes") or []
-        relevant_cards = _cards_for_roles(evidence_cards, _SECTION_CARD_ROLES.get(sid, ["facts"]))
-        cards_ctx = _cards_context(relevant_cards, max_cards=10)
-
-        system = (
-            "You are a legal section reviser. Revise ONLY what the grounding report flags. "
-            "Do not add unsupported claims. Do not rewrite clean sections.\n\n"
-            "Return JSON: {section_id, title, draft_text, claims:[{claim,supporting_card_ids}], "
-            "word_count, warnings:[str], changes_made:[str]}"
-        )
-
-        prompt = (
-            f"Section to revise (section_id: {sid}):\n"
-            f"Original draft:\n{section['draft_text']}\n\n"
-            f"Required fixes:\n" + "\n".join(f"- {f}" for f in required_fixes) + "\n\n"
-            f"Available evidence:\n{cards_ctx}\n\n"
-            f"Revise to address the grounding failures."
-        )
-
-        raw = await _llm("worker_mid", prompt, system=system, max_tokens=1200)
-        try:
-            data = _parse_json(raw)
-        except Exception:
-            data = {}
-
-        # Normalize warnings — LLM occasionally returns a bare string instead of [str]
-        _prior_warnings = section.get("warnings", [])
-        if isinstance(_prior_warnings, str):
-            _prior_warnings = [_prior_warnings] if _prior_warnings else []
-
-        revised: SectionDraft = {
-            "section_id": sid,
-            "title":      data.get("title", section["title"]),
-            "draft_text": data.get("draft_text", section["draft_text"]),
-            "claims":     data.get("claims", section["claims"]),
-            "word_count": data.get("word_count", section["word_count"]),
-            "warnings":   _prior_warnings + ["[revised by section_reviser]"],
-        }
-
-        await _try_save_artifact(
-            state, f"section_revised:{sid}", dict(revised),
-            "worker_mid", "section_reviser", "revised_section",
-            source_ids=state.get("source_ids"),
-        )
-        final.append(revised)
-
-    return {"final_sections": final}
-
-
-section_reviser.default_worker_class = "worker_mid"
-section_reviser.escalation_worker_class = "orchestrator"
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 13. brief_assembler
+# 11. brief_assembler
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _assemble_markdown(sections: List[SectionDraft], manifest: Dict) -> str:
@@ -1701,68 +1592,7 @@ brief_assembler.default_worker_class = "tool_only"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 14. global_coherence_editor
-# ─────────────────────────────────────────────────────────────────────────────
-
-async def global_coherence_editor(state: AgentState) -> Dict:
-    """
-    Check the assembled brief for consistency and flow.
-    Harmonises terminology, ensures issue/holding/rule alignment,
-    removes repeated explanations. Does not add unsupported doctrine.
-    """
-    assembled = state.get("assembled_brief") or ""
-    if not assembled:
-        return {"coherence_edit": {"edited_markdown": "", "contradictions_found": [], "repetition_removed": [], "terminology_fixes": [], "remaining_warnings": []}}
-
-    excerpt = assembled[:5000]
-
-    system = (
-        "You are a global coherence editor reviewing a law-school case brief. "
-        "Check for: contradictions, repetition, inconsistent terminology, "
-        "and mismatched issue/holding/rule statements. Do NOT add unsupported doctrine.\n\n"
-        "Return JSON with:\n"
-        "  coherence_pass: bool\n"
-        "  edited_markdown: string (the edited brief — may be same as input if clean)\n"
-        "  contradictions_found: [str]\n"
-        "  repetition_removed: [str]\n"
-        "  terminology_fixes: [str]\n"
-        "  remaining_warnings: [str]\n"
-        "Return only JSON."
-    )
-
-    prompt = (
-        f"Case brief to review:\n\n{excerpt}\n\n"
-        f"Edit for coherence and consistency."
-    )
-
-    raw = await _llm("worker_mid", prompt, system=system, max_tokens=4500)
-    try:
-        data = _parse_json(raw)
-    except Exception:
-        data = {"coherence_pass": True, "edited_markdown": assembled}
-
-    edit_result = {
-        "coherence_pass":      bool(data.get("coherence_pass", True)),
-        "edited_markdown":     data.get("edited_markdown") or assembled,
-        "contradictions_found":data.get("contradictions_found", []),
-        "repetition_removed":  data.get("repetition_removed", []),
-        "terminology_fixes":   data.get("terminology_fixes", []),
-        "remaining_warnings":  data.get("remaining_warnings", []),
-    }
-
-    await _try_save_artifact(
-        state, "coherence_edit", {k: v for k, v in edit_result.items() if k != "edited_markdown"},
-        "worker_mid", "global_coherence_editor", "coherence_edit",
-        source_ids=state.get("source_ids"),
-    )
-    return {"coherence_edit": edit_result}
-
-
-global_coherence_editor.default_worker_class = "worker_mid"
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 15. critic
+# 12. critic
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def critic(state: AgentState) -> Dict:
@@ -1771,8 +1601,7 @@ async def critic(state: AgentState) -> Dict:
     Scores accuracy, briefing quality, exam usefulness, and citation discipline.
     Issues section revision targets if the brief would not survive a cold call.
     """
-    coherence_edit = state.get("coherence_edit") or {}
-    brief_text = coherence_edit.get("edited_markdown") or state.get("assembled_brief") or ""
+    brief_text = state.get("assembled_brief") or ""
     grounding_reports = state.get("grounding_reports") or []
 
     failing_sections = [r["section_id"] for r in grounding_reports if not r["grounding_pass"]]
@@ -1809,8 +1638,7 @@ async def critic(state: AgentState) -> Dict:
 
     prompt = (
         f"Case brief excerpt:\n{excerpt}\n\n"
-        f"Sections with grounding failures: {failing_sections}\n"
-        f"Coherence issues: {coherence_edit.get('contradictions_found', [])}\n\n"
+        f"Sections with grounding failures: {failing_sections}\n\n"
         f"Critique this brief."
     )
 
@@ -1954,10 +1782,20 @@ async def brief_revision_agent(state: AgentState) -> Dict:
     updated_sections = [section_map.get(s["section_id"], s) for s in final_sections]
     reassembled = _assemble_markdown(updated_sections, manifest)
 
+    # Clear grounding reports for revised sections — their old failures are stale.
+    # The next critic pass evaluates the revised text on its merits without
+    # being shown failures that no longer apply to the rewritten content.
+    revised_ids = set(targets[:4])
+    surviving_reports = [
+        r for r in (state.get("grounding_reports") or [])
+        if r["section_id"] not in revised_ids
+    ]
+
     return {
-        "final_sections":  updated_sections,
-        "assembled_brief": reassembled,
-        "revision_count":  (state.get("revision_count") or 0) + 1,
+        "final_sections":    updated_sections,
+        "assembled_brief":   reassembled,
+        "revision_count":    (state.get("revision_count") or 0) + 1,
+        "grounding_reports": surviving_reports,
     }
 
 
@@ -1975,8 +1813,7 @@ async def final_formatter(state: AgentState) -> Dict:
     Applies headings, TOC, source references, length stats, and clean markdown.
     Does NOT perform new legal reasoning.
     """
-    coherence_edit = state.get("coherence_edit") or {}
-    brief_text = coherence_edit.get("edited_markdown") or state.get("assembled_brief") or ""
+    brief_text = state.get("assembled_brief") or ""
     manifest   = state.get("drafting_manifest") or {}
     budget     = state.get("budget") or {}
 
@@ -1988,31 +1825,149 @@ async def final_formatter(state: AgentState) -> Dict:
                 revision_count=state.get("revision_count", 0))
 
     system = (
-        "You are the final formatting agent for a T-14 law-school case brief. "
-        "Do NOT perform new legal reasoning. Format verified content into clean, "
-        "student-ready markdown.\n\n"
+        "You are the final synthesis and formatting agent for a T-14 law-school case brief.\n"
+        "Your job: reorganise the assembled draft into the STANDARD TEMPLATE below, "
+        "synthesising any missing derived sections from the content already present. "
+        "You may distil, reorder, and clarify — but do NOT invent facts or legal "
+        "conclusions that are absent from the draft.\n\n"
+
         "FORMATTING RULES:\n"
-        "  - Heading hierarchy: # for case title, ## for section headers, "
-        "### for subsection labels.\n"
-        "  - **Bold** the black-letter rule statement and the holding.\n"
-        "  - Issue: 'Whether ...' on its own paragraph line.\n"
-        "  - Holding: answers the issue on the very next line, also bolded.\n"
+        "  - Heading hierarchy: # for case title, ## for Roman-numeral sections, "
+        "### for subsections.\n"
+        "  - **Bold** every black-letter rule statement and every holding.\n"
+        "  - Issues: 'Whether ...' form, one per numbered line.\n"
+        "  - Holdings: bold, one sentence answering each issue.\n"
         "  - Rule elements: bulleted list, one element per bullet.\n"
-        "  - Exam triggers: bulleted list under the Exam Translation section.\n"
-        "  - Cold-call questions: numbered list with model answer in a blockquote "
-        "(> Model Answer: ...) below each question.\n"
-        "  - ⚠️ Warnings (overbroad language, unsupported claims): prefix with '⚠️ '.\n"
+        "  - Exam triggers: bulleted list.\n"
+        "  - Cold-call: numbered Qs with model answer in blockquote (> **Model Answer:** ...).\n"
+        "  - ⚠️ Do-not-overread warnings: prefix with '⚠️ '.\n"
+        "  - Omit optional sections marked [omit if absent] when the draft contains no "
+        "relevant content — do not hallucinate placeholder text.\n"
         "  - Do NOT include raw JSON, code fences, or template artifacts.\n"
-        "  - Preserve ALL existing content — clean formatting only, no new legal analysis.\n"
-        "Return ONLY the final Markdown. No explanation."
+        "Return ONLY the final Markdown document. No explanation, no preamble.\n\n"
+
+        "STANDARD TEMPLATE (output sections in this exact order):\n\n"
+
+        "# [Case Name]\n"
+        "**Citation:** [full citation]  \n"
+        "**Court:** [court]  **Decided:** [year]  \n"
+        "**Disposition:** [outcome]  **Opinion:** [authoring justice]\n\n"
+        "---\n\n"
+
+        "## I. One-Sentence Rule\n"
+        "[Single sentence: subject + may/cannot/must + condition. "
+        "Captures the holding and its doctrinal significance in one line — "
+        "the most quotable statement of what this case stands for.]\n\n"
+        "---\n\n"
+
+        "## II. Procedural Posture\n"
+        "[Numbered steps: how the dispute moved from origin → trial → appeals → "
+        "this court. Include what each court held and why.]\n\n"
+        "---\n\n"
+
+        "## III. Facts\n"
+        "### A. Parties\n"
+        "[Petitioner: ... | Respondent: ...]\n"
+        "### B. Background & Context\n"
+        "[Operative facts — who, what, where, scale of the enterprise or conduct]\n"
+        "### C. The Dispute\n"
+        "[Specific conduct at issue and why it led to litigation]\n\n"
+        "---\n\n"
+
+        "## IV. Statutory / Constitutional Framework  [omit if absent]\n"
+        "[If a statute: identify the Act, list the key sections and their operative "
+        "language (§ number + what it says). "
+        "If a constitutional case: quote the clause at issue. "
+        "Omit entirely if the case does not turn on a specific text.]\n\n"
+        "---\n\n"
+
+        "## V. Issues Presented\n"
+        "1. Whether [issue 1]\n"
+        "2. Whether [issue 2 — omit if only one issue]\n\n"
+        "---\n\n"
+
+        "## VI. Holdings\n"
+        "**1.** [Direct answer to Issue 1]\n"
+        "**2.** [Direct answer to Issue 2 — omit if only one issue]\n\n"
+        "---\n\n"
+
+        "## VII. Rule & Legal Test\n"
+        "**[Black-letter rule — bold full sentence]**\n\n"
+        "Elements / test:\n"
+        "- [element or factor 1]\n"
+        "- [element or factor 2]\n"
+        "...\n\n"
+        "**Limiting Principle:** [what the rule expressly does NOT cover]\n\n"
+        "---\n\n"
+
+        "## VIII. Reasoning\n"
+        "[Court's analytical steps in logical sequence. "
+        "Use ### subsections for multi-step reasoning "
+        "(e.g., ### A. The Framing Move, ### B. The Key Distinction).]\n\n"
+        "---\n\n"
+
+        "## IX. Arguments & Court's Answers  [omit if absent]\n"
+        "[The losing party's main arguments and the Court's specific responses. "
+        "Format each as: **Argument:** [X] → **Court:** [Y]. "
+        "Omit if the draft contains no adversarial framing.]\n\n"
+        "---\n\n"
+
+        "## X. Black Letter Law\n"
+        "[Bulleted doctrine extracted from the case, grouped by category.]\n"
+        "**[Category — e.g., Commerce Clause]:**\n"
+        "- [rule]\n"
+        "- [rule]\n\n"
+        "---\n\n"
+
+        "## XI. Doctrinal Significance\n"
+        "[One focused paragraph: what jurisprudential shift this case marks, "
+        "what earlier cases it modifies or distinguishes, "
+        "where it sits in the doctrinal timeline.]\n\n"
+        "---\n\n"
+
+        "## XII. Dissent  [omit if absent]\n"
+        "[Summary of dissent: who dissented, on what grounds, "
+        "why it matters for understanding the majority. "
+        "Omit if no dissent.]\n\n"
+        "---\n\n"
+
+        "## XIII. Pedagogy\n"
+        "[What this case teaches, what concept it illustrates, "
+        "how it fits the course arc, what a student should take away.]\n\n"
+        "---\n\n"
+
+        "## XIV. Exam Translation\n"
+        "**Exam Triggers:**\n"
+        "- [fact pattern that should make you think of this case]\n"
+        "- [another trigger]\n\n"
+        "⚠️ **Do-Not-Overread:** [what the holding expressly does NOT say — "
+        "the most common exam mistake]\n\n"
+        "---\n\n"
+
+        "## XV. If/Then Case Map\n"
+        "- **If** [strong analogy fact], **then** this case applies because [reason]\n"
+        "- **If** [distinguishing fact], **then** this case does **not** apply because [reason]\n"
+        "- **If** [ambiguous fact], **then** argue both sides using [factors]\n\n"
+        "---\n\n"
+
+        "## XVI. Cold Call Q&A\n"
+        "**1.** [Question]\n"
+        "> **Model Answer:** [answer]\n\n"
+        "**2.** [Question]\n"
+        "> **Model Answer:** [answer]\n\n"
+        "**3.** [Question — include at least one that asks how this case differs from "
+        "a related/prior case]\n"
+        "> **Model Answer:** [answer]\n"
     )
 
     prompt = (
-        f"Case brief to format:\n\n{brief_text[:7000]}\n\n"
-        f"Format for student use."
+        f"Case brief draft to reorganise into the standard template:\n\n"
+        f"{brief_text[:18000]}\n\n"
+        f"Reorganise into the standard template. Synthesise all sections. "
+        f"Omit optional sections only if the draft truly contains no relevant content."
     )
 
-    formatted = await _llm("worker_low", prompt, system=system, max_tokens=7000,
+    formatted = await _llm("worker_mid", prompt, system=system, max_tokens=12000,
                            _node="final_formatter")
 
     final_sections = state.get("final_sections") or state.get("raw_sections") or []
@@ -2030,7 +1985,7 @@ async def final_formatter(state: AgentState) -> Dict:
 
     await _try_save_artifact(
         state, "final_output", {"markdown": final, "word_count": total_words},
-        "worker_low", "final_formatter", "final_output",
+        "worker_mid", "final_formatter", "final_output",
         source_ids=state.get("source_ids"),
     )
     _node_done("final_formatter", state,
@@ -2038,4 +1993,4 @@ async def final_formatter(state: AgentState) -> Dict:
     return {"final_output": final}
 
 
-final_formatter.default_worker_class = "worker_low"
+final_formatter.default_worker_class = "worker_mid"

@@ -1,66 +1,49 @@
 # utils/llm_clients/gemini_client.py
 
 import os
-import json
 import asyncio
 import time
 from dotenv import load_dotenv
 
-# --- VERTEX AI IMPORTS (Commented out) ---
-# import vertexai
-# from vertexai.generative_models import (
-#     GenerativeModel, GenerationConfig, HarmCategory, HarmBlockThreshold
-# )
-# from google.oauth2 import service_account
-# from google.api_core import exceptions as google_exceptions
-
-# --- GOOGLE AI STUDIO IMPORTS ---
-import google.generativeai as genai
-from google.generativeai.types import HarmCategory, HarmBlockThreshold
+from google import genai
+from google.genai import types
 
 load_dotenv()
 
-# --- VERTEX AI CONFIGURATION (@AGENT: Not using Vertex/GPC at the moment) ---
-# GOOGLE_PROJECT_ID = os.getenv("GEMINI_PROJECT_ID", "").strip()
-# GEMINI_LOCATION = os.getenv("GEMINI_LOCATION", "us-central1").strip()
-# CREDENTIALS_JSON_STR = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON", "")
-# CREDENTIALS_FILE_PATH = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_FILE", "")
-#
-# if not GOOGLE_PROJECT_ID:
-#     raise ValueError("GEMINI_PROJECT_ID environment variable not set")
-#
-# # Initialize Vertex AI
-# try:
-#     if CREDENTIALS_FILE_PATH:
-#         credentials = service_account.Credentials.from_service_account_file(CREDENTIALS_FILE_PATH)
-#         vertexai.init(project=GOOGLE_PROJECT_ID, location=GEMINI_LOCATION, credentials=credentials)
-#     elif CREDENTIALS_JSON_STR:
-#         info = json.loads(CREDENTIALS_JSON_STR)
-#         credentials = service_account.Credentials.from_service_account_info(info)
-#         vertexai.init(project=GOOGLE_PROJECT_ID, location=GEMINI_LOCATION, credentials=credentials)
-#     else:
-#         vertexai.init(project=GOOGLE_PROJECT_ID, location=GEMINI_LOCATION)
-# except Exception as e:
-#     raise RuntimeError(f"Failed to initialize Vertex AI: {e}")
-
-# --- GOOGLE AI STUDIO CONFIGURATION ---
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY_AI_STUDIO", "").strip()
 
 if not GEMINI_API_KEY:
     raise ValueError("GEMINI_API_KEY_AI_STUDIO environment variable not set")
 
-try:
-    genai.configure(api_key=GEMINI_API_KEY)
-except Exception as e:
-    raise RuntimeError(f"Failed to configure Google AI Studio: {e}")
+# One client per process — holds API key and connection pool
+_client = genai.Client(api_key=GEMINI_API_KEY)
+
+# Permissive safety settings for legal/professional content.
+# Gemini's default (when safety_settings=None) is BLOCK_MEDIUM_AND_ABOVE, which
+# incorrectly flags case law content — labor coercion, dangerous-conditions fact
+# patterns, etc. hit MEDIUM probability on harassment/dangerous-content categories.
+# BLOCK_ONLY_HIGH still blocks genuinely harmful high-confidence content while
+# allowing legal document analysis through.
+_PERMISSIVE_SAFETY = [
+    types.SafetySetting(
+        category=cat,
+        threshold=types.HarmBlockThreshold.BLOCK_ONLY_HIGH,
+    )
+    for cat in (
+        types.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
+        types.HarmCategory.HARM_CATEGORY_HARASSMENT,
+        types.HarmCategory.HARM_CATEGORY_HATE_SPEECH,
+        types.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
+    )
+]
 
 
 class GeminiClient:
     """
-    Gemini client with streaming support and production-grade error handling.
+    Gemini client using the google.genai SDK.
     Compatible with StreamingChatManager interface.
     """
-    
+
     def __init__(
         self,
         model_name: str = "gemini-2.5-flash",
@@ -70,158 +53,90 @@ class GeminiClient:
         top_k: int = 40,
         streaming: bool = False,
         callback_manager=None,
-        enable_safety_filters: bool = False,  # 🆕 Optional safety
+        enable_safety_filters: bool = False,
         **kwargs
     ):
         self.model_name = model_name
         self.temperature = temperature
         self.max_output_tokens = max_output_tokens
+        self.top_p = top_p
+        self.top_k = top_k
         self.streaming = streaming
         self.callback_manager = callback_manager
         self.max_tokens = max_output_tokens
-        
-        # --- VERTEX AI CONFIG (@AGENT: Not using GCP/Vertex right now, Commented out) ---
-        # self.generation_config = GenerationConfig(
-        #     temperature=temperature,
-        #     max_output_tokens=max_output_tokens,
-        #     top_p=top_p,
-        #     top_k=top_k
-        # )
 
-        # --- GOOGLE AI STUDIO CONFIG ---
-        self.generation_config = genai.types.GenerationConfig(
-            temperature=temperature,
-            max_output_tokens=max_output_tokens,
-            top_p=top_p,
-            top_k=top_k
-        )
-        
-        # 🆕 Optional safety settings (disabled by default for testing)
-        self.safety_settings = None
+        # enable_safety_filters=True  → BLOCK_MEDIUM_AND_ABOVE (strict)
+        # enable_safety_filters=False → BLOCK_ONLY_HIGH (permissive, legal content safe)
+        # Never pass None — that defers to Gemini's default (BLOCK_MEDIUM_AND_ABOVE)
+        # which incorrectly blocks case law content.
         if enable_safety_filters:
-            self.safety_settings = {
-                HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
-                HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
-                HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
-                HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
-            }
-        
-        # --- VERTEX AI MODEL INIT (@AGENT: Not using GCP/Vertex right now, Commented out) ---
-        # self._model = GenerativeModel(self.model_name)
+            self._safety_settings = [
+                types.SafetySetting(
+                    category=cat,
+                    threshold=types.HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
+                )
+                for cat in (
+                    types.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
+                    types.HarmCategory.HARM_CATEGORY_HARASSMENT,
+                    types.HarmCategory.HARM_CATEGORY_HATE_SPEECH,
+                    types.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
+                )
+            ]
+        else:
+            self._safety_settings = _PERMISSIVE_SAFETY
 
-        # --- GOOGLE AI STUDIO MODEL INIT ---
-        self._model = genai.GenerativeModel(self.model_name)
-
-    def _handle_response(self, response):
-        """Extract text from Gemini response with safety checking"""
-        if not response.candidates:
-            return ""
-        
-        candidate = response.candidates[0]
-        
-        # Check safety ratings
-        if hasattr(candidate, 'safety_ratings') and candidate.safety_ratings:
-            blocked = [r.category.name for r in candidate.safety_ratings if r.blocked]
-            if blocked:
-                return "Response blocked due to safety concerns."
-        
-        if not candidate.content or not candidate.content.parts:
-            return ""
-        
-        first_part = candidate.content.parts[0]
-        return first_part.text if hasattr(first_part, 'text') else ""
+    def _build_config(self, system_prompt: str | None = None) -> types.GenerateContentConfig:
+        return types.GenerateContentConfig(
+            temperature=self.temperature,
+            max_output_tokens=self.max_output_tokens,
+            top_p=self.top_p,
+            top_k=self.top_k,
+            safety_settings=self._safety_settings,
+            system_instruction=system_prompt,
+        )
 
     def chat(self, prompt: str, system_prompt: str = None) -> str:
-        """Send chat message with optional system prompt"""
+        """Send chat message with optional system prompt."""
         try:
-            if system_prompt:
-                full_prompt = f"{system_prompt}\n\n{prompt}"
-            else:
-                full_prompt = prompt
-            
-            # Only pass safety_settings if enabled
-            kwargs = {
-                "generation_config": self.generation_config
-            }
-            if self.safety_settings:
-                kwargs["safety_settings"] = self.safety_settings
-            
-            response = self._model.generate_content(full_prompt, **kwargs)
-            return self._handle_response(response)
-            
+            response = _client.models.generate_content(
+                model=self.model_name,
+                contents=prompt,
+                config=self._build_config(system_prompt),
+            )
+            return response.text or ""
         except Exception as e:
             raise RuntimeError(f"Gemini API error: {e}")
 
-    #  Labeled as 'FIX 1'
     async def stream_chat(self, prompt: str, system_prompt: str = None):
-        """Stream chat response without blocking the async event loop.
-
-        The AI Studio SDK's streaming iterator is synchronous — each next() call
-        blocks until the next network chunk arrives.  Running it in a thread and
-        bridging via asyncio.Queue lets the event loop stay free to handle Redis
-        publishes and WebSocket sends between chunks.
-
-        Large Gemini chunks (Gemini returns paragraph-sized pieces, not tokens)
-        are sub-split into ~15-char pieces with a small sleep so the frontend
-        receives many small content_delta events and can render progressively.
-        """
-        import threading
-
-        full_prompt = f"{system_prompt}\n\n{prompt}" if system_prompt else prompt
-
-        kwargs = {"generation_config": self.generation_config, "stream": True}
-        if self.safety_settings:
-            kwargs["safety_settings"] = self.safety_settings
-
-        loop = asyncio.get_event_loop()
-        queue: asyncio.Queue = asyncio.Queue()
-
-        def _run_sync() -> None:
-            try:
-                response_stream = self._model.generate_content(full_prompt, **kwargs)
-                for chunk in response_stream:
-                    if chunk.text:
-                        loop.call_soon_threadsafe(queue.put_nowait, chunk.text)
-            except Exception as exc:
-                loop.call_soon_threadsafe(queue.put_nowait, exc)
-            finally:
-                loop.call_soon_threadsafe(queue.put_nowait, None)  # sentinel
-
-        thread = threading.Thread(target=_run_sync, daemon=True)
-        thread.start()
-
-        # Sub-chunk size: small enough to feel like token streaming (~15 chars).
-        # Adjust upward if you want fewer, larger broadcasts.
+        """Stream chat response using the native async SDK — no threading needed."""
         SUB_CHUNK_SIZE = 15
-        SUB_CHUNK_DELAY = 0.02  # 20ms between sub-chunks
+        SUB_CHUNK_DELAY = 0.02
 
-        while True:
-            item = await queue.get()
-            if item is None:
-                break
-            if isinstance(item, Exception):
-                raise RuntimeError(f"Gemini streaming error: {item}")
-            # Split large API chunks so the frontend gets many small deltas
-            for i in range(0, len(item), SUB_CHUNK_SIZE):
-                yield item[i : i + SUB_CHUNK_SIZE]
-                await asyncio.sleep(SUB_CHUNK_DELAY)
+        async for chunk in await _client.aio.models.generate_content_stream(
+            model=self.model_name,
+            contents=prompt,
+            config=self._build_config(system_prompt),
+        ):
+            text = chunk.text
+            if text:
+                for i in range(0, len(text), SUB_CHUNK_SIZE):
+                    yield text[i : i + SUB_CHUNK_SIZE]
+                    await asyncio.sleep(SUB_CHUNK_DELAY)
 
     def chat_with_retry(self, prompt: str, max_retries: int = 3, system_prompt: str = None) -> str:
-        """Chat with automatic retry on provider outage"""
+        """Chat with automatic retry on provider outage."""
         for attempt in range(max_retries):
             try:
                 return self.chat(prompt, system_prompt)
             except Exception as e:
                 if attempt == max_retries - 1:
                     raise Exception(f"Gemini failed after {max_retries} attempts: {e}")
-                
                 wait_time = 2 ** attempt
                 print(f"⚠️ Gemini attempt {attempt + 1} failed: {e}. Retrying in {wait_time}s...")
                 time.sleep(wait_time)
 
-    # Labeled as 'FIX 2'
     async def stream_chat_with_retry(self, prompt: str, max_retries: int = 3, system_prompt: str = None):
-        """Streaming chat with retry logic, updated for async iteration."""
+        """Streaming chat with retry logic."""
         for attempt in range(max_retries):
             try:
                 async for chunk in self.stream_chat(prompt, system_prompt):
@@ -230,7 +145,6 @@ class GeminiClient:
             except Exception as e:
                 if attempt == max_retries - 1:
                     raise Exception(f"Gemini streaming failed after {max_retries} attempts: {e}")
-                
                 wait_time = 2 ** attempt
                 print(f"⚠️ Gemini streaming attempt {attempt + 1} failed: {e}. Retrying in {wait_time}s...")
                 await asyncio.sleep(wait_time)

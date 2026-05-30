@@ -2,10 +2,9 @@
 """
 LangGraph StateGraph for the case-brief agent.
 
-Graph topology (17 nodes):
+Graph topology (14 nodes):
   head_orchestrator       → [Send×N] source_profiler
-  source_profiler         → corpus_orientation_synthesizer      (merge all N)
-  corpus_orientation_synthesizer → retrieval_planner
+  source_profiler         → retrieval_planner                   (merge all N; inlines corpus orientation)
   retrieval_planner       → [Send×T] planned_retriever          (one per target)
   planned_retriever       → [Send×B] evidence_card_builder      (one per bundle)
   evidence_card_builder   → [Send×4] legal_artifact_extractor   (4 parallel types)
@@ -13,12 +12,10 @@ Graph topology (17 nodes):
   doctrinal_synthesizer   → brief_drafter
   brief_drafter           → [Send×10] section_writer            (one per section type)
   section_writer          → [Send×N] section_grounder           (one per drafted section)
-  section_grounder        → section_reviser                     (merge all, sequential)
-  section_reviser         → brief_assembler
-  brief_assembler         → global_coherence_editor
-  global_coherence_editor → critic
+  section_grounder        → brief_assembler                     (merge all; raw_sections fallback)
+  brief_assembler         → critic
   critic                  → (should_revise?)
-    → brief_revision_agent → critic                             (loop, max 2 passes)
+    → brief_revision_agent → critic                             (loop, max 3 passes)
     → final_formatter → END
 
 Checkpointing:
@@ -77,7 +74,6 @@ def _build_graph(checkpointer):
         # nodes
         head_orchestrator,
         source_profiler,
-        corpus_orientation_synthesizer,
         retrieval_planner,
         planned_retriever,
         evidence_card_builder,
@@ -86,9 +82,7 @@ def _build_graph(checkpointer):
         brief_drafter,
         section_writer,
         section_grounder,
-        section_reviser,
         brief_assembler,
-        global_coherence_editor,
         critic,
         brief_revision_agent,
         final_formatter,
@@ -105,23 +99,20 @@ def _build_graph(checkpointer):
     builder = StateGraph(AgentState)
 
     # ── nodes ──────────────────────────────────────────────────────────────────
-    builder.add_node("head_orchestrator",              head_orchestrator)
-    builder.add_node("source_profiler",                source_profiler)
-    builder.add_node("corpus_orientation_synthesizer", corpus_orientation_synthesizer)
-    builder.add_node("retrieval_planner",              retrieval_planner)
-    builder.add_node("planned_retriever",              planned_retriever)
-    builder.add_node("evidence_card_builder",          evidence_card_builder)
-    builder.add_node("legal_artifact_extractor",       legal_artifact_extractor)
-    builder.add_node("doctrinal_synthesizer",          doctrinal_synthesizer)
-    builder.add_node("brief_drafter",                  brief_drafter)
-    builder.add_node("section_writer",                 section_writer)
-    builder.add_node("section_grounder",               section_grounder)
-    builder.add_node("section_reviser",                section_reviser)
-    builder.add_node("brief_assembler",                brief_assembler)
-    builder.add_node("global_coherence_editor",        global_coherence_editor)
-    builder.add_node("critic",                         critic)
-    builder.add_node("brief_revision_agent",           brief_revision_agent)
-    builder.add_node("final_formatter",                final_formatter)
+    builder.add_node("head_orchestrator",        head_orchestrator)
+    builder.add_node("source_profiler",          source_profiler)
+    builder.add_node("retrieval_planner",        retrieval_planner)
+    builder.add_node("planned_retriever",        planned_retriever)
+    builder.add_node("evidence_card_builder",    evidence_card_builder)
+    builder.add_node("legal_artifact_extractor", legal_artifact_extractor)
+    builder.add_node("doctrinal_synthesizer",    doctrinal_synthesizer)
+    builder.add_node("brief_drafter",            brief_drafter)
+    builder.add_node("section_writer",           section_writer)
+    builder.add_node("section_grounder",         section_grounder)
+    builder.add_node("brief_assembler",          brief_assembler)
+    builder.add_node("critic",                   critic)
+    builder.add_node("brief_revision_agent",     brief_revision_agent)
+    builder.add_node("final_formatter",          final_formatter)
 
     # ── entry ──────────────────────────────────────────────────────────────────
     builder.set_entry_point("head_orchestrator")
@@ -131,11 +122,8 @@ def _build_graph(checkpointer):
     # head_orchestrator → parallel source_profiler (one per source doc)
     builder.add_conditional_edges("head_orchestrator", head_orchestrator_to_profiler)
 
-    # all source_profiler branches merge → corpus_orientation_synthesizer
-    builder.add_edge("source_profiler", "corpus_orientation_synthesizer")
-
-    # corpus_orientation_synthesizer → retrieval_planner
-    builder.add_edge("corpus_orientation_synthesizer", "retrieval_planner")
+    # all source_profiler branches merge → retrieval_planner (inlines corpus orientation)
+    builder.add_edge("source_profiler", "retrieval_planner")
 
     # retrieval_planner → parallel planned_retriever (one per retrieval target)
     builder.add_conditional_edges("retrieval_planner", retrieval_planner_to_retriever)
@@ -158,17 +146,11 @@ def _build_graph(checkpointer):
     # all section_writer branches merge → parallel section_grounder (one per section)
     builder.add_conditional_edges("section_writer", writers_to_grounders)
 
-    # all section_grounder branches merge → section_reviser (sequential)
-    builder.add_edge("section_grounder", "section_reviser")
+    # all section_grounder branches merge → brief_assembler
+    builder.add_edge("section_grounder", "brief_assembler")
 
-    # section_reviser → brief_assembler
-    builder.add_edge("section_reviser", "brief_assembler")
-
-    # brief_assembler → global_coherence_editor
-    builder.add_edge("brief_assembler", "global_coherence_editor")
-
-    # global_coherence_editor → critic
-    builder.add_edge("global_coherence_editor", "critic")
+    # brief_assembler → critic
+    builder.add_edge("brief_assembler", "critic")
 
     # critic → conditional: brief_revision_agent (loop) or final_formatter
     builder.add_conditional_edges(

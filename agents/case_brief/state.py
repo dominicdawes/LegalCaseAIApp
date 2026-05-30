@@ -205,7 +205,6 @@ class AgentState(TypedDict):
     final_sections:      NotRequired[List[SectionDraft]]
 
     assembled_brief:     NotRequired[str]
-    coherence_edit:      NotRequired[Dict[str, Any]]  # {edited_markdown, contradictions_found, ...}
     critique:            NotRequired[BriefCritique]
     revision_count:      NotRequired[int]
 
