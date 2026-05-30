@@ -3,7 +3,7 @@
 # Core web
 fastapi==0.111.0
 uvicorn==0.30.1
-websockets==12.0
+websockets>=13.0
 
 # Celery / Redis (task dispatch only — no task execution here)
 celery==5.4.0
@@ -14,7 +14,7 @@ redis
 python-dotenv
 loguru
 psutil
-httpx
+httpx>=0.28.1,<1.0.0
 pybreaker
 tenacity==8.5.0
 json_repair
@@ -30,7 +30,7 @@ requests
 PyMuPDF==1.24.10
 
 # Database / storage
-supabase==2.5.0
+supabase>=2.9.0
 psycopg2-binary==2.9.9
 asyncpg>=0.28.0
 boto3
