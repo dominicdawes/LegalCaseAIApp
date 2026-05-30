@@ -7,7 +7,7 @@ import os
 import io
 import tempfile
 from typing import Iterator, Union, List
-from langchain.schema import Document
+from langchain_core.documents import Document
 from .base import BaseDocumentLoader
 import docx # python-docx
 import docx2txt

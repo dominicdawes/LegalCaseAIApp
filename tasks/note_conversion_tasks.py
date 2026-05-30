@@ -55,13 +55,13 @@ from celery.exceptions import Retry as CeleryRetry
 # ===== MACHINE LEARNING & TEXT PROCESSING =====
 import tiktoken
 from langchain_core.load import dumpd
-from langchain_community.embeddings import OpenAIEmbeddings
-from langchain.prompts import PromptTemplate
-from langchain.schema import AIMessage
-from langchain.callbacks.base import BaseCallbackHandler
-from langchain.callbacks.manager import CallbackManager
+from langchain_openai import OpenAIEmbeddings
+from langchain_core.prompts import PromptTemplate
+from langchain_core.messages import AIMessage
+from langchain_core.callbacks.base import BaseCallbackHandler
+from langchain_core.callbacks.manager import CallbackManager
 from langchain_community.document_loaders import PyPDFLoader
-from langchain.text_splitter import CharacterTextSplitter
+from langchain_text_splitters import CharacterTextSplitter
 
 # ===== PROJECT MODULES =====
 from tasks.celery_app import celery_app

@@ -3,7 +3,7 @@
 import os
 import yaml
 from typing import Dict, Any
-from langchain.prompts import PromptTemplate
+from langchain_core.prompts import PromptTemplate
 
 
 # Where your YAML lives

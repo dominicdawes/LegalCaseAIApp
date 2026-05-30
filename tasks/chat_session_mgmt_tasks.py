@@ -27,7 +27,7 @@ from contextlib import asynccontextmanager
 
 # ===== LLM & LANGCHAIN =====
 import tiktoken
-from langchain.callbacks.base import BaseCallbackHandler
+from langchain_core.callbacks.base import BaseCallbackHandler
 
 # ===== CELERY & TASK QUEUE =====
 from celery import Task
@@ -434,9 +434,7 @@ def rag_chat_task(
             model_name = "o4-mini"
 
         # Step 1) Embed the query
-        # from langchain_openai import OpenAIEmbeddings       # Lazy-import heavy modules
-        # from langchain.embeddings.openai import OpenAIEmbeddings    # Lazy-import heavy modules
-        from langchain_community.embeddings import OpenAIEmbeddings
+        from langchain_openai import OpenAIEmbeddings
 
         embedding_model = OpenAIEmbeddings(
             model="text-embedding-ada-002",

@@ -3,7 +3,7 @@
 from typing import List, Iterator
 from ebooklib import epub, ITEM_DOCUMENT
 from bs4 import BeautifulSoup
-from langchain.schema import Document
+from langchain_core.documents import Document
 from .base import BaseDocumentLoader
 
 

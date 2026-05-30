@@ -5,8 +5,8 @@ import time
 import logging
 from typing import List, Dict, Any, Iterator, Tuple
 from dataclasses import dataclass
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.schema import Document
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_core.documents import Document
 
 logger = logging.getLogger(__name__)
 

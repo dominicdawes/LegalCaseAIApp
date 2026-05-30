@@ -4,7 +4,7 @@
 
 from typing import Iterator, Union
 import io
-from langchain.schema import Document
+from langchain_core.documents import Document
 from .base import BaseDocumentLoader
 
 import fitz

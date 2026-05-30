@@ -51,7 +51,7 @@ except ImportError:
 
 # ===== MACHINE LEARNING & TEXT PROCESSING =====  
 import tiktoken
-from langchain_community.embeddings import OpenAIEmbeddings
+from langchain_openai import OpenAIEmbeddings
 
 # ===== PROJECT MODULES =====
 from tasks.celery_app import celery_app, run_async_in_worker

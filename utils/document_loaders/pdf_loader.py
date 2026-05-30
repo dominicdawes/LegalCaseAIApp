@@ -3,7 +3,7 @@
 from typing import List, Iterator, Union, Optional
 import io
 import logging
-from langchain.schema import Document
+from langchain_core.documents import Document
 import fitz
 from .base import BaseDocumentLoader
 

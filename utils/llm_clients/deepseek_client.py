@@ -3,7 +3,7 @@ import os
 from typing import Optional, Dict, Any
 from openai import OpenAI
 from langchain_openai import ChatOpenAI
-from langchain.schema import SystemMessage, HumanMessage
+from langchain_core.messages import SystemMessage, HumanMessage
 from dotenv import load_dotenv
 
 # Load environment variables

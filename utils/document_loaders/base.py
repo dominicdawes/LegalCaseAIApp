@@ -4,7 +4,7 @@
 
 import io
 from typing import List, Any, Iterator, Union
-from langchain.schema import Document
+from langchain_core.documents import Document
 
 
 class BaseDocumentLoader:

@@ -60,7 +60,7 @@ class TaskCancelledError(Exception):
 # ===== LLM & LANGCHAIN =====
 import tiktoken
 from langchain_openai import OpenAIEmbeddings
-from langchain.callbacks.base import BaseCallbackHandler
+from langchain_core.callbacks.base import BaseCallbackHandler
 
 # ===== CELERY & TASK QUEUE =====
 from celery import Task
@@ -550,7 +550,7 @@ class StreamingChatManager:
     
     def _generate_embedding_sync(self, query: str) -> List[float]:
         """Synchronous embedding generation for thread pool"""
-        from langchain_community.embeddings import OpenAIEmbeddings
+        from langchain_openai import OpenAIEmbeddings
         embedder = OpenAIEmbeddings(
             model="text-embedding-ada-002",
             api_key=OPENAI_API_KEY
@@ -1791,7 +1791,7 @@ async def process_legacy_rag(
     
     try:
         # Step 1) Embed the query (blocking, no cache)
-        from langchain_community.embeddings import OpenAIEmbeddings
+        from langchain_openai import OpenAIEmbeddings
         
         embedding_model = OpenAIEmbeddings(
             model="text-embedding-ada-002",
