@@ -116,17 +116,23 @@ class DoclingPDFLoader(BaseDocumentLoader):
     def __init__(self, max_tokens: int = 512, merge_peers: bool = True):
         self.max_tokens = max_tokens
         self.merge_peers = merge_peers
-        self._converter = None   # lazy-init to avoid import cost at module load
+        self._converter_text = None   # lazy-init, do_ocr=False (text-layer PDFs)
+        self._converter_ocr  = None   # lazy-init, Tesseract CLI (scanned PDFs)
         self._chunker = None
 
     # ——— Lazy initialisation ———————————————————————————————————————————————
 
     def _ensure_ready(self) -> None:
-        if self._converter is not None:
+        if self._converter_text is not None:
             return
 
         try:
-            from docling.document_converter import DocumentConverter
+            from docling.document_converter import DocumentConverter, PdfFormatOption
+            from docling.datamodel.base_models import InputFormat
+            from docling.datamodel.pipeline_options import (
+                PdfPipelineOptions,
+                TesseractCliOcrOptions,
+            )
             from docling.chunking import HybridChunker
         except ImportError as exc:
             raise ImportError(
@@ -134,7 +140,29 @@ class DoclingPDFLoader(BaseDocumentLoader):
                 "Run: pip install docling"
             ) from exc
 
-        self._converter = DocumentConverter()
+        # ── Text-layer converter — OCR disabled, fast path ────────────────
+        self._converter_text = DocumentConverter(
+            format_options={
+                InputFormat.PDF: PdfFormatOption(
+                    pipeline_options=PdfPipelineOptions(do_ocr=False)
+                )
+            }
+        )
+
+        # ── Scanned-PDF converter — Tesseract CLI OCR ─────────────────────
+        # TesseractCliOcrOptions uses the system tesseract binary (already
+        # installed — pytesseract is in requirements-worker.txt).
+        # Does NOT download 40 MB RapidOCR models; ~2–3× faster on CPU.
+        self._converter_ocr = DocumentConverter(
+            format_options={
+                InputFormat.PDF: PdfFormatOption(
+                    pipeline_options=PdfPipelineOptions(
+                        do_ocr=True,
+                        ocr_options=TesseractCliOcrOptions(lang=["eng"]),
+                    )
+                )
+            }
+        )
 
         # HybridChunker: use the default tokenizer with our max_tokens cap.
         # The spec calls for a voyage-law-2–compatible tokenizer; since that
@@ -147,8 +175,8 @@ class DoclingPDFLoader(BaseDocumentLoader):
             merge_peers=self.merge_peers,
         )
         logger.info(
-            f"🔧 DoclingPDFLoader ready (max_tokens={self.max_tokens}, "
-            f"merge_peers={self.merge_peers})"
+            f"🔧 DoclingPDFLoader ready: text-layer + Tesseract OCR converters "
+            f"(max_tokens={self.max_tokens}, merge_peers={self.merge_peers})"
         )
 
     # ——— Public API ————————————————————————————————————————————————————————
@@ -175,10 +203,28 @@ class DoclingPDFLoader(BaseDocumentLoader):
         self._ensure_ready()
 
         file_buffer.seek(0)
+
+        # ── OCR bypass: skip Tesseract for text-layer PDFs (< 100ms check) ──
+        # Published legal documents (court opinions, statutes, law reviews) are
+        # virtually always text-layer PDFs — running OCR wastes 10–15 minutes.
+        try:
+            from utils.document_loaders.loader_factory import is_pdf_text_based
+            _is_text = is_pdf_text_based(file_buffer)
+        except Exception:
+            _is_text = False   # if the check itself fails, fall back to OCR path
+
+        if _is_text:
+            converter = self._converter_text
+            logger.info(f"⚡ OCR bypassed for '{source_filename}' (text-layer detected)")
+        else:
+            converter = self._converter_ocr
+            logger.info(f"🔍 Running Tesseract OCR for '{source_filename}' (image-based PDF)")
+
+        file_buffer.seek(0)
         try:
             from docling.datamodel.document import DocumentStream
             stream = DocumentStream(name=source_filename, stream=file_buffer)
-            result = self._converter.convert(stream)
+            result = converter.convert(stream)
         except Exception as exc:
             logger.error(f"❌ Docling conversion failed for {source_filename}: {exc}")
             raise

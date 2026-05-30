@@ -125,6 +125,13 @@ USE_VOYAGE_EMBEDDINGS   = os.getenv("USE_VOYAGE_EMBEDDINGS",   "false").lower() 
 INGEST_LLM_PROVIDER = os.getenv("INGEST_LLM_PROVIDER", "gemini").strip()
 INGEST_LLM_MODEL    = os.getenv("INGEST_LLM_MODEL",    "gemini-3.1-flash-lite").strip()
 
+# ── Blurb generation batching ─────────────────────────────────────────────────
+# Number of prose chunks to pack into a single LLM call for blurb generation.
+# Table chunks are always processed individually (they need longer summaries).
+# Increasing this value reduces API roundtrips on large documents (100+ pages).
+# Override via BLURB_BATCH_SIZE env var.
+BLURB_BATCH_SIZE = int(os.getenv("BLURB_BATCH_SIZE", "8"))
+
 # Queue configuration
 INGEST_QUEUE = 'ingest'
 PARSE_QUEUE = 'parsing'
@@ -272,6 +279,30 @@ metrics_collector = MetricsCollector()
 logger.info("📊 Initializing metrics collector...")
 metrics_collector = MetricsCollector()
 logger.info("✅ Metrics collector initialized")
+
+# ——— Worker Startup Hooks ————————————————————————————————————————————————————————
+
+@worker_init.connect
+def _warm_docling_on_startup(sender=None, **kwargs):
+    """
+    Pre-load Docling layout + OCR models when the Celery worker starts.
+
+    Without pre-warming, the first upload cold-loads ~40 MB of RapidOCR / Tesseract
+    models plus the layout transformer, adding ~30s to the first document's parse time.
+    Pre-warming runs _ensure_ready() (no document needed) so the models are already
+    in memory by the time the first upload task arrives.
+
+    Non-fatal: if Docling isn't installed or warm-up fails, the worker still starts.
+    """
+    if USE_HIERARCHICAL_INGEST:
+        try:
+            from utils.document_loaders.docling_loader import DoclingPDFLoader
+            logger.info("🔥 Pre-warming Docling models at worker startup...")
+            DoclingPDFLoader()._ensure_ready()
+            logger.info("✅ Docling models warm — first upload will not cold-load")
+        except Exception as exc:
+            logger.warning(f"⚠️ Docling pre-warm failed (non-fatal): {exc}")
+
 
 # ——— Helpers & Utilities ——————————————————————————————————————————————————————————
 
@@ -1037,15 +1068,16 @@ async def _generate_chunk_blurbs_async(
     Provider and model are controlled by INGEST_LLM_PROVIDER / INGEST_LLM_MODEL
     (defaults: gemini / gemini-3.1-flash-lite) and can be hot-swapped via .env.
 
-    For table chunks the blurb is a longer LLM-written summary that will be
-    used as the embed_text (we embed the summary, not the raw markdown).
-    For prose/heading/list chunks the blurb is prepended to the content to
-    form embed_text.
+    Batching strategy (reduces API roundtrips on large documents):
+      - Prose/heading/list chunks: batched BLURB_BATCH_SIZE per LLM call.
+        The model returns a JSON array [{"i": 0, "blurb": "..."}, ...].
+        Falls back to empty blurbs for any batch that fails JSON parsing.
+      - Table chunks: processed individually (need longer 2-4 sentence summaries).
 
     Populates two keys in each metadata dict:
       chunk_summary — stored in document_vector_store.chunk_summary
       embed_text    — the text actually passed to the embedding model
-                      (replaces raw content for embedding purposes only)
+                      (blurb+content for prose; LLM summary for tables)
 
     Returns the updated metadatas list.
     """
@@ -1060,73 +1092,160 @@ async def _generate_chunk_blurbs_async(
         f"<document>\n{full_doc_text}\n</document>"
     )
 
-    # One client per document — reused across all concurrent blurb calls
+    # Two clients per document:
+    #   client_table — 200 tokens (individual table summaries)
+    #   client_batch — BLURB_BATCH_SIZE * 80 + 150 tokens (batched prose blurbs)
+    # client.chat() only accepts (prompt, system_prompt) — max_output_tokens is
+    # set at construction time.
+    batch_max_tokens = BLURB_BATCH_SIZE * 80 + 150
     try:
-        client = LLMFactory.get_client_for(
+        client_table = LLMFactory.get_client_for(
             INGEST_LLM_PROVIDER, INGEST_LLM_MODEL,
             temperature=0.2, streaming=False, max_output_tokens=200,
+        )
+        client_batch = LLMFactory.get_client_for(
+            INGEST_LLM_PROVIDER, INGEST_LLM_MODEL,
+            temperature=0.2, streaming=False, max_output_tokens=batch_max_tokens,
         )
     except Exception as e:
         logger.warning(f"⚠️ [BLURB-{short_id}] Could not create ingest LLM client ({INGEST_LLM_PROVIDER}/{INGEST_LLM_MODEL}): {e} — skipping blurbs")
         return metadatas
 
     loop = asyncio.get_event_loop()
-    # Semaphore caps concurrent calls to avoid rate-limit exhaustion
+    # Semaphore caps concurrent API calls (batch calls count the same as individual)
     semaphore = asyncio.Semaphore(10)
 
-    async def _blurb_one(idx: int, text: str, meta: Dict) -> tuple:
-        chunk_type = meta.get('chunk_type', 'prose')
-        truncated = text[:2_000] if chunk_type == 'table' else text[:1_000]
-
-        if chunk_type == 'table':
-            user_msg = (
-                "Write 2-4 sentences summarising the following table from a legal "
-                "document.  Identify what it shows, any key legal concepts or "
-                "statutes, and what a law student would learn from it.  "
-                "Output only the sentences, no preamble.\n\n"
-                f"<table>\n{truncated}\n</table>"
-            )
-        else:
-            user_msg = (
-                "Write exactly 1-2 sentences that situate the following passage "
-                "in the context of the document above, mentioning the relevant "
-                "legal concept, rule, or case name.  "
-                "Output only the 1-2 sentences, no preamble.\n\n"
-                f"<chunk>\n{truncated}\n</chunk>"
-            )
-
+    # ── Individual table blurb (unchanged logic, uses client_table) ──────
+    async def _blurb_one_table(idx: int, text: str, meta: Dict) -> tuple:
+        truncated = text[:2_000]
+        user_msg = (
+            "Write 2-4 sentences summarising the following table from a legal "
+            "document.  Identify what it shows, any key legal concepts or "
+            "statutes, and what a law student would learn from it.  "
+            "Output only the sentences, no preamble.\n\n"
+            f"<table>\n{truncated}\n</table>"
+        )
         async with semaphore:
             try:
                 blurb = await loop.run_in_executor(
-                    None, lambda: client.chat(user_msg, system_prompt)
+                    None, lambda: client_table.chat(user_msg, system_prompt)
                 )
                 blurb = blurb.strip()
             except Exception as e:
-                logger.debug(f"Blurb gen failed for chunk {idx}: {e}")
+                logger.debug(f"Table blurb gen failed for chunk {idx}: {e}")
                 blurb = ""
 
         updated_meta = dict(meta)
         updated_meta['chunk_summary'] = blurb
-
-        if chunk_type == 'table':
-            # Embed the LLM summary, not the raw markdown
-            updated_meta['embed_text'] = blurb if blurb else text
-        else:
-            # Prepend blurb for contextual retrieval
-            updated_meta['embed_text'] = f"{blurb}\n\n{text}" if blurb else text
-
+        updated_meta['embed_text'] = blurb if blurb else text
         return idx, updated_meta
 
-    tasks = [_blurb_one(i, c, m) for i, (c, m) in enumerate(zip(chunks, metadatas))]
-    results = await asyncio.gather(*tasks, return_exceptions=True)
+    # ── Batched prose blurbs ──────────────────────────────────────────────
+    async def _blurb_batch(batch_global_indices: List[int]) -> List[tuple]:
+        """
+        Send BLURB_BATCH_SIZE prose chunks in a single LLM call.
+        Returns a list of (global_idx, updated_meta) tuples.
+        Falls back to empty blurbs for the whole batch on any failure.
+        """
+        batch_texts = [chunks[i][:1_000] for i in batch_global_indices]
+        batch_metas = [metadatas[i] for i in batch_global_indices]
 
+        # Build numbered chunk list for the prompt
+        chunks_block = "\n".join(
+            f"[{local_i}] <chunk>{t}</chunk>"
+            for local_i, t in enumerate(batch_texts)
+        )
+        user_msg = (
+            "Write exactly 1-2 sentences for each chunk below that situate it "
+            "in the context of the document above, mentioning the relevant legal "
+            "concept, rule, or case name.\n"
+            f"Return ONLY a JSON array with {len(batch_global_indices)} objects: "
+            '[{"i": 0, "blurb": "..."}, {"i": 1, "blurb": "..."}, ...]\n\n'
+            f"<chunks>\n{chunks_block}\n</chunks>"
+        )
+        async with semaphore:
+            try:
+                raw = await loop.run_in_executor(
+                    None, lambda: client_batch.chat(user_msg, system_prompt)
+                )
+                raw = raw.strip()
+            except Exception as e:
+                logger.debug(f"Batch blurb gen failed for indices {batch_global_indices}: {e}")
+                raw = "[]"
+
+        # Parse the JSON array response
+        blurb_map: Dict[int, str] = {}
+        try:
+            # Strip markdown code fences if present
+            clean = raw.strip()
+            if clean.startswith("```"):
+                clean = "\n".join(clean.split("\n")[1:])
+                clean = clean.rstrip("`").strip()
+            parsed = json.loads(clean)
+            for item in parsed:
+                if isinstance(item, dict) and "i" in item and "blurb" in item:
+                    blurb_map[int(item["i"])] = str(item["blurb"]).strip()
+        except Exception as e:
+            logger.debug(f"Batch blurb JSON parse failed: {e} — raw: {raw[:200]}")
+
+        results_out = []
+        for local_i, (global_idx, text, meta) in enumerate(
+            zip(batch_global_indices, batch_texts, batch_metas)
+        ):
+            blurb = blurb_map.get(local_i, "")
+            updated_meta = dict(meta)
+            updated_meta['chunk_summary'] = blurb
+            updated_meta['embed_text'] = f"{blurb}\n\n{chunks[global_idx]}" if blurb else chunks[global_idx]
+            results_out.append((global_idx, updated_meta))
+
+        return results_out
+
+    # ── Separate table vs prose indices ──────────────────────────────────
+    table_indices = [i for i, m in enumerate(metadatas) if m.get('chunk_type') == 'table']
+    prose_indices = [i for i, m in enumerate(metadatas) if m.get('chunk_type') != 'table']
+
+    # Build batches for prose chunks
+    batches = [
+        prose_indices[i:i + BLURB_BATCH_SIZE]
+        for i in range(0, len(prose_indices), BLURB_BATCH_SIZE)
+    ]
+
+    n_batches = len(batches)
+    n_tables  = len(table_indices)
+    logger.info(
+        f"📝 [BLURB-{short_id}] {len(chunks)} chunks → "
+        f"{n_batches} prose batch(es) of ≤{BLURB_BATCH_SIZE} + {n_tables} table(s)"
+    )
+
+    # ── Launch all tasks concurrently ─────────────────────────────────────
+    all_tasks = (
+        [_blurb_batch(b) for b in batches]
+        + [_blurb_one_table(i, chunks[i], metadatas[i]) for i in table_indices]
+    )
+    raw_results = await asyncio.gather(*all_tasks, return_exceptions=True)
+
+    # ── Merge results back into the metadatas list ────────────────────────
     updated = list(metadatas)
-    for r in results:
-        if isinstance(r, tuple):
+    n_ok = 0
+    for r in raw_results:
+        if isinstance(r, Exception):
+            logger.debug(f"Blurb task raised: {r}")
+            continue
+        if isinstance(r, list):
+            # batch result: list of (idx, meta) tuples
+            for item in r:
+                if isinstance(item, tuple):
+                    idx, meta = item
+                    updated[idx] = meta
+                    if meta.get('chunk_summary'):
+                        n_ok += 1
+        elif isinstance(r, tuple):
+            # individual table result
             idx, meta = r
             updated[idx] = meta
+            if meta.get('chunk_summary'):
+                n_ok += 1
 
-    n_ok = sum(1 for r in results if isinstance(r, tuple) and r[1].get('chunk_summary'))
     logger.info(f"📝 [BLURB-{short_id}] {n_ok}/{len(chunks)} blurbs generated via {INGEST_LLM_PROVIDER}/{INGEST_LLM_MODEL}")
     return updated
 
