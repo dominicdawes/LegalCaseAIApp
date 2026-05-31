@@ -74,10 +74,11 @@ class DeepSeekClient:
         thinking_param = {"type": "enabled"} if thinking_enabled else {"type": "disabled"}
         self._raw_thinking_param = thinking_param  # saved for raw_chat_completion
 
-        # Inject into model_kwargs → extra_body so LangChain forwards it correctly
+        # Build extra_body as a direct ChatOpenAI parameter (not inside model_kwargs).
+        # langchain-openai 0.2+ warns when extra_body is buried in model_kwargs.
         model_kwargs = kwargs.pop("model_kwargs", {})
-        model_kwargs["extra_body"] = {
-            **model_kwargs.get("extra_body", {}),
+        extra_body = {
+            **model_kwargs.pop("extra_body", {}),
             "thinking": thinking_param,
         }
 
@@ -88,6 +89,7 @@ class DeepSeekClient:
             "api_key": DEEPSEEK_API_KEY,
             "base_url": self.base_url,
             "max_tokens": max_output_tokens,
+            "extra_body": extra_body,
             "model_kwargs": model_kwargs,
             **kwargs
         }

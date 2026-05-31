@@ -188,6 +188,24 @@ async def _llm(
                     )
                     await asyncio.sleep(wait)
                     continue
+                # Retry transient network drops (httpx.ReadError, connection resets)
+                # that occur mid-stream on long DeepSeek calls.
+                is_network_error = (
+                    getattr(exc.__class__, "__module__", "").startswith("httpx")
+                    or any(
+                        kw in type(exc).__name__
+                        for kw in ("ReadError", "ConnectError", "RemoteProtocol", "ConnectionReset")
+                    )
+                )
+                if is_network_error and attempt < _LLM_RATE_LIMIT_RETRIES:
+                    wait = 5 * (attempt + 1)
+                    logger.warning(
+                        "🌐 [%s] Network error (%s) — waiting %ds before retry %d/%d",
+                        _node or worker_class, type(exc).__name__, wait,
+                        attempt + 1, _LLM_RATE_LIMIT_RETRIES,
+                    )
+                    await asyncio.sleep(wait)
+                    continue
                 raise
 
 
