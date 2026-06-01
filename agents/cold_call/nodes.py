@@ -86,7 +86,8 @@ DEPTH_MAP = {
 # isn't enough (e.g. burst of parallel calls that exceeds the minute token bucket).
 _LLM_RATE_LIMIT_RETRIES = 3   # additional attempts after the first 429
 _LLM_RATE_LIMIT_DELAY   = 60  # seconds to wait before each retry (linear: 60, 120, 180 s)
-_LLM_CALL_TIMEOUT       = 180  # seconds before a hung LLM call is aborted
+_LLM_CALL_TIMEOUT       = 300  # seconds before a hung LLM call is aborted
+_LLM_TIMEOUT_RETRIES    = 1   # extra attempts on timeout before giving up
 
 # DeepSeek has much higher RPM than Anthropic Tier 1 — allow up to 10 concurrent
 # calls instead of the 2 returned by the Anthropic-probe semaphore.
@@ -171,8 +172,10 @@ async def _llm(
     else:
         sem = await get_llm_semaphore()
 
+    total_attempts = _LLM_RATE_LIMIT_RETRIES + _LLM_TIMEOUT_RETRIES + 1
+    timeout_attempts = 0
     async with sem:
-        for attempt in range(_LLM_RATE_LIMIT_RETRIES + 1):
+        for attempt in range(total_attempts):
             try:
                 if hasattr(client, "achat"):
                     return await asyncio.wait_for(
@@ -186,12 +189,15 @@ async def _llm(
                     return "".join(chunks)
                 return await asyncio.wait_for(_stream(), timeout=_LLM_CALL_TIMEOUT)
             except asyncio.TimeoutError:
+                timeout_attempts += 1
                 logger.warning(
-                    "⏱️ [%s] LLM call timed out after %ds (attempt %d/%d)",
+                    "⏱️ [%s] LLM call timed out after %ds (timeout attempt %d/%d)",
                     _node or worker_class, _LLM_CALL_TIMEOUT,
-                    attempt + 1, _LLM_RATE_LIMIT_RETRIES + 1,
+                    timeout_attempts, _LLM_TIMEOUT_RETRIES + 1,
                 )
-                raise
+                if timeout_attempts > _LLM_TIMEOUT_RETRIES:
+                    raise
+                continue
             except Exception as exc:
                 err = str(exc)
                 is_rate_limit = (
@@ -307,6 +313,7 @@ async def head_orchestrator(state: AgentState) -> Dict:
     list_sources_tool = next(t for t in tools if t.name == "list_sources")
     sources_json = await list_sources_tool.ainvoke({})
     logger.info("  📋 [head_orchestrator] list_sources → %d chars", len(sources_json))
+    node_max_tokens = 800
 
     system = (
         "You are the orchestrator for a T-14 law-school cold-call question generation pipeline. "
@@ -329,6 +336,7 @@ async def head_orchestrator(state: AgentState) -> Dict:
         "  retrieval_depth: 'standard' | 'deep'\n"
         "  expected_cases: list of case names visible in the sources\n"
         "Return only JSON."
+        f"\n\n**IMPORTANT**: keep your response under {node_max_tokens} tokens."
     )
 
     raw = await _llm(
@@ -337,7 +345,7 @@ async def head_orchestrator(state: AgentState) -> Dict:
         f"Requested sequences: {state.get('requested_sequence_count', 5)}\n"
         f"Target difficulty: {state.get('target_difficulty', 'day_one_t14')}",
         system=system,
-        max_tokens=800,
+        max_tokens=node_max_tokens,
         _node="head_orchestrator",
     )
     try:
@@ -408,6 +416,7 @@ async def source_profiler(state: Dict) -> Dict:
     sections_brief = json.dumps(outline.get("toc", [])[:20], indent=2)
     doc_summary = outline.get("doc_summary") or ""
     concepts = outline.get("doc_concepts", [])[:15]
+    node_max_tokens = 1000
 
     system = (
         "You are inventorying a legal source document for cold-call question generation. "
@@ -423,6 +432,7 @@ async def source_profiler(state: Dict) -> Dict:
         "  identified_statutes: list of statute/rule references (max 5)\n"
         "  confidence: float 0.0-1.0\n"
         "Return only JSON."
+        f"\n\n**IMPORTANT**: keep your response under {node_max_tokens} tokens."
     )
 
     raw = await _llm(
@@ -430,7 +440,7 @@ async def source_profiler(state: Dict) -> Dict:
         f"Document summary: {doc_summary}\n\nKey concepts: {json.dumps(concepts)}\n\n"
         f"Table of contents:\n{sections_brief}\n\nInventory this document.",
         system=system,
-        max_tokens=1000,
+        max_tokens=node_max_tokens,
     )
     try:
         data = _parse_json(raw)
@@ -492,6 +502,7 @@ async def corpus_synthesizer(state: AgentState) -> Dict:
         "  course_context: string (e.g. 'Torts / Negligence')\n"
         "  total_case_count: int\n"
         "Return only JSON."
+        f"\n\n**IMPORTANT**: keep your response under 1500 tokens."
     )
 
     raw = await _llm(
@@ -651,6 +662,7 @@ async def case_rule_extractor(state: Dict) -> Dict:
         "  policy_concerns: [str] (policy rationales with the specific values at stake, max 4)\n"
         "  source_refs: [str] (chunk_ids from context)\n"
         "Return only JSON."
+        f"\n\n**IMPORTANT**: keep your response under 3000 tokens."
     )
 
     raw = await _llm(
@@ -756,6 +768,7 @@ async def doctrine_mapper(state: AgentState) -> Dict:
         "  nodes: [{id, type: case|rule|doctrine, label}]\n"
         "  edges: [{from_id, to_id, rel_type: DEFINES|DISTINGUISHES|EXPANDS|LIMITS|EXCEPTION_TO|ANALOGOUS_TO|CONFLICTS_WITH, rationale, source_refs:[]}]\n"
         "Return only JSON."
+        f"\n\n**IMPORTANT**: keep your response under 2000 tokens."
     )
 
     raw = await _llm(
@@ -839,6 +852,7 @@ async def compare_distinguish_mapper(state: AgentState) -> Dict:
             "  question: str (the professor's compare/distinguish question, 1-2 sentences)\n"
             "  model_distinction: str (the answer students should give, 2-3 sentences)\n"
             "Return only JSON."
+            f"\n\n**IMPORTANT**: keep your response under 600 tokens."
         )
 
         raw = await _llm(
@@ -992,6 +1006,7 @@ async def cold_call_seed_generator(state: Dict) -> Dict:
         "'rule boundary', 'policy analysis')\n"
         "  difficulty: 'early' | 'middle' | 'deep'\n"
         "Return only the JSON array."
+        f"\n\n**IMPORTANT**: keep your response under 3000 tokens."
     )
 
     case_ctx = (
@@ -1071,6 +1086,7 @@ async def seed_diversity_agent(state: AgentState) -> Dict:
         "  coverage_by_theme: {theme: count}\n"
         "  duplicates_flagged: [{seed_id, reason}]\n"
         "Return only JSON."
+        f"\n\n**IMPORTANT**: keep your response under 1200 tokens."
     )
 
     raw = await _llm(
@@ -1238,6 +1254,7 @@ async def socratic_thread_builder(state: Dict) -> Dict:
         "  source_refs: [] (leave empty; filled by grounder)\n"
         "  metadata: {}\n"
         "Return only the JSON array."
+        f"\n\n**IMPORTANT**: keep your response under 4000 tokens."
     )
 
     cmp_ctx = ""
@@ -1425,6 +1442,7 @@ async def socratic_answer_agent(state: Dict) -> Dict:
         "  [{question_id, model_answer, strong_answer, common_weak_answer, "
         "professor_follow_up_trap, recovery_phrase}]\n"
         "Return only the JSON array."
+        f"\n\n**IMPORTANT**: keep your response under 6000 tokens."
     )
 
     case_ctx = (
@@ -1623,6 +1641,7 @@ async def critic_coverage_agent(state: AgentState) -> Dict:
         "  FACT_CHANGE_HYPO, RULE_BOUNDARY, COMPARE_DISTINGUISH, POLICY_ANALYSIS → bump up one level\n\n"
         "Return JSON array: [{question_id, sequence_id, difficulty_label}].\n"
         "Return only JSON."
+        f"\n\n**IMPORTANT**: keep your response under 2000 tokens."
     )
 
     q_list = []
