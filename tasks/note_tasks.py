@@ -86,6 +86,7 @@ USE_LANGGRAPH_AGENT = os.getenv("USE_LANGGRAPH_AGENT", "false").lower() == "true
 USE_ATTACK_OUTLINE_AGENT = os.getenv("USE_ATTACK_OUTLINE_AGENT", "false").lower() == "true"
 USE_CASE_BRIEF_AGENT = os.getenv("USE_CASE_BRIEF_AGENT", "false").lower() == "true"
 USE_COLD_CALL_AGENT = os.getenv("USE_COLD_CALL_AGENT", "false").lower() == "true"
+USE_FLASHCARD_AGENT = os.getenv("USE_FLASHCARD_AGENT", "false").lower() == "true"
 USE_VOYAGE_EMBEDDINGS = os.getenv("USE_VOYAGE_EMBEDDINGS", "true").lower() == "true"  # corpus is always Voyage-indexed
 
 # Queue configuration
@@ -207,6 +208,19 @@ class AsyncNoteManager:
         try:
             logger.info(f"🎯 Starting async note generation: {note_type} for project {project_id}")
 
+            # ── Pipeline routing log ────────────────────────────────────────────────
+            _agent_active = {
+                "exam_questions": USE_LANGGRAPH_AGENT,
+                "attack_outline": USE_ATTACK_OUTLINE_AGENT,
+                "case_brief":     USE_CASE_BRIEF_AGENT,
+                "cold_call":      USE_COLD_CALL_AGENT,
+                "flashcards":     USE_FLASHCARD_AGENT,
+            }
+            if _agent_active.get(note_type, False):
+                logger.info(f"🤖 Using {note_type} agent")
+            else:
+                logger.info(f"🕰️ Using {note_type} legacy")
+
             # ── LangGraph agentic path ──────────────────────────────────────────────
             if note_type == "exam_questions" and USE_LANGGRAPH_AGENT:
                 return await self._generate_exam_questions_agent(
@@ -237,6 +251,15 @@ class AsyncNoteManager:
 
             if note_type == "cold_call" and USE_COLD_CALL_AGENT:
                 return await self._generate_cold_call_agent(
+                    note_id=note_id,
+                    user_id=user_id,
+                    project_id=project_id,
+                    note_title=note_title,
+                    addtl_params=addtl_params or {},
+                )
+
+            if note_type == "flashcards" and USE_FLASHCARD_AGENT:
+                return await self._generate_flashcard_agent(
                     note_id=note_id,
                     user_id=user_id,
                     project_id=project_id,
@@ -1379,6 +1402,101 @@ class AsyncNoteManager:
 
         logger.info(f"✅ Case brief agent completed for note {note_id[:8]}…")
         return markdown
+
+    async def _generate_flashcard_agent(
+        self,
+        note_id: str,
+        user_id: str,
+        project_id: str,
+        note_title: str,
+        addtl_params: Dict,
+    ) -> str:
+        """Route flashcards to the LangGraph agentic pipeline when USE_FLASHCARD_AGENT=true."""
+        try:
+            from agents.flashcards.graph import run_flashcard_agent
+        except ImportError:
+            logger.warning("langgraph not installed — falling back to standard RAG path for flashcards")
+            return await self.generate_note_async(
+                note_id=note_id,
+                user_id=user_id,
+                note_type="flashcards",
+                project_id=project_id,
+                note_title=note_title,
+                provider="anthropic",
+                model_name="claude-opus-4-7",
+                num_sources=10,
+                addtl_params=addtl_params,
+            )
+
+        source_ids = addtl_params.get("document_ids") or []
+        num_cards = int(addtl_params.get("num_cards", 10))
+        is_essential = addtl_params.get("is_essential", False)
+
+        if not source_ids:
+            async with get_db_connection() as conn:
+                rows = await conn.fetch(
+                    "SELECT id FROM document_sources WHERE project_id = $1",
+                    uuid.UUID(project_id),
+                )
+            source_ids = [str(r["id"]) for r in rows]
+
+        await self._update_note_progress_async(note_id, "PROCESSING")
+
+        from agents.ledger import AgentLedgerService
+        ledger = AgentLedgerService()
+        job_uuid = uuid.UUID(note_id)
+        run_meta = None
+        try:
+            await ledger.ensure_job(
+                job_id=job_uuid,
+                project_id=project_id,
+                source_ids=source_ids,
+                job_type="flashcards",
+            )
+            run_meta = await ledger.initialize_run(
+                job_id=job_uuid,
+                graph_name="flashcards",
+            )
+            agent_thread_id = run_meta.langgraph_thread_id
+            agent_run_id    = str(run_meta.run_id)
+        except Exception as ledger_exc:
+            logger.warning(f"Ledger init failed (non-fatal): {ledger_exc}")
+            agent_thread_id = note_id
+            agent_run_id    = None
+
+        try:
+            final_state = await run_flashcard_agent(
+                request=note_title,
+                project_id=project_id,
+                source_ids=source_ids,
+                num_cards=num_cards,
+                use_voyage=USE_VOYAGE_EMBEDDINGS,
+                is_essential=is_essential,
+                thread_id=agent_thread_id,
+                job_id=note_id,
+                run_id=agent_run_id,
+                user_id=user_id,
+            )
+        except Exception as e:
+            if run_meta:
+                try:
+                    await ledger.mark_run_failed(run_meta.run_id, e)
+                    await ledger.set_job_status(job_uuid, "failed")
+                except Exception:
+                    pass
+            logger.error(f"Flashcard agent failed: {e}", exc_info=True)
+            raise
+
+        if run_meta:
+            try:
+                await ledger.complete_run(run_meta.run_id)
+                await ledger.set_job_status(job_uuid, "succeeded")
+            except Exception as ledger_exc:
+                logger.warning(f"Ledger completion update failed (non-fatal): {ledger_exc}")
+
+        num_cards_persisted = len(final_state.get("accepted_card_ids") or [])
+        logger.info(f"🃏 Flashcard agent completed for note {note_id[:8]}… — {num_cards_persisted} cards")
+        return final_state.get("final_output") or ""
 
     async def _generate_cold_call_agent(
         self,
