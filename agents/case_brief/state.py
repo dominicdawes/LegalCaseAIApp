@@ -204,6 +204,11 @@ class AgentState(TypedDict):
     # final_sections = raw_sections with failed sections replaced by revisions
     final_sections:      NotRequired[List[SectionDraft]]
 
+    # Sections that have been revised across all revision rounds.
+    # Replace semantics (NotRequired, no operator.add) — brief_revision_agent carries
+    # forward the accumulated set so critic can exclude stale grounding reports.
+    revised_section_ids: NotRequired[List[str]]
+
     assembled_brief:     NotRequired[str]
     critique:            NotRequired[BriefCritique]
     revision_count:      NotRequired[int]

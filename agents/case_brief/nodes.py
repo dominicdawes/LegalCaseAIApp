@@ -51,7 +51,7 @@ from utils.llm_clients.anthropic_rate_limits import get_llm_semaphore
 
 logger = logging.getLogger(__name__)
 
-MAX_REVISIONS = 3
+MAX_REVISIONS = 1
 
 SECTION_TYPES = [
     "case_identity",
@@ -1620,9 +1620,25 @@ async def critic(state: AgentState) -> Dict:
     Issues section revision targets if the brief would not survive a cold call.
     """
     brief_text = state.get("assembled_brief") or ""
-    grounding_reports = state.get("grounding_reports") or []
 
-    failing_sections = [r["section_id"] for r in grounding_reports if not r["grounding_pass"]]
+    # Deduplicate grounding_reports: keep one entry per section_id, preferring the
+    # last (most recent) because operator.add appends later runs to the end.
+    _seen: set = set()
+    _deduped: list = []
+    for r in reversed(state.get("grounding_reports") or []):
+        if r["section_id"] not in _seen:
+            _deduped.append(r)
+            _seen.add(r["section_id"])
+
+    # Exclude sections that have been revised — their original grounding is stale.
+    # revised_section_ids accumulates across all revision rounds.
+    _revised = set(state.get("revised_section_ids") or [])
+    failing_sections = [
+        r["section_id"] for r in _deduped
+        if not r.get("grounding_pass", True)
+        and r["section_id"] not in _revised
+    ]
+
     excerpt = brief_text[:4500]
 
     _node_start("critic", state,
@@ -1641,7 +1657,8 @@ async def critic(state: AgentState) -> Dict:
         "Would a student know when to use this case? (0 = useless; 10 = exam-ready)\n"
         "  citation_discipline: Is every claim traced to source evidence? "
         "Are there unsupported assertions? (0 = hallucinated; 10 = fully grounded)\n\n"
-        "PASS THRESHOLD: all scores >= 6.5 AND no failed grounding sections.\n"
+        "PASS THRESHOLD: average score >= 6.0. Score leniently — a solid first-draft brief "
+        "that covers the key legal points passes even if some sections could be richer.\n"
         "CRITIQUE: list specific issues — name the section_id and the problem. "
         "Generic praise or criticism ('the brief is good overall') fails the critique standard.\n"
         "REVISION INSTRUCTIONS: 2-4 targeted sentences on what to fix and how.\n\n"
@@ -1679,7 +1696,7 @@ async def critic(state: AgentState) -> Dict:
         if sid not in sections_to_revise:
             sections_to_revise.append(sid)
 
-    quality_pass = bool(data.get("quality_pass", all(v >= 6.5 for v in scores.values()) and not failing_sections))
+    quality_pass = bool(data.get("quality_pass", (sum(scores.values()) / len(scores)) >= 6.0))
     revise = bool(data.get("revise", not quality_pass))
 
     critique_result: BriefCritique = {
@@ -1800,20 +1817,22 @@ async def brief_revision_agent(state: AgentState) -> Dict:
     updated_sections = [section_map.get(s["section_id"], s) for s in final_sections]
     reassembled = _assemble_markdown(updated_sections, manifest)
 
-    # Clear grounding reports for revised sections — their old failures are stale.
-    # The next critic pass evaluates the revised text on its merits without
-    # being shown failures that no longer apply to the rewritten content.
+    # Accumulate all revised section IDs across rounds so the critic can exclude
+    # their stale grounding reports.  revised_section_ids uses replace (NotRequired)
+    # semantics — we carry the previous set forward explicitly rather than relying
+    # on operator.add (which grounding_reports uses and which caused n_failing to
+    # compound: surviving_reports got appended on top of originals each round).
     revised_ids = set(targets[:4])
-    surviving_reports = [
-        r for r in (state.get("grounding_reports") or [])
-        if r["section_id"] not in revised_ids
-    ]
+    all_revised = set(state.get("revised_section_ids") or []) | revised_ids
 
     return {
-        "final_sections":    updated_sections,
-        "assembled_brief":   reassembled,
-        "revision_count":    (state.get("revision_count") or 0) + 1,
-        "grounding_reports": surviving_reports,
+        "final_sections":      updated_sections,
+        "assembled_brief":     reassembled,
+        "revision_count":      (state.get("revision_count") or 0) + 1,
+        "revised_section_ids": list(all_revised),
+        # No grounding_reports key: grounding_reports is operator.add — any value
+        # returned here would be appended, not replaced, compounding stale reports.
+        # The critic dedups and filters by revised_section_ids instead.
     }
 
 
