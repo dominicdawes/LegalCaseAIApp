@@ -1049,7 +1049,7 @@ local_card_critic.escalation_worker_class = "orchestrator"
 
 def should_repair_batch(state: AgentState) -> str:
     """Route to card_repair_agent if batch failed and revision budget remains."""
-    if state.get("batch_revision_count", 0) >= 2:
+    if state.get("batch_revision_count", 0) >= 1:
         return "batch_commit"
     eval_result = state.get("current_batch_eval")
     if eval_result and not eval_result.get("passes", True):

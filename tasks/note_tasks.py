@@ -722,7 +722,7 @@ class AsyncNoteManager:
                 WHERE id = $7
                 """,
                 content, True, False, is_essential, num_sources,
-                referenced_sources or [], note_id,
+                [str(s) for s in referenced_sources] if referenced_sources else [], note_id,
             )
 
         logger.info(f"✅ Note saved successfully")
@@ -791,7 +791,7 @@ class AsyncNoteManager:
                         """,
                         deck_data['description'], deck_data['num_cards'],
                         deck_data.get('is_active', True), is_essential, num_sources,
-                        referenced_sources or [], note_id,
+                        [str(s) for s in referenced_sources] if referenced_sources else [], note_id,
                     )
                     deck_id = note_id
 
@@ -915,7 +915,7 @@ class AsyncNoteManager:
                         WHERE id = $6
                         """,
                         num_questions_saved, True, is_essential, num_sources,
-                        referenced_sources or [], note_id,
+                        [str(s) for s in referenced_sources] if referenced_sources else [], note_id,
                     )
                     quiz_note_id = note_id
 
