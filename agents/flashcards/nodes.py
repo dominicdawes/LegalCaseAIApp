@@ -740,6 +740,7 @@ async def flashcard_drafter(state: AgentState) -> Dict:
                 + "\n".join(f"- {s}" for s in used_sigs[-25:])
             )
 
+        _max_tokens = 900
         system = (
             "You are a T-14 law professor creating a single bar-caliber flashcard.\n\n"
             "FRONT (QUESTION) STANDARDS:\n"
@@ -777,6 +778,7 @@ async def flashcard_drafter(state: AgentState) -> Dict:
             '  "hint":          str (empty string if not applicable)\n'
             '  "exam_use_note": str (one sentence for APPLICATION/ANALYSIS, else "")\n'
             '  "source_refs":   [chunk_id UUID strings from [chunk_id:...] markers]\n'
+            f"\n\n**IMPORTANT**: keep your response under {_max_tokens} tokens."
         )
 
         prompt = (
@@ -790,7 +792,7 @@ async def flashcard_drafter(state: AgentState) -> Dict:
             "Draft the flashcard."
         )
 
-        raw = await _llm("orchestrator", prompt, system=system, max_tokens=900,
+        raw = await _llm("orchestrator", prompt, system=system, max_tokens=_max_tokens,
                          _node="flashcard_drafter")
         try:
             data = _parse_json(raw)
