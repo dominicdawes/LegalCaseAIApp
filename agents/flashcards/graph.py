@@ -78,7 +78,6 @@ def _build_graph(checkpointer):
         concept_extractor,
         card_blueprint_planner,
         flashcard_drafter,
-        answer_backside_enricher,
         local_card_critic,
         should_repair_batch,
         card_repair_agent,
@@ -96,7 +95,6 @@ def _build_graph(checkpointer):
     builder.add_node("concept_extractor",                concept_extractor)
     builder.add_node("card_blueprint_planner",           card_blueprint_planner)
     builder.add_node("flashcard_drafter",                flashcard_drafter)
-    builder.add_node("answer_backside_enricher",         answer_backside_enricher)
     builder.add_node("local_card_critic",                local_card_critic)
     builder.add_node("card_repair_agent",                card_repair_agent)
     builder.add_node("batch_commit",                     batch_commit)
@@ -119,8 +117,7 @@ def _build_graph(checkpointer):
     builder.add_edge("card_blueprint_planner", "flashcard_drafter")
 
     # ── Batch pipeline ────────────────────────────────────────────────────────
-    builder.add_edge("flashcard_drafter",        "answer_backside_enricher")
-    builder.add_edge("answer_backside_enricher", "local_card_critic")
+    builder.add_edge("flashcard_drafter",        "local_card_critic")
 
     # local_card_critic → conditional: repair or commit
     builder.add_conditional_edges(

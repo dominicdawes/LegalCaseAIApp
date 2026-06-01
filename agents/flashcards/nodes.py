@@ -256,7 +256,7 @@ async def head_orchestrator(state: AgentState) -> Dict:
     sources_json = await list_sources_tool.ainvoke({})
 
     num_cards = max(1, state.get("num_cards") or 10)
-    batch_size = min(max(state.get("batch_size") or 5, 1), 10)
+    batch_size = min(max(state.get("batch_size") or 8, 1), 10)
     num_batches = math.ceil(num_cards / batch_size)
 
     _node_start("head_orchestrator", state,
@@ -507,7 +507,7 @@ async def concept_extractor(state: AgentState) -> Dict:
         + "\n\nExtract the concept inventory."
     )
 
-    raw = await _llm("orchestrator", prompt, system=system, max_tokens=3000,
+    raw = await _llm("worker_mid", prompt, system=system, max_tokens=3000,
                      _node="concept_extractor")
     try:
         inventory = _parse_json(raw)
@@ -758,11 +758,16 @@ async def flashcard_drafter(state: AgentState) -> Dict:
             "- For APPLICATION cards: present a 2-3 sentence fact pattern and ask "
             "  'What result?' or 'Which rule applies?'\n\n"
             "BACK (ANSWER) STANDARDS:\n"
-            "- Precise, complete, self-contained — a student can study from the back alone.\n"
+            "- Self-contained — a student studying the back alone gets the full answer.\n"
+            "- Structure: (a) direct answer; (b) operative legal rule/formulation; "
+            "  (c) any critical limiting condition (the 'unless/but').\n"
             "- For recall: max 80 words; one focused answer.\n"
             "- For application/analysis: up to 120 words; include the rule + application.\n"
-            "- Do NOT add wrong answers or distractors — just the correct answer.\n"
-            "- If there is a key limiting condition (the 'unless'), state it.\n\n"
+            "- Do NOT add wrong answers or distractors — just the correct answer.\n\n"
+            "EXAM USE NOTE:\n"
+            "- For APPLICATION and ANALYSIS cards: one sentence explaining when to deploy "
+            "  this rule on an exam (e.g. 'Spot this when facts show X').\n"
+            "- For all other card types: empty string.\n\n"
             "HINT STANDARDS:\n"
             "- One memory-aid sentence that points to the key concept WITHOUT revealing the answer.\n"
             "- Leave empty ('') if not useful for this card type.\n\n"
@@ -770,6 +775,7 @@ async def flashcard_drafter(state: AgentState) -> Dict:
             '  "front_content": str (max 40 words)\n'
             '  "back_content":  str (max 120 words)\n'
             '  "hint":          str (empty string if not applicable)\n'
+            '  "exam_use_note": str (one sentence for APPLICATION/ANALYSIS, else "")\n'
             '  "source_refs":   [chunk_id UUID strings from [chunk_id:...] markers]\n'
         )
 
@@ -784,7 +790,7 @@ async def flashcard_drafter(state: AgentState) -> Dict:
             "Draft the flashcard."
         )
 
-        raw = await _llm("orchestrator", prompt, system=system, max_tokens=800,
+        raw = await _llm("orchestrator", prompt, system=system, max_tokens=900,
                          _node="flashcard_drafter")
         try:
             data = _parse_json(raw)
@@ -793,6 +799,7 @@ async def flashcard_drafter(state: AgentState) -> Dict:
                 "front_content": f"What is the rule from {spec.get('topic', 'this doctrine')}?",
                 "back_content": "See source material for the applicable rule.",
                 "hint": "",
+                "exam_use_note": "",
                 "source_refs": [],
             }
 
@@ -805,11 +812,16 @@ async def flashcard_drafter(state: AgentState) -> Dict:
             if (m := _UUID_RE.search(str(raw_ref)))
         ]
 
+        back = (data.get("back_content") or "").strip()
+        exam_note = (data.get("exam_use_note") or "").strip()
+        if exam_note:
+            back = back.rstrip() + f"\n\n*Exam tip: {exam_note}*"
+
         return {
             "spec_index": spec["spec_index"],
             "card_type": spec["card_type"],
             "front_content": (data.get("front_content") or "").strip(),
-            "back_content": (data.get("back_content") or "").strip(),
+            "back_content": back,
             "hint": (data.get("hint") or "").strip(),
             "source_refs": src_refs or chunk_ids[:4],
             "grounding_verdict": "",
@@ -1499,7 +1511,7 @@ async def deterministic_formatter_persister(state: AgentState) -> Dict:
                         num_cards            = $2,
                         is_active            = $3,
                         is_essential         = $4,
-                        num_sources          = $5,
+                        num_sources_based_on = $5,
                         referenced_sources   = $6,
                         note_progress_status = 'COMPLETE'
                     WHERE id = $7
@@ -1509,7 +1521,7 @@ async def deterministic_formatter_persister(state: AgentState) -> Dict:
                     True,
                     is_essential,
                     len(source_ids),
-                    source_ids,
+                    [str(s) for s in source_ids],
                     job_id,
                 )
             logger.info(
