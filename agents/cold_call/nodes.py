@@ -63,7 +63,7 @@ from .constants import (
     QUESTION_TYPES_OPTIONAL_UPPER_LEVEL,
     SEED_THEMES,
 )
-from .worker_config import _fetch_worker_model, model_costs
+from .worker_config import _fetch_worker_model, model_costs, DEFAULT_PROVIDER, PROVIDER_FALLBACK
 from utils.llm_clients.anthropic_rate_limits import get_llm_semaphore
 
 logger = logging.getLogger(__name__)
@@ -138,82 +138,105 @@ async def _llm(
     provider: Optional[str] = None,
     _node: str = "",
 ) -> str:
-    """Call the LLM with rate-limit protection.
+    """Call the LLM with rate-limit protection and provider fallback.
 
-    Acquires a dynamic semaphore (sized to the org's Anthropic tier via
-    utils/llm_clients/anthropic_rate_limits.py) before each call, capping
-    concurrency to keep total output token throughput within the org's
-    tokens-per-minute limit.
+    Tries the primary provider first (default: DeepSeek). If that provider
+    exhausts its timeout retries, falls back to the next provider in
+    PROVIDER_FALLBACK (DeepSeek → OpenAI → Anthropic) before giving up.
 
     On a 429 RateLimitError, waits _LLM_RATE_LIMIT_DELAY seconds and retries
-    up to _LLM_RATE_LIMIT_RETRIES times before re-raising.
+    up to _LLM_RATE_LIMIT_RETRIES times (same provider — rate limits are not
+    a signal to switch providers).
     """
     from utils.llm_clients.llm_factory import LLMFactory
-    _provider, model_name, thinking = _fetch_worker_model(worker_class, provider)
-    if _node:
-        _llm_call(_node, worker_class, model_name, max_tokens)
 
-    # Auto-append token budget soft limit to every system prompt that doesn't already have one
+    _primary = (provider or DEFAULT_PROVIDER).lower()
+    provider_chain = [_primary]
+    if _fallback := PROVIDER_FALLBACK.get(_primary):
+        provider_chain.append(_fallback)
+
+    # Auto-append token budget soft limit if not already present
     if system and "IMPORTANT" not in system:
         system = system + f"\n\n**IMPORTANT**: keep your response under {max_tokens} tokens."
 
-    client_kwargs: Dict[str, Any] = {}
-    if thinking is not None:
-        client_kwargs["thinking"] = thinking
+    last_exc: BaseException = RuntimeError("_llm: no providers tried")
 
-    client = LLMFactory.get_client_for(
-        _provider, model_name,
-        temperature=0.7, streaming=False, max_output_tokens=max_tokens,
-        **client_kwargs,
-    )
+    for p_idx, _pname in enumerate(provider_chain):
+        _provider, model_name, thinking = _fetch_worker_model(worker_class, _pname)
 
-    if _provider == "deepseek":
-        sem = _get_deepseek_semaphore()
-    else:
-        sem = await get_llm_semaphore()
-
-    total_attempts = _LLM_RATE_LIMIT_RETRIES + _LLM_TIMEOUT_RETRIES + 1
-    timeout_attempts = 0
-    async with sem:
-        for attempt in range(total_attempts):
-            try:
-                if hasattr(client, "achat"):
-                    return await asyncio.wait_for(
-                        client.achat(prompt, system_prompt=system or None),
-                        timeout=_LLM_CALL_TIMEOUT,
-                    )
-                async def _stream() -> str:
-                    chunks: List[str] = []
-                    async for chunk in client.stream_chat(prompt, system_prompt=system or None):
-                        chunks.append(chunk)
-                    return "".join(chunks)
-                return await asyncio.wait_for(_stream(), timeout=_LLM_CALL_TIMEOUT)
-            except asyncio.TimeoutError:
-                timeout_attempts += 1
+        if _node:
+            if p_idx == 0:
+                _llm_call(_node, worker_class, model_name, max_tokens)
+            else:
                 logger.warning(
-                    "⏱️ [%s] LLM call timed out after %ds (timeout attempt %d/%d)",
-                    _node or worker_class, _LLM_CALL_TIMEOUT,
-                    timeout_attempts, _LLM_TIMEOUT_RETRIES + 1,
+                    "🔀 [%s] %s timed out — falling back to %s/%s",
+                    _node or worker_class, provider_chain[0], _provider, model_name,
                 )
-                if timeout_attempts > _LLM_TIMEOUT_RETRIES:
-                    raise
-                continue
-            except Exception as exc:
-                err = str(exc)
-                is_rate_limit = (
-                    "429" in err
-                    or "rate_limit" in err.lower()
-                    or "rate limit" in err.lower()
-                )
-                if is_rate_limit and attempt < _LLM_RATE_LIMIT_RETRIES:
-                    wait = _LLM_RATE_LIMIT_DELAY * (attempt + 1)  # 60, 120, 180 s
+
+        client_kwargs: Dict[str, Any] = {}
+        if thinking is not None:
+            client_kwargs["thinking"] = thinking
+
+        client = LLMFactory.get_client_for(
+            _provider, model_name,
+            temperature=0.7, streaming=False, max_output_tokens=max_tokens,
+            **client_kwargs,
+        )
+
+        if _provider == "deepseek":
+            sem = _get_deepseek_semaphore()
+        else:
+            sem = await get_llm_semaphore()
+
+        timeout_attempts = 0
+        timed_out = False
+        async with sem:
+            for attempt in range(_LLM_RATE_LIMIT_RETRIES + 1):
+                try:
+                    if hasattr(client, "achat"):
+                        return await asyncio.wait_for(
+                            client.achat(prompt, system_prompt=system or None),
+                            timeout=_LLM_CALL_TIMEOUT,
+                        )
+                    async def _stream() -> str:
+                        chunks: List[str] = []
+                        async for chunk in client.stream_chat(prompt, system_prompt=system or None):
+                            chunks.append(chunk)
+                        return "".join(chunks)
+                    return await asyncio.wait_for(_stream(), timeout=_LLM_CALL_TIMEOUT)
+                except asyncio.TimeoutError as exc:
+                    timeout_attempts += 1
                     logger.warning(
-                        "🚦 [%s] Rate limit hit (429) — waiting %ds before retry %d/%d",
-                        _node or worker_class, wait, attempt + 1, _LLM_RATE_LIMIT_RETRIES,
+                        "⏱️ [%s] LLM call timed out after %ds (timeout attempt %d/%d)",
+                        _node or worker_class, _LLM_CALL_TIMEOUT,
+                        timeout_attempts, _LLM_TIMEOUT_RETRIES + 1,
                     )
-                    await asyncio.sleep(wait)
+                    last_exc = exc
+                    if timeout_attempts > _LLM_TIMEOUT_RETRIES:
+                        timed_out = True
+                        break  # exhausted for this provider; try next in chain
                     continue
-                raise
+                except Exception as exc:
+                    err = str(exc)
+                    is_rate_limit = (
+                        "429" in err
+                        or "rate_limit" in err.lower()
+                        or "rate limit" in err.lower()
+                    )
+                    if is_rate_limit and attempt < _LLM_RATE_LIMIT_RETRIES:
+                        wait = _LLM_RATE_LIMIT_DELAY * (attempt + 1)  # 60, 120, 180 s
+                        logger.warning(
+                            "🚦 [%s] Rate limit hit (429) — waiting %ds before retry %d/%d",
+                            _node or worker_class, wait, attempt + 1, _LLM_RATE_LIMIT_RETRIES,
+                        )
+                        await asyncio.sleep(wait)
+                        continue
+                    raise  # non-timeout, non-429: propagate immediately, no provider switch
+
+        if not timed_out:
+            break  # exited inner loop without timing out (shouldn't reach here)
+
+    raise last_exc
 
 
 async def _try_save_artifact(
@@ -492,6 +515,7 @@ async def corpus_synthesizer(state: AgentState) -> Dict:
         }
         for p in profiles
     ]
+    node_max_tokens = 1500
 
     system = (
         "You are synthesising source profiles for a cold-call generation pipeline. "
@@ -502,7 +526,7 @@ async def corpus_synthesizer(state: AgentState) -> Dict:
         "  course_context: string (e.g. 'Torts / Negligence')\n"
         "  total_case_count: int\n"
         "Return only JSON."
-        f"\n\n**IMPORTANT**: keep your response under 1500 tokens."
+        f"\n\n**IMPORTANT**: keep your response under {node_max_tokens} tokens."
     )
 
     raw = await _llm(
@@ -511,7 +535,7 @@ async def corpus_synthesizer(state: AgentState) -> Dict:
         f"Course context from plan: {job_plan.get('course_context', '')}\n"
         f"Consolidate into a case inventory.",
         system=system,
-        max_tokens=1500,
+        max_tokens=node_max_tokens,
     )
     try:
         data = _parse_json(raw)
@@ -624,6 +648,7 @@ async def case_rule_extractor(state: Dict) -> Dict:
 
     _node_start("case_rule_extractor", state,
                 case=case_name[:40], source_ids=[s[:8] for s in source_ids[:3]])
+    node_max_tokens = 3000
 
     system = (
         "You are a T-14 law professor extracting a complete structured case analysis for "
@@ -662,14 +687,14 @@ async def case_rule_extractor(state: Dict) -> Dict:
         "  policy_concerns: [str] (policy rationales with the specific values at stake, max 4)\n"
         "  source_refs: [str] (chunk_ids from context)\n"
         "Return only JSON."
-        f"\n\n**IMPORTANT**: keep your response under 3000 tokens."
+        f"\n\n**IMPORTANT**: keep your response under {node_max_tokens} tokens."
     )
 
     raw = await _llm(
         "orchestrator",
         f"Case to extract: {case_name}\n\nSource context:\n{context}\n\nExtract the full case/rule object.",
         system=system,
-        max_tokens=3000,
+        max_tokens=node_max_tokens,
         _node="case_rule_extractor",
     )
     try:
@@ -758,6 +783,7 @@ async def doctrine_mapper(state: AgentState) -> Dict:
         }
         for c in cases
     ]
+    node_max_tokens = 2000
 
     system = (
         "You are a legal doctrine mapper. Given multiple case/rule objects, "
@@ -768,7 +794,7 @@ async def doctrine_mapper(state: AgentState) -> Dict:
         "  nodes: [{id, type: case|rule|doctrine, label}]\n"
         "  edges: [{from_id, to_id, rel_type: DEFINES|DISTINGUISHES|EXPANDS|LIMITS|EXCEPTION_TO|ANALOGOUS_TO|CONFLICTS_WITH, rationale, source_refs:[]}]\n"
         "Return only JSON."
-        f"\n\n**IMPORTANT**: keep your response under 2000 tokens."
+        f"\n\n**IMPORTANT**: keep your response under {node_max_tokens} tokens."
     )
 
     raw = await _llm(
@@ -777,7 +803,7 @@ async def doctrine_mapper(state: AgentState) -> Dict:
         f"Course context: {corpus_analysis.get('course_context', '')}\n\n"
         f"Build the doctrinal map.",
         system=system,
-        max_tokens=2000,
+        max_tokens=node_max_tokens,
     )
     try:
         data = _parse_json(raw)
@@ -822,6 +848,7 @@ async def compare_distinguish_mapper(state: AgentState) -> Dict:
     cases = state.get("case_rule_objects") or []
     doctrine_map = state.get("doctrine_map") or {}
     edges = doctrine_map.get("edges") or []
+    node_max_tokens = 600
 
     if len(cases) < 2:
         return {"compare_distinguish_prompts": []}
@@ -852,7 +879,7 @@ async def compare_distinguish_mapper(state: AgentState) -> Dict:
             "  question: str (the professor's compare/distinguish question, 1-2 sentences)\n"
             "  model_distinction: str (the answer students should give, 2-3 sentences)\n"
             "Return only JSON."
-            f"\n\n**IMPORTANT**: keep your response under 600 tokens."
+            f"\n\n**IMPORTANT**: keep your response under {node_max_tokens} tokens."
         )
 
         raw = await _llm(
@@ -862,7 +889,7 @@ async def compare_distinguish_mapper(state: AgentState) -> Dict:
             f"Doctrine relationship: {edge.get('rel_type','')}\nRationale: {edge.get('rationale','')}\n\n"
             f"Generate a compare/distinguish question.",
             system=system,
-            max_tokens=600,
+            max_tokens=node_max_tokens,
         )
         try:
             d = _parse_json(raw)
@@ -979,6 +1006,7 @@ async def cold_call_seed_generator(state: Dict) -> Dict:
 
     _node_start("cold_call_seed_generator", state,
                 case=case_obj.get("case_name", "")[:40], n_seeds=n_seeds)
+    node_max_tokens = 3000
 
     system = (
         "You are a T-14 law professor generating diverse cold-call seed questions. "
@@ -1006,7 +1034,7 @@ async def cold_call_seed_generator(state: Dict) -> Dict:
         "'rule boundary', 'policy analysis')\n"
         "  difficulty: 'early' | 'middle' | 'deep'\n"
         "Return only the JSON array."
-        f"\n\n**IMPORTANT**: keep your response under 3000 tokens."
+        f"\n\n**IMPORTANT**: keep your response under {node_max_tokens} tokens."
     )
 
     case_ctx = (
@@ -1018,7 +1046,7 @@ async def cold_call_seed_generator(state: Dict) -> Dict:
         f"Policy concerns: {json.dumps(case_obj.get('policy_concerns', []))}\n"
     )
 
-    raw = await _llm("orchestrator", f"{case_ctx}\n\nGenerate {n_seeds} diverse seeds.", system=system, max_tokens=3000, _node="cold_call_seed_generator")
+    raw = await _llm("orchestrator", f"{case_ctx}\n\nGenerate {n_seeds} diverse seeds.", system=system, max_tokens=node_max_tokens, _node="cold_call_seed_generator")
     try:
         seeds_raw = _parse_json(raw)
         if not isinstance(seeds_raw, list):
@@ -1069,6 +1097,7 @@ async def seed_diversity_agent(state: AgentState) -> Dict:
 
     if not all_seeds:
         return {"approved_seeds": [], "seed_attempt_count": attempt}
+    node_max_tokens = 1200
 
     seeds_brief = [
         {"seed_id": s["seed_id"], "theme": s["sequence_theme"], "type": s["question_type"], "question": s["question"][:80]}
@@ -1086,7 +1115,7 @@ async def seed_diversity_agent(state: AgentState) -> Dict:
         "  coverage_by_theme: {theme: count}\n"
         "  duplicates_flagged: [{seed_id, reason}]\n"
         "Return only JSON."
-        f"\n\n**IMPORTANT**: keep your response under 1200 tokens."
+        f"\n\n**IMPORTANT**: keep your response under {node_max_tokens} tokens."
     )
 
     raw = await _llm(
@@ -1094,7 +1123,7 @@ async def seed_diversity_agent(state: AgentState) -> Dict:
         f"All generated seeds ({len(all_seeds)} total):\n{json.dumps(seeds_brief, indent=2)}\n\n"
         f"Select the best {requested} diverse seeds.",
         system=system,
-        max_tokens=1200,
+        max_tokens=node_max_tokens,
     )
     try:
         data = _parse_json(raw)
@@ -1199,6 +1228,7 @@ async def socratic_thread_builder(state: Dict) -> Dict:
       F,G,H → deep (rule boundary, counterargument/losing side, policy/exam)
     Includes inline hypothetical generation for the FACT_CHANGE_HYPO slot.
     """
+    node_max_tokens = 4000
     seed: Seed = state["seed"]
     case_id = seed.get("case_id", "")
     case_obj = next(
@@ -1254,7 +1284,7 @@ async def socratic_thread_builder(state: Dict) -> Dict:
         "  source_refs: [] (leave empty; filled by grounder)\n"
         "  metadata: {}\n"
         "Return only the JSON array."
-        f"\n\n**IMPORTANT**: keep your response under 4000 tokens."
+        f"\n\n**IMPORTANT**: keep your response under {node_max_tokens} tokens."
     )
 
     cmp_ctx = ""
@@ -1289,7 +1319,7 @@ async def socratic_thread_builder(state: Dict) -> Dict:
         "orchestrator",
         f"{case_ctx}{seed_ctx}\nBuild the 8-question Socratic thread.",
         system=system,
-        max_tokens=4000,
+        max_tokens=node_max_tokens,
         _node="socratic_thread_builder",
     )
     try:
@@ -1379,6 +1409,7 @@ async def socratic_answer_agent(state: Dict) -> Dict:
     from agents.tools.base import make_tools
     from agents.tools.registry import COLD_CALL_RETRIEVER_TOOLS
 
+    node_max_tokens = 6000
     sequence: QuestionSequence = state["sequence"]
     seq_id = sequence["sequence_id"]
     case_id = sequence.get("case_id", "")
@@ -1442,7 +1473,7 @@ async def socratic_answer_agent(state: Dict) -> Dict:
         "  [{question_id, model_answer, strong_answer, common_weak_answer, "
         "professor_follow_up_trap, recovery_phrase}]\n"
         "Return only the JSON array."
-        f"\n\n**IMPORTANT**: keep your response under 6000 tokens."
+        f"\n\n**IMPORTANT**: keep your response under {node_max_tokens} tokens."
     )
 
     case_ctx = (
@@ -1459,7 +1490,7 @@ async def socratic_answer_agent(state: Dict) -> Dict:
         f"Questions to answer:\n{questions_ctx}\n\n"
         f"Generate Socratic answers for each question.",
         system=system,
-        max_tokens=6000,
+        max_tokens=node_max_tokens,
         _node="socratic_answer_agent",
     )
     try:
@@ -1630,6 +1661,7 @@ async def critic_coverage_agent(state: AgentState) -> Dict:
     coverage_score = max(0.0, min(1.0, 1.0 - (len(missing) / len(must_have)) * 0.5))
 
     # Stamp difficulty_label onto each question using LLM for a quick pass
+    node_max_tokens = 2000
     system = (
         "You are stamping difficulty labels on cold-call questions. "
         "For each question assign: 'easy' | 'medium' | 'hard' based on "
@@ -1641,7 +1673,7 @@ async def critic_coverage_agent(state: AgentState) -> Dict:
         "  FACT_CHANGE_HYPO, RULE_BOUNDARY, COMPARE_DISTINGUISH, POLICY_ANALYSIS → bump up one level\n\n"
         "Return JSON array: [{question_id, sequence_id, difficulty_label}].\n"
         "Return only JSON."
-        f"\n\n**IMPORTANT**: keep your response under 2000 tokens."
+        f"\n\n**IMPORTANT**: keep your response under {node_max_tokens} tokens."
     )
 
     q_list = []
@@ -1652,7 +1684,7 @@ async def critic_coverage_agent(state: AgentState) -> Dict:
 
     difficulty_map: Dict[str, Dict[str, str]] = {}  # seq_id → {q_id → label}
     if q_list:
-        raw = await _llm("worker_mid", f"Questions:\n{json.dumps(q_list, indent=2)}\n\nLabel difficulties.", system=system, max_tokens=2000)
+        raw = await _llm("worker_mid", f"Questions:\n{json.dumps(q_list, indent=2)}\n\nLabel difficulties.", system=system, max_tokens=node_max_tokens)
         try:
             labels = _parse_json(raw)
             if isinstance(labels, list):

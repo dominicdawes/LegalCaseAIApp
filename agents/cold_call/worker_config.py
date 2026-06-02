@@ -74,6 +74,13 @@ WORKER_THINKING_MAP: Dict[str, Dict[str, Optional[bool]]] = {
     "worker_low":   {"deepseek": False},
 }
 
+# On repeated timeouts, try the next provider before giving up entirely.
+# Only fires after _LLM_TIMEOUT_RETRIES are exhausted for the primary provider.
+PROVIDER_FALLBACK: Dict[str, str] = {
+    "deepseek": "openai",
+    "openai":   "anthropic",
+}
+
 
 def _fetch_worker_model(
     worker_class: WorkerClass,
