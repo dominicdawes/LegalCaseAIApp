@@ -627,18 +627,23 @@ async def case_rule_extractor(state: Dict) -> Dict:
     ]
     seen_ids: set = set()
     all_chunks: List[Dict] = []
-    for q in queries:
-        try:
-            tool = hybrid_tool or search_tool
-            if tool:
+    tool = hybrid_tool or search_tool
+    if tool:
+        async def _fetch(q: str) -> List[Dict]:
+            try:
                 raw = await tool.ainvoke({"query": q, "k": 12})
-                for c in json.loads(raw):
-                    cid = c.get("id") or c.get("chunk_id") or ""
-                    if cid and cid not in seen_ids:
-                        seen_ids.add(cid)
-                        all_chunks.append(c)
-        except Exception as exc:
-            logger.debug("case_rule_extractor query='%s' failed: %s", q[:60], exc)
+                return json.loads(raw)
+            except Exception as exc:
+                logger.debug("case_rule_extractor query='%s' failed: %s", q[:60], exc)
+                return []
+
+        results = await asyncio.gather(*[_fetch(q) for q in queries])
+        for chunk_list in results:
+            for c in chunk_list:
+                cid = c.get("id") or c.get("chunk_id") or ""
+                if cid and cid not in seen_ids:
+                    seen_ids.add(cid)
+                    all_chunks.append(c)
 
     context = "\n\n---\n\n".join(
         f"[chunk_id:{c.get('id', c.get('chunk_id', '?'))} p.{c.get('page_number', '?')}]\n"
@@ -1046,7 +1051,7 @@ async def cold_call_seed_generator(state: Dict) -> Dict:
         f"Policy concerns: {json.dumps(case_obj.get('policy_concerns', []))}\n"
     )
 
-    raw = await _llm("orchestrator", f"{case_ctx}\n\nGenerate {n_seeds} diverse seeds.", system=system, max_tokens=node_max_tokens, _node="cold_call_seed_generator")
+    raw = await _llm("worker_mid", f"{case_ctx}\n\nGenerate {n_seeds} diverse seeds.", system=system, max_tokens=node_max_tokens, _node="cold_call_seed_generator")
     try:
         seeds_raw = _parse_json(raw)
         if not isinstance(seeds_raw, list):
@@ -1079,7 +1084,7 @@ async def cold_call_seed_generator(state: Dict) -> Dict:
     return {"seeds": seeds}
 
 
-cold_call_seed_generator.default_worker_class = "orchestrator"
+cold_call_seed_generator.default_worker_class = "worker_mid"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1461,8 +1466,6 @@ async def socratic_answer_agent(state: Dict) -> Dict:
         "T-14 ANSWER STANDARDS:\n"
         "• model_answer: must cite the specific rule elements and apply them to the named facts; "
         "do NOT use generic statements like 'the rule applies here'\n"
-        "• strong_answer: what an A student says — more precise, acknowledges exceptions, "
-        "names the legally relevant fact; 3-4 sentences minimum\n"
         "• common_weak_answer: the surface-level answer an unprepared student gives — "
         "usually correct conclusion but missing the rule mechanics\n"
         "• professor_follow_up_trap: the NEXT question a professor asks after a strong answer "
@@ -1470,7 +1473,7 @@ async def socratic_answer_agent(state: Dict) -> Dict:
         "• recovery_phrase: a rule-focused sentence the student can say if they blank "
         "(not just 'I need more time'; it must move the analysis forward)\n\n"
         "Return a JSON array where each object corresponds to one question_id:\n"
-        "  [{question_id, model_answer, strong_answer, common_weak_answer, "
+        "  [{question_id, model_answer, common_weak_answer, "
         "professor_follow_up_trap, recovery_phrase}]\n"
         "Return only the JSON array."
         f"\n\n**IMPORTANT**: keep your response under {node_max_tokens} tokens."
@@ -1484,11 +1487,14 @@ async def socratic_answer_agent(state: Dict) -> Dict:
         f"Policy concerns: {json.dumps(case_obj.get('policy_concerns', []))}\n"
     )
 
-    raw = await _llm(
-        "orchestrator",
+    _answer_prompt = (
         f"{case_ctx}\n\nSource material:\n{source_ctx[:2000]}\n\n"
         f"Questions to answer:\n{questions_ctx}\n\n"
-        f"Generate Socratic answers for each question.",
+        f"Generate Socratic answers for each question."
+    )
+    raw = await _llm(
+        "orchestrator",
+        _answer_prompt,
         system=system,
         max_tokens=node_max_tokens,
         _node="socratic_answer_agent",
@@ -1500,6 +1506,25 @@ async def socratic_answer_agent(state: Dict) -> Dict:
     except Exception:
         answers_raw = []
 
+    if not answers_raw:
+        _node_warn("socratic_answer_agent", state,
+                   f"zero answers parsed for seq {seq_id[:16]} — retrying LLM call (attempt 2/2)")
+        try:
+            raw = await _llm(
+                "orchestrator",
+                _answer_prompt,
+                system=system,
+                max_tokens=node_max_tokens,
+                _node="socratic_answer_agent",
+            )
+            answers_raw = _parse_json(raw)
+            if not isinstance(answers_raw, list):
+                answers_raw = []
+        except Exception as exc:
+            _node_warn("socratic_answer_agent", state,
+                       f"retry failed for seq {seq_id[:16]}: {exc} — continuing with empty answers")
+            answers_raw = []
+
     answers: List[QuestionAnswer] = []
     for a in answers_raw:
         if not isinstance(a, dict):
@@ -1507,7 +1532,6 @@ async def socratic_answer_agent(state: Dict) -> Dict:
         answers.append({
             "question_id": a.get("question_id", ""),
             "model_answer": a.get("model_answer", ""),
-            "strong_answer": a.get("strong_answer", ""),
             "common_weak_answer": a.get("common_weak_answer", ""),
             "professor_follow_up_trap": a.get("professor_follow_up_trap", ""),
             "recovery_phrase": a.get("recovery_phrase", ""),
