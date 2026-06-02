@@ -1801,7 +1801,7 @@ async def formatter_export_agent(state: AgentState) -> Dict:
                         len(seq.get("questions") or []),
                         seq.get("coverage_tags") or [],
                         seq.get("source_refs") or [],
-                        seq.get("metadata") or {},
+                        json.dumps(seq.get("metadata") or {}),
                     )
                 except Exception as db_exc:
                     logger.warning("cold_call_sequences insert failed (non-fatal): %s", db_exc)
@@ -1831,7 +1831,7 @@ async def formatter_export_agent(state: AgentState) -> Dict:
                             q.get("target_skill", ""),
                             q.get("expected_answer_shape", ""),
                             q.get("source_refs") or [],
-                            q.get("metadata") or {},
+                            json.dumps(q.get("metadata") or {}),
                         )
                         q_exported += 1
                     except Exception as db_exc:
