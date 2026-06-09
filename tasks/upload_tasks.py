@@ -788,78 +788,139 @@ async def _analyze_download_and_store_document_for_workflow(
 
 def copy_embeddings_for_project_sync(existing_source_id: str, new_source_id: str, project_id: str, user_id: str) -> Dict[str, Any]:
     """
-    [SYNC] Copy embeddings from an existing processed document to a new project
-    Converts python dict rows into the JSONB rows required by Supabase
-    Also used in the ultra-low latency path for 100% reused documents
-    
+    [SYNC] Copy embeddings from an existing processed document to a new project.
+    Handles both Ada-legacy and Voyage-law-2 embeddings, all hierarchical columns
+    (chunk_summary, section_path, chunk_type), and remaps parent_chunk_id UUIDs so
+    the parent-expansion retrieval path works correctly in the new project.
+    Also copies document_sections rows for section-level hierarchical retrieval.
+
     Args:
         existing_source_id: Source ID of the already-processed document
         new_source_id: Source ID of the new document entry
         project_id: Target project ID
         user_id: User who uploaded the document
-    
+
     Returns:
-        Dict with copy statistics
+        Dict with copy statistics: copied_count, total_tokens, sections_copied
     """
-    # Use global pool instead of local pool
     pool = get_global_sync_db_pool()
     conn = pool.getconn()
-    
+
     try:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            # Get vector embeddings from the existing document
+
+            # ── 1. Fetch all chunks (Ada or Voyage) ───────────────────────────
             cur.execute(
                 '''
-                SELECT content, metadata, embedding_ada_legacy, num_tokens, page_number, chunk_index
+                SELECT id, content, metadata,
+                       embedding_ada_legacy, embedding_voyage_2,
+                       num_tokens, page_number, chunk_index,
+                       chunk_summary, section_path, chunk_type, parent_chunk_id
                 FROM document_vector_store
-                WHERE source_id = %s AND embedding_ada_legacy IS NOT NULL
-                ORDER BY page_number, chunk_index
+                WHERE source_id = %s
+                  AND (embedding_ada_legacy IS NOT NULL OR embedding_voyage_2 IS NOT NULL)
+                ORDER BY chunk_index
                 ''',
                 (existing_source_id,)
             )
-            existing_embeddings = cur.fetchall()
-            
-            if not existing_embeddings:
+            existing_chunks = cur.fetchall()
+
+            if not existing_chunks:
                 logger.warning(f"No embeddings found for source_id {existing_source_id}")
-                return {'copied_count': 0, 'total_tokens': 0}
-            
-            # Prepare records for bulk insert
-            records_to_insert = []
+                return {'copied_count': 0, 'total_tokens': 0, 'sections_copied': 0}
+
+            # ── 2. Build old-UUID → new-UUID mapping for parent_chunk_id remap ─
+            id_map = {str(row['id']): str(uuid.uuid4()) for row in existing_chunks}
+
+            # ── 3. Build chunk insert records ─────────────────────────────────
+            chunk_records = []
             total_tokens = 0
-            
-            # Parse fetched embeddings
-            for embedding_row in existing_embeddings:
-                records_to_insert.append((
+            now = datetime.now(timezone.utc)
+
+            for row in existing_chunks:
+                new_id = id_map[str(row['id'])]
+                old_parent = row.get('parent_chunk_id')
+                new_parent = id_map.get(str(old_parent)) if old_parent else None
+
+                chunk_records.append((
+                    new_id,
+                    new_source_id,
+                    project_id,
+                    row['content'],
+                    Json(row['metadata']),
+                    row['embedding_ada_legacy'],
+                    row['embedding_voyage_2'],
+                    row['num_tokens'],
+                    row['page_number'],
+                    row['chunk_index'],
+                    row.get('chunk_summary'),
+                    row.get('section_path'),
+                    row.get('chunk_type'),
+                    new_parent,
+                    user_id,
+                    now,
+                ))
+                total_tokens += row['num_tokens'] or 0
+
+            cur.executemany(
+                '''INSERT INTO document_vector_store
+                   (id, source_id, project_id, content, metadata,
+                    embedding_ada_legacy, embedding_voyage_2,
+                    num_tokens, page_number, chunk_index,
+                    chunk_summary, section_path, chunk_type, parent_chunk_id,
+                    user_id, created_at)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)''',
+                chunk_records,
+            )
+
+            # ── 4. Copy document_sections (section-level Voyage embeddings) ───
+            cur.execute(
+                '''
+                SELECT section_path, section_summary, embedding,
+                       start_chunk_idx, end_chunk_idx
+                FROM document_sections
+                WHERE source_id = %s
+                ''',
+                (existing_source_id,)
+            )
+            existing_sections = cur.fetchall()
+
+            section_records = []
+            for sec in existing_sections:
+                section_records.append((
                     str(uuid.uuid4()),
                     new_source_id,
                     project_id,
-                    embedding_row['content'],
-                    Json(embedding_row['metadata']), # <-- FIXED HERE: Serialize dict back to JSON
-                    embedding_row['embedding_ada_legacy'],
-                    embedding_row['num_tokens'],
-                    embedding_row['page_number'],
-                    embedding_row['chunk_index'],
-                    user_id,
-                    datetime.now(timezone.utc)
+                    sec['section_path'],
+                    sec['section_summary'],
+                    sec['embedding'],
+                    sec['start_chunk_idx'],
+                    sec['end_chunk_idx'],
+                    now,
                 ))
-                total_tokens += embedding_row['num_tokens'] or 0
-            
-            # Bulk insert the copied embeddings
-            cur.executemany(
-                '''INSERT INTO document_vector_store
-                (id, source_id, project_id, content, metadata, embedding_ada_legacy, num_tokens, page_number, chunk_index, user_id, created_at)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)''',
-                records_to_insert
-            )
+
+            if section_records:
+                cur.executemany(
+                    '''INSERT INTO document_sections
+                       (id, source_id, project_id, section_path, section_summary,
+                        embedding, start_chunk_idx, end_chunk_idx, created_at)
+                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                       ON CONFLICT DO NOTHING''',
+                    section_records,
+                )
+
             conn.commit()
-            
-            logger.info(f"✅ Copied {len(records_to_insert)} embeddings from {existing_source_id} to {new_source_id} for project {project_id}")
-            
-            return {
-                'copied_count': len(records_to_insert),
-                'total_tokens': total_tokens
-            }
-            
+
+        logger.info(
+            f"✅ Copied {len(chunk_records)} chunks + {len(section_records)} sections "
+            f"from {existing_source_id} to {new_source_id} for project {project_id}"
+        )
+        return {
+            'copied_count': len(chunk_records),
+            'total_tokens': total_tokens,
+            'sections_copied': len(section_records),
+        }
+
     finally:
         pool.putconn(conn)
 
@@ -2557,9 +2618,10 @@ def process_reused_document_task(
 
         try:
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-                # FIND source document info for copying
+                # FIND source document info for copying (including pre-computed metadata)
                 cur.execute(
-                    'SELECT total_chunks, total_batches FROM document_sources WHERE id = %s',
+                    '''SELECT total_chunks, total_batches, doc_summary, doc_concepts
+                       FROM document_sources WHERE id = %s''',
                     (existing_doc_id,)
                 )
                 source_info = cur.fetchone()
@@ -2569,24 +2631,30 @@ def process_reused_document_task(
 
                 # UPSERT: if this is a speculative doc the row already exists with
                 # a placeholder content_hash and PENDING status — overwrite those fields.
+                # doc_summary and doc_concepts are copied from the existing source so the
+                # reused doc has them immediately without re-running LLM extraction tasks.
                 cur.execute(
                     '''INSERT INTO document_sources
                     (id, cdn_url, content_hash, project_id, content_tags, uploaded_by,
                     vector_embed_status, filename, file_size_bytes, file_extension,
-                    total_chunks, total_batches, created_at, processing_metadata)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    total_chunks, total_batches, created_at, processing_metadata,
+                    doc_summary, doc_concepts)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     ON CONFLICT (id) DO UPDATE SET
-                        content_hash       = EXCLUDED.content_hash,
+                        content_hash        = EXCLUDED.content_hash,
                         vector_embed_status = EXCLUDED.vector_embed_status,
-                        total_chunks       = EXCLUDED.total_chunks,
-                        total_batches      = EXCLUDED.total_batches,
-                        processing_metadata = EXCLUDED.processing_metadata''',
+                        total_chunks        = EXCLUDED.total_chunks,
+                        total_batches       = EXCLUDED.total_batches,
+                        processing_metadata = EXCLUDED.processing_metadata,
+                        doc_summary         = EXCLUDED.doc_summary,
+                        doc_concepts        = EXCLUDED.doc_concepts''',
                     (new_doc_id, doc_data['cdn_url'], doc_data['content_hash'],
                     project_id, doc_data.get('content_tags', []), workflow_metadata['user_id'],
                     ProcessingStatus.COMPLETE.value, doc_data['filename'],
                     doc_data['file_size_bytes'], os.path.splitext(doc_data['filename'])[1].lower(),
                     source_info['total_chunks'], source_info['total_batches'],
-                    datetime.now(timezone.utc), Json(workflow_metadata))
+                    datetime.now(timezone.utc), Json(workflow_metadata),
+                    source_info.get('doc_summary'), source_info.get('doc_concepts'))
                 )
                 conn.commit()
         finally:
@@ -2600,13 +2668,18 @@ def process_reused_document_task(
             workflow_metadata['user_id']
         )
         
-        logger.info(f"♻️ [DOC-{new_doc_id[:8]}] Smart reuse complete: {copy_result['copied_count']} chunks")
+        logger.info(
+            f"♻️ [DOC-{new_doc_id[:8]}] Smart reuse complete: "
+            f"{copy_result['copied_count']} chunks, "
+            f"{copy_result['sections_copied']} sections"
+        )
         return {
             'doc_id': new_doc_id,
             'processing_type': 'REUSED',
             'status': 'COMPLETE',
             'chunks_reused': copy_result['copied_count'],
-            'tokens_reused': copy_result['total_tokens']
+            'tokens_reused': copy_result['total_tokens'],
+            'sections_copied': copy_result['sections_copied'],
         }
         
     except Exception as e:
