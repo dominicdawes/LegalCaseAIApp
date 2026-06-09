@@ -819,7 +819,7 @@ async def grounder(state: Dict) -> Dict:
         artifact_type="verification_result",
         source_ids=state.get("source_ids"),
     )
-    return {"verified_questions": [vq]}
+    return {"grounded_questions": [vq]}
 
 
 grounder.default_worker_class    = "worker_low"
@@ -832,7 +832,7 @@ grounder.escalation_worker_class = "worker_mid"
 
 async def critic(state: AgentState) -> Dict:
     """Holistic critique of the full draft exam. Flags questions that need revision."""
-    questions = state.get("verified_questions") or []
+    questions = state.get("verified_questions") or state.get("grounded_questions") or []
     n = state["n_questions"]
 
     questions_text = "\n\n---\n\n".join(

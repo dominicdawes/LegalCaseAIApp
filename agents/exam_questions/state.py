@@ -6,7 +6,8 @@ All fields use TypedDict so LangGraph can merge partial state updates
 from parallel Send branches cleanly.
 """
 
-from typing import Any, Dict, List, Optional
+import operator
+from typing import Annotated, Any, Dict, List, Optional
 from typing_extensions import TypedDict, NotRequired
 
 
@@ -71,22 +72,28 @@ class AgentState(TypedDict):
     concept_synthesis: NotRequired[str]   # JSON: {throughlines, shared_concepts}
 
     # ── per-document profiles (populated by parallel SourceProfiler) ──────────
-    source_profiles: NotRequired[List[SourceProfile]]
+    source_profiles: Annotated[List[SourceProfile], operator.add]
 
     # ── clustered issues (IssueClusterer output) ─────────────────────────────
     chosen_issues: NotRequired[List[IssueCluster]]
 
     # ── retrieval results (Retriever parallel fanout) ──────────────────────
-    retrieval_bundles: NotRequired[List[RetrievalBundle]]
+    retrieval_bundles: Annotated[List[RetrievalBundle], operator.add]
 
     # ── drafted questions (QuestionDrafter + AnswerKeyBuilder parallel) ─────
-    draft_questions: NotRequired[List[DraftQuestion]]
+    draft_questions: Annotated[List[DraftQuestion], operator.add]
 
-    # ── verified questions (Grounder + Critic + optional Reviser) ───────────
+    # ── grounded questions (Grounder parallel fan-out accumulator) ───────────
+    # Separate from verified_questions so Critic can replace verified_questions
+    # without fighting the operator.add reducer during the revision loop.
+    grounded_questions: Annotated[List[VerifiedQuestion], operator.add]
+
+    # ── verified questions (Critic + optional Reviser + FinalDrafter) ────────
+    # Plain field — sequential nodes replace the whole list each pass.
     verified_questions: NotRequired[List[VerifiedQuestion]]
 
     # ── persisted exam card IDs (exam_card_writer parallel fan-out) ─────────
-    persisted_question_ids: NotRequired[List[str]]   # exam_questions.id rows written to DB
+    persisted_question_ids: Annotated[List[str], operator.add]
 
     # ── final assembled markdown ─────────────────────────────────────────────
     final_output: NotRequired[str]
