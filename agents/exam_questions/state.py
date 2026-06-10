@@ -83,6 +83,12 @@ class AgentState(TypedDict):
     # ── drafted questions (QuestionDrafter + AnswerKeyBuilder parallel) ─────
     draft_questions: Annotated[List[DraftQuestion], operator.add]
 
+    # ── grounder input queue (AnswerKeyBuilder → grounder_dispatcher barrier) ─
+    # Each answer_key_builder appends its finished draft here. grounder_dispatcher
+    # waits for all AKBs to complete (barrier join via add_edge), then reads this
+    # list to fan out to exactly N grounders — one per question, no accumulation.
+    grounder_queue: Annotated[List[DraftQuestion], operator.add]
+
     # ── grounded questions (Grounder parallel fan-out accumulator) ───────────
     # Separate from verified_questions so Critic can replace verified_questions
     # without fighting the operator.add reducer during the revision loop.

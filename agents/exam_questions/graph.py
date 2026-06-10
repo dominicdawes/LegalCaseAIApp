@@ -51,11 +51,11 @@ async def _checkpointer_ctx():
     _setup_ok = False
     try:
         from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
-        from tasks.database import DB_DSN
-        # Disable prepared-statement caching so PgBouncer transaction-pooling works.
-        _dsn = (DB_DSN or "").strip()
-        _sep = "&" if "?" in _dsn else "?"
-        _dsn = _dsn + _sep + "prepared_statement_cache_size=0"
+        import os
+        # Use the direct Supabase connection (port 5432) not the PgBouncer pool
+        # (port 6543). The pooler runs in transaction mode which doesn't support
+        # prepared statements used by AsyncPostgresSaver's pipeline writes.
+        _dsn = (os.getenv("POSTGRES_DSN") or "").strip()
         async with AsyncPostgresSaver.from_conn_string(_dsn) as saver:
             await saver.setup()
             _setup_ok = True
@@ -95,7 +95,8 @@ def _build_graph(checkpointer):
         question_drafter,
         drafter_to_answerkey,
         answer_key_builder,
-        answerkey_to_grounder,
+        grounder_dispatcher,
+        grounder_dispatcher_to_grounder,
         grounder,
         critic,
         should_revise,
@@ -108,18 +109,19 @@ def _build_graph(checkpointer):
     builder = StateGraph(AgentState)
 
     # ── nodes ──────────────────────────────────────────────────────────────────
-    builder.add_node("planner",            planner)
-    builder.add_node("source_profiler",    source_profiler)
+    builder.add_node("planner",             planner)
+    builder.add_node("source_profiler",     source_profiler)
     builder.add_node("concept_synthesizer", concept_synthesizer)
-    builder.add_node("issue_clusterer",    issue_clusterer)
-    builder.add_node("retriever",          retriever)
-    builder.add_node("question_drafter",   question_drafter)
-    builder.add_node("answer_key_builder", answer_key_builder)
-    builder.add_node("grounder",           grounder)
-    builder.add_node("critic",             critic)
-    builder.add_node("reviser",            reviser)
-    builder.add_node("final_drafter",      final_drafter)
-    builder.add_node("exam_card_writer",   exam_card_writer)
+    builder.add_node("issue_clusterer",     issue_clusterer)
+    builder.add_node("retriever",           retriever)
+    builder.add_node("question_drafter",    question_drafter)
+    builder.add_node("answer_key_builder",  answer_key_builder)
+    builder.add_node("grounder_dispatcher", grounder_dispatcher)
+    builder.add_node("grounder",            grounder)
+    builder.add_node("critic",              critic)
+    builder.add_node("reviser",             reviser)
+    builder.add_node("final_drafter",       final_drafter)
+    builder.add_node("exam_card_writer",    exam_card_writer)
 
     # ── entry ──────────────────────────────────────────────────────────────────
     builder.set_entry_point("planner")
@@ -143,8 +145,10 @@ def _build_graph(checkpointer):
     # question_drafter → parallel answer_key_builder
     builder.add_conditional_edges("question_drafter", drafter_to_answerkey)
 
-    # answer_key_builder → parallel grounder
-    builder.add_conditional_edges("answer_key_builder", answerkey_to_grounder)
+    # answer_key_builder → grounder_dispatcher (barrier: waits for ALL AKBs)
+    # then fans out to one grounder per finished draft
+    builder.add_edge("answer_key_builder", "grounder_dispatcher")
+    builder.add_conditional_edges("grounder_dispatcher", grounder_dispatcher_to_grounder)
 
     # grounder (all branches) → critic
     builder.add_edge("grounder", "critic")

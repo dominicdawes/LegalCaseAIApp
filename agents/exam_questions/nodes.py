@@ -591,6 +591,8 @@ async def question_drafter(state: Dict) -> Dict:
 
     _node_start("question_drafter", state, issue=bundle["issue_label"][:40])
 
+    _max_tokens = 1200
+
     system = (
         "You are a T-14 law professor drafting a bar-caliber exam question.\n\n"
         "FACT PATTERN STANDARDS:\n"
@@ -615,7 +617,9 @@ async def question_drafter(state: Dict) -> Dict:
         "  fact_pattern (str): the fact pattern narrative\n"
         "  call_of_question (str): the call of the question\n"
         "  chunk_ids_used (list of str): chunk_id UUID strings from [chunk_id:...] markers "
-        "(copy only the UUID, not the page number)"
+        "(copy only the UUID, not the page number)\n\n"
+        f"**IMPORTANT**: your entire response must be under {_max_tokens} tokens. "
+        "Keep the fact pattern concise — 150-250 words is ideal."
     )
 
     prompt = (
@@ -624,7 +628,7 @@ async def question_drafter(state: Dict) -> Dict:
         f"Draft the fact-pattern hypothetical."
     )
 
-    raw = await _llm("orchestrator", prompt, system=system, max_tokens=2000,
+    raw = await _llm("orchestrator", prompt, system=system, max_tokens=_max_tokens,
                      _node="question_drafter")
     try:
         data = _parse_json(raw)
@@ -718,24 +722,30 @@ async def answer_key_builder(state: Dict) -> Dict:
     updated_draft["answer_key"] = answer_key
     _node_done("answer_key_builder", state,
                issue=draft.get("issue_label", "?")[:40])
-    return {"draft_questions": [updated_draft]}
+    # Write to both draft_questions (accumulated list) and grounder_queue
+    # (the barrier accumulator that grounder_dispatcher reads after all AKBs finish).
+    return {"draft_questions": [updated_draft], "grounder_queue": [updated_draft]}
 
 
 answer_key_builder.default_worker_class = "orchestrator"
 
 
-def answerkey_to_grounder(state: AgentState) -> List[Send]:
-    """Fan-out: one Grounder for the current branch's draft.
+async def grounder_dispatcher(state: AgentState) -> Dict:
+    """Barrier node — no-op.
 
-    Uses state["draft"] (the single draft passed explicitly by drafter_to_answerkey)
-    rather than state.get("draft_questions"), which accumulates all branches due to
-    the operator.add reducer and would cause N×N grounder fan-out.
+    add_edge("answer_key_builder", "grounder_dispatcher") makes LangGraph wait
+    for ALL parallel answer_key_builder branches to complete before this node
+    runs. At that point grounder_queue holds exactly N finished drafts.
+    grounder_dispatcher_to_grounder then fans out to N parallel grounders.
     """
-    draft = state.get("draft")
-    if not draft:
-        return []
-    logger.info("exam_questions x1 node fan out for grounder")
-    return [Send("grounder", {"draft": draft, **state})]
+    return {}
+
+
+def grounder_dispatcher_to_grounder(state: AgentState) -> List[Send]:
+    """Fan-out: one Grounder per finished draft in the grounder_queue."""
+    queue = state.get("grounder_queue") or []
+    logger.info("exam_questions x%d node fan out for grounder", len(queue))
+    return [Send("grounder", {"draft": d, **state}) for d in queue]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
