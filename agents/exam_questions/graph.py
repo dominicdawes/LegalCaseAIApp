@@ -40,22 +40,37 @@ async def _checkpointer_ctx():
     Async context manager that yields a configured LangGraph checkpointer.
 
     Tries AsyncPostgresSaver first (durable, survives worker restarts).
-    Falls back to MemorySaver if langgraph-checkpoint-postgres or psycopg
-    is not installed — useful for local dev without the extra deps.
+    prepared_statement_cache_size=0 is required for Supabase PgBouncer in
+    transaction-pooling mode, which does not support prepared statements.
+
+    Falls back to MemorySaver only when setup fails (before yielding).
+    Errors that occur AFTER yielding (during graph.ainvoke) are re-raised
+    so they propagate normally — a second yield from an asynccontextmanager
+    generator raises RuntimeError.
     """
+    _setup_ok = False
     try:
         from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
         from tasks.database import DB_DSN
-        async with AsyncPostgresSaver.from_conn_string(DB_DSN) as saver:
-            await saver.setup()   # creates checkpoint tables if they don't exist
+        # Disable prepared-statement caching so PgBouncer transaction-pooling works.
+        _dsn = (DB_DSN or "").strip()
+        _sep = "&" if "?" in _dsn else "?"
+        _dsn = _dsn + _sep + "prepared_statement_cache_size=0"
+        async with AsyncPostgresSaver.from_conn_string(_dsn) as saver:
+            await saver.setup()
+            _setup_ok = True
             yield saver
+            return
     except (ImportError, Exception) as exc:
+        if _setup_ok:
+            raise  # error came from inside graph.ainvoke — propagate, don't mask
         if not isinstance(exc, ImportError):
             logger.warning(
                 "AsyncPostgresSaver failed (%s) — falling back to MemorySaver", exc
             )
-        from langgraph.checkpoint.memory import MemorySaver
-        yield MemorySaver()
+
+    from langgraph.checkpoint.memory import MemorySaver
+    yield MemorySaver()
 
 
 # ── Graph builder ──────────────────────────────────────────────────────────────
