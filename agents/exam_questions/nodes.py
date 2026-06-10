@@ -60,7 +60,8 @@ Style constraints:
 # ── Rate-limit guard ──────────────────────────────────────────────────────────
 _LLM_RATE_LIMIT_RETRIES = 3
 _LLM_RATE_LIMIT_DELAY   = 60   # seconds (linear: 60, 120, 180 s)
-_LLM_CALL_TIMEOUT       = 180  # seconds before a hung LLM call is aborted
+_LLM_CALL_TIMEOUT       = 300  # seconds before a hung LLM call is aborted
+_LLM_TIMEOUT_RETRIES    = 1    # extra attempts on timeout before giving up
 
 _DEEPSEEK_SEMAPHORE: Optional[asyncio.Semaphore] = None
 
@@ -104,6 +105,7 @@ async def _llm(
     max_tokens: int = 2048,
     provider: Optional[str] = None,
     _node: str = "",
+    thinking: Optional[bool] = None,
 ) -> str:
     """Route an LLM call through LLMFactory with rate-limit protection and
     DeepSeek thinking-mode support.
@@ -111,9 +113,12 @@ async def _llm(
     Acquires a dynamic semaphore before each call to cap concurrency within
     the org's token-per-minute budget. On 429, retries up to
     _LLM_RATE_LIMIT_RETRIES times with linear back-off.
+
+    ``thinking`` overrides the WORKER_THINKING_MAP value for this call only.
     """
     from utils.llm_clients.llm_factory import LLMFactory
-    _provider, model_name, thinking = _fetch_worker_model(worker_class, provider)
+    _provider, model_name, map_thinking = _fetch_worker_model(worker_class, provider)
+    effective_thinking = thinking if thinking is not None else map_thinking
     if _node:
         _llm_call(_node, worker_class, model_name, max_tokens)
 
@@ -122,8 +127,8 @@ async def _llm(
         system = system + f"\n\n**IMPORTANT**: keep your response under {max_tokens} tokens."
 
     client_kwargs: Dict[str, Any] = {}
-    if thinking is not None:
-        client_kwargs["thinking"] = thinking
+    if effective_thinking is not None:
+        client_kwargs["thinking"] = effective_thinking
 
     from utils.llm_clients.llm_factory import WORKER_FALLBACK_CHAINS
     fallback_chain = WORKER_FALLBACK_CHAINS.get(worker_class, [])
@@ -134,6 +139,7 @@ async def _llm(
         sem = await get_llm_semaphore()
 
     async with sem:
+        timeout_attempts = 0
         for attempt in range(_LLM_RATE_LIMIT_RETRIES + 1):
             try:
                 return await asyncio.wait_for(
@@ -145,12 +151,15 @@ async def _llm(
                     timeout=_LLM_CALL_TIMEOUT,
                 )
             except asyncio.TimeoutError:
+                timeout_attempts += 1
                 logger.warning(
-                    "⏱️ [%s] LLM call timed out after %ds (attempt %d/%d)",
+                    "⏱️ [%s] LLM call timed out after %ds (timeout attempt %d/%d)",
                     _node or worker_class, _LLM_CALL_TIMEOUT,
-                    attempt + 1, _LLM_RATE_LIMIT_RETRIES + 1,
+                    timeout_attempts, _LLM_TIMEOUT_RETRIES + 1,
                 )
-                raise
+                if timeout_attempts > _LLM_TIMEOUT_RETRIES:
+                    raise
+                continue
             except Exception as exc:
                 err = str(exc)
                 is_rate_limit = (
@@ -716,7 +725,7 @@ async def answer_key_builder(state: Dict) -> Dict:
     )
 
     answer_key = await _llm("orchestrator", prompt, system=system, max_tokens=3000,
-                            _node="answer_key_builder")
+                            _node="answer_key_builder", thinking=False)
 
     updated_draft = dict(draft)
     updated_draft["answer_key"] = answer_key
