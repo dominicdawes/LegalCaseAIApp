@@ -52,11 +52,13 @@ async def _checkpointer_ctx():
     try:
         from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
         import os
-        # Use the direct Supabase connection (port 5432) not the PgBouncer pool
-        # (port 6543). The pooler runs in transaction mode which doesn't support
-        # prepared statements used by AsyncPostgresSaver's pipeline writes.
+        # Use the Supabase session-pooler (port 5432 on the pooler hostname) —
+        # session mode supports prepared statements unlike transaction mode (6543).
+        # prepared_statement_cache_size=0 is required when going through PgBouncer.
         _dsn = (os.getenv("POSTGRES_DSN") or "").strip()
-        async with AsyncPostgresSaver.from_conn_string(_dsn) as saver:
+        async with AsyncPostgresSaver.from_conn_string(
+            _dsn, prepared_statement_cache_size=0
+        ) as saver:
             await saver.setup()
             _setup_ok = True
             yield saver
