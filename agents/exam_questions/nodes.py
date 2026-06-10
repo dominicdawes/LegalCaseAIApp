@@ -725,13 +725,17 @@ answer_key_builder.default_worker_class = "orchestrator"
 
 
 def answerkey_to_grounder(state: AgentState) -> List[Send]:
-    """Fan-out: one Grounder per drafted question."""
-    drafts = state.get("draft_questions") or []
-    logger.info("exam_questions x%d node fan out for grounder", len(drafts))
-    return [
-        Send("grounder", {"draft": d, **state})
-        for d in drafts
-    ]
+    """Fan-out: one Grounder for the current branch's draft.
+
+    Uses state["draft"] (the single draft passed explicitly by drafter_to_answerkey)
+    rather than state.get("draft_questions"), which accumulates all branches due to
+    the operator.add reducer and would cause N×N grounder fan-out.
+    """
+    draft = state.get("draft")
+    if not draft:
+        return []
+    logger.info("exam_questions x1 node fan out for grounder")
+    return [Send("grounder", {"draft": draft, **state})]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1066,7 +1070,13 @@ async def final_drafter(state: AgentState) -> Dict:
             )
             return q
 
-    polished = list(await asyncio.gather(*[_polish_one(q) for q in questions]))
+    # Process in batches of 5 so concurrent orchestrator calls don't exceed the
+    # 180s timeout even when n_questions is 20-30.
+    _POLISH_BATCH = 5
+    polished: list = []
+    for i in range(0, len(questions), _POLISH_BATCH):
+        batch = questions[i : i + _POLISH_BATCH]
+        polished.extend(await asyncio.gather(*[_polish_one(q) for q in batch]))
 
     await _try_save_artifact(
         state,
