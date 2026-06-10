@@ -154,14 +154,9 @@ async def _llm(
     if thinking is not None:
         client_kwargs["thinking"] = thinking
 
-    client = LLMFactory.get_client_for(
-        _provider, model_name,
-        temperature=0.7, streaming=False, max_output_tokens=max_tokens,
-        **client_kwargs,
-    )
+    from utils.llm_clients.llm_factory import WORKER_FALLBACK_CHAINS
+    fallback_chain = WORKER_FALLBACK_CHAINS.get(worker_class, [])
 
-    # Option B: DeepSeek has much higher RPM than Anthropic — bypass the
-    # Anthropic-probe semaphore and use a larger static concurrency window.
     if _provider == "deepseek":
         sem = _get_deepseek_semaphore()
     else:
@@ -170,12 +165,11 @@ async def _llm(
     async with sem:
         for attempt in range(_LLM_RATE_LIMIT_RETRIES + 1):
             try:
-                if hasattr(client, "achat"):
-                    return await client.achat(prompt, system_prompt=system or None)
-                chunks: List[str] = []
-                async for chunk in client.stream_chat(prompt, system_prompt=system or None):
-                    chunks.append(chunk)
-                return "".join(chunks)
+                return await LLMFactory.async_call_with_fallback(
+                    _provider, model_name, prompt, system=system,
+                    max_tokens=max_tokens, fallback_chain=fallback_chain,
+                    **client_kwargs,
+                )
             except Exception as exc:
                 err = str(exc)
                 is_rate_limit = (
@@ -184,7 +178,7 @@ async def _llm(
                     or "rate limit" in err.lower()
                 )
                 if is_rate_limit and attempt < _LLM_RATE_LIMIT_RETRIES:
-                    wait = _LLM_RATE_LIMIT_DELAY * (attempt + 1)  # 60, 120, 180 s
+                    wait = _LLM_RATE_LIMIT_DELAY * (attempt + 1)
                     logger.warning(
                         "🚦 [%s] Rate limit hit (429) — waiting %ds before retry %d/%d",
                         _node or worker_class, wait, attempt + 1, _LLM_RATE_LIMIT_RETRIES,

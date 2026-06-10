@@ -28,7 +28,7 @@ _async_pool_init_lock = None
 _redis_init_lock = None
 
 # Configuration
-DB_DSN = os.getenv("POSTGRES_DSN_POOL")
+DB_DSN = (os.getenv("POSTGRES_DSN_POOL") or "").strip()
 DB_POOL_MIN_SIZE = 2
 DB_POOL_MAX_SIZE = 5
 

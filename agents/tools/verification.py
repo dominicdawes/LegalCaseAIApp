@@ -96,19 +96,13 @@ def build_verification_tools(ctx: ToolContext) -> list:
             "Return only valid JSON, no extra text."
         )
 
-        from utils.llm_clients.llm_factory import LLMFactory
-        llm = LLMFactory.get_client_for(
-            _VERIFY_PROVIDER, _VERIFY_MODEL,
-            temperature=0.0, streaming=False, max_output_tokens=512,
-        )
+        from utils.llm_clients.llm_factory import LLMFactory, VERIFY_FALLBACK_CHAIN
         try:
-            if hasattr(llm, "achat"):
-                raw = await llm.achat(prompt)
-            else:
-                parts: list = []
-                async for chunk in llm.stream_chat(prompt):
-                    parts.append(chunk)
-                raw = "".join(parts)
+            raw = await LLMFactory.async_call_with_fallback(
+                _VERIFY_PROVIDER, _VERIFY_MODEL, prompt,
+                temperature=0.0, max_tokens=512,
+                fallback_chain=VERIFY_FALLBACK_CHAIN,
+            )
         except Exception as llm_exc:
             logger.warning("verify_claim LLM call failed (%s) — returning insufficient", llm_exc)
             raw = ""

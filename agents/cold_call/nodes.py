@@ -231,7 +231,12 @@ async def _llm(
                         )
                         await asyncio.sleep(wait)
                         continue
-                    raise  # non-timeout, non-429: propagate immediately, no provider switch
+                    from utils.llm_clients.llm_factory import _is_capacity_error
+                    if _is_capacity_error(exc):
+                        last_exc = exc
+                        timed_out = True
+                        break  # capacity error — try next provider in chain
+                    raise  # non-timeout, non-429, non-503: propagate immediately
 
         if not timed_out:
             break  # exited inner loop without timing out (shouldn't reach here)

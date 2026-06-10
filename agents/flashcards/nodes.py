@@ -114,11 +114,8 @@ async def _llm(
     if thinking is not None:
         client_kwargs["thinking"] = thinking
 
-    client = LLMFactory.get_client_for(
-        _provider, model_name,
-        temperature=0.7, streaming=False, max_output_tokens=max_tokens,
-        **client_kwargs,
-    )
+    from utils.llm_clients.llm_factory import WORKER_FALLBACK_CHAINS
+    fallback_chain = WORKER_FALLBACK_CHAINS.get(worker_class, [])
 
     if _provider == "deepseek":
         sem = _get_deepseek_semaphore()
@@ -128,17 +125,14 @@ async def _llm(
     async with sem:
         for attempt in range(_LLM_RATE_LIMIT_RETRIES + 1):
             try:
-                if hasattr(client, "achat"):
-                    return await asyncio.wait_for(
-                        client.achat(prompt, system_prompt=system or None),
-                        timeout=_LLM_CALL_TIMEOUT,
-                    )
-                async def _stream() -> str:
-                    chunks: List[str] = []
-                    async for chunk in client.stream_chat(prompt, system_prompt=system or None):
-                        chunks.append(chunk)
-                    return "".join(chunks)
-                return await asyncio.wait_for(_stream(), timeout=_LLM_CALL_TIMEOUT)
+                return await asyncio.wait_for(
+                    LLMFactory.async_call_with_fallback(
+                        _provider, model_name, prompt, system=system,
+                        max_tokens=max_tokens, fallback_chain=fallback_chain,
+                        **client_kwargs,
+                    ),
+                    timeout=_LLM_CALL_TIMEOUT,
+                )
             except asyncio.TimeoutError:
                 logger.warning(
                     "⏱️ [%s] LLM call timed out after %ds (attempt %d/%d)",
