@@ -819,6 +819,7 @@ async def grounder(state: Dict) -> Dict:
 
     vq: VerifiedQuestion = {
         "question_index":    draft["question_index"],
+        "issue_label":       draft.get("issue_label", ""),
         "fact_pattern":      draft["fact_pattern"],
         "call_of_question":  draft["call_of_question"],
         "answer_key":        draft["answer_key"],

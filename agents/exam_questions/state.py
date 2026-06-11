@@ -43,6 +43,7 @@ class DraftQuestion(TypedDict):
 
 class VerifiedQuestion(TypedDict):
     question_index: int
+    issue_label: str
     fact_pattern: str
     call_of_question: str
     answer_key: str
