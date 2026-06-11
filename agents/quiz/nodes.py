@@ -525,11 +525,11 @@ async def cross_doc_concepts_synthesis(state: AgentState) -> Dict:
 
     cases_brief = [
         {
-            "case_name": e["case_name"],
-            "holding": e["holding"][:200],
-            "rule": e["rule"][:200],
-            "dicta": e["dicta"][:100],
-            "dissent": e["dissent"][:100],
+            "case_name": e.get("case_name") or "",
+            "holding":   (e.get("holding")  or "")[:200],
+            "rule":      (e.get("rule")      or "")[:200],
+            "dicta":     (e.get("dicta")     or "")[:100],
+            "dissent":   (e.get("dissent")   or "")[:100],
         }
         for e in extracts[:12]
     ]
