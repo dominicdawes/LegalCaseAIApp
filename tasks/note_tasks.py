@@ -86,6 +86,7 @@ USE_ATTACK_OUTLINE_AGENT = os.getenv("USE_ATTACK_OUTLINE_AGENT", "false").lower(
 USE_CASE_BRIEF_AGENT = os.getenv("USE_CASE_BRIEF_AGENT", "false").lower() == "true"
 USE_COLD_CALL_AGENT = os.getenv("USE_COLD_CALL_AGENT", "false").lower() == "true"
 USE_FLASHCARD_AGENT = os.getenv("USE_FLASHCARD_AGENT", "false").lower() == "true"
+USE_QUIZ_AGENT = os.getenv("USE_QUIZ_AGENT", "false").lower() == "true"
 USE_VOYAGE_EMBEDDINGS = os.getenv("USE_VOYAGE_EMBEDDINGS", "true").lower() == "true"  # corpus is always Voyage-indexed
 
 # Queue configuration
@@ -214,6 +215,7 @@ class AsyncNoteManager:
                 "case_brief":     USE_CASE_BRIEF_AGENT,
                 "cold_call":      USE_COLD_CALL_AGENT,
                 "flashcards":     USE_FLASHCARD_AGENT,
+                "quiz":           USE_QUIZ_AGENT,
             }
             if _agent_active.get(note_type, False):
                 logger.info(f"🤖 Using {note_type} agent")
@@ -250,6 +252,15 @@ class AsyncNoteManager:
 
             if note_type == "cold_call" and USE_COLD_CALL_AGENT:
                 return await self._generate_cold_call_agent(
+                    note_id=note_id,
+                    user_id=user_id,
+                    project_id=project_id,
+                    note_title=note_title,
+                    addtl_params=addtl_params or {},
+                )
+
+            if note_type == "quiz" and USE_QUIZ_AGENT:
+                return await self._generate_quiz_agent(
                     note_id=note_id,
                     user_id=user_id,
                     project_id=project_id,
@@ -1396,6 +1407,102 @@ class AsyncNoteManager:
 
         logger.info(f"✅ Case brief agent completed for note {note_id[:8]}…")
         return markdown
+
+    async def _generate_quiz_agent(
+        self,
+        note_id: str,
+        user_id: str,
+        project_id: str,
+        note_title: str,
+        addtl_params: Dict,
+    ) -> str:
+        """Route quiz to the LangGraph agentic pipeline when USE_QUIZ_AGENT=true."""
+        try:
+            from agents.quiz.graph import run_quiz_agent
+        except ImportError:
+            logger.warning("langgraph not installed — falling back to legacy path for quiz")
+            return await self.generate_note_async(
+                note_id=note_id,
+                user_id=user_id,
+                note_type="quiz",
+                project_id=project_id,
+                note_title=note_title,
+                provider="openai",
+                model_name="gpt-4o",
+                num_sources=10,
+                addtl_params=addtl_params,
+            )
+
+        source_ids = addtl_params.get("document_ids") or []
+        num_questions = int(addtl_params.get("num_questions", 10))
+
+        if not source_ids:
+            async with get_db_connection() as conn:
+                rows = await conn.fetch(
+                    "SELECT id FROM document_sources WHERE project_id = $1",
+                    uuid.UUID(project_id),
+                )
+            source_ids = [str(r["id"]) for r in rows]
+
+        await self._update_note_progress_async(note_id, "PROCESSING")
+
+        from agents.ledger import AgentLedgerService
+        ledger = AgentLedgerService()
+        job_uuid = uuid.UUID(note_id)
+        run_meta = None
+        try:
+            await ledger.ensure_job(
+                job_id=job_uuid,
+                project_id=project_id,
+                source_ids=source_ids,
+                job_type="quiz",
+            )
+            run_meta = await ledger.initialize_run(
+                job_id=job_uuid,
+                graph_name="quiz",
+            )
+            agent_thread_id = run_meta.langgraph_thread_id
+            agent_run_id    = str(run_meta.run_id)
+        except Exception as ledger_exc:
+            logger.warning(f"Ledger init failed (non-fatal): {ledger_exc}")
+            agent_thread_id = note_id
+            agent_run_id    = None
+
+        try:
+            final_state = await run_quiz_agent(
+                request=note_title,
+                project_id=project_id,
+                source_ids=source_ids,
+                num_questions=num_questions,
+                batch_size=int(addtl_params.get("batch_size", 5)),
+                quiz_mode=addtl_params.get("quiz_mode", "mixed"),
+                target_difficulty=addtl_params.get("target_difficulty", "application"),
+                use_voyage=USE_VOYAGE_EMBEDDINGS,
+                thread_id=agent_thread_id,
+                job_id=note_id,
+                run_id=agent_run_id,
+                user_id=user_id,
+            )
+        except Exception as e:
+            if run_meta:
+                try:
+                    await ledger.mark_run_failed(run_meta.run_id, e)
+                    await ledger.set_job_status(job_uuid, "failed")
+                except Exception:
+                    pass
+            logger.error(f"Quiz agent failed: {e}", exc_info=True)
+            raise
+
+        if run_meta:
+            try:
+                await ledger.complete_run(run_meta.run_id)
+                await ledger.set_job_status(job_uuid, "succeeded")
+            except Exception as ledger_exc:
+                logger.warning(f"Ledger completion update failed (non-fatal): {ledger_exc}")
+
+        num_persisted = len(final_state.get("persisted_question_ids") or [])
+        logger.info(f"✅ Quiz agent completed for note {note_id[:8]}… — {num_persisted} questions")
+        return final_state.get("final_output") or ""
 
     async def _generate_flashcard_agent(
         self,
