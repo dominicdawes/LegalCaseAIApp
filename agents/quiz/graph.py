@@ -43,20 +43,31 @@ USE_QUIZ_AGENT = os.getenv("USE_QUIZ_AGENT", "false").lower() == "true"
 
 @asynccontextmanager
 async def _checkpointer_ctx():
-    """Yield a durable AsyncPostgresSaver or fall back to MemorySaver."""
+    """Yield a durable AsyncPostgresSaver or fall back to MemorySaver.
+
+    Uses POSTGRES_DSN (session-mode pooler, port 5432) rather than the
+    transaction-mode pool (port 6543), which does not support prepared
+    statements.  The _setup_ok flag ensures errors inside graph.ainvoke
+    are re-raised instead of triggering an illegal second yield.
+    """
+    _setup_ok = False
     try:
         from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
-        from tasks.database import DB_DSN
-        async with AsyncPostgresSaver.from_conn_string(DB_DSN) as saver:
+        _dsn = (os.getenv("POSTGRES_DSN") or "").strip()
+        async with AsyncPostgresSaver.from_conn_string(_dsn) as saver:
             await saver.setup()
+            _setup_ok = True
             yield saver
+            return
     except (ImportError, Exception) as exc:
+        if _setup_ok:
+            raise
         if not isinstance(exc, ImportError):
             logger.warning(
                 "AsyncPostgresSaver failed (%s) — falling back to MemorySaver", exc
             )
-        from langgraph.checkpoint.memory import MemorySaver
-        yield MemorySaver()
+    from langgraph.checkpoint.memory import MemorySaver
+    yield MemorySaver()
 
 
 def _build_graph(checkpointer):

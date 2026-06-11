@@ -39,9 +39,8 @@ async def _checkpointer_ctx():
     """
     Async context manager that yields a configured LangGraph checkpointer.
 
-    Tries AsyncPostgresSaver first (durable, survives worker restarts).
-    prepared_statement_cache_size=0 is required for Supabase PgBouncer in
-    transaction-pooling mode, which does not support prepared statements.
+    Uses POSTGRES_DSN (direct connection, port 5432) — not the pgbouncer
+    transaction-mode pool — so prepared statements work without any special flags.
 
     Falls back to MemorySaver only when setup fails (before yielding).
     Errors that occur AFTER yielding (during graph.ainvoke) are re-raised
@@ -51,15 +50,7 @@ async def _checkpointer_ctx():
     _setup_ok = False
     try:
         from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
-        import os
-        # Use the Supabase session-pooler (port 5432 on the pooler hostname) —
-        # session mode supports prepared statements unlike transaction mode (6543).
-        # prepared_statement_cache_size=0 disables client-side statement caching,
-        # required when going through PgBouncer. Passed via DSN param since the
-        # from_conn_string kwarg API varies across langgraph-checkpoint-postgres versions.
         _dsn = (os.getenv("POSTGRES_DSN") or "").strip()
-        if "prepared_statement_cache_size" not in _dsn:
-            _dsn = _dsn.rstrip("/") + ("&" if "?" in _dsn else "?") + "prepared_statement_cache_size=0"
         async with AsyncPostgresSaver.from_conn_string(_dsn) as saver:
             await saver.setup()
             _setup_ok = True

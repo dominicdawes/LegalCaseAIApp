@@ -47,21 +47,29 @@ USE_CASE_BRIEF_AGENT = os.getenv("USE_CASE_BRIEF_AGENT", "false").lower() == "tr
 async def _checkpointer_ctx():
     """
     Yields a configured LangGraph checkpointer.
-    AsyncPostgresSaver preferred (durable); MemorySaver fallback for dev.
+    Uses POSTGRES_DSN (session-mode pooler, port 5432) rather than the
+    transaction-mode pool (port 6543), which does not support prepared
+    statements.  The _setup_ok flag ensures errors inside graph.ainvoke
+    are re-raised instead of triggering an illegal second yield.
     """
+    _setup_ok = False
     try:
         from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
-        from tasks.database import DB_DSN
-        async with AsyncPostgresSaver.from_conn_string(DB_DSN) as saver:
+        _dsn = (os.getenv("POSTGRES_DSN") or "").strip()
+        async with AsyncPostgresSaver.from_conn_string(_dsn) as saver:
             await saver.setup()
+            _setup_ok = True
             yield saver
+            return
     except (ImportError, Exception) as exc:
+        if _setup_ok:
+            raise
         if not isinstance(exc, ImportError):
             logger.warning(
                 "AsyncPostgresSaver failed (%s) — falling back to MemorySaver", exc
             )
-        from langgraph.checkpoint.memory import MemorySaver
-        yield MemorySaver()
+    from langgraph.checkpoint.memory import MemorySaver
+    yield MemorySaver()
 
 
 # ── Graph builder ──────────────────────────────────────────────────────────────
