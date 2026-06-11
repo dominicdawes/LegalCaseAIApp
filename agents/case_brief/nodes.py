@@ -1833,6 +1833,58 @@ brief_revision_agent.escalation_worker_class = "orchestrator"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# 17. final_formatter — helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+_ROMAN_NUMERALS = [
+    "I", "II", "III", "IV", "V", "VI", "VII", "VIII", "IX", "X",
+    "XI", "XII", "XIII", "XIV", "XV", "XVI", "XVII", "XVIII", "XIX", "XX",
+]
+_OMIT_MARKER    = re.compile(r'\s*\[omit(?:\s+if\s+absent)?\]', re.IGNORECASE)
+_ROMAN_HEADING  = re.compile(r'^(##\s+)([IVXLCDM]+)\.', re.IGNORECASE)
+
+
+def _prune_and_renumber_sections(text: str) -> str:
+    """
+    1. Split the brief on '## <Roman-numeral>.' section headings.
+    2. Drop any section whose body (after the heading line) is blank, only
+       dashes/whitespace, or contains an [omit if absent] marker.
+    3. Re-number the surviving sections I, II, III, … sequentially.
+    4. Strip any residual [omit if absent] artefacts from kept headings.
+    """
+    segments = re.split(r'(?m)(?=^## )', text)
+
+    preamble_parts: List[str] = []
+    sections: List[tuple] = []  # (header_line: str, body: str)
+
+    for seg in segments:
+        if not seg:
+            continue
+        nl = seg.find('\n')
+        header = seg[:nl] if nl != -1 else seg
+        body   = seg[nl:]  if nl != -1 else ""
+        if _ROMAN_HEADING.match(header):
+            sections.append((header, body))
+        else:
+            preamble_parts.append(seg)
+
+    kept: List[tuple] = []
+    for header, body in sections:
+        clean = re.sub(r'-{3,}', '', body).strip()
+        if not clean or _OMIT_MARKER.search(clean):
+            continue
+        kept.append((_OMIT_MARKER.sub('', header).rstrip(), body))
+
+    result = ''.join(preamble_parts)
+    for idx, (header, body) in enumerate(kept):
+        new_num    = _ROMAN_NUMERALS[idx] if idx < len(_ROMAN_NUMERALS) else str(idx + 1)
+        new_header = _ROMAN_HEADING.sub(rf'\g<1>{new_num}.', header, count=1)
+        result    += new_header + body
+
+    return result
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # 17. final_formatter
 # ─────────────────────────────────────────────────────────────────────────────
 
