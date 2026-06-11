@@ -256,6 +256,7 @@ async def head_orchestrator(state: AgentState) -> Dict:
     _node_start("head_orchestrator", state,
                 num_cards=num_cards, num_batches=num_batches)
 
+    _max_node_tokens = 800
     system = (
         "You are a T-14 law professor designing a rigorous flashcard deck.\n\n"
         "PLANNING REQUIREMENTS:\n"
@@ -266,14 +267,15 @@ async def head_orchestrator(state: AgentState) -> Dict:
         "   for comparison and contrast cards.\n"
         "4. Confirm scope in 2-3 sentences: doctrinal coverage, recommended card type "
         "   mix, and any limitations of the source material.\n"
-        "Respond with your 2-3 sentence scope confirmation only."
+        "Respond with your 2-3 sentence scope confirmation only.\n\n"
+        f"**IMPORTANT**: keep your response under {_max_node_tokens} tokens."
     )
     await _llm(
         "worker_mid",
         f"Documents: {sources_json}\nRequest: {state.get('request', '')}\n"
         f"Deck: {num_cards} flashcards, batch size {batch_size}.",
         system=system,
-        max_tokens=256,
+        max_tokens=_max_node_tokens,
         _node="head_orchestrator",
     )
 
@@ -716,7 +718,7 @@ async def flashcard_drafter(state: AgentState) -> Dict:
 
         query = f"{' '.join(spec.get('case_names') or [])} {spec.get('topic', '')}".strip()
         try:
-            chunks_json = await search_tool.ainvoke({"query": query, "k": 10})
+            chunks_json = await search_tool.ainvoke({"query": query, "k": 15})
             chunks = json.loads(chunks_json)
         except Exception:
             chunks = []
@@ -933,25 +935,49 @@ answer_backside_enricher.default_worker_class = "worker_mid"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Helper: fetch chunks by ID for grounding context
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def _fetch_chunks_by_ids(chunk_ids: List[str], project_id: str) -> Dict[str, str]:
+    """Fetch chunk content keyed by id. Non-fatal — returns {} on any error."""
+    if not chunk_ids:
+        return {}
+    try:
+        import uuid as _uuid_mod_inner
+        from tasks.database import get_db_connection
+        valid = [cid for cid in chunk_ids if cid]
+        async with get_db_connection() as conn:
+            rows = await conn.fetch(
+                "SELECT id::text, content FROM document_vector_store "
+                "WHERE id = ANY($1::uuid[]) AND project_id = $2",
+                valid,
+                _uuid_mod_inner.UUID(project_id),
+            )
+        return {row["id"]: row["content"] for row in rows}
+    except Exception as exc:
+        logger.warning("_fetch_chunks_by_ids failed (non-fatal): %s", exc)
+        return {}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # 7. local_card_critic
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def local_card_critic(state: AgentState) -> Dict:
     """
-    Evaluate the current batch as a pedagogical set.
+    Evaluate the current batch per-card on three dimensions (threshold 0.60):
+      vagueness     — front is specific and unambiguous
+      atomic_focus  — card tests exactly ONE learning target
+      answer_quality — back is concise, accurate, self-contained
 
-    Scores five dimensions per batch (0.0–1.0):
-      vagueness          — are fronts specific and unambiguous?
-      uniqueness         — do cards cover distinct concepts?
-      source_support     — are answers grounded in source material?
-      atomic_focus       — does each card test exactly one thing?
-      answer_quality     — are backsides concise, accurate, complete?
+    source_support is INFORMATIONAL ONLY: source chunks are fetched and shown
+    to the LLM as context but do not block pass/fail.
 
-    Also checks each card individually and flags any that need repair.
-    Batch passes if all dimension scores >= 0.70.
+    Batch passes if ≥ 80% of cards pass individually.
     """
     drafts = state.get("current_batch_drafts") or []
     batch_idx = state.get("current_batch_index", 0)
+    project_id = state.get("project_id", "")
     used_sigs = (state.get("used_card_signatures") or [])[-30:]
 
     if not drafts:
@@ -960,65 +986,77 @@ async def local_card_critic(state: AgentState) -> Dict:
                 "batch_index": batch_idx,
                 "passes": True,
                 "scores": {},
+                "batch_uniqueness_ok": True,
                 "rejection_reasons": [],
                 "revision_instructions": [],
                 "card_verdicts": [],
             }
         }
 
-    batch_payload = [
-        {
+    # Fetch source chunks for grounding context (informational)
+    all_chunk_ids = list({ref for d in drafts for ref in (d.get("source_refs") or [])})
+    chunk_map = await _fetch_chunks_by_ids(all_chunk_ids, project_id)
+
+    batch_payload = []
+    for d in drafts:
+        refs = d.get("source_refs") or []
+        source_texts = [chunk_map[r][:300] for r in refs if r in chunk_map]
+        source_ctx = "\n---\n".join(source_texts[:3])
+        entry = {
             "spec_index": d["spec_index"],
             "card_type": d["card_type"],
             "front_content": d["front_content"],
             "back_content": d["back_content"],
         }
-        for d in drafts
-    ]
+        if source_ctx:
+            entry["source_context"] = source_ctx[:600]
+        batch_payload.append(entry)
 
     _node_start("local_card_critic", state,
                 batch_idx=batch_idx, n_cards=len(drafts))
 
-    system = (
-        "You are a T-14 law school curriculum director performing pedagogical QA on a "
-        "batch of flashcards.\n\n"
-        "EVALUATION CRITERIA (score each 0.0–1.0):\n"
-        "  vagueness: Are fronts specific and unambiguous? A vague front like 'What is "
-        "  negligence?' fails; 'What is the duty element of negligence under the "
-        "  reasonable person standard?' passes. (1.0 = all fronts precise)\n"
-        "  uniqueness: Do cards cover distinct concepts with no near-duplicate content? "
-        "  Same rule tested two different ways is fine; same rule stated identically is not. "
-        "(1.0 = fully distinct)\n"
-        "  source_support: Are back answers grounded in the provided material, not "
-        "  hallucinated from general knowledge? (1.0 = fully grounded)\n"
-        "  atomic_focus: Does each card test exactly ONE learning target? "
-        "  A card combining rule + exception + policy in one back fails atomic. "
-        "(1.0 = fully atomic)\n"
-        "  answer_quality: Are backs concise, accurate, and self-contained? "
-        "  Does each back answer the specific question on the front? (1.0 = excellent)\n\n"
-        "PASS THRESHOLD: all scores >= 0.70.\n"
-        "REVISION INSTRUCTIONS must be specific: name the spec_index and the exact fix.\n\n"
-        "Return a JSON object:\n"
-        '  "passes": bool\n'
-        '  "scores": {"vagueness": f, "uniqueness": f, "source_support": f, '
-        '"atomic_focus": f, "answer_quality": f}\n'
-        '  "rejection_reasons": [str, ...] (empty if passes)\n'
-        '  "revision_instructions": [str, ...] (specific fixes per failing card)\n'
-        '  "card_verdicts": [{"spec_index": int, "passes": bool, "reason": str}, ...]\n'
-        "No extra text."
-    )
-
     avoid_context = ""
     if used_sigs:
         avoid_context = (
-            f"\n\nAlready-committed card signatures (check for duplicates):\n"
+            "\n\nAlready-committed card signatures (check uniqueness):\n"
             + "\n".join(f"- {s}" for s in used_sigs)
         )
 
+    system = (
+        "You are a T-14 law school curriculum director performing pedagogical QA.\n\n"
+        "SCORING (per card, 0.0–1.0, PASS THRESHOLD 0.60 each):\n"
+        "  vagueness:     Is the front specific and unambiguous? "
+        "'What is negligence?' fails; 'What is the duty element under the reasonable "
+        "person standard?' passes.\n"
+        "  atomic_focus:  Does the card test exactly ONE concept? "
+        "Combining rule + exception + policy in one back = fail.\n"
+        "  answer_quality: Is the back concise (≤120 words), accurate, and self-contained? "
+        "Does it directly answer the front?\n\n"
+        "PASS RULE: a card passes if ALL three scores ≥ 0.60.\n"
+        "BATCH PASSES if ≥ 80% of cards pass.\n\n"
+        "SOURCE GROUNDING (informational — does NOT affect pass/fail):\n"
+        "If source_context is provided for a card, note in source_grounding_notes whether "
+        "the back is well-grounded. This field is advisory only.\n\n"
+        "BATCH-LEVEL: check uniqueness — flag near-duplicate fronts.\n\n"
+        "Return ONLY a JSON object:\n"
+        '  "batch_passes": bool\n'
+        '  "batch_uniqueness_ok": bool\n'
+        '  "duplicate_pairs": [[spec_index_a, spec_index_b], ...]\n'
+        '  "card_verdicts": [\n'
+        '    {"spec_index": int, "passes": bool,\n'
+        '     "scores": {"vagueness": f, "atomic_focus": f, "answer_quality": f},\n'
+        '     "source_grounding_notes": str,\n'
+        '     "reason": str}\n'
+        '  ]\n'
+        '  "rejection_reasons": [str]\n'
+        '  "revision_instructions": [str]\n'
+        "No extra text."
+    )
+
     prompt = (
         f"Batch ({len(batch_payload)} cards):{avoid_context}\n\n"
-        f"{json.dumps(batch_payload, indent=2)}\n\n"
-        "Evaluate the batch."
+        + json.dumps(batch_payload, indent=2)
+        + "\n\nEvaluate the batch."
     )
 
     raw = await _llm("worker_mid", prompt, system=system, max_tokens=2000,
@@ -1029,25 +1067,36 @@ async def local_card_critic(state: AgentState) -> Dict:
             raise ValueError
     except Exception:
         result = {
-            "passes": True,
-            "scores": {},
+            "batch_passes": True,
+            "batch_uniqueness_ok": True,
+            "duplicate_pairs": [],
+            "card_verdicts": [],
             "rejection_reasons": [],
             "revision_instructions": [],
-            "card_verdicts": [],
         }
+
+    # Normalise: support both old `passes` key and new `batch_passes`
+    passes = result.get("batch_passes", result.get("passes", True))
+
+    # Re-derive batch_passes from card verdicts if LLM got it wrong
+    card_verdicts = result.get("card_verdicts", [])
+    if card_verdicts:
+        n_pass = sum(1 for v in card_verdicts if v.get("passes", True))
+        passes = (n_pass / len(card_verdicts)) >= 0.80
 
     batch_eval: FlashcardBatchEvaluation = {
         "batch_index": batch_idx,
-        "passes": result.get("passes", True),
-        "scores": result.get("scores", {}),
+        "passes": passes,
+        "scores": {"uniqueness": 1.0 if result.get("batch_uniqueness_ok", True) else 0.5},
+        "batch_uniqueness_ok": result.get("batch_uniqueness_ok", True),
         "rejection_reasons": result.get("rejection_reasons", []),
         "revision_instructions": result.get("revision_instructions", []),
-        "card_verdicts": result.get("card_verdicts", []),
+        "card_verdicts": card_verdicts,
     }
     _node_done("local_card_critic", state,
                batch_idx=batch_idx,
                passes=batch_eval["passes"],
-               n_verdicts=len(batch_eval["card_verdicts"]))
+               n_verdicts=len(card_verdicts))
     return {"current_batch_eval": batch_eval}
 
 
@@ -1056,7 +1105,7 @@ local_card_critic.escalation_worker_class = "orchestrator"
 
 
 def should_repair_batch(state: AgentState) -> str:
-    """Route to card_repair_agent if batch failed and revision budget remains."""
+    """Route to card_repair_agent if batch failed and revision budget remains (max 1 pass)."""
     if state.get("batch_revision_count", 0) >= 1:
         return "batch_commit"
     eval_result = state.get("current_batch_eval")
@@ -1085,7 +1134,7 @@ async def card_repair_agent(state: AgentState) -> Dict:
 
     verdict_map: Dict[int, Dict] = {
         v["spec_index"]: v
-        for v in (eval_result.get("card_verdicts") or [])
+        for v in (eval_result.get("card_verdicts") or eval_result.get("card_evaluations") or [])
         if isinstance(v, dict)
     }
     revision_instructions = eval_result.get("revision_instructions") or []
@@ -1326,6 +1375,139 @@ def batch_router(state: AgentState) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Parallel batch pipeline: helper + node + fan-out
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def _write_batch_cards_to_db(
+    accepted: List[Dict],
+    state: Dict,
+    card_order_offset: int,
+) -> List[str]:
+    """Write accepted cards to individual_cards; returns list of new UUIDs."""
+    from tasks.database import get_db_connection
+    job_id = (state.get("job_id") or "").strip()
+    user_id = (state.get("user_id") or "").strip()
+    project_id = (state.get("project_id") or "").strip()
+    if not job_id or not accepted:
+        return []
+    new_ids: List[str] = []
+    now = datetime.now(timezone.utc)
+    try:
+        async with get_db_connection() as conn:
+            for pos, draft in enumerate(accepted):
+                card_id = str(_uuid_mod.uuid4())
+                card_order = card_order_offset + pos
+                await conn.execute(
+                    """
+                    INSERT INTO individual_cards (
+                        id, deck_id, user_id, project_id,
+                        front_content, back_content, card_order,
+                        created_at, is_active
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                    ON CONFLICT (id) DO NOTHING
+                    """,
+                    card_id, job_id, user_id or None, project_id or None,
+                    draft["front_content"], draft["back_content"],
+                    card_order, now, True,
+                )
+                new_ids.append(card_id)
+                logger.info(
+                    "process_batch[offset=%d]: card[%s] → %s (order %d)",
+                    card_order_offset, draft["spec_index"], card_id[:8], card_order,
+                )
+    except Exception as exc:
+        logger.error("_write_batch_cards_to_db failed: %s", exc)
+    return new_ids
+
+
+async def process_batch(state: Dict) -> Dict:
+    """
+    Run the full batch pipeline for one batch spec in parallel with other batches.
+    Invoked via Send fan-out from card_blueprint_planner_to_batch.
+
+    Pipeline per batch: draft → critique → repair (max 1 pass) → DB write.
+    No cross-batch dedup: blueprint_planner pre-assigns disjoint spec_indices.
+    """
+    batch_spec = state.get("current_batch_spec") or {}
+    batch_idx = batch_spec.get("batch_index", 0)
+    batch_size_val = state.get("batch_size") or 5
+    card_order_offset = batch_idx * batch_size_val
+
+    # Synthetic serial state for calling existing node functions
+    serial = {
+        **state,
+        "current_batch_index": 0,
+        "batch_specs": [batch_spec],
+        "used_card_signatures": [],   # disjoint specs — no cross-batch dedup needed
+        "accepted_card_ids": [],
+        "batch_revision_count": 0,
+    }
+
+    # 1. Draft
+    draft_result = await flashcard_drafter(serial)
+    drafts = draft_result.get("current_batch_drafts", [])
+    serial = {**serial, "current_batch_drafts": drafts}
+
+    # 2. Critique
+    critic_result = await local_card_critic(serial)
+    eval_result = critic_result["current_batch_eval"]
+    serial = {**serial, "current_batch_eval": eval_result}
+
+    # 3. Repair (max 1 pass)
+    if should_repair_batch(serial) == "card_repair_agent":
+        repair_result = await card_repair_agent(serial)
+        drafts = repair_result.get("current_batch_drafts", drafts)
+
+    # 4. Write to DB with correct card_order based on batch position
+    accepted = [d for d in drafts if d.get("grounding_verdict", "") != "fail"]
+    new_card_ids = await _write_batch_cards_to_db(accepted, state, card_order_offset)
+
+    new_sigs = [f"{d['card_type']}:{d['front_content'][:40]}" for d in accepted]
+    coverage_delta: Dict[str, int] = {}
+    for d in accepted:
+        ctype = d.get("card_type", "UNKNOWN")
+        coverage_delta[ctype] = coverage_delta.get(ctype, 0) + 1
+
+    rejected_meta = [
+        {
+            "batch_index": batch_idx,
+            "spec_index": d["spec_index"],
+            "card_type": d["card_type"],
+            "reason": d.get("grounding_notes", "grounding_fail"),
+        }
+        for d in drafts if d.get("grounding_verdict") == "fail"
+    ]
+
+    logger.info(
+        "process_batch[%d]: %d cards written, %d rejected",
+        batch_idx, len(new_card_ids), len(rejected_meta),
+    )
+    return {
+        "accepted_card_ids":      new_card_ids,
+        "used_card_signatures":   new_sigs,
+        "rejected_card_metadata": rejected_meta,
+        "batch_results": [{
+            "batch_index": batch_idx,
+            "card_ids":    new_card_ids,
+            "coverage":    coverage_delta,
+        }],
+    }
+
+
+process_batch.default_worker_class = "orchestrator"
+
+
+def card_blueprint_planner_to_batch(state: AgentState) -> List[Send]:
+    """Fan-out: one process_batch per batch spec (all run in parallel)."""
+    batch_specs = state.get("batch_specs") or []
+    logger.info("flashcards: parallel fan-out → %d batches", len(batch_specs))
+    return [
+        Send("process_batch", {"current_batch_spec": bs, **state})
+        for bs in batch_specs
+    ]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # 10. global_deck_critic
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -1341,14 +1523,19 @@ async def global_deck_critic(state: AgentState) -> Dict:
     """
     sigs = state.get("used_card_signatures") or []
     accepted_count = len(state.get("accepted_card_ids") or [])
-    coverage_raw = state.get("coverage_summary") or "{}"
     num_cards = state.get("num_cards") or 10
     rejected_count = len(state.get("rejected_card_metadata") or [])
 
+    # Build coverage from parallel batch_results; fall back to legacy coverage_summary
+    coverage_raw = state.get("coverage_summary") or "{}"
     try:
-        coverage = json.loads(coverage_raw)
+        coverage = json.loads(coverage_raw) if coverage_raw != "{}" else {}
     except Exception:
         coverage = {}
+    if not coverage:
+        for br in (state.get("batch_results") or []):
+            for ctype, cnt in (br.get("coverage") or {}).items():
+                coverage[ctype] = coverage.get(ctype, 0) + cnt
 
     _node_start("global_deck_critic", state,
                 accepted=accepted_count, target=num_cards, rejected=rejected_count)
@@ -1448,9 +1635,13 @@ async def deterministic_formatter_persister(state: AgentState) -> Dict:
                 n_accepted=len(accepted_ids))
 
     try:
-        coverage = json.loads(coverage_raw)
+        coverage = json.loads(coverage_raw) if coverage_raw != "{}" else {}
     except Exception:
         coverage = {}
+    if not coverage:
+        for br in (state.get("batch_results") or []):
+            for ctype, cnt in (br.get("coverage") or {}).items():
+                coverage[ctype] = coverage.get(ctype, 0) + cnt
     try:
         deck_report = json.loads(deck_report_raw)
     except Exception:

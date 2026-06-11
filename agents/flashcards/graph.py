@@ -5,30 +5,26 @@ LangGraph StateGraph for the flashcard agent.
 Graph topology:
   head_orchestrator → [Send → source_profiler ×N] → concept_extractor
   concept_extractor → card_blueprint_planner
-  card_blueprint_planner → flashcard_drafter  ← ───────────────────────────┐
-  flashcard_drafter → answer_backside_enricher                              │
-  answer_backside_enricher → local_card_critic                              │
-  local_card_critic → (should_repair_batch?)                                │
-      → card_repair_agent → local_card_critic  (repair loop, max 2 passes)  │
-      → batch_commit                                                          │
-  batch_commit → (batch_router?) ──────────────────────────────────────────── ┘
-      → global_deck_critic → deterministic_formatter_persister → END
+  card_blueprint_planner → [Send → process_batch ×N_batches]  ← parallel fan-out
+  process_batch (×N, parallel) → global_deck_critic           ← merge point
+  global_deck_critic → deterministic_formatter_persister → END
 
-Batch loop:
-  batch_commit increments current_batch_index.
-  batch_router routes back to flashcard_drafter while batches remain and
-  accepted_count < num_cards; otherwise routes to global_deck_critic.
+Phase 1 — Source understanding (unchanged):
+  head_orchestrator fans out to one source_profiler per document; all branches
+  merge into concept_extractor via operator.add on source_profiles.
 
-Repair loop:
-  should_repair_batch routes to card_repair_agent when current_batch_eval.passes is
-  False AND batch_revision_count < 2; otherwise routes to batch_commit.
-  card_repair_agent increments batch_revision_count on each pass.
+Phase 2 — Parallel batch execution (new):
+  card_blueprint_planner pre-assigns disjoint spec_index ranges to each batch.
+  card_blueprint_planner_to_batch fans out via Send so all N batches run
+  concurrently. Each process_batch runs: draft → critique → repair (max 1) → DB write.
+  Results accumulate into accepted_card_ids, used_card_signatures, batch_results via
+  operator.add reducers; no cross-batch dedup lock needed.
 
-Checkpointing:
-  Uses AsyncPostgresSaver (langgraph-checkpoint-postgres) for durable state
-  across worker restarts.  Falls back to MemorySaver for local dev.
+Phase 3 — Final QA (unchanged):
+  global_deck_critic reads accepted_card_ids + used_card_signatures from merged state.
+  deterministic_formatter_persister updates the notes row.
 
-Enable via USE_FLASHCARD_AGENT env var (default: false).
+Enabled via USE_FLASHCARD_AGENT env var (default: false).
 """
 
 import logging
@@ -77,12 +73,8 @@ def _build_graph(checkpointer):
         source_profiler,
         concept_extractor,
         card_blueprint_planner,
-        flashcard_drafter,
-        local_card_critic,
-        should_repair_batch,
-        card_repair_agent,
-        batch_commit,
-        batch_router,
+        card_blueprint_planner_to_batch,
+        process_batch,
         global_deck_critic,
         deterministic_formatter_persister,
     )
@@ -90,51 +82,26 @@ def _build_graph(checkpointer):
     builder = StateGraph(AgentState)
 
     # ── nodes ──────────────────────────────────────────────────────────────────
-    builder.add_node("head_orchestrator",                head_orchestrator)
-    builder.add_node("source_profiler",                  source_profiler)
-    builder.add_node("concept_extractor",                concept_extractor)
-    builder.add_node("card_blueprint_planner",           card_blueprint_planner)
-    builder.add_node("flashcard_drafter",                flashcard_drafter)
-    builder.add_node("local_card_critic",                local_card_critic)
-    builder.add_node("card_repair_agent",                card_repair_agent)
-    builder.add_node("batch_commit",                     batch_commit)
-    builder.add_node("global_deck_critic",               global_deck_critic)
+    builder.add_node("head_orchestrator",                 head_orchestrator)
+    builder.add_node("source_profiler",                   source_profiler)
+    builder.add_node("concept_extractor",                 concept_extractor)
+    builder.add_node("card_blueprint_planner",            card_blueprint_planner)
+    builder.add_node("process_batch",                     process_batch)
+    builder.add_node("global_deck_critic",                global_deck_critic)
     builder.add_node("deterministic_formatter_persister", deterministic_formatter_persister)
 
     # ── entry ──────────────────────────────────────────────────────────────────
     builder.set_entry_point("head_orchestrator")
 
     # ── Phase 1: Source understanding ─────────────────────────────────────────
-    # head_orchestrator → parallel source_profiler (one per source document)
     builder.add_conditional_edges("head_orchestrator", head_orchestrator_to_profiler)
-
-    # All source_profiler branches merge into concept_extractor
-    builder.add_edge("source_profiler", "concept_extractor")
-
+    builder.add_edge("source_profiler",      "concept_extractor")
     builder.add_edge("concept_extractor",    "card_blueprint_planner")
 
-    # ── Phase 2: Batch loop entry ─────────────────────────────────────────────
-    builder.add_edge("card_blueprint_planner", "flashcard_drafter")
-
-    # ── Batch pipeline ────────────────────────────────────────────────────────
-    builder.add_edge("flashcard_drafter",        "local_card_critic")
-
-    # local_card_critic → conditional: repair or commit
-    builder.add_conditional_edges(
-        "local_card_critic",
-        should_repair_batch,
-        {"card_repair_agent": "card_repair_agent", "batch_commit": "batch_commit"},
-    )
-
-    # Repair loop: card_repair_agent routes back to local_card_critic
-    builder.add_edge("card_repair_agent", "local_card_critic")
-
-    # Batch loop: batch_commit routes back to drafter or advances to global critic
-    builder.add_conditional_edges(
-        "batch_commit",
-        batch_router,
-        {"flashcard_drafter": "flashcard_drafter", "global_deck_critic": "global_deck_critic"},
-    )
+    # ── Phase 2: Parallel batch execution ────────────────────────────────────
+    # All batches run concurrently; results merge into global_deck_critic
+    builder.add_conditional_edges("card_blueprint_planner", card_blueprint_planner_to_batch)
+    builder.add_edge("process_batch", "global_deck_critic")
 
     # ── Phase 3: Final QA + persistence ───────────────────────────────────────
     builder.add_edge("global_deck_critic",               "deterministic_formatter_persister")
@@ -144,6 +111,39 @@ def _build_graph(checkpointer):
 
 
 # ── Public run functions ───────────────────────────────────────────────────────
+
+def _base_initial_state(
+    request: str,
+    project_id: str,
+    source_ids: List[str],
+    num_cards: int,
+    batch_size: int,
+    use_voyage: bool,
+    is_essential: bool,
+    job_id: Optional[str],
+    run_id: Optional[str],
+    user_id: Optional[str],
+) -> Dict:
+    return {
+        "request":        request,
+        "project_id":     project_id,
+        "source_ids":     source_ids,
+        "num_cards":      num_cards,
+        "batch_size":     batch_size,
+        "use_voyage":     use_voyage,
+        "is_essential":   is_essential,
+        "job_id":         job_id or "",
+        "run_id":         run_id or "",
+        "user_id":        user_id or "",
+        # Annotated operator.add accumulators — must be initialised before fan-outs
+        "source_profiles":      [],
+        "accepted_card_ids":    [],
+        "used_card_signatures": [],
+        "rejected_card_metadata": [],
+        "batch_results":        [],
+        "budget": {"input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0},
+    }
+
 
 async def run_flashcard_agent(
     request: str,
@@ -161,50 +161,17 @@ async def run_flashcard_agent(
     """
     Run the flashcard agent to completion and return the final state.
 
-    Args:
-        request        — user's flashcard request string
-        project_id     — Supabase project UUID
-        source_ids     — document UUIDs to scope retrieval
-        num_cards      — total cards to generate (default 10, supports 50+)
-        batch_size     — cards per batch (default 5, max 10)
-        use_voyage     — True if documents were ingested with voyage-law-2
-        is_essential   — forwarded to notes.is_essential column
-        thread_id      — LangGraph checkpoint thread ID
-        job_id         — notes.id (parent deck container; individual_cards.deck_id FK)
-        run_id         — agent_runs.id for progress tracking
-        user_id        — auth.users.id; required for individual_cards.user_id FK
-
     Returns:
-        Final AgentState.  Key fields:
-          state["persisted_card_ids"]  — list of individual_cards UUIDs
-          state["final_output"]        — markdown deck summary
+        state["persisted_card_ids"]  — list of individual_cards UUIDs
+        state["final_output"]        — markdown deck summary
     """
-    initial_state = {
-        "request":        request,
-        "project_id":     project_id,
-        "source_ids":     source_ids,
-        "num_cards":      num_cards,
-        "batch_size":     batch_size,
-        "use_voyage":     use_voyage,
-        "is_essential":   is_essential,
-        "job_id":         job_id or "",
-        "run_id":         run_id or "",
-        "user_id":        user_id or "",
-        # Annotated accumulator — must be initialised before parallel fan-out
-        "source_profiles":              [],
-        # Batch loop initial state
-        "current_batch_index":          0,
-        "batch_revision_count":         0,
-        "accepted_card_ids":            [],
-        "rejected_card_metadata":       [],
-        "used_card_signatures":         [],
-        "coverage_summary":             "{}",
-        "budget": {"input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0},
-    }
+    initial_state = _base_initial_state(
+        request, project_id, source_ids, num_cards, batch_size,
+        use_voyage, is_essential, job_id, run_id, user_id,
+    )
     config = {
         "configurable": {"thread_id": thread_id or f"flashcard-agent-{job_id or 'local'}"}
     }
-
     async with _checkpointer_ctx() as checkpointer:
         graph = _build_graph(checkpointer)
         return await graph.ainvoke(initial_state, config=config)
@@ -226,43 +193,18 @@ async def run_flashcard_agent_stream(
     """
     Stream partial state updates from the flashcard agent.
 
-    Yields state snapshots as each node completes.  Monitor
-    state.get("current_batch_index") for batch progress and
-    state.get("accepted_card_ids") for accumulating IDs.
-
-    Usage:
-        async for state in run_flashcard_agent_stream(...):
-            accepted = len(state.get("accepted_card_ids") or [])
-            print(f"Cards committed so far: {accepted}")
-            if state.get("final_output"):
-                break
+    Monitor state.get("accepted_card_ids") for accumulating card IDs
+    as parallel batches complete.
     """
-    initial_state = {
-        "request":        request,
-        "project_id":     project_id,
-        "source_ids":     source_ids,
-        "num_cards":      num_cards,
-        "batch_size":     batch_size,
-        "use_voyage":     use_voyage,
-        "is_essential":   is_essential,
-        "job_id":         job_id or "",
-        "run_id":         run_id or "",
-        "user_id":        user_id or "",
-        "source_profiles":              [],
-        "current_batch_index":          0,
-        "batch_revision_count":         0,
-        "accepted_card_ids":            [],
-        "rejected_card_metadata":       [],
-        "used_card_signatures":         [],
-        "coverage_summary":             "{}",
-        "budget": {"input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0},
-    }
+    initial_state = _base_initial_state(
+        request, project_id, source_ids, num_cards, batch_size,
+        use_voyage, is_essential, job_id, run_id, user_id,
+    )
     config = {
         "configurable": {
             "thread_id": thread_id or f"flashcard-agent-stream-{job_id or 'local'}"
         }
     }
-
     async with _checkpointer_ctx() as checkpointer:
         graph = _build_graph(checkpointer)
         async for event in graph.astream(initial_state, config=config, stream_mode="values"):

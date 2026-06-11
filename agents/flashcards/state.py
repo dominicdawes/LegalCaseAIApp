@@ -3,12 +3,11 @@
 Typed state for the flashcard LangGraph agent.
 
 Design: thin-state pattern — full card text lives in the DB; state carries
-IDs, short signatures, and small metadata only.  In-flight batch fields are
-cleared by batch_commit before the next iteration so the context window stays
-bounded regardless of deck size.
+IDs, short signatures, and small metadata only.
 
 Parallel fan-out fields use Annotated[List[T], operator.add] so LangGraph
-concatenates branch results instead of last-writer-wins.
+concatenates branch results instead of last-writer-wins.  This applies to
+both the source_profiler fan-out AND the parallel process_batch fan-out.
 """
 
 import operator
@@ -24,7 +23,7 @@ class FlashcardSourceProfile(TypedDict):
     source_type: str           # case_opinion | casebook_excerpt | class_notes |
                                # attack_outline | doctrine_summary | statute | other
     document_summary: str
-    identified_cases: List[str]   # case name strings (e.g. "Palsgraf v. Long Island RR")
+    identified_cases: List[str]
     key_concepts: List[str]
     key_rules: List[str]
 
@@ -33,10 +32,10 @@ class FlashcardSourceProfile(TypedDict):
 
 class FlashcardCardSpec(TypedDict):
     spec_index: int            # global 0-based index across all batches
-    card_type: str             # e.g. "RULE_RECALL", "FACT_CHANGE_HYPO"
-    source_ids: List[str]      # which sources to draw from for this card
-    case_names: List[str]      # which cases to reference
-    topic: str                 # specific concept / rule / case for this card
+    card_type: str
+    source_ids: List[str]
+    case_names: List[str]
+    topic: str
     difficulty: str            # "recall" | "application" | "analysis"
 
 
@@ -50,9 +49,9 @@ class FlashcardBatchSpec(TypedDict):
 class DraftFlashcard(TypedDict):
     spec_index: int
     card_type: str
-    front_content: str         # the question / prompt side
-    back_content: str          # the answer / explanation side
-    hint: str                  # optional memory aid (one short sentence)
+    front_content: str
+    back_content: str
+    hint: str
     source_refs: List[str]     # chunk_ids used for grounding
     grounding_verdict: str     # "" | "pass" | "warn" | "fail"
     grounding_notes: str
@@ -62,12 +61,22 @@ class DraftFlashcard(TypedDict):
 
 class FlashcardBatchEvaluation(TypedDict):
     batch_index: int
-    passes: bool
-    scores: Dict[str, float]          # vagueness, uniqueness, source_support,
-                                      # atomic_focus, answer_quality
+    passes: bool                            # True if ≥80% of cards pass individually
+    scores: Dict[str, float]               # batch-level: uniqueness only
+    batch_uniqueness_ok: bool
     rejection_reasons: List[str]
     revision_instructions: List[str]
-    card_verdicts: List[Dict[str, Any]]   # [{spec_index, passes, reason}, ...]
+    # Per-card evaluations: {spec_index, passes, scores:{vagueness,atomic_focus,answer_quality},
+    #                        source_grounding_notes, reason}
+    card_verdicts: List[Dict[str, Any]]
+
+
+# ── Parallel batch result (returned by process_batch fan-out) ─────────────────
+
+class BatchResult(TypedDict):
+    batch_index: int
+    card_ids: List[str]
+    coverage: Dict[str, int]   # card_type → count for this batch
 
 
 # ── Full agent state ───────────────────────────────────────────────────────────
@@ -77,43 +86,49 @@ class AgentState(TypedDict):
     request: str
     project_id: str
     source_ids: List[str]
-    num_cards: int             # total flashcards to generate (default 10)
-    batch_size: int            # cards per batch (default 5, max 10)
-    is_essential: NotRequired[bool]    # forwarded to notes row
+    num_cards: int
+    batch_size: int
+    is_essential: NotRequired[bool]
     use_voyage: NotRequired[bool]
 
     # ── ledger identifiers ────────────────────────────────────────────────────
-    job_id: NotRequired[str]   # notes.id — deck container; individual_cards.deck_id FK
+    job_id: NotRequired[str]
     run_id: NotRequired[str]
-    user_id: NotRequired[str]  # auth.users.id — required for individual_cards.user_id FK
+    user_id: NotRequired[str]
 
-    # ── parallel fan-out accumulator (operator.add reducer) ───────────────────
+    # ── parallel fan-out accumulators (operator.add reducer) ──────────────────
     source_profiles: Annotated[List[FlashcardSourceProfile], operator.add]
 
+    # Per-batch parallel fan-out results (process_batch → global_deck_critic)
+    accepted_card_ids:      Annotated[List[str], operator.add]
+    used_card_signatures:   Annotated[List[str], operator.add]
+    rejected_card_metadata: Annotated[List[Dict[str, Any]], operator.add]
+    batch_results:          Annotated[List[BatchResult], operator.add]
+
     # ── sequential pipeline outputs ───────────────────────────────────────────
-    concept_inventory: NotRequired[str]    # JSON: extracted atoms per source
-    concept_synthesis: NotRequired[str]    # JSON: cross-doc throughlines
+    concept_inventory: NotRequired[str]
+    concept_synthesis: NotRequired[str]
     batch_specs: NotRequired[List[FlashcardBatchSpec]]
     num_batches: NotRequired[int]
 
-    # ── in-flight batch state (replaced each iteration by batch_commit) ───────
+    # ── Send payload: injected by card_blueprint_planner_to_batch ─────────────
+    current_batch_spec: NotRequired[FlashcardBatchSpec]
+
+    # ── legacy in-flight batch state (kept NotRequired for compat) ───────────
     current_batch_index: NotRequired[int]
     current_batch_drafts: NotRequired[List[DraftFlashcard]]
     current_batch_eval: NotRequired[Optional[FlashcardBatchEvaluation]]
-    batch_revision_count: NotRequired[int]     # reset to 0 by batch_commit
+    batch_revision_count: NotRequired[int]
 
-    # ── thin accumulators (batch_commit appends full list each iteration) ─────
-    accepted_card_ids: NotRequired[List[str]]           # individual_cards.id rows
-    rejected_card_metadata: NotRequired[List[Dict[str, Any]]]
-    used_card_signatures: NotRequired[List[str]]        # "TYPE:front[:40]" for dedup
-    coverage_summary: NotRequired[str]                  # JSON: {card_type: count}
+    # ── coverage (built from batch_results post-parallel) ────────────────────
+    coverage_summary: NotRequired[str]
 
     # ── post-loop global QA ───────────────────────────────────────────────────
     global_deck_report: NotRequired[str]
 
     # ── final output ──────────────────────────────────────────────────────────
     persisted_card_ids: NotRequired[List[str]]
-    final_output: NotRequired[str]            # markdown summary written to notes row
+    final_output: NotRequired[str]
 
     # ── budget tracking ───────────────────────────────────────────────────────
-    budget: NotRequired[Dict[str, Any]]       # {input_tokens, output_tokens, cost_usd}
+    budget: NotRequired[Dict[str, Any]]
