@@ -49,9 +49,8 @@ except ImportError:
         TypeError, AttributeError, NameError, KeyError, IndexError,
     )
 
-# ===== MACHINE LEARNING & TEXT PROCESSING =====  
+# ===== MACHINE LEARNING & TEXT PROCESSING =====
 import tiktoken
-from langchain_openai import OpenAIEmbeddings
 
 # ===== PROJECT MODULES =====
 from tasks.celery_app import celery_app, run_async_in_worker
@@ -563,13 +562,8 @@ class AsyncNoteManager:
     
     def _generate_embedding_sync(self, query: str) -> List[float]:
         """Synchronous embedding generation for thread pool"""
-        embedder = OpenAIEmbeddings(
-            model=OPENAI_EMBEDDING_MODEL,
-            api_key=OPENAI_API_KEY,
-            max_retries=3,
-            request_timeout=60
-        )
-        return embedder.embed_query(query)
+        from utils.llm_clients.voyage_client import VoyageEmbeddingsClient
+        return VoyageEmbeddingsClient().embed_query(query)
 
     async def _setup_llm_client_async(self, provider: str, model_name: str, temperature: float, max_output_tokens: int = 4056):
         """🆕 Async LLM client setup"""
@@ -600,13 +594,13 @@ class AsyncNoteManager:
             if source_ids:
                 uuid_list = [uuid.UUID(sid) for sid in source_ids]
                 rows = await conn.fetch(
-                    "SELECT * FROM match_document_chunks_hnsw($1, $2, $3, NULL, $4)",
+                    "SELECT * FROM match_document_chunks_hnsw($1, $2, $3, NULL, $4, NULL, true)",
                     project_id, vector_str, k, uuid_list,
                 )
                 logger.info(f"🎯 Subset retrieval ({len(source_ids)} docs): {len(rows)} chunks")
             else:
                 rows = await conn.fetch(
-                    "SELECT * FROM match_document_chunks_hnsw($1, $2, $3)",
+                    "SELECT * FROM match_document_chunks_hnsw($1, $2, $3, NULL, NULL, NULL, true)",
                     project_id, vector_str, k,
                 )
                 logger.info(f"🎯 Project-wide retrieval: {len(rows)} chunks")

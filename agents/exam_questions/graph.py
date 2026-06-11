@@ -54,11 +54,13 @@ async def _checkpointer_ctx():
         import os
         # Use the Supabase session-pooler (port 5432 on the pooler hostname) —
         # session mode supports prepared statements unlike transaction mode (6543).
-        # prepared_statement_cache_size=0 is required when going through PgBouncer.
+        # prepared_statement_cache_size=0 disables client-side statement caching,
+        # required when going through PgBouncer. Passed via DSN param since the
+        # from_conn_string kwarg API varies across langgraph-checkpoint-postgres versions.
         _dsn = (os.getenv("POSTGRES_DSN") or "").strip()
-        async with AsyncPostgresSaver.from_conn_string(
-            _dsn, prepared_statement_cache_size=0
-        ) as saver:
+        if "prepared_statement_cache_size" not in _dsn:
+            _dsn = _dsn.rstrip("/") + ("&" if "?" in _dsn else "?") + "prepared_statement_cache_size=0"
+        async with AsyncPostgresSaver.from_conn_string(_dsn) as saver:
             await saver.setup()
             _setup_ok = True
             yield saver

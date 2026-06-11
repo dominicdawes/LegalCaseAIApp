@@ -1075,7 +1075,7 @@ async def final_drafter(state: AgentState) -> Dict:
             f'  "call_of_question" — polished call of the question (str)\n'
             f'  "answer_key"       — polished answer key (str)\n'
         )
-        raw = await _llm("orchestrator", prompt, system=system, max_tokens=3000)
+        raw = await _llm("orchestrator", prompt, system=system, max_tokens=3000, thinking=False)
         try:
             patch = _parse_json(raw)
             updated = dict(q)
