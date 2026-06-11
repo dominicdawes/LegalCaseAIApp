@@ -50,7 +50,7 @@ async def _checkpointer_ctx():
     _setup_ok = False
     try:
         from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
-        _dsn = (os.getenv("POSTGRES_DSN") or "").strip()
+        _dsn = (os.getenv("POSTGRES_DSN_SESSION") or "").strip()
         async with AsyncPostgresSaver.from_conn_string(_dsn) as saver:
             await saver.setup()
             _setup_ok = True
