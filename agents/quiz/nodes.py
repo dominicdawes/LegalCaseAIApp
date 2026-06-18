@@ -622,8 +622,8 @@ async def quiz_blueprint_planner(state: AgentState) -> Dict:
         type_pool = MC_RECALL_TYPES + MC_APPLICATION_TYPES * 2 + MC_ANALYSIS_TYPES * 2
 
     cases_brief = [
-        {"case_id": e["case_id"], "case_name": e["case_name"],
-         "source_id": e["source_id"], "holding": e["holding"][:150]}
+        {"case_id": e.get("case_id") or "", "case_name": e.get("case_name") or "",
+         "source_id": e.get("source_id") or "", "holding": (e.get("holding") or "")[:150]}
         for e in extracts[:12]
     ]
     source_ids = [p["source_id"] for p in profiles]
