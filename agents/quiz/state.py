@@ -130,17 +130,21 @@ class AgentState(TypedDict):
     batch_specs:        NotRequired[List[BatchSpec]]
     num_batches:        NotRequired[int]
 
-    # ── in-flight batch state (replaced each iteration) ──────────────────────
+    # ── in-flight batch state (used inside process_batch's synthetic serial state) ─
     current_batch_index:  NotRequired[int]
     current_batch_drafts: NotRequired[List[DraftQuizQuestion]]
     current_batch_eval:   NotRequired[Optional[BatchEvaluation]]
-    batch_revision_count: NotRequired[int]   # reset to 0 by batch_commit each iteration
+    batch_revision_count: NotRequired[int]
+    current_batch_spec:   NotRequired[Any]   # BatchSpec passed via Send
 
-    # ── thin accumulators (batch_commit appends full list each iteration) ─────
-    accepted_question_ids:     NotRequired[List[str]]   # quiz_questions.id rows
-    rejected_question_metadata: NotRequired[List[Dict[str, Any]]]
-    used_question_signatures:  NotRequired[List[str]]   # "TYPE:stem[:40]" for dedup
-    coverage_summary:          NotRequired[str]         # JSON: {question_type: count, ...}
+    # ── parallel fan-out accumulators (operator.add reducer) ─────────────────
+    accepted_question_ids:      Annotated[List[str], operator.add]
+    rejected_question_metadata: Annotated[List[Dict[str, Any]], operator.add]
+    used_question_signatures:   Annotated[List[str], operator.add]
+    batch_results:              Annotated[List[Dict[str, Any]], operator.add]
+
+    # ── derived summary (computed in critic/final_formatter from batch_results) ─
+    coverage_summary: NotRequired[str]
 
     # ── post-loop QA ──────────────────────────────────────────────────────────
     critic_report: NotRequired[str]

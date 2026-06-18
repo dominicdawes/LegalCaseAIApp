@@ -5,24 +5,18 @@ LangGraph StateGraph for the quiz agent.
 Graph topology:
   head_orchestrator → [Send → source_profiler ×N] → case_rule_extractor
   case_rule_extractor → cross_doc_concepts_synthesis → quiz_blueprint_planner
-  quiz_blueprint_planner → question_drafter  ← ─────────────────────────┐
-  question_drafter → false_trap_red_herring_generator                    │
-  false_trap_red_herring_generator → question_evaluator                  │
-  question_evaluator → (should_revise_batch?)                            │
-      → reviser → question_evaluator  (revision loop, max 2 passes)      │
-      → grounder → batch_commit                                           │
-  batch_commit → (batch_router?) ─────────────────────────────────────── ┘
-      → critic → final_formatter → END
+  quiz_blueprint_planner → [Send → process_batch ×N_batches]   ← parallel fan-out
+  process_batch (×N, parallel) → critic                         ← merge point
+  critic → final_formatter → END
 
-Batch loop:
-  batch_commit increments current_batch_index.
-  batch_router routes back to question_drafter while batches remain and
-  accepted_count < num_questions; otherwise routes to critic.
-
-Revision loop:
-  should_revise_batch routes to reviser when current_batch_eval.passes is
-  False AND batch_revision_count < 2; otherwise routes to grounder.
-  reviser increments batch_revision_count on each pass.
+Phase 2 — Parallel batch execution:
+  quiz_blueprint_planner fans out all batches simultaneously via Send.
+  Each process_batch runs internally:
+    question_drafter (worker_mid) →
+    false_trap_red_herring_generator (worker_mid, parallel per-question) →
+    question_evaluator → reviser loop (max 2) → grounder → DB write.
+  Results accumulate into accepted_question_ids, rejected_question_metadata,
+  used_question_signatures, batch_results via operator.add reducers.
 
 Enabled via USE_QUIZ_AGENT env var (default: false).
 """
@@ -81,14 +75,8 @@ def _build_graph(checkpointer):
         case_rule_extractor,
         cross_doc_concepts_synthesis,
         quiz_blueprint_planner,
-        question_drafter,
-        false_trap_red_herring_generator,
-        question_evaluator,
-        should_revise_batch,
-        reviser,
-        grounder,
-        batch_commit,
-        batch_router,
+        quiz_blueprint_planner_to_batch,
+        process_batch,
         critic,
         final_formatter,
     )
@@ -96,58 +84,28 @@ def _build_graph(checkpointer):
     builder = StateGraph(AgentState)
 
     # ── nodes ──────────────────────────────────────────────────────────────────
-    builder.add_node("head_orchestrator",               head_orchestrator)
-    builder.add_node("source_profiler",                 source_profiler)
-    builder.add_node("case_rule_extractor",             case_rule_extractor)
-    builder.add_node("cross_doc_concepts_synthesis",    cross_doc_concepts_synthesis)
-    builder.add_node("quiz_blueprint_planner",          quiz_blueprint_planner)
-    builder.add_node("question_drafter",                question_drafter)
-    builder.add_node("false_trap_red_herring_generator", false_trap_red_herring_generator)
-    builder.add_node("question_evaluator",              question_evaluator)
-    builder.add_node("reviser",                         reviser)
-    builder.add_node("grounder",                        grounder)
-    builder.add_node("batch_commit",                    batch_commit)
-    builder.add_node("critic",                          critic)
-    builder.add_node("final_formatter",                 final_formatter)
+    builder.add_node("head_orchestrator",            head_orchestrator)
+    builder.add_node("source_profiler",              source_profiler)
+    builder.add_node("case_rule_extractor",          case_rule_extractor)
+    builder.add_node("cross_doc_concepts_synthesis", cross_doc_concepts_synthesis)
+    builder.add_node("quiz_blueprint_planner",       quiz_blueprint_planner)
+    builder.add_node("process_batch",                process_batch)
+    builder.add_node("critic",                       critic)
+    builder.add_node("final_formatter",              final_formatter)
 
     # ── entry ──────────────────────────────────────────────────────────────────
     builder.set_entry_point("head_orchestrator")
 
     # ── Phase 1: Source understanding ─────────────────────────────────────────
-    # head_orchestrator → parallel source_profiler (one per source document)
     builder.add_conditional_edges("head_orchestrator", head_orchestrator_to_profiler)
-
-    # All source_profiler branches merge into case_rule_extractor
-    builder.add_edge("source_profiler", "case_rule_extractor")
-
-    builder.add_edge("case_rule_extractor",          "cross_doc_concepts_synthesis")
+    builder.add_edge("source_profiler",          "case_rule_extractor")
+    builder.add_edge("case_rule_extractor",      "cross_doc_concepts_synthesis")
     builder.add_edge("cross_doc_concepts_synthesis", "quiz_blueprint_planner")
 
-    # ── Phase 2: Batch loop entry ─────────────────────────────────────────────
-    builder.add_edge("quiz_blueprint_planner", "question_drafter")
-
-    # ── Batch pipeline ────────────────────────────────────────────────────────
-    builder.add_edge("question_drafter", "false_trap_red_herring_generator")
-    builder.add_edge("false_trap_red_herring_generator", "question_evaluator")
-
-    # question_evaluator → conditional: reviser or grounder
-    builder.add_conditional_edges(
-        "question_evaluator",
-        should_revise_batch,
-        {"reviser": "reviser", "grounder": "grounder"},
-    )
-
-    # Revision loop: reviser loops back to question_evaluator (max 2 via batch_revision_count)
-    builder.add_edge("reviser", "question_evaluator")
-
-    builder.add_edge("grounder", "batch_commit")
-
-    # Batch loop: batch_commit routes back to question_drafter or advances to critic
-    builder.add_conditional_edges(
-        "batch_commit",
-        batch_router,
-        {"question_drafter": "question_drafter", "critic": "critic"},
-    )
+    # ── Phase 2: Parallel batch fan-out ───────────────────────────────────────
+    # All batches run concurrently; results merge into critic via operator.add
+    builder.add_conditional_edges("quiz_blueprint_planner", quiz_blueprint_planner_to_batch)
+    builder.add_edge("process_batch", "critic")
 
     # ── Phase 3: Final QA + formatting ────────────────────────────────────────
     builder.add_edge("critic",          "final_formatter")
@@ -206,15 +164,12 @@ async def run_quiz_agent(
         "job_id":             job_id or "",
         "run_id":             run_id or "",
         "user_id":            user_id or "",
-        # Annotated accumulator — must be initialised before parallel fan-out
-        "source_profiles":    [],
-        # Batch loop initial state
-        "current_batch_index":  0,
-        "batch_revision_count": 0,
-        "accepted_question_ids":      [],
+        # Annotated operator.add accumulators — must be initialised before fan-outs
+        "source_profiles":          [],
+        "accepted_question_ids":    [],
         "rejected_question_metadata": [],
-        "used_question_signatures":   [],
-        "coverage_summary":           "{}",
+        "used_question_signatures": [],
+        "batch_results":            [],
         "budget": {"input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0},
     }
     config = {"configurable": {"thread_id": thread_id or f"quiz-agent-{job_id or 'local'}"}}
@@ -264,13 +219,11 @@ async def run_quiz_agent_stream(
         "job_id":             job_id or "",
         "run_id":             run_id or "",
         "user_id":            user_id or "",
-        "source_profiles":    [],
-        "current_batch_index":  0,
-        "batch_revision_count": 0,
-        "accepted_question_ids":      [],
+        "source_profiles":          [],
+        "accepted_question_ids":    [],
         "rejected_question_metadata": [],
-        "used_question_signatures":   [],
-        "coverage_summary":           "{}",
+        "used_question_signatures": [],
+        "batch_results":            [],
         "budget": {"input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0},
     }
     config = {

@@ -1,6 +1,6 @@
 # agents/quiz/nodes.py
 """
-All 13 nodes + 3 routing helpers for the quiz LangGraph agent.
+All nodes + routing helpers for the quiz LangGraph agent.
 
 Node index (in execution order):
   1.  head_orchestrator              — worker_mid; validate inputs, select quiz mode
@@ -8,19 +8,22 @@ Node index (in execution order):
   3.  case_rule_extractor            — orchestrator; structured extraction per identified case
   4.  cross_doc_concepts_synthesis   — worker_mid; doctrine clusters, confusables, traps
   5.  quiz_blueprint_planner         — worker_mid; create all batch_specs with question allocations
-  6.  question_drafter               — orchestrator; draft 5 MCQ stems + answer skeletons per batch
-  7.  false_trap_red_herring_generator — orchestrator; enrich distractors with type + feedback
-  8.  question_evaluator             — worker_mid; batch-level pedagogical QA scoring
-  9.  reviser                        — orchestrator; fix failing questions (max 2 passes per batch)
-  10. grounder                       — worker_low; verify question/answer claims against source
-  11. batch_commit                   — tool_only; write accepted questions to DB, update progress
-  12. critic                         — worker_low; global diversity + coverage check
-  13. final_formatter                — worker_low; update parent notes row, return summary
+  6.  process_batch                  — orchestrator; parallel fan-out node: runs the full
+                                       per-batch pipeline (nodes 6a–6e) for each batch concurrently
+      6a. question_drafter           — worker_mid; draft 5 MCQ stems + answer skeletons
+      6b. false_trap_red_herring_generator — worker_mid; enrich distractors (parallel per-question)
+      6c. question_evaluator         — worker_mid; batch-level pedagogical QA scoring
+      6d. reviser                    — orchestrator; fix failing questions (max 2 passes)
+      6e. grounder                   — worker_low; verify claims against source
+      6f. batch_commit               — tool_only; write accepted questions to DB
+  7.  critic                         — worker_low; global diversity + coverage check
+  8.  final_formatter                — worker_low; update parent notes row, return summary
 
 Routing helpers (not nodes):
-  head_orchestrator_to_profiler — Send per source_id
-  should_revise_batch           — "reviser" | "grounder"
-  batch_router                  — "question_drafter" | "critic"
+  head_orchestrator_to_profiler      — Send per source_id
+  quiz_blueprint_planner_to_batch    — Send per batch_spec (parallel fan-out)
+  should_revise_batch                — "reviser" | "grounder" (used inside process_batch)
+  batch_router                       — legacy sequential router (kept but unused in parallel mode)
 """
 
 import asyncio
@@ -821,7 +824,7 @@ async def question_drafter(state: AgentState) -> Dict:
             "Draft the multiple-choice question."
         )
 
-        raw = await _llm("orchestrator", prompt, system=system, max_tokens=1500,
+        raw = await _llm("worker_mid", prompt, system=system, max_tokens=1500,
                          _node="question_drafter")
         try:
             data = _parse_json(raw)
@@ -909,29 +912,12 @@ question_drafter.default_worker_class = "orchestrator"
 async def false_trap_red_herring_generator(state: AgentState) -> Dict:
     """
     Enrich all wrong answers in the current batch with distractor_type and
-    feedback (pedagogical rationale).  Also writes feedback for the correct
-    answer.  Works over the full batch in one LLM call for efficiency.
+    feedback (pedagogical rationale).  Runs one parallel LLM call per question
+    (~700 tokens each) instead of one bulk call for the whole batch.
     """
     drafts = list(state.get("current_batch_drafts") or [])
     if not drafts:
         return {}
-
-    # Serialize batch for prompt
-    batch_payload = []
-    for d in drafts:
-        batch_payload.append({
-            "spec_index": d["spec_index"],
-            "question_type": d["question_type"],
-            "question_stem": d["question_stem"],
-            "answers": [
-                {
-                    "choice_letter": a["choice_letter"],
-                    "answer_text": a["answer_text"],
-                    "is_correct": a["is_correct"],
-                }
-                for a in d["answers"]
-            ],
-        })
 
     _node_start("false_trap_red_herring_generator", state,
                 n_drafts=len(drafts))
@@ -956,7 +942,7 @@ async def false_trap_red_herring_generator(state: AgentState) -> Dict:
         "     (b) Name the case or doctrine it derives from;\n"
         "     (c) Note any limiting conditions or scope restrictions (the 'unless/but').\n\n"
         f"Available distractor_type values: {DISTRACTOR_TYPES}\n\n"
-        "Return a JSON array — one object per question — each with:\n"
+        "Return a JSON object with:\n"
         '  "spec_index": int\n'
         '  "answers": [\n'
         '    {"choice_letter": str, "distractor_type": str, "feedback": str},\n'
@@ -965,27 +951,32 @@ async def false_trap_red_herring_generator(state: AgentState) -> Dict:
         "No extra text."
     )
 
-    prompt = (
-        f"Enrich the following {len(batch_payload)} quiz questions:\n\n"
-        f"{json.dumps(batch_payload, indent=2)}"
-    )
-
-    raw = await _llm("orchestrator", prompt, system=system, max_tokens=3500,
-                     _node="false_trap_red_herring_generator")
-    try:
-        enriched_batch = _parse_json(raw)
-        if not isinstance(enriched_batch, list):
-            raise ValueError
-        enriched_map = {item["spec_index"]: item for item in enriched_batch}
-    except Exception:
-        enriched_map = {}
-
-    updated_drafts = []
-    for draft in drafts:
-        enriched = enriched_map.get(draft["spec_index"])
-        if not enriched:
-            updated_drafts.append(draft)
-            continue
+    async def _enrich_one(draft: DraftQuizQuestion) -> DraftQuizQuestion:
+        payload = {
+            "spec_index": draft["spec_index"],
+            "question_type": draft["question_type"],
+            "question_stem": draft["question_stem"],
+            "answers": [
+                {
+                    "choice_letter": a["choice_letter"],
+                    "answer_text": a["answer_text"],
+                    "is_correct": a["is_correct"],
+                }
+                for a in draft["answers"]
+            ],
+        }
+        prompt = (
+            f"Enrich the following quiz question with distractor labels and feedback:\n\n"
+            f"{json.dumps(payload, indent=2)}"
+        )
+        try:
+            raw = await _llm("worker_mid", prompt, system=system, max_tokens=700,
+                             _node="false_trap_red_herring_generator")
+            enriched = _parse_json(raw)
+            if not isinstance(enriched, dict):
+                raise ValueError
+        except Exception:
+            return draft
 
         answer_enrichment = {
             a["choice_letter"]: a for a in (enriched.get("answers") or [])
@@ -998,15 +989,16 @@ async def false_trap_red_herring_generator(state: AgentState) -> Dict:
                 "distractor_type": patch.get("distractor_type", ans["distractor_type"]),
                 "feedback": patch.get("feedback", ans["feedback"]),
             })
+        return {**draft, "answers": new_answers}
 
-        updated_drafts.append({**draft, "answers": new_answers})
+    updated_drafts = list(await asyncio.gather(*[_enrich_one(d) for d in drafts]))
 
     _node_done("false_trap_red_herring_generator", state,
                n_enriched=len(updated_drafts))
     return {"current_batch_drafts": updated_drafts}
 
 
-false_trap_red_herring_generator.default_worker_class = "orchestrator"
+false_trap_red_herring_generator.default_worker_class = "worker_mid"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1464,6 +1456,104 @@ def batch_router(state: AgentState) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# 11b. process_batch  (parallel fan-out version of the batch pipeline)
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def process_batch(state: Dict) -> Dict:
+    """
+    Run the full batch pipeline for one batch spec in parallel with other batches.
+    Invoked via Send fan-out from quiz_blueprint_planner_to_batch.
+
+    Pipeline: question_drafter → false_trap_red_herring_generator
+              → question_evaluator → reviser loop (max 2) → grounder → DB write.
+
+    Uses a synthetic serial state so existing node functions need no changes.
+    Returns only the delta for this batch; operator.add reducers in AgentState
+    accumulate results across all parallel batches.
+    """
+    batch_spec = state.get("current_batch_spec") or {}
+    batch_idx = batch_spec.get("batch_index", 0)
+
+    # Isolated serial state — no cross-batch interference.
+    # current_batch_index=0 because batch_specs has exactly one entry at position 0.
+    serial: Dict = {
+        **state,
+        "current_batch_index":   0,
+        "batch_specs":           [batch_spec],
+        "current_batch_drafts":  [],
+        "current_batch_eval":    None,
+        "batch_revision_count":  0,
+        # Reset accumulators so batch_commit returns only this batch's delta
+        "accepted_question_ids":      [],
+        "rejected_question_metadata": [],
+        "used_question_signatures":   [],
+        "coverage_summary":           "{}",
+    }
+
+    # 1. Draft
+    serial = {**serial, **(await question_drafter(serial))}
+
+    # 2. Enrich distractors (parallel per-question inside the node)
+    serial = {**serial, **(await false_trap_red_herring_generator(serial))}
+
+    # 3. Evaluate → revise loop (max 2 revision passes)
+    for _ in range(3):
+        serial = {**serial, **(await question_evaluator(serial))}
+        if should_revise_batch(serial) != "reviser":
+            break
+        serial = {**serial, **(await reviser(serial))}
+
+    # 4. Ground
+    grounded = await grounder(serial)
+    serial = {**serial, **grounded}
+
+    # Capture grounded drafts before batch_commit clears them
+    grounded_drafts = serial.get("current_batch_drafts") or []
+    accepted_drafts = [d for d in grounded_drafts if d.get("grounding_verdict", "") != "fail"]
+
+    # 5. Write accepted questions to DB
+    commit_result = await batch_commit(serial)
+
+    new_question_ids = commit_result.get("accepted_question_ids") or []
+    new_rejected     = commit_result.get("rejected_question_metadata") or []
+    new_sigs         = commit_result.get("used_question_signatures") or []
+
+    # Coverage delta for this batch (merged by final_formatter via batch_results)
+    coverage_delta: Dict[str, int] = {}
+    for d in accepted_drafts:
+        qt = d.get("question_type", "UNKNOWN")
+        coverage_delta[qt] = coverage_delta.get(qt, 0) + 1
+
+    logger.info(
+        "process_batch[%d]: %d questions written, %d rejected",
+        batch_idx, len(new_question_ids), len(new_rejected),
+    )
+    return {
+        "accepted_question_ids":      new_question_ids,
+        "rejected_question_metadata": new_rejected,
+        "used_question_signatures":   new_sigs,
+        "batch_results": [{
+            "batch_index":  batch_idx,
+            "question_ids": new_question_ids,
+            "coverage":     coverage_delta,
+        }],
+    }
+
+
+process_batch.default_worker_class = "orchestrator"
+
+
+def quiz_blueprint_planner_to_batch(state: AgentState) -> List[Send]:
+    """Fan-out: one process_batch per batch spec (all run in parallel)."""
+    batch_specs = state.get("batch_specs") or []
+    logger.info("quiz: parallel fan-out → %d batches", len(batch_specs))
+    return [
+        Send("process_batch", {"current_batch_spec": bs, **state})
+        for bs in batch_specs
+    ]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # 12. critic
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -1475,11 +1565,18 @@ async def critic(state: AgentState) -> Dict:
     """
     sigs = state.get("used_question_signatures") or []
     accepted_count = len(state.get("accepted_question_ids") or [])
-    coverage_raw = state.get("coverage_summary") or "{}"
-    try:
-        coverage = json.loads(coverage_raw)
-    except Exception:
-        coverage = {}
+
+    # Compute coverage from batch_results (parallel mode) with fallback to coverage_summary
+    batch_results = state.get("batch_results") or []
+    coverage: Dict[str, int] = {}
+    for br in batch_results:
+        for qt, cnt in (br.get("coverage") or {}).items():
+            coverage[qt] = coverage.get(qt, 0) + cnt
+    if not coverage:
+        try:
+            coverage = json.loads(state.get("coverage_summary") or "{}")
+        except Exception:
+            coverage = {}
 
     num_questions = state.get("num_questions") or 10
     rejected_count = len(state.get("rejected_question_metadata") or [])
@@ -1570,10 +1667,17 @@ async def final_formatter(state: AgentState) -> Dict:
     _node_start("final_formatter", state,
                 n_accepted=len(accepted_ids), quiz_mode=quiz_mode)
 
-    try:
-        coverage = json.loads(coverage_raw)
-    except Exception:
-        coverage = {}
+    # Compute coverage from batch_results (parallel mode) with fallback to coverage_summary
+    batch_results_list = state.get("batch_results") or []
+    coverage: Dict[str, int] = {}
+    for br in batch_results_list:
+        for qt, cnt in (br.get("coverage") or {}).items():
+            coverage[qt] = coverage.get(qt, 0) + cnt
+    if not coverage:
+        try:
+            coverage = json.loads(coverage_raw)
+        except Exception:
+            coverage = {}
     try:
         critic_report = json.loads(critic_report_raw)
     except Exception:
