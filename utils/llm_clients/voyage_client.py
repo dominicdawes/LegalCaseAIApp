@@ -2,6 +2,7 @@
 
 import os
 import logging
+from functools import lru_cache
 from typing import List
 
 from dotenv import load_dotenv
@@ -67,3 +68,15 @@ class VoyageEmbeddingsClient:
         import asyncio
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(None, self.embed_query, text)
+
+
+@lru_cache(maxsize=None)
+def get_voyage_client(model: str = VOYAGE_MODEL,
+                      batch_size: int = _VOYAGE_MAX_BATCH) -> VoyageEmbeddingsClient:
+    """Return a shared VoyageEmbeddingsClient.
+
+    The client is stateless (an HTTP wrapper), so a single cached instance is reused
+    across fan-out branches instead of being reconstructed — and re-logging its
+    "ready" line — on every call.
+    """
+    return VoyageEmbeddingsClient(model=model, batch_size=batch_size)

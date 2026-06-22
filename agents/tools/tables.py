@@ -48,8 +48,8 @@ def build_table_tools(ctx: ToolContext) -> list:
 
         loop = asyncio.get_event_loop()
         if ctx.use_voyage:
-            from utils.llm_clients.voyage_client import VoyageEmbeddingsClient
-            client = VoyageEmbeddingsClient()
+            from utils.llm_clients.voyage_client import get_voyage_client
+            client = get_voyage_client()
             embedding = await loop.run_in_executor(None, client.embed_query, query)
         else:
             import httpx

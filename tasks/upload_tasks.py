@@ -1008,9 +1008,9 @@ def _create_smart_embedding_batches(chunks: List[str], metadatas: List[Dict]) ->
 
 async def _call_voyage_embeddings_async(texts: List[str]) -> List[List[float]]:
     """Voyage AI embeddings via voyage-law-2 (1024-dim). Called when USE_VOYAGE_EMBEDDINGS=true."""
-    from utils.llm_clients.voyage_client import VoyageEmbeddingsClient
+    from utils.llm_clients.voyage_client import get_voyage_client
     loop = asyncio.get_event_loop()
-    voyage = VoyageEmbeddingsClient()
+    voyage = get_voyage_client()
     try:
         return await loop.run_in_executor(None, voyage.embed_documents, texts)
     except Exception as e:

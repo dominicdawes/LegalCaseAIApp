@@ -573,8 +573,8 @@ class AsyncNoteManager:
     
     def _generate_embedding_sync(self, query: str) -> List[float]:
         """Synchronous embedding generation for thread pool"""
-        from utils.llm_clients.voyage_client import VoyageEmbeddingsClient
-        return VoyageEmbeddingsClient().embed_query(query)
+        from utils.llm_clients.voyage_client import get_voyage_client
+        return get_voyage_client().embed_query(query)
 
     async def _setup_llm_client_async(self, provider: str, model_name: str, temperature: float, max_output_tokens: int = 4056):
         """🆕 Async LLM client setup"""

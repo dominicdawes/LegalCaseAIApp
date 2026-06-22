@@ -31,6 +31,8 @@ import logging
 import re
 from typing import Any, Dict, List, Optional
 
+import httpx
+import openai
 from langgraph.types import Send
 
 from .state import (
@@ -65,6 +67,18 @@ MAX_REVISIONS = 2
 # isn't enough (e.g. burst of sequential nodes that together exceed the minute bucket).
 _LLM_RATE_LIMIT_RETRIES = 3   # additional attempts after the first 429
 _LLM_RATE_LIMIT_DELAY   = 60  # seconds to wait before each retry (linear: 60, 120, 180 s)
+
+# Transient network/stream failures worth retrying with a short backoff.
+# httpx.ReadError (seen crashing final_drafter) is a TransportError subclass; the
+# streaming path leaks the raw httpx error instead of wrapping it in an openai error.
+_RETRYABLE_NETWORK_ERRORS = (
+    httpx.TransportError,      # ReadError, ConnectError, WriteError, RemoteProtocolError, ...
+    httpx.TimeoutException,    # ReadTimeout, ConnectTimeout, PoolTimeout
+    openai.APIConnectionError,
+    openai.APITimeoutError,
+)
+_LLM_NETWORK_RETRIES    = 2    # short retries for transient network errors
+_LLM_NETWORK_DELAY      = 3    # seconds (linear: 3, 6)
 
 # DeepSeek has much higher RPM than Anthropic Tier 1 — allow up to 10 concurrent
 # calls instead of the 2 returned by the Anthropic-probe semaphore.
@@ -182,6 +196,15 @@ async def _llm(
                     logger.warning(
                         "🚦 [%s] Rate limit hit (429) — waiting %ds before retry %d/%d",
                         _node or worker_class, wait, attempt + 1, _LLM_RATE_LIMIT_RETRIES,
+                    )
+                    await asyncio.sleep(wait)
+                    continue
+                if isinstance(exc, _RETRYABLE_NETWORK_ERRORS) and attempt < _LLM_NETWORK_RETRIES:
+                    wait = _LLM_NETWORK_DELAY * (attempt + 1)
+                    logger.warning(
+                        "🌐 [%s] Transient network error (%s) — retry %d/%d after %ds",
+                        _node or worker_class, type(exc).__name__,
+                        attempt + 1, _LLM_NETWORK_RETRIES, wait,
                     )
                     await asyncio.sleep(wait)
                     continue

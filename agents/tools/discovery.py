@@ -130,14 +130,14 @@ def build_discovery_tools(ctx: ToolContext) -> list:
         Returns JSON array: [{source_id, filename, doc_summary, score}]
         """
         from utils.retrieval import find_docs
-        from utils.llm_clients.voyage_client import VoyageEmbeddingsClient
+        from utils.llm_clients.voyage_client import get_voyage_client
         import httpx
 
         k = max(1, min(k, 10))
 
         loop = asyncio.get_event_loop()
         if ctx.use_voyage:
-            client = VoyageEmbeddingsClient()
+            client = get_voyage_client()
             embedding = await loop.run_in_executor(None, client.embed_query, query)
         else:
             async with httpx.AsyncClient(timeout=30.0) as http:

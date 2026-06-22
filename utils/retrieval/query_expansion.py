@@ -183,8 +183,8 @@ async def _embed_queries(
     use_voyage = os.getenv("USE_VOYAGE_EMBEDDINGS", "false").lower() == "true"
 
     if use_voyage:
-        from utils.llm_clients.voyage_client import VoyageEmbeddingsClient
-        client = VoyageEmbeddingsClient()
+        from utils.llm_clients.voyage_client import get_voyage_client
+        client = get_voyage_client()
 
         async def _voyage_embed():
             return await loop.run_in_executor(None, client.embed_documents, remaining)

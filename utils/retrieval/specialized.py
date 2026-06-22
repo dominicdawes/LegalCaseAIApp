@@ -200,9 +200,9 @@ def _cosine_similarities(query: List[float], texts: List[str]) -> List[float]:
 
     async def _embed():
         if USE_VOYAGE_EMBEDDINGS:
-            from utils.llm_clients.voyage_client import VoyageEmbeddingsClient
+            from utils.llm_clients.voyage_client import get_voyage_client
             loop = asyncio.get_event_loop()
-            client = VoyageEmbeddingsClient()
+            client = get_voyage_client()
             return await loop.run_in_executor(None, client.embed_documents, texts)
         else:
             import httpx

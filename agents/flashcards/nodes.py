@@ -30,6 +30,8 @@ import uuid as _uuid_mod
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
+import httpx
+import openai
 from langgraph.types import Send
 
 from .constants import (
@@ -56,6 +58,18 @@ logger = logging.getLogger(__name__)
 _LLM_RATE_LIMIT_RETRIES = 3
 _LLM_RATE_LIMIT_DELAY   = 60   # seconds (linear: 60, 120, 180 s)
 _LLM_CALL_TIMEOUT       = 180  # seconds before a hung LLM call is aborted
+
+# Transient network/stream failures worth retrying with a short backoff.
+# httpx.ReadError (seen crashing final_drafter) is a TransportError subclass; the
+# streaming path leaks the raw httpx error instead of wrapping it in an openai error.
+_RETRYABLE_NETWORK_ERRORS = (
+    httpx.TransportError,      # ReadError, ConnectError, WriteError, RemoteProtocolError, ...
+    httpx.TimeoutException,    # ReadTimeout, ConnectTimeout, PoolTimeout
+    openai.APIConnectionError,
+    openai.APITimeoutError,
+)
+_LLM_NETWORK_RETRIES    = 2    # short retries for transient network errors
+_LLM_NETWORK_DELAY      = 3    # seconds (linear: 3, 6)
 
 _DEEPSEEK_SEMAPHORE: Optional[asyncio.Semaphore] = None
 
@@ -152,6 +166,15 @@ async def _llm(
                     logger.warning(
                         "🚦 [%s] Rate limit hit (429) — waiting %ds before retry %d/%d",
                         _node or worker_class, wait, attempt + 1, _LLM_RATE_LIMIT_RETRIES,
+                    )
+                    await asyncio.sleep(wait)
+                    continue
+                if isinstance(exc, _RETRYABLE_NETWORK_ERRORS) and attempt < _LLM_NETWORK_RETRIES:
+                    wait = _LLM_NETWORK_DELAY * (attempt + 1)
+                    logger.warning(
+                        "🌐 [%s] Transient network error (%s) — retry %d/%d after %ds",
+                        _node or worker_class, type(exc).__name__,
+                        attempt + 1, _LLM_NETWORK_RETRIES, wait,
                     )
                     await asyncio.sleep(wait)
                     continue

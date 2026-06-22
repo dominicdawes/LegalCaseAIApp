@@ -230,8 +230,8 @@ async def _build_section_summaries_async(source_id: str, project_id: str) -> Dic
     existing_paths = {r["section_path"] for r in existing}
 
     # ── 4. Generate summaries and embed ──────────────────────────────────
-    from utils.llm_clients.voyage_client import VoyageEmbeddingsClient
-    voyage = VoyageEmbeddingsClient()
+    from utils.llm_clients.voyage_client import get_voyage_client
+    voyage = get_voyage_client()
 
     new_sections: List[Dict] = []
 
