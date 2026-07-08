@@ -182,6 +182,7 @@ class ExportResult(TypedDict):
     export_batch_id: str
     question_sequences_exported: int
     answer_sequences_exported: int
+    questions_exported: int  # total Q/A pairs across all sequences (deterministic)
 
 
 # ── Full agent state ──────────────────────────────────────────────────────────

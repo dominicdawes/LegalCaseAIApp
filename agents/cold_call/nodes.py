@@ -453,7 +453,6 @@ async def source_profiler(state: Dict) -> Dict:
 
     source_id = state["source_id"]
     project_id = state["project_id"]
-
     tools = make_tools(
         project_id,
         source_ids=[source_id],
@@ -1918,10 +1917,16 @@ async def formatter_export_agent(state: AgentState) -> Dict:
     except Exception as outer_exc:
         logger.warning("formatter_export_agent DB export failed (non-fatal): %s", outer_exc)
 
+    # Deterministic count of Q/A pairs across all sequences (independent of
+    # whether the Supabase inserts above succeeded — every question has one
+    # answer slot, so this is the number of cold-call Q/A pairs produced).
+    total_questions = sum(len(seq.get("questions") or []) for seq in final_sequences)
+
     export_result: ExportResult = {
         "export_batch_id": export_batch_id,
         "question_sequences_exported": len(final_sequences),
         "answer_sequences_exported": len(answer_sequences),
+        "questions_exported": total_questions,
     }
 
     # ── Markdown summary for notes stub ──────────────────────────────────────

@@ -1704,6 +1704,7 @@ class AsyncNoteManager:
         ref_sources = [str(sid) for sid in source_ids] if source_ids else []
         export_result = final_state.get("export_result") or {}
         num_sequences = export_result.get("question_sequences_exported", 0)
+        num_questions = export_result.get("questions_exported", 0)
 
         async with get_db_connection() as conn:
             await conn.execute(
@@ -1714,16 +1715,17 @@ class AsyncNoteManager:
                     is_essential         = $3,
                     num_sources_based_on = $4,
                     referenced_sources   = $5::uuid[],
+                    num_questions        = $6,
                     note_progress_status = 'COMPLETE',
                     error_message        = NULL
-                WHERE id = $6
+                WHERE id = $7
                 """,
-                markdown, True, False, len(source_ids), ref_sources, note_id,
+                markdown, True, False, len(source_ids), ref_sources, num_questions, note_id,
             )
 
         logger.info(
             f"✅ Cold call agent completed for note {note_id[:8]}… "
-            f"({num_sequences} sequences exported)"
+            f"({num_sequences} sequences, {num_questions} Q/A pairs exported)"
         )
         return markdown
 
