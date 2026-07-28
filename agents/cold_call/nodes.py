@@ -1223,14 +1223,21 @@ def seeds_routing(state: AgentState) -> List[Send]:
             for case in cases
         ]
 
-    # Proceed to thread builders
+    # Proceed to thread builders. Assign a stable, gap-free sequence_index to
+    # each seed HERE, where the full ordered seed list exists. The builders run
+    # as a parallel Send fan-out, so they cannot derive their own index from
+    # len(socratic_sequences) — mid-fan-out that list is still empty for every
+    # worker, which would pin every sequence to index 1 (and collapse the seq_id
+    # suffix to _001 for all of them).
     sends = [
-        Send("socratic_thread_builder", {"seed": seed, **state})
-        for seed in approved_seeds
+        Send("socratic_thread_builder", {"seed": {**seed, "sequence_index": idx}, **state})
+        for idx, seed in enumerate(approved_seeds, start=1)
     ]
 
-    # Also fan-out compare/distinguish prompts as extra thread seeds
+    # Also fan-out compare/distinguish prompts as extra thread seeds, continuing
+    # the sequence_index numbering.
     cmp_prompts = state.get("compare_distinguish_prompts") or []
+    next_idx = len(sends) + 1
     for cmp in cmp_prompts[:max(0, requested - len(approved_seeds))]:
         synthetic_seed: Seed = {
             "seed_id": f"seed_cmp_{cmp['comparison_id']}",
@@ -1241,7 +1248,8 @@ def seeds_routing(state: AgentState) -> List[Send]:
             "target_skill": "compare-and-distinguish two cases",
             "difficulty": "deep",
         }
-        sends.append(Send("socratic_thread_builder", {"seed": synthetic_seed, **state}))
+        sends.append(Send("socratic_thread_builder", {"seed": {**synthetic_seed, "sequence_index": next_idx}, **state}))
+        next_idx += 1
 
     logger.info("cold_call x%d node fan out for socratic_thread_builder", len(sends))
     return sends
@@ -1361,7 +1369,9 @@ async def socratic_thread_builder(state: Dict) -> Dict:
     except Exception:
         questions_raw = []
 
-    seq_idx = len(state.get("socratic_sequences") or []) + 1
+    # Index assigned deterministically at fan-out (see seeds_routing). Fall back
+    # to the old best-effort count only if a seed somehow arrives without one.
+    seq_idx = seed.get("sequence_index") or (len(state.get("socratic_sequences") or []) + 1)
     seq_id = f"seq_{case_id}_{seed.get('seed_id', 'unknown')}_{seq_idx:03d}"
 
     questions: List[SequenceQuestion] = []
@@ -1828,6 +1838,14 @@ async def formatter_export_agent(state: AgentState) -> Dict:
                 seq_id = seq["sequence_id"]
                 ans_seq = answer_by_seq.get(seq_id, {"sequence_id": seq_id, "answers": []})
 
+                # Row IDs must be unique per run. `seq_id` is content-deterministic
+                # (case_id + seed_id + sequence_index) and omits the run, so
+                # regenerating cold-calls for a previously-generated case yields
+                # identical IDs and every `ON CONFLICT (id) DO NOTHING` silently
+                # no-ops — the note stub is written (fresh UUID) but no sequence /
+                # question / answer rows are ever added. Scope IDs to the run.
+                db_seq_id = f"{seq_id}__{export_batch_id[:8]}"
+
                 # Insert cold_call_sequences row
                 try:
                     await conn.execute(
@@ -1840,7 +1858,7 @@ async def formatter_export_agent(state: AgentState) -> Dict:
                         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,NOW())
                         ON CONFLICT (id) DO NOTHING
                         """,
-                        seq_id,
+                        db_seq_id,
                         export_batch_id,
                         note_id or None,
                         state.get("user_id") or None,
@@ -1870,8 +1888,8 @@ async def formatter_export_agent(state: AgentState) -> Dict:
                             ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,NOW())
                             ON CONFLICT (id) DO NOTHING
                             """,
-                            f"q_{seq_id}_{q.get('question_id', '')}",
-                            seq_id,
+                            f"q_{db_seq_id}_{q.get('question_id', '')}",
+                            db_seq_id,
                             export_batch_id,
                             q.get("question_id", ""),
                             q.get("question_index", 0),
@@ -1900,8 +1918,8 @@ async def formatter_export_agent(state: AgentState) -> Dict:
                             ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,NOW())
                             ON CONFLICT (id) DO NOTHING
                             """,
-                            f"a_{seq_id}_{ans.get('question_id', '')}",
-                            seq_id,
+                            f"a_{db_seq_id}_{ans.get('question_id', '')}",
+                            db_seq_id,
                             export_batch_id,
                             ans.get("question_id", ""),
                             ans.get("model_answer", ""),

@@ -190,7 +190,7 @@ async def run_cold_call_agent(
     request: str,
     project_id: str,
     source_ids: List[str],
-    requested_sequence_count: int = 5,
+    requested_sequence_count: int = 3,
     target_difficulty: str = "day_one_t14",
     use_voyage: bool = False,
     thread_id: Optional[str] = None,
@@ -206,7 +206,7 @@ async def run_cold_call_agent(
         request                 — user request string
         project_id              — Supabase project UUID
         source_ids              — list of document_sources UUIDs to scope retrieval
-        requested_sequence_count — number of question sequences to generate (default 5)
+        requested_sequence_count — number of question sequences to generate (default 3)
         target_difficulty       — 'law_1l' | 'day_one_t14' | 'advanced'
         use_voyage              — True if documents were ingested with voyage-law-2
         thread_id               — LangGraph checkpoint thread ID
@@ -251,7 +251,7 @@ async def run_cold_call_agent_stream(
     request: str,
     project_id: str,
     source_ids: List[str],
-    requested_sequence_count: int = 5,
+    requested_sequence_count: int = 3,
     target_difficulty: str = "day_one_t14",
     use_voyage: bool = False,
     thread_id: Optional[str] = None,

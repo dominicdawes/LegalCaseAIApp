@@ -1629,7 +1629,7 @@ class AsyncNoteManager:
             )
 
         source_ids = addtl_params.get("source_ids") or []
-        requested_sequence_count = int(addtl_params.get("num_sequences", 5))
+        requested_sequence_count = int(addtl_params.get("num_sequences", 3))
         target_difficulty = addtl_params.get("target_difficulty", "day_one_t14")
 
         # If no explicit source_ids, fetch all for the project
