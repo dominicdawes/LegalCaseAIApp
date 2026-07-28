@@ -12,7 +12,7 @@ Node index (in execution order):
   7.  question_type_bank_selector  — worker_mid; selects question types for this run
   8.  cold_call_seed_generator     — orchestrator; generates N diverse seeds per case (parallel Send)
   9.  seed_diversity_agent         — worker_mid; checks diversity, approves seeds (merge + retry gate)
-  10. socratic_thread_builder      — orchestrator; builds 8-deep question sequence per seed (parallel Send)
+  10. socratic_thread_builder      — orchestrator; builds 5-deep question sequence per seed (parallel Send)
   11. socratic_answer_agent        — orchestrator; generates Because/Unless/But answers per sequence (parallel Send)
   12. grounder_agent               — worker_mid; verifies answer grounding per sequence (parallel Send)
   13. critic_coverage_agent        — orchestrator; coverage QA, difficulty labelling (merge point)
@@ -74,10 +74,12 @@ MAX_SEED_RETRIES = 2
 DIVERSITY_THRESHOLD = 0.65
 SEEDS_PER_CASE_MULTIPLIER = 3   # generate 3× requested count per case; diversity agent prunes
 
-# Question depth buckets by label position in the A-I sequence
+# Question depth buckets by label position in the A-E sequence.
+# Extra letters (F-I) are a fallback for any run where the LLM over-generates.
 DEPTH_MAP = {
     "A": "early", "B": "early",
-    "C": "middle", "D": "middle", "E": "middle",
+    "C": "middle",
+    "D": "deep", "E": "deep",
     "F": "deep", "G": "deep", "H": "deep", "I": "deep",
 }
 
@@ -393,7 +395,7 @@ async def head_orchestrator(state: AgentState) -> Dict:
     raw = await _llm(
         "orchestrator",
         f"Sources available:\n{sources_json}\n\nUser request: {state['request']}\n"
-        f"Requested sequences: {state.get('requested_sequence_count', 5)}\n"
+        f"Requested sequences: {state.get('requested_sequence_count', 3)}\n"
         f"Target difficulty: {state.get('target_difficulty', 'day_one_t14')}",
         system=system,
         max_tokens=node_max_tokens,
@@ -407,7 +409,7 @@ async def head_orchestrator(state: AgentState) -> Dict:
         job_plan = {
             "job_type": "cold_call",
             "source_ids": state["source_ids"],
-            "requested_sequence_count": state.get("requested_sequence_count", 5),
+            "requested_sequence_count": state.get("requested_sequence_count", 3),
             "target_difficulty": state.get("target_difficulty", "day_one_t14"),
             "course_context": "",
             "coverage_mode": "single_case",
@@ -685,7 +687,7 @@ async def case_rule_extractor(state: Dict) -> Dict:
     system = (
         "You are a T-14 law professor extracting a complete structured case analysis for "
         "cold-call question generation. Your extraction must be thorough enough to support "
-        "8-deep Socratic questioning — from direct fact comprehension through rule boundary "
+        "5-deep Socratic questioning — from direct fact comprehension through rule boundary "
         "testing and policy analysis.\n\n"
         "T-14 EXTRACTION REQUIREMENTS:\n"
         "• legally_relevant_facts: identify ONLY the facts the court's rule actually hinges on "
@@ -1028,7 +1030,7 @@ async def cold_call_seed_generator(state: Dict) -> Dict:
     diversity agent a larger pool to draw from.
     """
     case_obj: CaseRuleObject = state.get("case_obj") or (state.get("case_rule_objects") or [{}])[0]
-    requested = state.get("requested_sequence_count", 5)
+    requested = state.get("requested_sequence_count", 3)
     q_selection: QuestionTypeSelection = state.get("question_type_selection") or {
         "selected_question_types": {"early": [], "middle": [], "deep": []},
         "required_types": [],
@@ -1124,7 +1126,7 @@ async def seed_diversity_agent(state: AgentState) -> Dict:
     requested_sequence_count seeds. Increment seed_attempt_count for retry tracking.
     """
     all_seeds = state.get("seeds") or []
-    requested = state.get("requested_sequence_count", 5)
+    requested = state.get("requested_sequence_count", 3)
     attempt = (state.get("seed_attempt_count") or 0) + 1
 
     if not all_seeds:
@@ -1205,7 +1207,7 @@ def seeds_routing(state: AgentState) -> List[Send]:
     Also injects compare/distinguish prompts as synthetic thread seeds.
     """
     approved_seeds = state.get("approved_seeds") or []
-    requested = state.get("requested_sequence_count", 5)
+    requested = state.get("requested_sequence_count", 3)
     attempt = state.get("seed_attempt_count") or 1
     cases = state.get("case_rule_objects") or []
 
@@ -1261,14 +1263,14 @@ def seeds_routing(state: AgentState) -> List[Send]:
 
 async def socratic_thread_builder(state: Dict) -> Dict:
     """
-    Build a full 8-deep Socratic question sequence (1A–1H) from one seed.
+    Build a full 5-deep Socratic question sequence (1A–1E) from one seed.
     Depth progression:
       A,B → early (direct comprehension, reasoning chain)
-      C,D,E → middle (fact probe, holding vs dicta, hypo)
-      F,G,H → deep (rule boundary, counterargument/losing side, policy/exam)
+      C → middle (fact-change hypothetical)
+      D,E → deep (rule boundary, counterargument/policy/exam)
     Includes inline hypothetical generation for the FACT_CHANGE_HYPO slot.
     """
-    node_max_tokens = 4000
+    node_max_tokens = 2500
     seed: Seed = state["seed"]
     case_id = seed.get("case_id", "")
     case_obj = next(
@@ -1293,29 +1295,25 @@ async def socratic_thread_builder(state: Dict) -> Dict:
         "You are a T-14 law professor building a Socratic cold-call question sequence. "
         "The sequence must escalate methodically — each question should be harder to answer "
         "than the one before, and should build on what a strong student would have said.\n\n"
-        "T-14 DEPTH STRUCTURE — 8 questions (A through H):\n"
+        "T-14 DEPTH STRUCTURE — 5 questions (A through E):\n"
         "  A: Direct comprehension — 'What are the legally relevant facts?' "
         "(Do not ask for a conclusion; ask for facts only)\n"
         "  B: Reasoning chain — 'Why did the court reach that conclusion?' "
         "(Ask for the court's analytical steps, not just the holding)\n"
-        "  C: Legally relevant fact probe — 'Which of those facts actually mattered to the rule?' "
-        "(Force the student to distinguish material from background facts)\n"
-        "  D: Holding vs. dicta — 'Was that statement necessary to the holding?' "
-        "(Test whether the student understands the scope of the precedent)\n"
-        "  E: Fact-change hypothetical — 'What if [specific key fact] had been different — "
+        "  C: Fact-change hypothetical — 'What if [specific key fact] had been different — "
         "would the result change?' (Name the exact fact being changed)\n"
-        "  F: Rule boundary — 'Where does the rule stop? Give me a case where it wouldn't apply.'\n"
-        "  G: Counterargument / losing side — 'What is the best argument for the losing party?'\n"
-        "  H: Policy or exam application — 'What policy value does this rule serve?' "
-        "or 'How would you argue this issue on an exam?'\n\n"
+        "  D: Rule boundary — 'Where does the rule stop? Give me a case where it wouldn't apply.'\n"
+        "  E: Counterargument or policy/exam application — 'What is the best argument for the "
+        "losing party?' or 'What policy value does this rule serve?' or 'How would you argue "
+        "this issue on an exam?'\n\n"
         "T-14 QUESTION STANDARDS:\n"
         "• Each question must be phrased as a professor would ask it aloud in class\n"
         "• Each question must reference specific case facts — never generic\n"
         "• Each question must logically follow from the prior (do not reset context)\n"
         "• expected_answer_shape: describe what an A student would say in 2-3 sentences\n\n"
-        "Return a JSON array of exactly 8 question objects. Each:\n"
-        "  question_id: '1A' through '1H'\n"
-        "  question_index: 1-8\n"
+        "Return a JSON array of exactly 5 question objects. Each:\n"
+        "  question_id: '1A' through '1E'\n"
+        "  question_index: 1-5\n"
         "  question_type: the type tag (e.g. LEGALLY_RELEVANT_FACTS)\n"
         "  depth_position: 'early' | 'middle' | 'deep'\n"
         "  question_text: str (the professor's actual spoken question)\n"
@@ -1357,7 +1355,7 @@ async def socratic_thread_builder(state: Dict) -> Dict:
 
     raw = await _llm(
         "orchestrator",
-        f"{case_ctx}{seed_ctx}\nBuild the 8-question Socratic thread.",
+        f"{case_ctx}{seed_ctx}\nBuild the 5-question Socratic thread.",
         system=system,
         max_tokens=node_max_tokens,
         _node="socratic_thread_builder",
@@ -1376,7 +1374,7 @@ async def socratic_thread_builder(state: Dict) -> Dict:
 
     questions: List[SequenceQuestion] = []
     labels = ["A", "B", "C", "D", "E", "F", "G", "H", "I"]
-    for i, q in enumerate(questions_raw[:9]):
+    for i, q in enumerate(questions_raw[:5]):
         if not isinstance(q, dict):
             continue
         label = labels[i] if i < len(labels) else str(i + 1)
@@ -1451,7 +1449,7 @@ async def socratic_answer_agent(state: Dict) -> Dict:
     from agents.tools.base import make_tools
     from agents.tools.registry import COLD_CALL_RETRIEVER_TOOLS
 
-    node_max_tokens = 6000
+    node_max_tokens = 4000
     sequence: QuestionSequence = state["sequence"]
     seq_id = sequence["sequence_id"]
     case_id = sequence.get("case_id", "")
