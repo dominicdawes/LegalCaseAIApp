@@ -583,15 +583,28 @@ class StreamingChatManager:
     async def _wait_for_speculative_uploads(
         self,
         chat_session_id: str,
-        timeout_s: float = 12.0,
+        timeout_s: float = None,
         poll_interval_s: float = 0.3,
     ) -> bool:
         """
         Barrier: wait for any in-flight speculative uploads to finish
         embedding before running RAG retrieval.
 
+        The 12s default was sized for mid-chat drag-drop, where the user reads
+        their own file for a moment before asking anything. Since /new-project
+        now navigates to /chat on submit, a user can land and type immediately
+        while a 60s+ ingest is still running — timing out there would answer
+        from an empty index. Default raised accordingly; the Redis gate's own
+        600s TTL still bounds the worst case.
+
+        Progress is published while waiting so the composer can explain the
+        delay instead of looking hung.
+
         Returns True if all uploads completed, False if timed out.
         """
+        if timeout_s is None:
+            timeout_s = float(os.getenv("SPECULATIVE_UPLOAD_BARRIER_TIMEOUT_S", "90"))
+
         gate_key = f"pending_uploads:{chat_session_id}"
 
         async with get_redis_connection() as r:
@@ -601,7 +614,13 @@ class StreamingChatManager:
             return True
 
         logger.info(f"⏳ Waiting for {pending} speculative upload(s) to finish embedding...")
-        deadline = time.monotonic() + timeout_s
+        started = time.monotonic()
+        deadline = started + timeout_s
+        last_notified = 0.0
+
+        from utils.progress_events import publish_waiting_for_documents
+
+        await publish_waiting_for_documents(chat_session_id, pending, 0.0)
 
         while time.monotonic() < deadline:
             await asyncio.sleep(poll_interval_s)
@@ -615,12 +634,20 @@ class StreamingChatManager:
             if remaining == 0:
                 logger.info("✅ All speculative uploads ready — proceeding with RAG")
                 return True
+
+            elapsed = time.monotonic() - started
             logger.info(f"⏳ Still waiting on {remaining} upload(s)...")
+
+            # Re-emit at most every 3s — enough to keep the UI alive without
+            # flooding the socket at the 0.3s poll rate.
+            if elapsed - last_notified >= 3.0:
+                last_notified = elapsed
+                await publish_waiting_for_documents(chat_session_id, remaining, elapsed)
 
         async with get_redis_connection() as r:
             stragglers = await r.hkeys(gate_key)
         logger.warning(
-            f"⚠️ Timed out waiting for speculative uploads: "
+            f"⚠️ Timed out waiting for speculative uploads after {timeout_s}s: "
             f"{[s.decode() if isinstance(s, bytes) else s for s in stragglers]}. "
             f"Proceeding with partial context."
         )

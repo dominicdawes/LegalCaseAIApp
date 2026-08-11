@@ -1081,6 +1081,27 @@ class InlineUploadMessageRequest(BaseModel):
     document_ids: List[str]
 
 
+class AttachNoteRequest(BaseModel):
+    """
+    Payload sent by WeWeb when the user clicks Submit on /new-project.
+
+    By this point the documents have already been ingesting since drag-drop via
+    /speculative-ingest/, so this call does NOT start any ingest work — it only
+    records which note to build once those documents land, and returns fast so
+    WeWeb can navigate straight to /chat.
+    """
+    project_id: str
+    user_id: str
+    chat_session_id: str
+    document_ids: List[str]
+    note_type: str
+    note_title: str
+    provider: Optional[str] = None
+    model_name: Optional[str] = None
+    temperature: Optional[float] = None
+    addtl_params: Optional[Dict[str, Any]] = None
+
+
 @app.post("/speculative-ingest/")
 async def speculative_ingest(request: SpeculativeIngestRequest):
     """
@@ -1143,8 +1164,22 @@ async def speculative_ingest(request: SpeculativeIngestRequest):
             f"session={request.chat_session_id[:8]}"
         )
 
-        # ── 4. Return identifiers to WeWeb ────────────────────────────────────
-        return {"doc_id": doc_id, "celery_task_id": job.id}
+        # ── 4. First progress beat, so the file card shows a live stage as soon
+        #      as it renders rather than sitting on a bare spinner ─────────────
+        from utils.progress_events import publish_ingest_progress, IngestStage
+        await publish_ingest_progress(
+            request.chat_session_id,
+            doc_id,
+            IngestStage.RECEIVED,
+            filename=request.filename,
+        )
+
+        # ── 5. Return identifiers to WeWeb ────────────────────────────────────
+        return {
+            "doc_id": doc_id,
+            "celery_task_id": job.id,
+            "cdn_url": request.cdn_url,
+        }
 
     except Exception as e:
         logger.error(f"Error starting speculative ingest: {e}", exc_info=True)
@@ -1166,6 +1201,104 @@ async def cancel_speculative_upload_endpoint(request: CancelSpeculativeUploadReq
         return {"status": "cancelled", "doc_id": request.doc_id}
     except Exception as e:
         logger.error(f"Error cancelling speculative upload: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/new-rag-project/attach-note/")
+async def attach_note_to_speculative_project(request: AttachNoteRequest):
+    """
+    Submit handler for the /new-project flow, replacing the blocking wait on
+    vector_embed_status == 'COMPLETE'.
+
+    Ingest is already running (started on drag-drop by /speculative-ingest/), so
+    all this does is:
+
+      1. Insert the `notes` stub (INITIALIZED) — the WeWeb realtime listener on
+         public.notes fires on this INSERT, giving the /chat spinner a row to
+         bind to before any generation work has begun.
+      2. Anchor the uploaded files in the chat timeline as a file_upload message.
+      3. Park the note request in Redis and immediately try to fire it, in case
+         ingest already finished while the user was choosing a note type.
+      4. Return — WeWeb navigates to /chat/{chat_session_id} on this 200.
+
+    If the documents are still embedding, finalize_batch_and_create_note fires
+    the note instead. Exactly one of the two wins; see try_fire_pending_note.
+    """
+    try:
+        note_id = str(uuid.uuid4())
+
+        # ── 1. Stub note row (drives the /chat spinner immediately) ───────────
+        supabase_client.table("notes").insert(
+            {
+                "id":                   note_id,
+                "user_id":              request.user_id,
+                "project_id":           request.project_id,
+                "title":                request.note_title,
+                "note_type":            request.note_type,
+                "note_progress_status": "INITIALIZED",
+                "created_at":           datetime.now(timezone.utc).isoformat(),
+            }
+        ).execute()
+
+        # ── 2. Anchor the files in the conversation timeline ──────────────────
+        from utils.speculative_upload import (
+            persist_inline_upload,
+            register_pending_note,
+            try_fire_pending_note,
+        )
+
+        if request.document_ids:
+            try:
+                persist_inline_upload(
+                    request.user_id, request.chat_session_id, request.document_ids
+                )
+            except Exception as e:
+                # Non-fatal: the note still generates, the timeline just lacks the anchor.
+                logger.warning(f"⚠️ Could not persist file_upload message: {e}")
+
+        # ── 3. Park the request, then try to claim it right away ──────────────
+        await register_pending_note(
+            request.project_id,
+            {
+                "note_id":         note_id,
+                "note_type":       request.note_type,
+                "chat_session_id": request.chat_session_id,
+                "document_ids":    request.document_ids,
+                "task_kwargs": {
+                    "note_id":     note_id,
+                    "user_id":     request.user_id,
+                    "note_type":   request.note_type,
+                    "project_id":  request.project_id,
+                    "note_title":  request.note_title,
+                    "provider":    request.provider,
+                    "model_name":  request.model_name,
+                    "temperature": request.temperature,
+                    "addtl_params": {
+                        **(request.addtl_params or {}),
+                        "document_ids": request.document_ids,
+                    },
+                },
+            },
+        )
+
+        fired = await try_fire_pending_note(request.project_id)
+
+        logger.info(
+            f"📝 Attached note {note_id[:8]} ({request.note_type}) to project "
+            f"{request.project_id[:8]} — "
+            f"{'dispatched immediately' if fired else 'waiting on ingest'}"
+        )
+
+        # ── 4. Return so WeWeb can navigate ───────────────────────────────────
+        return {
+            "note_id":         note_id,
+            "chat_session_id": request.chat_session_id,
+            "document_ids":    request.document_ids,
+            "note_dispatched": bool(fired),
+        }
+
+    except Exception as e:
+        logger.error(f"Error attaching note to project: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 

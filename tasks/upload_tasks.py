@@ -25,7 +25,7 @@ import io
 import json
 import hashlib
 import time
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass, field
 from typing import List, Dict, Any, Iterator, Optional, AsyncGenerator, Tuple
 from enum import Enum
@@ -39,6 +39,7 @@ import asyncio
 # import gevent
 # import gevent.socket
 import socket
+from concurrent.futures import ThreadPoolExecutor
 
 # ===== NETWORKING & HTTP =====
 import requests
@@ -56,7 +57,7 @@ import asyncpg
 import psycopg2
 from psycopg2.extras import Json
 from psycopg2.pool import ThreadedConnectionPool
-from psycopg2.extras import execute_batch
+from psycopg2.extras import execute_batch, execute_values
 
 # ===== CELERY & TASK QUEUE =====
 from celery import chord, group, chain
@@ -79,7 +80,12 @@ from tasks.celery_app import celery_app
 from tasks.note_tasks import rag_note_task
 # from utils.lightrag.lightrag_utils import lightrag_client, lightrag_integration  # LightRAG disabled
 from utils.s3_utils import upload_to_s3, s3_client
-from utils.cloudfront_utils import get_cloudfront_url
+from utils.cloudfront_utils import get_cloudfront_url, cloudfront_domain
+from utils.progress_events import (
+    publish_ingest_progress,
+    publish_ingest_progress_sync,
+    IngestStage,
+)
 from utils.supabase_utils import supabase_client
 from utils.document_loaders.base import BaseDocumentLoader
 from utils.document_loaders.loader_factory import get_loader_for, analyze_document_before_processing, get_high_performance_loader
@@ -130,7 +136,23 @@ INGEST_LLM_MODEL    = os.getenv("INGEST_LLM_MODEL",    "gemini-3.1-flash-lite").
 # Table chunks are always processed individually (they need longer summaries).
 # Increasing this value reduces API roundtrips on large documents (100+ pages).
 # Override via BLURB_BATCH_SIZE env var.
-BLURB_BATCH_SIZE = int(os.getenv("BLURB_BATCH_SIZE", "8"))
+BLURB_BATCH_SIZE = int(os.getenv("BLURB_BATCH_SIZE", "20"))
+
+# Max characters of document synopsis (title + TOC + opening) shared as the
+# system prompt across every blurb call for one document.  Kept small and
+# byte-identical per document so provider-side prompt caching can hit — the
+# per-chunk context the model actually needs comes from `section_path`.
+BLURB_CONTEXT_CHARS = int(os.getenv("BLURB_CONTEXT_CHARS", "2000"))
+
+# ── Ingest byte cache ─────────────────────────────────────────────────────────
+# The batch coordinator downloads every file to hash it.  Rather than making the
+# parser download the same bytes a second time from CloudFront, the coordinator
+# parks them here keyed by content_hash and the parser picks them up.  Falls back
+# to a CDN download on a miss (different process, restart, eviction).
+INGEST_CACHE_DIR = os.getenv("INGEST_CACHE_DIR", os.path.join(tempfile.gettempdir(), "ingest_cache"))
+# Entries older than this are swept at worker start — they can only exist if a
+# worker was hard-killed between download and parse.
+INGEST_CACHE_MAX_AGE_S = int(os.getenv("INGEST_CACHE_MAX_AGE_S", "3600"))
 
 # Queue configuration
 INGEST_QUEUE = 'ingest'
@@ -280,6 +302,33 @@ logger.info("📊 Initializing metrics collector...")
 metrics_collector = MetricsCollector()
 logger.info("✅ Metrics collector initialized")
 
+# ——— Dedicated Executors ——————————————————————————————————————————————————————————
+#
+# Every `run_in_executor(None, ...)` in this module used to share the event
+# loop's DEFAULT ThreadPoolExecutor, which is sized min(32, cpu_count + 4) — only
+# 6 threads on a 2-vCPU instance.  That silently capped the blurb semaphore and
+# let a CPU-bound Docling parse starve the LLM calls.  Two purpose-built pools:
+#
+#   _LLM_EXECUTOR — blurb + embedding API calls.  Pure network wait, so heavy
+#                   oversubscription relative to CPU count is correct.
+#   _CPU_EXECUTOR — Docling parsing.  Deliberately small so a parse can never
+#                   monopolise the process or starve I/O work.
+_LLM_EXECUTOR = ThreadPoolExecutor(
+    max_workers=int(os.getenv("INGEST_LLM_THREADS", "24")),
+    thread_name_prefix="ingest-llm",
+)
+_CPU_EXECUTOR = ThreadPoolExecutor(
+    max_workers=int(os.getenv("INGEST_PARSE_THREADS", str(max(2, (os.cpu_count() or 2))))),
+    thread_name_prefix="ingest-parse",
+)
+
+@worker_shutdown.connect
+def _shutdown_ingest_executors(sender=None, **kwargs):
+    """Drain the ingest executors when the worker stops."""
+    _LLM_EXECUTOR.shutdown(wait=False)
+    _CPU_EXECUTOR.shutdown(wait=False)
+    logger.info("🛑 Ingest executors shut down")
+
 # ——— Worker Startup Hooks ————————————————————————————————————————————————————————
 
 @worker_init.connect
@@ -289,8 +338,12 @@ def _warm_docling_on_startup(sender=None, **kwargs):
 
     Without pre-warming, the first upload cold-loads ~40 MB of RapidOCR / Tesseract
     models plus the layout transformer, adding ~30s to the first document's parse time.
-    Pre-warming runs _ensure_ready() (no document needed) so the models are already
-    in memory by the time the first upload task arrives.
+
+    NOTE: constructing a DocumentConverter does NOT load models — docling builds
+    its pipeline lazily on the first convert(). _ensure_ready() alone therefore
+    left the first real upload paying the whole cost anyway. warm_up() runs one
+    conversion over a tiny in-memory PDF, which is what actually resides the
+    models.
 
     Non-fatal: if Docling isn't installed or warm-up fails, the worker still starts.
     """
@@ -298,13 +351,156 @@ def _warm_docling_on_startup(sender=None, **kwargs):
         try:
             from utils.document_loaders.docling_loader import DoclingPDFLoader
             logger.info("🔥 Pre-warming Docling models at worker startup...")
-            DoclingPDFLoader()._ensure_ready()
-            logger.info("✅ Docling models warm — first upload will not cold-load")
+            started = time.perf_counter()
+            if DoclingPDFLoader().warm_up():
+                logger.info(
+                    f"✅ Docling models warm in {time.perf_counter() - started:.1f}s "
+                    f"— first upload will not cold-load"
+                )
         except Exception as exc:
             logger.warning(f"⚠️ Docling pre-warm failed (non-fatal): {exc}")
 
 
+@worker_init.connect
+def _sweep_ingest_cache_on_startup(sender=None, **kwargs):
+    """
+    Drop stale ingest-cache files left behind by a previous worker.
+
+    _process_document_async_workflow purges its own entry in a finally block, so
+    leftovers only appear if the worker was hard-killed mid-document. Without
+    this sweep those PDFs would accumulate on a small instance disk.
+    """
+    try:
+        if not os.path.isdir(INGEST_CACHE_DIR):
+            return
+        cutoff = time.time() - INGEST_CACHE_MAX_AGE_S
+        removed = 0
+        for entry in os.listdir(INGEST_CACHE_DIR):
+            path = os.path.join(INGEST_CACHE_DIR, entry)
+            try:
+                if os.path.isfile(path) and os.path.getmtime(path) < cutoff:
+                    os.remove(path)
+                    removed += 1
+            except OSError:
+                continue
+        if removed:
+            logger.info(f"🧹 Swept {removed} stale ingest-cache file(s)")
+    except Exception as exc:
+        logger.warning(f"⚠️ Ingest cache sweep failed (non-fatal): {exc}")
+
+
 # ——— Helpers & Utilities ——————————————————————————————————————————————————————————
+
+class PhaseTimer:
+    """
+    Accumulates per-phase wall-clock timings for one document so the ingest
+    pipeline can be optimised against measurements instead of guesses.
+
+    Usage:
+        timings = PhaseTimer(doc_id)
+        with timings.phase("parse"):
+            ...
+        timings.log()   # → ⏱️ [DOC-abc12345] parse=8420ms embed=1130ms total=9550ms
+    """
+
+    def __init__(self, doc_id: str):
+        self.doc_id = doc_id
+        self.phases: Dict[str, float] = {}
+        self._start = time.perf_counter()
+
+    @contextmanager
+    def phase(self, name: str):
+        started = time.perf_counter()
+        try:
+            yield
+        finally:
+            elapsed_ms = (time.perf_counter() - started) * 1000
+            self.phases[name] = self.phases.get(name, 0.0) + elapsed_ms
+
+    @property
+    def total_ms(self) -> float:
+        return (time.perf_counter() - self._start) * 1000
+
+    def to_dict(self) -> Dict[str, int]:
+        out = {k: int(v) for k, v in self.phases.items()}
+        out["total"] = int(self.total_ms)
+        return out
+
+    def log(self) -> None:
+        parts = " ".join(f"{k}={int(v)}ms" for k, v in self.phases.items())
+        logger.info(
+            f"⏱️ [DOC-{self.doc_id[:8]}] {parts} total={int(self.total_ms)}ms"
+        )
+
+
+# ——— Ingest Byte Cache ————————————————————————————————————————————————————————————
+
+def _is_own_cdn_url(url: str) -> bool:
+    """
+    True when the URL already points at our own CloudFront distribution.
+
+    WeWeb uploads to S3/CDN before it calls us, so for those URLs the file is
+    already exactly where the pipeline wants it — downloading it only to push
+    the identical bytes back to a fresh S3 key is a wasted round trip.
+    """
+    if not url or not cloudfront_domain:
+        return False
+    try:
+        return urllib.parse.urlparse(url).netloc.lower() == cloudfront_domain.lower()
+    except Exception:
+        return False
+
+
+def _ingest_cache_path(content_hash: str) -> str:
+    return os.path.join(INGEST_CACHE_DIR, f"{content_hash}.bin")
+
+
+def _write_ingest_cache(content_hash: str, stream: io.BytesIO) -> None:
+    """Park already-downloaded bytes for the parser. Best-effort."""
+    try:
+        os.makedirs(INGEST_CACHE_DIR, exist_ok=True)
+        path = _ingest_cache_path(content_hash)
+        stream.seek(0)
+        # Write to a temp name then rename, so a reader can never observe a
+        # half-written file.
+        tmp_path = f"{path}.{uuid.uuid4().hex[:8]}.part"
+        with open(tmp_path, "wb") as fh:
+            fh.write(stream.read())
+        os.replace(tmp_path, path)
+        stream.seek(0)
+        logger.info(f"💾 Cached {content_hash[:8]} for parser handoff")
+    except Exception as e:
+        logger.warning(f"⚠️ Ingest cache write failed for {content_hash[:8]}: {e}")
+
+
+def _read_ingest_cache(content_hash: Optional[str]) -> Optional[io.BytesIO]:
+    """Retrieve parked bytes. Returns None on any miss — caller re-downloads."""
+    if not content_hash:
+        return None
+    try:
+        path = _ingest_cache_path(content_hash)
+        if not os.path.exists(path):
+            return None
+        with open(path, "rb") as fh:
+            buf = io.BytesIO(fh.read())
+        buf.seek(0)
+        return buf
+    except Exception as e:
+        logger.warning(f"⚠️ Ingest cache read failed for {content_hash[:8]}: {e}")
+        return None
+
+
+def _purge_ingest_cache(content_hash: Optional[str]) -> None:
+    """Drop parked bytes once the document has been parsed. Best-effort."""
+    if not content_hash:
+        return
+    try:
+        path = _ingest_cache_path(content_hash)
+        if os.path.exists(path):
+            os.remove(path)
+    except Exception as e:
+        logger.debug(f"Ingest cache purge failed for {content_hash[:8]}: {e}")
+
 
 def _calculate_stream_hash(stream: io.BytesIO) -> str:
     """Calculate SHA-256 hash from an in-memory stream without consuming it."""
@@ -384,28 +580,49 @@ def _update_document_status_sync(doc_id: str, status: ProcessingStatus, error_me
             if conn:
                 pool.putconn(conn)
 
-def _update_batch_progress_sync(batch_id: str, project_id: str, status: BatchProgressStatus):
+def _update_batch_progress_sync(
+    batch_id: str,
+    project_id: str,
+    status: BatchProgressStatus,
+    doc_ids: Optional[List[str]] = None,
+):
     """
     [PER BATCH] Update batch_progress for all documents in a batch
     Includes retry logic for stale connections.
+
+    Rows are normally matched on processing_metadata->>'batch_id', which is only
+    stamped once the per-document INSERT in _process_document_async_workflow has
+    run.  The early batch phases (ANALYZING, PROCESSING) fire *before* that, so
+    those calls used to update zero rows and the UI stayed blind through the
+    whole download/dedupe phase.  Callers that already know the document ids —
+    the speculative flow pre-creates its row — pass `doc_ids` to match directly.
     """
     pool = get_global_sync_db_pool()
     retries = 3
-    
+
+    if doc_ids:
+        sql = """
+            UPDATE document_sources
+            SET batch_progress = %s, updated_at = NOW()
+            WHERE project_id = %s
+            AND (id = ANY(%s::uuid[]) OR processing_metadata->>'batch_id' = %s)
+        """
+        params = (status.value, project_id, list(doc_ids), batch_id)
+    else:
+        sql = """
+            UPDATE document_sources
+            SET batch_progress = %s, updated_at = NOW()
+            WHERE project_id = %s
+            AND processing_metadata->>'batch_id' = %s
+        """
+        params = (status.value, project_id, batch_id)
+
     for attempt in range(retries):
         conn = None
         try:
             conn = pool.getconn()
             with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    UPDATE document_sources 
-                    SET batch_progress = %s, updated_at = NOW()
-                    WHERE project_id = %s 
-                    AND processing_metadata->>'batch_id' = %s
-                    """,
-                    (status.value, project_id, batch_id)
-                )
+                cur.execute(sql, params)
                 rows_updated = cur.rowcount
             conn.commit()
             logger.info(f"📊 [BATCH-{batch_id[:8]}] Progress → {status.value} ({rows_updated} docs)")
@@ -928,6 +1145,18 @@ async def _download_and_prep_doc(client: httpx.AsyncClient, url: str, project_id
     """
     Helper for `_analyze_download_and_store_document_for_workflow` to download to memory (does not write to Disk),
     hash, stream to S3 & Store in AWS CLoudfront, and prep data.
+
+    Transfer minimisation (two fixes, both material on large PDFs):
+
+    1. When `url` is already on our own CloudFront distribution — which is the
+       case for every WeWeb upload, since WeWeb pushes to S3/CDN before calling
+       us — the S3 re-upload is skipped entirely and the incoming URL is reused.
+       Previously the identical bytes were pushed back up to a fresh S3 key.
+    2. The downloaded bytes are parked in the ingest cache keyed by content_hash
+       so the parser can pick them up instead of re-downloading from CloudFront.
+
+    Together these take the common path from three full transfers of the file
+    (download → upload → download) down to one.
     """
     try:
         # Define headers for anti-bot detection
@@ -936,12 +1165,12 @@ async def _download_and_prep_doc(client: httpx.AsyncClient, url: str, project_id
         # Define client stream
         async with client.stream("GET", url, headers=headers) as response:
             response.raise_for_status()
-            
+
             # Stream response into an in-memory buffer
             content_stream = io.BytesIO()
             async for chunk in response.aiter_bytes():
                 content_stream.write(chunk)
-            
+
             file_size = content_stream.tell()
             if file_size == 0:
                 logger.warning(f"Skipping zero-byte file from URL: {url}")
@@ -952,12 +1181,26 @@ async def _download_and_prep_doc(client: httpx.AsyncClient, url: str, project_id
             # Enhanced file extension detection
             ext = get_file_extension_from_url(url)
             filename = parse_clean_filename_from_url(url, ext)
-            s3_key = f"{project_id}/{uuid.uuid4()}{ext}"
-            
-            # Stream directly to S3 && AWS CloudFront from the in-memory buffer
-            upload_to_s3(client=s3_client, file_source=content_stream, s3_object_key=s3_key)
-            cdn_url = get_cloudfront_url(s3_key)
-            
+
+            if _is_own_cdn_url(url):
+                # Already on our CDN — nothing to copy.
+                cdn_url = url
+                logger.info(f"⚡ Skipped S3 re-upload — '{filename}' is already on our CDN")
+            else:
+                s3_key = f"{project_id}/{uuid.uuid4()}{ext}"
+                # Stream directly to S3 && AWS CloudFront from the in-memory buffer
+                # (boto3 is blocking, so keep it off the shared event loop).
+                await asyncio.to_thread(
+                    upload_to_s3,
+                    client=s3_client,
+                    file_source=content_stream,
+                    s3_object_key=s3_key,
+                )
+                cdn_url = get_cloudfront_url(s3_key)
+
+            # Park the bytes so the parser does not re-download them.
+            await asyncio.to_thread(_write_ingest_cache, content_hash, content_stream)
+
             # Leverages my url (AWS Cloudfront) to perform in-memory streaming for the rest of the ingest pipeline
             return {
                 'cdn_url': cdn_url,
@@ -1012,7 +1255,7 @@ async def _call_voyage_embeddings_async(texts: List[str]) -> List[List[float]]:
     loop = asyncio.get_event_loop()
     voyage = get_voyage_client()
     try:
-        return await loop.run_in_executor(None, voyage.embed_documents, texts)
+        return await loop.run_in_executor(_LLM_EXECUTOR, voyage.embed_documents, texts)
     except Exception as e:
         logger.error(f"Voyage API call failed: {e}")
         return []
@@ -1057,6 +1300,7 @@ async def _parse_and_chunk_docling_async(
     source_filename: str,
     cdn_url: str,
     project_id: str,
+    content_hash: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Hierarchical ingest PDF path: download → DoclingPDFLoader (HybridChunker).
@@ -1065,31 +1309,44 @@ async def _parse_and_chunk_docling_async(
 
     Extra key 'raw_doc' carries the DoclingDocument for TOC extraction and
     blurb generation; it is popped before the result is returned upstream.
+
+    When `content_hash` is supplied and the batch coordinator has already parked
+    the bytes in the ingest cache, the CloudFront download is skipped entirely.
     """
-    _update_document_status_sync(source_id, ProcessingStatus.PARSING)
+    await asyncio.to_thread(
+        _update_document_status_sync, source_id, ProcessingStatus.PARSING
+    )
     short_id = source_id[:8]
-    file_buffer = io.BytesIO()
 
     try:
-        # ── Download ─────────────────────────────────────────────────────────
-        async with httpx.AsyncClient(timeout=120.0) as client:
-            async with client.stream("GET", cdn_url, headers=DEFAULT_HEADERS) as response:
-                response.raise_for_status()
-                async for raw_bytes in response.aiter_bytes(chunk_size=8_192):
-                    if raw_bytes:
-                        file_buffer.write(raw_bytes)
-        downloaded_bytes = file_buffer.tell()
-        file_buffer.seek(0)
-        logger.info(f"📥 [DOCLING-{short_id}] Downloaded {downloaded_bytes:,} bytes")
+        # ── Acquire bytes: cache first, CDN as fallback ──────────────────────
+        file_buffer = await asyncio.to_thread(_read_ingest_cache, content_hash)
 
-        # ── Docling parse + HybridChunker (CPU-bound → executor) ─────────────
+        if file_buffer is not None:
+            logger.info(
+                f"⚡ [DOCLING-{short_id}] Reused {file_buffer.getbuffer().nbytes:,} "
+                f"cached bytes — CDN download skipped"
+            )
+        else:
+            file_buffer = io.BytesIO()
+            async with httpx.AsyncClient(timeout=120.0) as client:
+                async with client.stream("GET", cdn_url, headers=DEFAULT_HEADERS) as response:
+                    response.raise_for_status()
+                    async for raw_bytes in response.aiter_bytes(chunk_size=8_192):
+                        if raw_bytes:
+                            file_buffer.write(raw_bytes)
+            downloaded_bytes = file_buffer.tell()
+            file_buffer.seek(0)
+            logger.info(f"📥 [DOCLING-{short_id}] Downloaded {downloaded_bytes:,} bytes")
+
+        # ── Docling parse + HybridChunker (CPU-bound → dedicated executor) ───
         file_ext = source_filename.rsplit(".", 1)[-1].upper() if "." in source_filename else "PDF"
         logger.info(f"🦆 Parsing {file_ext} with Docling 🪿")
         from utils.document_loaders.docling_loader import DoclingPDFLoader
         loader = DoclingPDFLoader()
         loop = asyncio.get_event_loop()
         texts, metadatas, raw_doc = await loop.run_in_executor(
-            None,
+            _CPU_EXECUTOR,
             lambda: loader.load_document(file_buffer, source_id, source_filename, cdn_url),
         )
 
@@ -1114,14 +1371,74 @@ async def _parse_and_chunk_docling_async(
 
     except Exception as e:
         logger.error(f"💥 [DOCLING-{short_id}] Parsing failed: {e}", exc_info=True)
-        _update_document_status_sync(source_id, ProcessingStatus.FAILED_PARSING, str(e))
+        await asyncio.to_thread(
+            _update_document_status_sync,
+            source_id,
+            ProcessingStatus.FAILED_PARSING,
+            str(e),
+        )
         return {'success': False, 'error': str(e)}
+
+
+def _build_doc_synopsis(
+    chunks: List[str],
+    metadatas: List[Dict],
+    filename: Optional[str] = None,
+    toc: Optional[List[Dict]] = None,
+) -> str:
+    """
+    Compact stand-in for the full document text in the blurb system prompt.
+
+    Previously the entire document (up to 50 000 chars ≈ 12.5k tokens) was
+    re-sent on EVERY blurb call — ~475k input tokens for a 300-chunk document,
+    and the dominant wall-clock cost of the hierarchical path.
+
+    Contextual retrieval only needs enough to situate a chunk, and the precise
+    location already travels per-chunk in `section_path`. So the shared context
+    is reduced to: filename, the Docling-extracted table of contents (the
+    document's skeleton), and the opening passage (caption, court, parties).
+    """
+    parts: List[str] = []
+
+    if filename:
+        parts.append(f"Title: {filename}")
+
+    if toc:
+        # extract_toc_from_docling_doc emits {"text", "level", "page"}
+        outline = "\n".join(
+            f"{'  ' * max(0, int(entry.get('level') or 1) - 1)}- {entry.get('text')}"
+            for entry in toc[:60]
+            if entry.get("text")
+        )
+        if outline:
+            parts.append(f"Table of contents:\n{outline}")
+    else:
+        # No TOC (scanned doc, flat structure) — fall back to the distinct
+        # section paths Docling assigned, which convey the same skeleton.
+        seen, sections = set(), []
+        for meta in metadatas:
+            sp = (meta or {}).get("section_path")
+            if sp and sp not in seen:
+                seen.add(sp)
+                sections.append(sp)
+            if len(sections) >= 40:
+                break
+        if sections:
+            parts.append("Sections:\n" + "\n".join(f"- {s}" for s in sections))
+
+    opening = "\n\n".join(chunks[:3])[:BLURB_CONTEXT_CHARS]
+    if opening:
+        parts.append(f"Opening passage:\n{opening}")
+
+    return "\n\n".join(parts)
 
 
 async def _generate_chunk_blurbs_async(
     chunks: List[str],
     metadatas: List[Dict],
     doc_id: str,
+    filename: Optional[str] = None,
+    toc: Optional[List[Dict]] = None,
 ) -> List[Dict]:
     """
     [AGENTIC INGEST]
@@ -1135,6 +1452,10 @@ async def _generate_chunk_blurbs_async(
         Falls back to empty blurbs for any batch that fails JSON parsing.
       - Table chunks: processed individually (need longer 2-4 sentence summaries).
 
+    The shared system prompt is a compact synopsis (see _build_doc_synopsis)
+    rather than the full document, and is byte-identical across every call for
+    a given document so provider-side prompt caching can hit.
+
     Populates two keys in each metadata dict:
       chunk_summary — stored in document_vector_store.chunk_summary
       embed_text    — the text actually passed to the embedding model
@@ -1146,11 +1467,15 @@ async def _generate_chunk_blurbs_async(
 
     short_id = doc_id[:8]
 
-    # Build document context passed as system prompt to every chunk call
-    full_doc_text = "\n\n".join(chunks)[:50_000]
+    # Compact, cache-friendly document context shared by every call below.
+    synopsis = _build_doc_synopsis(chunks, metadatas, filename, toc)
     system_prompt = (
         "You are a legal-document analyst helping to build a retrieval index.\n\n"
-        f"<document>\n{full_doc_text}\n</document>"
+        f"<document>\n{synopsis}\n</document>"
+    )
+    logger.info(
+        f"📝 [BLURB-{short_id}] Shared context {len(synopsis):,} chars "
+        f"(was up to 50,000)"
     )
 
     # Two clients per document:
@@ -1173,8 +1498,10 @@ async def _generate_chunk_blurbs_async(
         return metadatas
 
     loop = asyncio.get_event_loop()
-    # Semaphore caps concurrent API calls (batch calls count the same as individual)
-    semaphore = asyncio.Semaphore(10)
+    # Semaphore caps concurrent API calls (batch calls count the same as individual).
+    # Sized against _LLM_EXECUTOR — with the old default executor this could never
+    # exceed ~6 on a 2-vCPU box no matter what number was written here.
+    semaphore = asyncio.Semaphore(int(os.getenv("BLURB_CONCURRENCY", "16")))
 
     # ── Individual table blurb (unchanged logic, uses client_table) ──────
     async def _blurb_one_table(idx: int, text: str, meta: Dict) -> tuple:
@@ -1189,7 +1516,7 @@ async def _generate_chunk_blurbs_async(
         async with semaphore:
             try:
                 blurb = await loop.run_in_executor(
-                    None, lambda: client_table.chat(user_msg, system_prompt)
+                    _LLM_EXECUTOR, lambda: client_table.chat(user_msg, system_prompt)
                 )
                 blurb = blurb.strip()
             except Exception as e:
@@ -1211,15 +1538,18 @@ async def _generate_chunk_blurbs_async(
         batch_texts = [chunks[i][:1_000] for i in batch_global_indices]
         batch_metas = [metadatas[i] for i in batch_global_indices]
 
-        # Build numbered chunk list for the prompt
+        # Build numbered chunk list for the prompt. Each chunk carries its own
+        # section_path, which is the per-chunk context that used to be inferred
+        # from the full-document dump in the system prompt.
         chunks_block = "\n".join(
-            f"[{local_i}] <chunk>{t}</chunk>"
-            for local_i, t in enumerate(batch_texts)
+            f"[{local_i}] ({(m or {}).get('section_path') or 'body'}) <chunk>{t}</chunk>"
+            for local_i, (t, m) in enumerate(zip(batch_texts, batch_metas))
         )
         user_msg = (
             "Write exactly 1-2 sentences for each chunk below that situate it "
             "in the context of the document above, mentioning the relevant legal "
-            "concept, rule, or case name.\n"
+            "concept, rule, or case name.  The parenthesised text after each "
+            "index is the chunk's location in the document outline.\n"
             f"Return ONLY a JSON array with {len(batch_global_indices)} objects: "
             '[{"i": 0, "blurb": "..."}, {"i": 1, "blurb": "..."}, ...]\n\n'
             f"<chunks>\n{chunks_block}\n</chunks>"
@@ -1227,7 +1557,7 @@ async def _generate_chunk_blurbs_async(
         async with semaphore:
             try:
                 raw = await loop.run_in_executor(
-                    None, lambda: client_batch.chat(user_msg, system_prompt)
+                    _LLM_EXECUTOR, lambda: client_batch.chat(user_msg, system_prompt)
                 )
                 raw = raw.strip()
             except Exception as e:
@@ -1313,7 +1643,13 @@ async def _generate_chunk_blurbs_async(
 
 # ——— Async Helper Functions ——————————————————————————————————————————————————————
 
-async def _parse_document_async(source_id: str, source_filename: str, cdn_url: str, project_id: str) -> Dict[str, Any]:
+async def _parse_document_async(
+    source_id: str,
+    source_filename: str,
+    cdn_url: str,
+    project_id: str,
+    content_hash: Optional[str] = None,
+) -> Dict[str, Any]:
     """
     Parse single document (or any type) asynchronously.
     Uses the DocumentLoader class to parse documents
@@ -1326,7 +1662,9 @@ async def _parse_document_async(source_id: str, source_filename: str, cdn_url: s
             'total_pages': processing_summary['total_pages'],
             'performance_metrics': perf_summary)
     """
-    _update_document_status_sync(source_id, ProcessingStatus.PARSING)
+    await asyncio.to_thread(
+        _update_document_status_sync, source_id, ProcessingStatus.PARSING
+    )
 
     short_id = source_id[:8]
     file_buffer = io.BytesIO()
@@ -1335,35 +1673,44 @@ async def _parse_document_async(source_id: str, source_filename: str, cdn_url: s
 
     with Timer() as total_timer:
         try:
-            # Phase 1: FIXED - Async HTTP streaming download
+            # Phase 1: Acquire bytes — ingest cache first, streaming download as fallback
             with Timer() as download_timer:
-                logger.info(f"🚀 Starting document streaming for {source_id}, with url: {cdn_url}")
-                
-                # ✅ FIXED: Use async HTTP client instead of requests
-                async with httpx.AsyncClient(timeout=120.0) as client:
-                    async with client.stream("GET", cdn_url, headers=DEFAULT_HEADERS) as response:
-                        response.raise_for_status()
-                        
-                        # Log response headers for debugging
-                        content_length = response.headers.get('content-length')
-                        content_type = response.headers.get('content-type', 'unknown')
-                        
-                        # Stream into memory buffer
-                        downloaded_bytes = 0
-                        chunk_count = 0
-                        
-                        async for chunk in response.aiter_bytes(chunk_size=8192):
-                            if chunk:
-                                file_buffer.write(chunk)
-                                downloaded_bytes += len(chunk)
-                                chunk_count += 1
-                                
-                                # Log progress every 5MB or 500 chunks
-                                if chunk_count % 500 == 0 or downloaded_bytes % (1024 * 1024 * 5) == 0:
-                                    logger.info(f"📥 [PARSE-{short_id}] Downloaded {downloaded_bytes:,} bytes ({chunk_count} chunks)")
-                                
-                                # ✅ FIXED: Use asyncio.sleep instead of gevent.sleep
-                                await asyncio.sleep(0)
+                cached_buffer = await asyncio.to_thread(_read_ingest_cache, content_hash)
+
+                if cached_buffer is not None:
+                    file_buffer = cached_buffer
+                    logger.info(
+                        f"⚡ [PARSE-{short_id}] Reused {file_buffer.getbuffer().nbytes:,} "
+                        f"cached bytes — CDN download skipped"
+                    )
+                else:
+                    logger.info(f"🚀 Starting document streaming for {source_id}, with url: {cdn_url}")
+
+                    # ✅ FIXED: Use async HTTP client instead of requests
+                    async with httpx.AsyncClient(timeout=120.0) as client:
+                        async with client.stream("GET", cdn_url, headers=DEFAULT_HEADERS) as response:
+                            response.raise_for_status()
+
+                            # Log response headers for debugging
+                            content_length = response.headers.get('content-length')
+                            content_type = response.headers.get('content-type', 'unknown')
+
+                            # Stream into memory buffer
+                            downloaded_bytes = 0
+                            chunk_count = 0
+
+                            async for chunk in response.aiter_bytes(chunk_size=8192):
+                                if chunk:
+                                    file_buffer.write(chunk)
+                                    downloaded_bytes += len(chunk)
+                                    chunk_count += 1
+
+                                    # Log progress every 5MB or 500 chunks
+                                    if chunk_count % 500 == 0 or downloaded_bytes % (1024 * 1024 * 5) == 0:
+                                        logger.info(f"📥 [PARSE-{short_id}] Downloaded {downloaded_bytes:,} bytes ({chunk_count} chunks)")
+
+                                    # ✅ FIXED: Use asyncio.sleep instead of gevent.sleep
+                                    await asyncio.sleep(0)
 
                 file_buffer.seek(0)
                 doc_metrics.download_time_ms = download_timer.elapsed_ms
@@ -1559,24 +1906,32 @@ async def _embed_batch_async(
         #   USE_VOYAGE_EMBEDDINGS=false → embedding_ada_legacy (vector(1536), ada-002)
         embedding_col = "embedding_voyage_2" if USE_VOYAGE_EMBEDDINGS else "embedding_ada_legacy"
 
-        pool = get_global_sync_db_pool()
-        conn = pool.getconn()
-        try:
-            with conn.cursor() as cur:
-                cur.executemany(
-                    f'''INSERT INTO document_vector_store
-                    (id, source_id, project_id, content, metadata, {embedding_col},
-                     num_tokens, page_number, chunk_index, cdn_url,
-                     chunk_summary, section_path, chunk_type, parent_chunk_id,
-                     created_at)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                            %s, %s, %s, %s, %s)''',
-                    records_to_insert
-                )
-                conn.commit()
-        finally:
-            pool.putconn(conn)
-        
+        # psycopg2 is blocking and the worker shares ONE event loop across every
+        # concurrent document and chat stream, so this must not run inline:
+        # a few hundred vector rows would stall everything else in the process.
+        # execute_values also beats executemany substantially at this row count.
+        def _insert_vectors():
+            pool = get_global_sync_db_pool()
+            conn = pool.getconn()
+            try:
+                with conn.cursor() as cur:
+                    execute_values(
+                        cur,
+                        f'''INSERT INTO document_vector_store
+                        (id, source_id, project_id, content, metadata, {embedding_col},
+                         num_tokens, page_number, chunk_index, cdn_url,
+                         chunk_summary, section_path, chunk_type, parent_chunk_id,
+                         created_at)
+                        VALUES %s''',
+                        records_to_insert,
+                        page_size=200,
+                    )
+                    conn.commit()
+            finally:
+                pool.putconn(conn)
+
+        await asyncio.to_thread(_insert_vectors)
+
         logger.info(f"✅ [BATCH-{short_id}] Stored {len(records_to_insert)} embeddings")
         
         return {
@@ -1607,7 +1962,9 @@ async def _handle_batch_failure_async(
         logger.error(f"   {i}. {error}")
     
     # Update batch progress
-    _update_batch_progress_sync(batch_id, project_id, BatchProgressStatus.BATCH_FAILED)
+    await asyncio.to_thread(
+        _update_batch_progress_sync, batch_id, project_id, BatchProgressStatus.BATCH_FAILED
+    )
 
 async def _process_embeddings_async(doc_id: str, project_id: str, chunks: List[str], metadatas: List[Dict] = None) -> Dict[str, Any]:
     """
@@ -1671,24 +2028,33 @@ async def _process_embeddings_async(doc_id: str, project_id: str, chunks: List[s
         }
         
         # ——— 4. Determine Final Status ———————————————————————————————————————————
+        # Status writes are sync psycopg2 — keep them off the shared event loop.
         if len(successful_batches) == 0:
-            _update_document_status_sync(doc_id, ProcessingStatus.FAILED_EMBEDDING)
+            await asyncio.to_thread(
+                _update_document_status_sync, doc_id, ProcessingStatus.FAILED_EMBEDDING
+            )
             return {
                 'success': False,
                 'error': f'All {len(embedding_batches)} embedding batches failed'
             }
         elif len(failed_batches) > 0:
-            _update_document_status_sync(doc_id, ProcessingStatus.PARTIAL)
+            await asyncio.to_thread(
+                _update_document_status_sync, doc_id, ProcessingStatus.PARTIAL
+            )
             logger.warning(f"⚠️ [DOC-{short_id}] Partial success: {len(successful_batches)}/{len(embedding_batches)} batches")
         else:
-            _update_document_status_sync(doc_id, ProcessingStatus.COMPLETE, stats=results_dict)
+            await asyncio.to_thread(
+                _update_document_status_sync, doc_id, ProcessingStatus.COMPLETE, None, results_dict
+            )
             logger.info(f"✅ [DOC-{short_id}] All embeddings successful")
-        
+
         return results_dict
-        
+
     except Exception as e:
         logger.error(f"❌ [DOC-{short_id}] Embedding processing failed: {e}")
-        _update_document_status_sync(doc_id, ProcessingStatus.FAILED_EMBEDDING, str(e))
+        await asyncio.to_thread(
+            _update_document_status_sync, doc_id, ProcessingStatus.FAILED_EMBEDDING, str(e)
+        )
         return {
             'success': False,
             'error': str(e)
@@ -1771,11 +2137,22 @@ async def _execute_batch_workflow(batch_id: str, file_urls: List[str], metadata:
     """
     project_id = metadata['project_id']
     user_id = metadata['user_id']
-    
+
+    # Rows pre-created by /speculative-ingest/ exist before this task runs but do
+    # not yet carry batch_id in processing_metadata — match them by id so the
+    # early phases are actually visible to the UI.
+    known_doc_ids = [d for d in [metadata.get('speculative_doc_id')] if d]
+
     # ——— Step 1: Concurrent Document Analysis ————————————————————————————————————
 
     logger.info(f"🔍 [BATCH-{batch_id[:8]}] Analyzing document types...")
-    _update_batch_progress_sync(batch_id, project_id, BatchProgressStatus.BATCH_ANALYZING)
+    await asyncio.to_thread(
+        _update_batch_progress_sync,
+        batch_id,
+        project_id,
+        BatchProgressStatus.BATCH_ANALYZING,
+        known_doc_ids,
+    )
 
     async with httpx.AsyncClient(timeout=60.0) as client:
         analysis_tasks = [
@@ -1812,7 +2189,13 @@ async def _execute_batch_workflow(batch_id: str, file_urls: List[str], metadata:
     logger.info(f"   ♻️ Reused documents: {len(reused_documents)}")
     logger.info(f"   📋 Duplicate documents: {len(duplicate_documents)}")
     logger.info(f"   ❌ Failed downloads: {len(failed_downloads)}")
-    _update_batch_progress_sync(batch_id, project_id, BatchProgressStatus.BATCH_PROCESSING)
+    await asyncio.to_thread(
+        _update_batch_progress_sync,
+        batch_id,
+        project_id,
+        BatchProgressStatus.BATCH_PROCESSING,
+        known_doc_ids,
+    )
 
     # flattened dictionary
     logger.info(f"🪲 DEBUG: Original metadata keys: {list(metadata.keys())}")
@@ -1856,7 +2239,9 @@ async def _execute_batch_workflow(batch_id: str, file_urls: List[str], metadata:
         # Sub-case B: All failed downloads (network/access issues)
         elif len(failed_downloads) > 0:
             logger.error(f"❌ [BATCH-{batch_id[:8]}] All documents failed to download")
-            _update_batch_progress_sync(batch_id, project_id, BatchProgressStatus.BATCH_FAILED)
+            await asyncio.to_thread(
+                _update_batch_progress_sync, batch_id, project_id, BatchProgressStatus.BATCH_FAILED
+            )
             
             # FIXED: Don't use apply_async - handle failure synchronously
             await _handle_batch_failure_async(batch_id, metadata, failed_downloads)
@@ -1942,7 +2327,9 @@ async def _execute_batch_workflow(batch_id: str, file_urls: List[str], metadata:
             group(document_tasks),
             finalize_batch_and_create_note.s(batch_id, workflow_metadata)
         )
-        _update_batch_progress_sync(batch_id, project_id, BatchProgressStatus.BATCH_EMBEDDING) # ← Technically embedding start with apply_async() in the parent function but this is a good place
+        await asyncio.to_thread(
+            _update_batch_progress_sync, batch_id, project_id, BatchProgressStatus.BATCH_EMBEDDING
+        )  # ← Technically embedding starts with apply_async() in the parent function but this is a good place
         
         return {
             'batch_id': batch_id,
@@ -2173,7 +2560,22 @@ def finalize_batch_and_create_note(
         
     else:
         logger.info(f"ℹ️ [BATCH-{batch_id[:8]}] Note generation not requested")
-    
+
+    # ——— 🎯 Deferred Note (speculative-ingest flow) ————————————————————————————————
+    # Ingest for this batch was started on drag-drop, before the user had chosen a
+    # note type, so `create_note` is False here.  If they have since submitted,
+    # POST /new-rag-project/attach-note/ parked the request in Redis; fire it now
+    # that the documents are terminal.  The DEL-claim inside try_fire_pending_note
+    # makes this safe against the endpoint racing us and against the multiple
+    # finalizers a multi-file drop produces.
+    deferred_note_id = None
+    if not workflow_metadata.get('create_note'):
+        try:
+            from utils.speculative_upload import try_fire_pending_note
+            deferred_note_id = run_async_in_worker(try_fire_pending_note(project_id))
+        except Exception as e:
+            logger.error(f"❌ [BATCH-{batch_id[:8]}] Deferred note dispatch failed: {e}")
+
     return {
         'batch_id': batch_id,
         'batch_status': batch_status,
@@ -2181,7 +2583,11 @@ def finalize_batch_and_create_note(
         'failed_documents': failure_count,
         'total_chunks_processed': total_chunks,
         'tokens_saved': total_tokens_reused,
-        'note_generation_triggered': workflow_metadata.get('create_note') and batch_status in ['COMPLETE', 'PARTIAL']
+        'note_generation_triggered': bool(
+            (workflow_metadata.get('create_note') and batch_status in ['COMPLETE', 'PARTIAL'])
+            or deferred_note_id
+        ),
+        'deferred_note_id': deferred_note_id,
     }
 
 # ——— [DOCUMENT LEVEL] Document Processing  ————————————————————————————————————————————————
@@ -2238,9 +2644,16 @@ def process_new_document_wrapper(
         # Update document status (sync call, like your pattern)
         _update_document_status_sync(doc_id, ProcessingStatus.COMPLETE, stats=result)
 
+        chat_session_id = workflow_metadata.get('chat_session_id')
+        publish_ingest_progress_sync(
+            chat_session_id,
+            doc_id,
+            IngestStage.COMPLETE,
+            filename=doc_data.get('filename'),
+        )
+
         # Clear the speculative-upload Redis gate for this doc (if the call
         # came from a drag-drop chat flow that included chat_session_id).
-        chat_session_id = workflow_metadata.get('chat_session_id')
         if chat_session_id:
             from utils.speculative_upload import clear_speculative_upload
             run_async_in_worker(clear_speculative_upload(chat_session_id, doc_id))
@@ -2251,7 +2664,14 @@ def process_new_document_wrapper(
     except Exception as e:
         logger.error(f"❌ [DOC-{short_id}] Document processing failed: {e}", exc_info=True)
         _update_document_status_sync(doc_id, ProcessingStatus.FAILED_PARSING, str(e))
-        
+        publish_ingest_progress_sync(
+            workflow_metadata.get('chat_session_id'),
+            doc_id,
+            IngestStage.FAILED,
+            filename=doc_data.get('filename'),
+            detail=str(e)[:200],
+        )
+
         # Return error result instead of raising (better for batch coordination)
         return {
             'doc_id': doc_id,
@@ -2260,8 +2680,10 @@ def process_new_document_wrapper(
             'error': str(e),
             'chunks_created': 0
         }
-    
+
     finally:
+        # Drop the parked bytes — the parser is done with them either way.
+        _purge_ingest_cache(doc_data.get('content_hash'))
         # Cleanup (like your pattern)
         gc.collect()
 
@@ -2287,78 +2709,99 @@ async def _process_document_async_workflow(
     doc_data (Dict): document metadata
     """
     short_id = doc_id[:8]
-    
+    timings = PhaseTimer(doc_id)
+    chat_session_id = workflow_metadata.get('chat_session_id')
+    filename = doc_data.get('filename')
+    content_hash = doc_data.get('content_hash')
+
+    await publish_ingest_progress(
+        chat_session_id, doc_id, IngestStage.DOWNLOADED, filename=filename
+    )
+
     try:
-        # ——— 1. INSERT Document Record (Sync DB) ———————————————————————————————————
-        # Use global pool instead of local pool
-        pool = get_global_sync_db_pool()
-        conn = pool.getconn()
-        try:
-            logger.info(f"📋 [DOC-{short_id}] workflow_meta → {workflow_metadata}")
-            with conn.cursor() as cur:
-                # FIXED: Use .get() with default value instead of direct key access
-                is_essential = workflow_metadata.get('is_essential', False)
-                
-                if is_essential:
-                    # Get "1L Essential" course and section with defaults
-                    essential_course = workflow_metadata.get('essential_course')
-                    essential_section = workflow_metadata.get('essential_section')
-                    
-                    cur.execute(
-                        '''INSERT INTO document_sources
-                        (id, essential_course, essential_section, is_essential, cdn_url, content_hash, project_id, content_tags, uploaded_by,
-                        vector_embed_status, filename, file_size_bytes, file_extension, created_at, processing_metadata)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                        ON CONFLICT (id) DO UPDATE SET
-                            content_hash = EXCLUDED.content_hash,
-                            vector_embed_status = EXCLUDED.vector_embed_status,
-                            processing_metadata = EXCLUDED.processing_metadata''',
-                        (doc_id, essential_course, essential_section, is_essential, doc_data['cdn_url'], doc_data['content_hash'],
-                        project_id, doc_data.get('content_tags', []), workflow_metadata['user_id'],
-                        ProcessingStatus.PENDING.value, doc_data['filename'],
-                        doc_data['file_size_bytes'], os.path.splitext(doc_data['filename'])[1].lower(),
-                        datetime.now(timezone.utc), Json(workflow_metadata))
-                    )
-                else:
-                    # Non-essential document - use standard insert
-                    cur.execute(
-                        '''INSERT INTO document_sources
-                        (id, cdn_url, content_hash, project_id, content_tags, uploaded_by,
-                        vector_embed_status, filename, file_size_bytes, file_extension, created_at, processing_metadata)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                        ON CONFLICT (id) DO UPDATE SET
-                            content_hash = EXCLUDED.content_hash,
-                            vector_embed_status = EXCLUDED.vector_embed_status,
-                            processing_metadata = EXCLUDED.processing_metadata''',
-                        (doc_id, doc_data['cdn_url'], doc_data['content_hash'],
-                        project_id, doc_data.get('content_tags', []), workflow_metadata['user_id'],
-                        ProcessingStatus.PENDING.value, doc_data['filename'],
-                        doc_data['file_size_bytes'], os.path.splitext(doc_data['filename'])[1].lower(),
-                        datetime.now(timezone.utc), Json(workflow_metadata))
-                    )
-                conn.commit()
-        finally:
-            pool.putconn(conn)
-        
+        # ——— 1. INSERT Document Record (Sync DB, off the shared loop) ——————————————
+        # psycopg2 blocks; the worker's single event loop serves every concurrent
+        # document and chat stream, so this runs in a thread.
+        def _insert_document_row():
+            # Use global pool instead of local pool
+            pool = get_global_sync_db_pool()
+            conn = pool.getconn()
+            try:
+                logger.info(f"📋 [DOC-{short_id}] workflow_meta → {workflow_metadata}")
+                with conn.cursor() as cur:
+                    # FIXED: Use .get() with default value instead of direct key access
+                    is_essential = workflow_metadata.get('is_essential', False)
+
+                    if is_essential:
+                        # Get "1L Essential" course and section with defaults
+                        essential_course = workflow_metadata.get('essential_course')
+                        essential_section = workflow_metadata.get('essential_section')
+
+                        cur.execute(
+                            '''INSERT INTO document_sources
+                            (id, essential_course, essential_section, is_essential, cdn_url, content_hash, project_id, content_tags, uploaded_by,
+                            vector_embed_status, filename, file_size_bytes, file_extension, created_at, processing_metadata)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                            ON CONFLICT (id) DO UPDATE SET
+                                content_hash = EXCLUDED.content_hash,
+                                vector_embed_status = EXCLUDED.vector_embed_status,
+                                processing_metadata = EXCLUDED.processing_metadata''',
+                            (doc_id, essential_course, essential_section, is_essential, doc_data['cdn_url'], doc_data['content_hash'],
+                            project_id, doc_data.get('content_tags', []), workflow_metadata['user_id'],
+                            ProcessingStatus.PENDING.value, doc_data['filename'],
+                            doc_data['file_size_bytes'], os.path.splitext(doc_data['filename'])[1].lower(),
+                            datetime.now(timezone.utc), Json(workflow_metadata))
+                        )
+                    else:
+                        # Non-essential document - use standard insert
+                        cur.execute(
+                            '''INSERT INTO document_sources
+                            (id, cdn_url, content_hash, project_id, content_tags, uploaded_by,
+                            vector_embed_status, filename, file_size_bytes, file_extension, created_at, processing_metadata)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                            ON CONFLICT (id) DO UPDATE SET
+                                content_hash = EXCLUDED.content_hash,
+                                vector_embed_status = EXCLUDED.vector_embed_status,
+                                processing_metadata = EXCLUDED.processing_metadata''',
+                            (doc_id, doc_data['cdn_url'], doc_data['content_hash'],
+                            project_id, doc_data.get('content_tags', []), workflow_metadata['user_id'],
+                            ProcessingStatus.PENDING.value, doc_data['filename'],
+                            doc_data['file_size_bytes'], os.path.splitext(doc_data['filename'])[1].lower(),
+                            datetime.now(timezone.utc), Json(workflow_metadata))
+                        )
+                    conn.commit()
+            finally:
+                pool.putconn(conn)
+
+        with timings.phase("insert"):
+            await asyncio.to_thread(_insert_document_row)
+
         # ——— 2. PARSE Document ———————————————————————————————————————————————————
         logger.info(f"📋 [DOC-{short_id}] → PARSING ({'Docling' if USE_HIERARCHICAL_INGEST else 'legacy'})")
+        await publish_ingest_progress(
+            chat_session_id, doc_id, IngestStage.PARSING, filename=filename
+        )
 
-        if USE_HIERARCHICAL_INGEST:
-            parse_result = await _parse_and_chunk_docling_async(
-                doc_id,
-                doc_data['filename'],
-                doc_data['cdn_url'],
-                project_id,
-            )
-        else:
-            parse_result = await _parse_document_async(
-                doc_id,
-                doc_data['filename'],
-                doc_data['cdn_url'],
-                project_id,
-            )
+        with timings.phase("parse"):
+            if USE_HIERARCHICAL_INGEST:
+                parse_result = await _parse_and_chunk_docling_async(
+                    doc_id,
+                    doc_data['filename'],
+                    doc_data['cdn_url'],
+                    project_id,
+                    content_hash=content_hash,
+                )
+            else:
+                parse_result = await _parse_document_async(
+                    doc_id,
+                    doc_data['filename'],
+                    doc_data['cdn_url'],
+                    project_id,
+                    content_hash=content_hash,
+                )
 
         if not parse_result.get('success'):
+            timings.log()
             return {
                 'doc_id': doc_id,
                 'processing_type': 'NEW',
@@ -2370,24 +2813,49 @@ async def _process_document_async_workflow(
         chunks = parse_result['chunks']
         chunks_metadata = parse_result.get('metadatas', [])
         logger.info(f"✅ [DOC-{short_id}] Parsed {len(chunks)} chunks")
+        await publish_ingest_progress(
+            chat_session_id, doc_id, IngestStage.PARSED, filename=filename
+        )
 
         # LightRAG hook (disabled)
         if USE_LIGHTRAG_INTEGRATION:
             lightrag_client.insert_document_into_kg(doc_id=doc_id, chunks=chunks)
 
+        # ——— 2a. TOC EXTRACTION (hierarchical path only) ——————————————————————
+        # Hoisted ahead of blurb generation: the TOC is the document skeleton
+        # that _build_doc_synopsis uses in place of the old full-text dump.
+        toc = None
+        raw_doc = parse_result.get('raw_doc')
+        if USE_HIERARCHICAL_INGEST and raw_doc is not None:
+            try:
+                from utils.document_loaders.docling_loader import extract_toc_from_docling_doc
+                with timings.phase("toc"):
+                    toc = await asyncio.to_thread(extract_toc_from_docling_doc, raw_doc)
+            except Exception as toc_err:
+                logger.warning(f"⚠️ TOC extraction failed: {toc_err}")
+
         # ——— 2b. CONTEXTUAL BLURBS (hierarchical path only) ——————————————————
         # Must run before embedding: table chunks embed their LLM summary, not raw markdown.
         if USE_HIERARCHICAL_INGEST:
             logger.info(f"📝 [DOC-{short_id}] → BLURB GENERATION")
-            chunks_metadata = await _generate_chunk_blurbs_async(
-                chunks, chunks_metadata, doc_id
+            await publish_ingest_progress(
+                chat_session_id, doc_id, IngestStage.BLURBS, filename=filename
             )
+            with timings.phase("blurbs"):
+                chunks_metadata = await _generate_chunk_blurbs_async(
+                    chunks, chunks_metadata, doc_id, filename=filename, toc=toc
+                )
 
         # ——— 3. EMBEDDING Process, async with concurrency control ————————————————
         logger.info(f"📋 [DOC-{short_id}] → EMBEDDING")
-        embedding_result = await _process_embeddings_async(doc_id, project_id, chunks, chunks_metadata)
+        await publish_ingest_progress(
+            chat_session_id, doc_id, IngestStage.EMBEDDING, filename=filename
+        )
+        with timings.phase("embed"):
+            embedding_result = await _process_embeddings_async(doc_id, project_id, chunks, chunks_metadata)
 
         if not embedding_result.get('success'):
+            timings.log()
             return {
                 'doc_id': doc_id,
                 'processing_type': 'NEW',
@@ -2412,38 +2880,37 @@ async def _process_document_async_workflow(
             build_section_summaries.delay(doc_id, project_id)
             logger.info(f"🚀 [DOC-{short_id}] Post-embed sub-tasks dispatched")
 
-            # Persist TOC extracted by Docling (best-effort)
-            raw_doc = parse_result.get('raw_doc')
-            if raw_doc is not None:
+            # Persist the TOC extracted above (best-effort)
+            if toc:
                 try:
-                    from utils.document_loaders.docling_loader import extract_toc_from_docling_doc
-                    toc = extract_toc_from_docling_doc(raw_doc)
-                    if toc:
-                        async with get_db_connection() as conn:
-                            await conn.execute(
-                                "UPDATE document_sources SET toc = $1 WHERE id = $2",
-                                json.dumps(toc), doc_id,
-                            )
-                        logger.info(f"📑 [DOC-{short_id}] TOC saved ({len(toc)} entries)")
+                    async with get_db_connection() as conn:
+                        await conn.execute(
+                            "UPDATE document_sources SET toc = $1 WHERE id = $2",
+                            json.dumps(toc), doc_id,
+                        )
+                    logger.info(f"📑 [DOC-{short_id}] TOC saved ({len(toc)} entries)")
                 except Exception as toc_err:
                     logger.warning(f"⚠️ TOC save failed: {toc_err}")
 
         # ——— Return Success Result ———————————————————————————————————————————————
+        timings.log()
         return {
             'doc_id': doc_id,
             'processing_type': 'NEW',
             'status': 'COMPLETE',
             'chunks_created': embedding_result['chunks_embedded'],
             'total_tokens': embedding_result['total_tokens'],
-            'processing_time_ms': embedding_result.get('processing_time_ms', 0)
+            'processing_time_ms': int(timings.total_ms),
+            'phase_timings_ms': timings.to_dict(),
         }
-        
+
     except Exception as e:
         logger.error(f"❌ [DOC-{short_id}] Async processing failed: {e}")
+        timings.log()
         return {
             'doc_id': doc_id,
             'processing_type': 'NEW',
-            'status': 'FAILED', 
+            'status': 'FAILED',
             'error': str(e),
             'chunks_created': 0
         }

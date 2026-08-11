@@ -21,6 +21,7 @@ Tables get special treatment per the "retrieved" spec:
 
 import io
 import logging
+import os
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterator, List, Optional, Tuple
@@ -33,6 +34,52 @@ logger = logging.getLogger(__name__)
 # Stored in metadata so the generation layer can apply the rule without re-querying.
 TABLE_INLINE_MAX_ROWS = 30
 TABLE_INLINE_MAX_COLS = 8
+
+# TableFormer runs over every page when enabled and is a large share of parse
+# time.  Court opinions and statutes — the dominant input here — contain almost
+# no tables, so this is worth turning off once measured.  Default stays on to
+# preserve existing behaviour.
+DOCLING_TABLE_STRUCTURE = os.getenv("DOCLING_TABLE_STRUCTURE", "true").lower() == "true"
+
+# Threads Docling's own pipeline may use. Defaults to the box's CPU count.
+DOCLING_NUM_THREADS = int(os.getenv("DOCLING_NUM_THREADS", str(os.cpu_count() or 2)))
+
+
+def _build_minimal_pdf() -> bytes:
+    """
+    A valid one-page PDF with a single line of text, used only to warm Docling's
+    pipeline at worker start. Built rather than hard-coded so the xref offsets
+    are always correct.
+    """
+    content = b"BT /F1 12 Tf 20 100 Td (warmup) Tj ET\n"
+    objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] "
+        b"/Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>",
+        b"<< /Length %d >>\nstream\n" % len(content) + content + b"endstream",
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+    ]
+
+    out = bytearray(b"%PDF-1.4\n")
+    offsets = []
+    for i, body in enumerate(objects, start=1):
+        offsets.append(len(out))
+        out += b"%d 0 obj\n" % i + body + b"\nendobj\n"
+
+    xref_pos = len(out)
+    out += b"xref\n0 %d\n" % (len(objects) + 1)
+    out += b"0000000000 65535 f \n"
+    for off in offsets:
+        out += b"%010d 00000 n \n" % off
+    out += b"trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n" % (
+        len(objects) + 1,
+        xref_pos,
+    )
+    return bytes(out)
+
+
+_MINIMAL_PDF = _build_minimal_pdf()
 
 
 # ——— Data Structure ———————————————————————————————————————————————————————————
@@ -140,11 +187,29 @@ class DoclingPDFLoader(BaseDocumentLoader):
                 "Run: pip install docling"
             ) from exc
 
+        def _accelerate(opts):
+            """Apply thread count if this docling build exposes accelerator options."""
+            try:
+                from docling.datamodel.pipeline_options import AcceleratorOptions
+
+                opts.accelerator_options = AcceleratorOptions(
+                    num_threads=DOCLING_NUM_THREADS
+                )
+            except Exception:
+                # Older docling builds don't have AcceleratorOptions — harmless.
+                pass
+            return opts
+
         # ── Text-layer converter — OCR disabled, fast path ────────────────
         self._converter_text = DocumentConverter(
             format_options={
                 InputFormat.PDF: PdfFormatOption(
-                    pipeline_options=PdfPipelineOptions(do_ocr=False)
+                    pipeline_options=_accelerate(
+                        PdfPipelineOptions(
+                            do_ocr=False,
+                            do_table_structure=DOCLING_TABLE_STRUCTURE,
+                        )
+                    )
                 )
             }
         )
@@ -156,9 +221,12 @@ class DoclingPDFLoader(BaseDocumentLoader):
         self._converter_ocr = DocumentConverter(
             format_options={
                 InputFormat.PDF: PdfFormatOption(
-                    pipeline_options=PdfPipelineOptions(
-                        do_ocr=True,
-                        ocr_options=TesseractCliOcrOptions(lang=["eng"]),
+                    pipeline_options=_accelerate(
+                        PdfPipelineOptions(
+                            do_ocr=True,
+                            do_table_structure=DOCLING_TABLE_STRUCTURE,
+                            ocr_options=TesseractCliOcrOptions(lang=["eng"]),
+                        )
                     )
                 )
             }
@@ -176,8 +244,37 @@ class DoclingPDFLoader(BaseDocumentLoader):
         )
         logger.info(
             f"🔧 DoclingPDFLoader ready: text-layer + Tesseract OCR converters "
-            f"(max_tokens={self.max_tokens}, merge_peers={self.merge_peers})"
+            f"(max_tokens={self.max_tokens}, merge_peers={self.merge_peers}, "
+            f"table_structure={DOCLING_TABLE_STRUCTURE}, threads={DOCLING_NUM_THREADS})"
         )
+
+    # ——— Warm-up ———————————————————————————————————————————————————————————
+
+    def warm_up(self) -> bool:
+        """
+        Force the text-layer pipeline to build and load its models.
+
+        Constructing a DocumentConverter does NOT load anything — docling builds
+        the pipeline lazily on the first convert(), so calling _ensure_ready()
+        alone still leaves the first real upload paying the full model-load cost
+        (~30s). Running one tiny conversion here moves that cost to worker boot.
+
+        Returns True if the warm conversion succeeded. Never raises.
+        """
+        try:
+            self._ensure_ready()
+
+            from docling.datamodel.document import DocumentStream
+
+            stream = DocumentStream(
+                name="warmup.pdf", stream=io.BytesIO(_MINIMAL_PDF)
+            )
+            self._converter_text.convert(stream)
+            logger.info("🔥 Docling text-layer pipeline warmed (models resident)")
+            return True
+        except Exception as exc:
+            logger.warning(f"⚠️ Docling warm-up conversion failed (non-fatal): {exc}")
+            return False
 
     # ——— Public API ————————————————————————————————————————————————————————
 

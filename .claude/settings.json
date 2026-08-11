@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m pytest test/ -q --no-header)",
+      "Bash(conda run *)",
+      "Bash(python verify_ingest.py)"
+    ]
+  }
+}
