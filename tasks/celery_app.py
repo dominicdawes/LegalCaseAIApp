@@ -159,6 +159,13 @@ def setup_loggers(logger, **kwargs):
             # Agent pipeline — one entry covers all agents.*.nodes/graph/ledger sub-loggers
             'agents',
             'utils.llm_clients',
+            # Anything not listed here is invisible in the worker: the root
+            # logger sits at WARNING when SHOW_CELERY_LOGS is False, so an
+            # unlisted module's logger.info() is dropped silently.
+            'utils.ingest_telemetry',      # [MEM] fan-out / RSS diagnostics
+            'utils.document_loaders',      # covers docling_loader and friends
+            'utils.speculative_upload',    # upload gate, cancellation, note gate
+            'utils.progress_events',       # ingest/note progress publishing
         ]
 
         for module_name in task_modules:
@@ -174,6 +181,8 @@ def setup_loggers(logger, **kwargs):
             'tasks.upload_tasks', 'tasks.note_tasks', 'tasks.chat_tasks',
             'tasks.chat_streaming_tasks', 'tasks.sample_tasks',
             'agents', 'utils.llm_clients',
+            'utils.ingest_telemetry', 'utils.document_loaders',
+            'utils.speculative_upload', 'utils.progress_events',
         ]:
             module_logger = logging.getLogger(module_name)
             module_logger.setLevel(logging.ERROR)  # Only errors

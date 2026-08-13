@@ -6,7 +6,9 @@
       "Bash(python verify_ingest.py)",
       "Bash(python -c ' *)",
       "Bash(PYTHONIOENCODING=utf-8 python verify_cancel.py)",
-      "Bash(PYTHONIOENCODING=utf-8 python verify_ingest.py)"
+      "Bash(PYTHONIOENCODING=utf-8 python verify_ingest.py)",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('tasks/celery_app.py',encoding='utf-8'\\).read\\(\\)\\); print\\('syntax OK'\\)\")",
+      "Bash(python -)"
     ]
   }
 }
