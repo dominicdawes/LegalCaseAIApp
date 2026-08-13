@@ -2976,6 +2976,7 @@ async def _process_document_async_workflow(
             chat_session_id, doc_id, IngestStage.PARSING, filename=filename
         )
 
+        used_hierarchical = USE_HIERARCHICAL_INGEST
         with timings.phase("parse"):
             if USE_HIERARCHICAL_INGEST:
                 parse_result = await _parse_and_chunk_docling_async(
@@ -2985,6 +2986,34 @@ async def _process_document_async_workflow(
                     project_id,
                     content_hash=content_hash,
                 )
+
+                # Docling is the richest path but also the most fragile — it
+                # drags in torch, a downloaded layout model and (historically) a
+                # C++ toolchain, and any of those breaking used to fail the
+                # document outright. The legacy loader needs none of that, so
+                # fall back rather than lose the upload. The user gets their
+                # document searchable; only the hierarchical extras
+                # (section_path, chunk_type, table structure) are missing.
+                if not parse_result.get('success'):
+                    used_hierarchical = False
+                    logger.warning(
+                        f"⚠️ [DOC-{short_id}] Docling parse failed "
+                        f"({parse_result.get('error', 'unknown')!r:.200}) — "
+                        f"falling back to the legacy loader"
+                    )
+                    with timings.phase("parse_fallback"):
+                        parse_result = await _parse_document_async(
+                            doc_id,
+                            doc_data['filename'],
+                            doc_data['cdn_url'],
+                            project_id,
+                            content_hash=content_hash,
+                        )
+                    if parse_result.get('success'):
+                        logger.info(
+                            f"✅ [DOC-{short_id}] Legacy fallback recovered the document "
+                            f"({len(parse_result.get('chunks', []))} chunks, no hierarchy)"
+                        )
             else:
                 parse_result = await _parse_document_async(
                     doc_id,
@@ -3020,7 +3049,7 @@ async def _process_document_async_workflow(
         # that _build_doc_synopsis uses in place of the old full-text dump.
         toc = None
         raw_doc = parse_result.get('raw_doc')
-        if USE_HIERARCHICAL_INGEST and raw_doc is not None:
+        if used_hierarchical and raw_doc is not None:
             try:
                 from utils.document_loaders.docling_loader import extract_toc_from_docling_doc
                 with timings.phase("toc"):
@@ -3030,7 +3059,7 @@ async def _process_document_async_workflow(
 
         # ——— 2b. CONTEXTUAL BLURBS (hierarchical path only) ——————————————————
         # Must run before embedding: table chunks embed their LLM summary, not raw markdown.
-        if USE_HIERARCHICAL_INGEST:
+        if used_hierarchical or USE_HIERARCHICAL_INGEST:
             await _checkpoint("blurb generation")
             logger.info(f"📝 [DOC-{short_id}] → BLURB GENERATION")
             await publish_ingest_progress(
@@ -3068,7 +3097,7 @@ async def _process_document_async_workflow(
         # Fired as fire-and-forget Celery tasks; never blocks note generation.
         # Gated on cancellation: these write document_sections / document_sources
         # rows, and dispatching them after a cancel would resurrect the document.
-        if USE_HIERARCHICAL_INGEST and not await is_document_cancelled(doc_id):
+        if used_hierarchical and not await is_document_cancelled(doc_id):
             from tasks.hierarchical_ingest_tasks import (
                 extract_doc_summary,
                 extract_doc_concepts,

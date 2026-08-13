@@ -42,6 +42,17 @@ COPY . /app
 
 # 6) Set environment variables for better logging
 ENV PYTHONUNBUFFERED=1
+
+# Docling's layout model (RT-DETR) is wrapped in torch.compile. TorchInductor
+# emits C++ and shells out to g++ at runtime, which this slim runtime image does
+# not carry — without this the parse fails per page with InvalidCxxCompiler.
+# Eager mode avoids needing a toolchain at all; the alternative is adding
+# build-essential (~200MB) and paying compile CPU/RAM on a 2-CPU/4GB worker.
+ENV TORCHDYNAMO_DISABLE=1
+# Keep any residual compilation single-threaded if it is ever re-enabled.
+ENV TORCHINDUCTOR_COMPILE_THREADS=1
+# Quieter dynamo output; the graph-break warnings are expected in eager mode.
+ENV TORCHDYNAMO_VERBOSE=0
 ENV CELERY_HIJACK_ROOT_LOGGER=0
 ENV CELERY_LOG_LEVEL=INFO
 ENV CELERY_HIJACK_ROOT_LOGGER=False

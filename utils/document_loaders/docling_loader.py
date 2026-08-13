@@ -31,6 +31,43 @@ from .base import BaseDocumentLoader
 
 logger = logging.getLogger(__name__)
 
+# ——— TorchDynamo / Inductor ———————————————————————————————————————————————————
+#
+# Docling's layout model (RT-DETR, via transformers) is run through
+# torch.compile. TorchInductor compiles generated C++ AT RUNTIME and needs g++,
+# which the python:3.11-slim runtime image does not have — every page raised
+#   InvalidCxxCompiler: No working C++ compiler found in
+#   torch._inductor.config.cpp.cxx: (None, 'g++')
+# and the whole conversion failed.
+#
+# Eager mode is the right trade here: compilation buys perhaps 10-30% inference
+# speed but requires a full toolchain in the image and burns CPU and memory
+# compiling on first use — both scarce on a 2-CPU/4GB worker.
+#
+# Set before torch is imported (docling pulls it in when converters are built),
+# so setdefault at module scope is early enough. Override by exporting
+# TORCHDYNAMO_DISABLE=0 if you add a compiler to the image.
+os.environ.setdefault("TORCHDYNAMO_DISABLE", "1")
+
+
+def _disable_torch_compile() -> None:
+    """
+    Belt-and-braces: turn dynamo off in-process and make any residual compile
+    attempt degrade to eager instead of raising.
+
+    The env var above covers the normal path; this covers the case where torch
+    was already imported by something else before this module loaded.
+    """
+    try:
+        import torch._dynamo as dynamo
+
+        dynamo.config.suppress_errors = True   # fall back to eager, never raise
+        dynamo.config.disable = True
+        logger.info("🔧 TorchDynamo disabled — layout model runs eager (no g++ needed)")
+    except Exception as exc:
+        # torch missing or internals moved; the env var is still in force.
+        logger.debug(f"Could not configure torch._dynamo directly: {exc}")
+
 # Maximum table dimensions to render inline vs. summarise-only at generation time.
 # Stored in metadata so the generation layer can apply the rule without re-querying.
 TABLE_INLINE_MAX_ROWS = 30
@@ -199,6 +236,9 @@ class DoclingPDFLoader(BaseDocumentLoader):
                 self._build()
 
     def _build(self) -> None:
+        # Must happen before the converters (and therefore torch) come up.
+        _disable_torch_compile()
+
         try:
             from docling.document_converter import DocumentConverter, PdfFormatOption
             from docling.datamodel.base_models import InputFormat
