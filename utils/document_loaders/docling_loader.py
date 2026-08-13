@@ -22,6 +22,7 @@ Tables get special treatment per the "retrieved" spec:
 import io
 import logging
 import os
+import threading
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterator, List, Optional, Tuple
@@ -43,6 +44,13 @@ DOCLING_TABLE_STRUCTURE = os.getenv("DOCLING_TABLE_STRUCTURE", "true").lower() =
 
 # Threads Docling's own pipeline may use. Defaults to the box's CPU count.
 DOCLING_NUM_THREADS = int(os.getenv("DOCLING_NUM_THREADS", str(os.cpu_count() or 2)))
+
+# How many documents may be inside converter.convert() at the same time.
+# Each concurrent conversion holds its own page rasters and intermediate layout
+# tensors, so this is the main lever on peak worker memory. Default 1 — raise it
+# only after watching RSS on a real batch.
+DOCLING_PARSE_CONCURRENCY = max(1, int(os.getenv("DOCLING_PARSE_CONCURRENCY", "1")))
+_PARSE_SLOTS = threading.BoundedSemaphore(DOCLING_PARSE_CONCURRENCY)
 
 
 def _build_minimal_pdf() -> bytes:
@@ -166,13 +174,31 @@ class DoclingPDFLoader(BaseDocumentLoader):
         self._converter_text = None   # lazy-init, do_ocr=False (text-layer PDFs)
         self._converter_ocr  = None   # lazy-init, Tesseract CLI (scanned PDFs)
         self._chunker = None
+        # Guards converter construction AND conversion — see _ensure_ready and
+        # load_document. The worker runs `-P threads`, so several documents can
+        # reach this object concurrently.
+        self._lock = threading.RLock()
 
     # ——— Lazy initialisation ———————————————————————————————————————————————
 
     def _ensure_ready(self) -> None:
+        # Double-checked locking: without the lock, N threads arriving together
+        # would each see _converter_text is None and each build a full set of
+        # converters, loading N copies of the layout model.
         if self._converter_text is not None:
             return
 
+        with self._lock:
+            if self._converter_text is not None:
+                return
+            # Logs the RSS cost of the converters. Seeing this line ONCE per
+            # worker is the proof that the singleton is working; seeing it once
+            # per document is the bug that caused the 4GB OOM.
+            from utils.ingest_telemetry import telemetry
+            with telemetry.model_load("Docling converters"):
+                self._build()
+
+    def _build(self) -> None:
         try:
             from docling.document_converter import DocumentConverter, PdfFormatOption
             from docling.datamodel.base_models import InputFormat
@@ -320,8 +346,16 @@ class DoclingPDFLoader(BaseDocumentLoader):
         file_buffer.seek(0)
         try:
             from docling.datamodel.document import DocumentStream
+            from utils.ingest_telemetry import telemetry
+
             stream = DocumentStream(name=source_filename, stream=file_buffer)
-            result = converter.convert(stream)
+            # Serialised deliberately. Docling's DocumentConverter holds mutable
+            # pipeline state and is not documented as thread-safe, and each
+            # concurrent conversion also holds its own page rasters in memory —
+            # six at once is what pushed the 4GB worker over its limit.
+            # DOCLING_PARSE_CONCURRENCY controls how many may overlap.
+            with telemetry.parse_slot(source_id, _PARSE_SLOTS):
+                result = converter.convert(stream)
         except Exception as exc:
             logger.error(f"❌ Docling conversion failed for {source_filename}: {exc}")
             raise
@@ -532,6 +566,43 @@ class DoclingPDFLoader(BaseDocumentLoader):
 
 
 # ——— TOC extraction helper (called from upload_tasks after load_document) ————
+
+
+# ——— Process-wide Singleton ———————————————————————————————————————————————————
+#
+# Docling's converters carry the layout model (and, on the OCR path, Tesseract
+# plumbing) — hundreds of MB of resident weights each. Constructing a loader per
+# document meant every concurrent ingest loaded its own copy: six simultaneous
+# uploads produced six "Loading weights: 0/770" bars and >4GB RSS, which is what
+# was OOM-killing the Render worker on repeat.
+#
+# There is no reason for more than one per process. Always go through
+# get_docling_loader() rather than instantiating DoclingPDFLoader directly.
+
+_LOADER_SINGLETON: Optional["DoclingPDFLoader"] = None
+_SINGLETON_LOCK = threading.Lock()
+
+
+def get_docling_loader(max_tokens: int = 512, merge_peers: bool = True) -> "DoclingPDFLoader":
+    """
+    Return the shared process-wide DoclingPDFLoader, creating it on first use.
+
+    Thread-safe: the worker runs `-P threads`, so concurrent documents race here.
+    Construction is cheap (models load lazily on first convert); the important
+    part is that everyone ends up with the SAME instance.
+    """
+    global _LOADER_SINGLETON
+
+    if _LOADER_SINGLETON is not None:
+        return _LOADER_SINGLETON
+
+    with _SINGLETON_LOCK:
+        if _LOADER_SINGLETON is None:
+            _LOADER_SINGLETON = DoclingPDFLoader(
+                max_tokens=max_tokens, merge_peers=merge_peers
+            )
+            logger.info("🦆 Created shared DoclingPDFLoader singleton")
+    return _LOADER_SINGLETON
 
 
 def extract_toc_from_docling_doc(doc) -> list:

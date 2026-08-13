@@ -172,9 +172,11 @@ def get_loader_for(filename: str,
 
     # ── Hierarchical ingest: Docling replaces the legacy PDF path ────────────
     if ext == ".pdf" and USE_HIERARCHICAL_INGEST:
-        from .docling_loader import DoclingPDFLoader
+        # Shared instance — see get_docling_loader; one copy of the layout model
+        # per process, not one per document.
+        from .docling_loader import get_docling_loader
         logger.info("🔬 [USE_HIERARCHICAL_INGEST] Using DoclingPDFLoader")
-        return DoclingPDFLoader()
+        return get_docling_loader()
 
     # PDF-specific logic with performance optimization
     if ext == ".pdf":

@@ -49,8 +49,9 @@ from utils.supabase_utils import supabase_client
 
 logger = logging.getLogger(__name__)
 
-_GATE_TTL = 600   # seconds — speculative upload gate
-_NOTE_TTL = 3600  # seconds — deferred note request
+_GATE_TTL = 600    # seconds — speculative upload gate
+_NOTE_TTL = 3600   # seconds — deferred note request
+_CANCEL_TTL = 3600 # seconds — cancellation flag; outlives any realistic ingest
 
 # A document is "terminal" once ingest can do no more with it. FAILED_* counts:
 # a note should still be attempted from whatever else embedded successfully,
@@ -86,6 +87,60 @@ async def clear_speculative_upload(chat_session_id: str, doc_id: str) -> None:
     async with get_redis_connection() as r:
         await r.hdel(f"pending_uploads:{chat_session_id}", doc_id)
     logger.info(f"✅ Cleared speculative upload {doc_id[:8]} for session {chat_session_id[:8]}")
+
+
+# ——— Cooperative Cancellation ————————————————————————————————————————————————
+#
+# The worker runs with `-P threads` (Dockerfile), and Celery cannot forcibly
+# terminate a thread — `revoke(terminate=True)` only prevents a task that has
+# not started yet from starting. An ingest already in flight therefore keeps
+# running after a cancel, finishes, and re-creates the document_sources row it
+# was deleted from (the INSERT ... ON CONFLICT DO UPDATE in
+# _process_document_async_workflow), so the cancelled file silently reappears.
+#
+# The fix is cooperative: cancel raises a flag, and the ingest checks it at
+# phase boundaries (before parse, before blurbs, before embed, before the final
+# status write) and bails out early. Same shape as the _is_cancelled check
+# already used for streaming chat in tasks/chat_tasks.py.
+
+
+class DocumentCancelledError(Exception):
+    """Raised inside the ingest pipeline when the user cancelled the upload."""
+
+
+def _cancel_key(doc_id: str) -> str:
+    return f"cancelled_doc:{doc_id}"
+
+
+async def mark_document_cancelled(doc_id: str) -> None:
+    """Raise the cancellation flag for an in-flight ingest."""
+    async with get_redis_connection() as r:
+        await r.set(_cancel_key(doc_id), "1", ex=_CANCEL_TTL)
+    logger.info(f"🚩 Marked doc {doc_id[:8]} cancelled")
+
+
+async def is_document_cancelled(doc_id: str) -> bool:
+    """
+    Check the cancellation flag. Never raises — a Redis blip must not abort an
+    otherwise healthy ingest, so failure is reported as 'not cancelled'.
+    """
+    if not doc_id:
+        return False
+    try:
+        async with get_redis_connection() as r:
+            return await r.exists(_cancel_key(doc_id)) > 0
+    except Exception as e:
+        logger.warning(f"⚠️ Cancellation check failed for {doc_id[:8]}: {e}")
+        return False
+
+
+async def clear_document_cancelled(doc_id: str) -> None:
+    """Drop the flag once the worker has acted on it."""
+    try:
+        async with get_redis_connection() as r:
+            await r.delete(_cancel_key(doc_id))
+    except Exception as e:
+        logger.debug(f"Cancellation flag clear failed for {doc_id[:8]}: {e}")
 
 
 # ——— Deferred Note Gate ——————————————————————————————————————————————————————
@@ -224,15 +279,25 @@ async def cancel_speculative_upload(
 ) -> None:
     """
     User cancelled the file. Undo everything:
-    1. Revoke the Celery task
-    2. Clear from Redis gate
-    3. Delete embeddings if any landed
-    4. Delete the document_source row
-    5. Delete from S3
+    1. Raise the cancellation flag (see mark_document_cancelled)
+    2. Revoke the Celery task
+    3. Clear from Redis gate
+    4. Read cdn_url, then delete section / vector / source rows
+    5. Delete the S3 object
+
+    Ordering matters: the flag goes up FIRST so an in-flight worker stops at its
+    next checkpoint instead of re-creating the rows we are about to delete.
     """
     from tasks.celery_app import celery_app
 
-    # 1 & 2 — Revoke and clear gate
+    # 1 — Cooperative cancel. `revoke(terminate=True)` cannot kill a running
+    # task under the threads pool the worker actually uses (Dockerfile: -P
+    # threads); terminate only applies to prefork. Without this flag an ingest
+    # already past its start would run to completion and re-insert
+    # document_sources via the ON CONFLICT upsert, resurrecting the row.
+    await mark_document_cancelled(doc_id)
+
+    # 2 & 3 — Revoke (stops it if it hasn't started yet) and clear the gate
     async with get_redis_connection() as r:
         celery_task_id = await r.hget(f"pending_uploads:{chat_session_id}", doc_id)
         if celery_task_id:
@@ -241,19 +306,43 @@ async def cancel_speculative_upload(
             logger.info(f"🛑 Revoked Celery task {task_id_str} for doc {doc_id[:8]}")
         await r.hdel(f"pending_uploads:{chat_session_id}", doc_id)
 
-    # 3 & 4 — Delete DB rows
+    # 4 — Delete DB rows.
+    # The old code deleted from "document_chunks", which does not exist — every
+    # cancel 500'd on UndefinedTableError and nothing was ever cleaned up.
+    # Chunks live in document_vector_store (source_id), and the hierarchical
+    # path adds document_sections (source_id). Children first, then the parent.
+    cdn_url = None
     async with get_db_connection() as conn:
+        row = await conn.fetchrow(
+            "SELECT cdn_url FROM document_sources WHERE id = $1", doc_id
+        )
+        if row:
+            cdn_url = row["cdn_url"]
+
         await conn.execute(
-            "DELETE FROM document_chunks WHERE document_id = $1", doc_id
+            "DELETE FROM document_sections WHERE source_id = $1", doc_id
+        )
+        await conn.execute(
+            "DELETE FROM document_vector_store WHERE source_id = $1", doc_id
         )
         await conn.execute(
             "DELETE FROM document_sources WHERE id = $1", doc_id
         )
 
-    # 5 — Best-effort S3 cleanup
+    # 5 — Best-effort S3 cleanup. The object key is never persisted, so it has
+    # to be recovered from cdn_url (the previous code passed doc_id, which is
+    # not the key and never matched anything).
     try:
-        from utils.s3_utils import delete_from_s3
-        await asyncio.to_thread(delete_from_s3, doc_id)
+        from utils.s3_utils import delete_from_s3, s3_key_from_url
+
+        s3_key = s3_key_from_url(cdn_url)
+        if s3_key:
+            await asyncio.to_thread(delete_from_s3, s3_key)
+            logger.info(f"🗑️ Deleted S3 object {s3_key} for doc {doc_id[:8]}")
+        else:
+            logger.warning(
+                f"⚠️ No usable S3 key for doc {doc_id[:8]} (cdn_url={cdn_url!r}) — object left in place"
+            )
     except Exception as e:
         logger.warning(f"⚠️ S3 cleanup failed for {doc_id[:8]}: {e}")
 

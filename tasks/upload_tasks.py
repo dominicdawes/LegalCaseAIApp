@@ -166,6 +166,19 @@ RETRY_BACKOFF_MULTIPLIER = 2
 DEFAULT_RETRY_DELAY = 5
 RATE_LIMIT = '150/m' # Tuned for a 2-CPU / 4GB RAM instance instead of 1000/m
 
+# ── Poison-message guard ──────────────────────────────────────────────────────
+# Celery runs with task_acks_late=True, so a message is only acked once its task
+# finishes. If a document is heavy enough to OOM-kill the worker, the broker
+# redelivers it on restart, it OOMs again, and the worker enters a permanent
+# crash loop — replaying the same documents for days. (The `celery purge` in the
+# Dockerfile does not help: unacked messages are requeued by the broker *after*
+# the purge, when it notices the dead connection.)
+#
+# Each attempt bumps a Redis counter; past the limit the document is failed
+# permanently so the message finally gets acked and the loop breaks.
+MAX_INGEST_ATTEMPTS = int(os.getenv("MAX_INGEST_ATTEMPTS", "3"))
+_INGEST_ATTEMPT_TTL = 24 * 3600  # seconds
+
 # OpenAI configuration
 OPENAI_EMBEDDING_MODEL = "text-embedding-ada-002"  # XTREMELY OUTDATAE
 OPENAI_MAX_TOKENS_PER_BATCH = 8190 # Safety margin below the 8192 limit
@@ -349,16 +362,34 @@ def _warm_docling_on_startup(sender=None, **kwargs):
     """
     if USE_HIERARCHICAL_INGEST:
         try:
-            from utils.document_loaders.docling_loader import DoclingPDFLoader
+            # Warm the SINGLETON — warming a throwaway instance loaded models
+            # into an object that was immediately garbage collected, so the
+            # first real upload still paid the full cold-load.
+            from utils.document_loaders.docling_loader import get_docling_loader
             logger.info("🔥 Pre-warming Docling models at worker startup...")
             started = time.perf_counter()
-            if DoclingPDFLoader().warm_up():
+            if get_docling_loader().warm_up():
                 logger.info(
                     f"✅ Docling models warm in {time.perf_counter() - started:.1f}s "
                     f"— first upload will not cold-load"
                 )
         except Exception as exc:
             logger.warning(f"⚠️ Docling pre-warm failed (non-fatal): {exc}")
+
+
+@worker_init.connect
+def _log_memory_ceiling_on_startup(sender=None, **kwargs):
+    """
+    Record the container's memory limit at boot so every later percentage in the
+    log is interpretable. Reads the cgroup limit, not host RAM — on Render the
+    host figure is far larger than the instance cap and makes usage look safe
+    right up to the OOM kill.
+    """
+    try:
+        from utils.ingest_telemetry import log_startup_memory
+        log_startup_memory()
+    except Exception as exc:
+        logger.debug(f"Memory ceiling log failed: {exc}")
 
 
 @worker_init.connect
@@ -427,10 +458,59 @@ class PhaseTimer:
         return out
 
     def log(self) -> None:
+        """
+        The single most useful line per document: where the time went, and what
+        the worker looked like while it went there.
+        """
         parts = " ".join(f"{k}={int(v)}ms" for k, v in self.phases.items())
+
+        state = ""
+        try:
+            from utils.ingest_telemetry import telemetry
+            state = f" | {telemetry.format_state()}"
+        except Exception:
+            pass
+
+        slowest = ""
+        if self.phases:
+            name, ms = max(self.phases.items(), key=lambda kv: kv[1])
+            share = 100.0 * ms / self.total_ms if self.total_ms else 0
+            slowest = f" | slowest={name} ({share:.0f}%)"
+
         logger.info(
             f"⏱️ [DOC-{self.doc_id[:8]}] {parts} total={int(self.total_ms)}ms"
+            f"{slowest}{state}"
         )
+
+
+# ——— Poison-message Guard ————————————————————————————————————————————————————————
+
+async def _record_ingest_attempt(doc_id: str) -> int:
+    """
+    Count this delivery of `doc_id` and return the attempt number (1 = first).
+
+    Fails open at 1: if Redis is unreachable we would rather process a document
+    twice than refuse to process it at all.
+    """
+    try:
+        key = f"ingest_attempts:{doc_id}"
+        async with get_redis_connection() as r:
+            count = await r.incr(key)
+            if count == 1:
+                await r.expire(key, _INGEST_ATTEMPT_TTL)
+            return int(count)
+    except Exception as e:
+        logger.warning(f"⚠️ Attempt counter unavailable for {doc_id[:8]}: {e}")
+        return 1
+
+
+async def _clear_ingest_attempts(doc_id: str) -> None:
+    """Reset the counter once the document has been processed successfully."""
+    try:
+        async with get_redis_connection() as r:
+            await r.delete(f"ingest_attempts:{doc_id}")
+    except Exception as e:
+        logger.debug(f"Attempt counter clear failed for {doc_id[:8]}: {e}")
 
 
 # ——— Ingest Byte Cache ————————————————————————————————————————————————————————————
@@ -1342,8 +1422,11 @@ async def _parse_and_chunk_docling_async(
         # ── Docling parse + HybridChunker (CPU-bound → dedicated executor) ───
         file_ext = source_filename.rsplit(".", 1)[-1].upper() if "." in source_filename else "PDF"
         logger.info(f"🦆 Parsing {file_ext} with Docling 🪿")
-        from utils.document_loaders.docling_loader import DoclingPDFLoader
-        loader = DoclingPDFLoader()
+        # Shared singleton — a per-document loader would load its own copy of the
+        # layout model (~hundreds of MB), and N concurrent uploads would then
+        # multiply that until the worker OOMed.
+        from utils.document_loaders.docling_loader import get_docling_loader
+        loader = get_docling_loader()
         loop = asyncio.get_event_loop()
         texts, metadatas, raw_doc = await loop.run_in_executor(
             _CPU_EXECUTOR,
@@ -2416,12 +2499,18 @@ def finalize_batch_and_create_note(
     # ——— Standard Batch Analysis ——————————————————————————————————————————————————
     successful_docs = []
     failed_docs = []
-    
+    cancelled_docs = []
+
     for result in processing_results:
         if result and isinstance(result, dict):
             status = result.get('status')
             if status in ['COMPLETE', 'PARTIAL']:
                 successful_docs.append(result)
+            elif status == 'CANCELLED':
+                # The user removed this file mid-ingest. Neither a success nor a
+                # failure — it's excluded from the totals entirely so a cancelled
+                # file can't drag the batch to FAILED or block note generation.
+                cancelled_docs.append(result)
             elif status == 'FAILED':
                 failed_docs.append(result)
             else:
@@ -2433,10 +2522,13 @@ def finalize_batch_and_create_note(
                 'status': 'FAILED',
                 'error': 'Invalid result format'
             })
-    
-    total_docs = len(processing_results)
+
+    total_docs = len(processing_results) - len(cancelled_docs)
     success_count = len(successful_docs)
     failure_count = len(failed_docs)
+
+    if cancelled_docs:
+        logger.info(f"🚫 [BATCH-{batch_id[:8]}] {len(cancelled_docs)} document(s) cancelled by user")
     
     # Calculate total chunks safely
     total_chunks = 0
@@ -2450,6 +2542,22 @@ def finalize_batch_and_create_note(
             total_tokens_reused += doc.get('tokens_reused', 0)
     
     # ——— Determine Final Batch Status ————————————————————————————————————————————
+    if total_docs == 0:
+        # Every document in the batch was cancelled. Nothing succeeded and
+        # nothing failed — don't mark the batch FAILED and don't persist a
+        # PARSE_ERROR note stub for a file the user deliberately removed.
+        logger.info(f"🚫 [BATCH-{batch_id[:8]}] All documents cancelled — nothing to finalize")
+        return {
+            'batch_id': batch_id,
+            'batch_status': 'CANCELLED',
+            'successful_documents': 0,
+            'failed_documents': 0,
+            'cancelled_documents': len(cancelled_docs),
+            'total_chunks_processed': 0,
+            'tokens_saved': 0,
+            'note_generation_triggered': False,
+        }
+
     if success_count == total_docs:
         batch_status = 'COMPLETE'
         final_progress = BatchProgressStatus.BATCH_COMPLETE
@@ -2619,7 +2727,49 @@ def process_new_document_wrapper(
     doc_id = workflow_metadata.get('speculative_doc_id') or str(uuid.uuid4())
     doc_data['id'] = doc_id
     short_id = doc_id[:8]
-    
+
+    # ——— Poison-message guard ————————————————————————————————————————————————
+    # Under task_acks_late, an OOM kill leaves this message unacked and the
+    # broker redelivers it forever. Give up after MAX_INGEST_ATTEMPTS so the
+    # message is finally acked and the worker stops crash-looping on it.
+    attempt = run_async_in_worker(_record_ingest_attempt(doc_id))
+    if attempt > MAX_INGEST_ATTEMPTS:
+        logger.error(
+            f"☠️ [DOC-{short_id}] Delivered {attempt} times — giving up. "
+            f"This document repeatedly killed the worker; failing it permanently "
+            f"so the queue can drain."
+        )
+        _update_document_status_sync(
+            doc_id,
+            ProcessingStatus.FAILED_PARSING,
+            f"Abandoned after {attempt} failed attempts (worker kept dying on this document)",
+        )
+        chat_session_id = workflow_metadata.get('chat_session_id')
+        if chat_session_id:
+            from utils.speculative_upload import clear_speculative_upload
+            run_async_in_worker(clear_speculative_upload(chat_session_id, doc_id))
+        publish_ingest_progress_sync(
+            chat_session_id, doc_id, IngestStage.FAILED,
+            filename=doc_data.get('filename'),
+            detail="Document could not be processed",
+        )
+        return {
+            'doc_id': doc_id,
+            'processing_type': 'NEW',
+            'status': 'FAILED',
+            'error': f'Abandoned after {attempt} attempts',
+            'chunks_created': 0,
+        }
+
+    if attempt > 1:
+        logger.warning(f"🔁 [DOC-{short_id}] Redelivery — attempt {attempt}/{MAX_INGEST_ATTEMPTS}")
+
+    # Fan-out + memory telemetry. The counters here are what reveal "six
+    # documents at once" in the log instead of leaving it to be inferred.
+    from utils.ingest_telemetry import telemetry
+    doc_start_rss = telemetry.document_started(doc_id, doc_data.get('filename', ''))
+    result_status = 'UNKNOWN'
+
     try:
         # Set explicit start time metadata (like your pattern)
         self.update_state(
@@ -2642,9 +2792,26 @@ def process_new_document_wrapper(
         )
         
         # Update document status (sync call, like your pattern)
+        chat_session_id = workflow_metadata.get('chat_session_id')
+
+        # A cancelled document has already had its rows deleted by
+        # cancel_speculative_upload. Writing COMPLETE here would re-create the
+        # document_sources row via the status UPDATE and resurrect the file in
+        # the UI, so skip straight to cleanup.
+        if result.get('status') == 'CANCELLED':
+            from utils.speculative_upload import (
+                clear_document_cancelled,
+                clear_speculative_upload,
+            )
+            if chat_session_id:
+                run_async_in_worker(clear_speculative_upload(chat_session_id, doc_id))
+            run_async_in_worker(clear_document_cancelled(doc_id))
+            logger.info(f"🚫 [DOC-{short_id}] Processing stopped — upload was cancelled")
+            result_status = 'CANCELLED'
+            return result
+
         _update_document_status_sync(doc_id, ProcessingStatus.COMPLETE, stats=result)
 
-        chat_session_id = workflow_metadata.get('chat_session_id')
         publish_ingest_progress_sync(
             chat_session_id,
             doc_id,
@@ -2658,7 +2825,9 @@ def process_new_document_wrapper(
             from utils.speculative_upload import clear_speculative_upload
             run_async_in_worker(clear_speculative_upload(chat_session_id, doc_id))
 
+        run_async_in_worker(_clear_ingest_attempts(doc_id))
         logger.info(f"✅ [DOC-{short_id}] Document processing completed successfully")
+        result_status = result.get('status', 'COMPLETE')
         return result
         
     except Exception as e:
@@ -2673,6 +2842,7 @@ def process_new_document_wrapper(
         )
 
         # Return error result instead of raising (better for batch coordination)
+        result_status = 'FAILED'
         return {
             'doc_id': doc_id,
             'processing_type': 'NEW',
@@ -2684,8 +2854,11 @@ def process_new_document_wrapper(
     finally:
         # Drop the parked bytes — the parser is done with them either way.
         _purge_ingest_cache(doc_data.get('content_hash'))
-        # Cleanup (like your pattern)
+        # Cleanup (like your pattern). gc runs BEFORE the telemetry read so the
+        # reported net delta reflects memory actually retained by this document
+        # rather than garbage that simply hasn't been collected yet.
         gc.collect()
+        telemetry.document_finished(doc_id, doc_start_rss, result_status)
 
 async def _process_document_async_workflow(
     doc_id: str,
@@ -2714,11 +2887,31 @@ async def _process_document_async_workflow(
     filename = doc_data.get('filename')
     content_hash = doc_data.get('content_hash')
 
+    from utils.speculative_upload import (
+        DocumentCancelledError,
+        is_document_cancelled,
+    )
+
+    async def _checkpoint(phase: str):
+        """
+        Bail out if the user cancelled since the last phase.
+
+        Celery cannot kill a running task under `-P threads`, so cancellation is
+        cooperative: /speculative-upload/cancel/ raises a Redis flag and we stop
+        here. Without this, a cancelled ingest runs to completion and re-creates
+        the document_sources row that cancel just deleted.
+        """
+        if await is_document_cancelled(doc_id):
+            raise DocumentCancelledError(
+                f"Document {short_id} cancelled by user before {phase}"
+            )
+
     await publish_ingest_progress(
         chat_session_id, doc_id, IngestStage.DOWNLOADED, filename=filename
     )
 
     try:
+        await _checkpoint("insert")
         # ——— 1. INSERT Document Record (Sync DB, off the shared loop) ——————————————
         # psycopg2 blocks; the worker's single event loop serves every concurrent
         # document and chat stream, so this runs in a thread.
@@ -2777,6 +2970,7 @@ async def _process_document_async_workflow(
             await asyncio.to_thread(_insert_document_row)
 
         # ——— 2. PARSE Document ———————————————————————————————————————————————————
+        await _checkpoint("parse")
         logger.info(f"📋 [DOC-{short_id}] → PARSING ({'Docling' if USE_HIERARCHICAL_INGEST else 'legacy'})")
         await publish_ingest_progress(
             chat_session_id, doc_id, IngestStage.PARSING, filename=filename
@@ -2837,6 +3031,7 @@ async def _process_document_async_workflow(
         # ——— 2b. CONTEXTUAL BLURBS (hierarchical path only) ——————————————————
         # Must run before embedding: table chunks embed their LLM summary, not raw markdown.
         if USE_HIERARCHICAL_INGEST:
+            await _checkpoint("blurb generation")
             logger.info(f"📝 [DOC-{short_id}] → BLURB GENERATION")
             await publish_ingest_progress(
                 chat_session_id, doc_id, IngestStage.BLURBS, filename=filename
@@ -2847,6 +3042,9 @@ async def _process_document_async_workflow(
                 )
 
         # ——— 3. EMBEDDING Process, async with concurrency control ————————————————
+        # Last checkpoint before we write vectors — past this point a cancel has
+        # rows to clean up, which is exactly what cancel_speculative_upload does.
+        await _checkpoint("embedding")
         logger.info(f"📋 [DOC-{short_id}] → EMBEDDING")
         await publish_ingest_progress(
             chat_session_id, doc_id, IngestStage.EMBEDDING, filename=filename
@@ -2868,7 +3066,9 @@ async def _process_document_async_workflow(
 
         # ——— 3b. POST-EMBED SUB-TASKS (hierarchical path only) ———————————————
         # Fired as fire-and-forget Celery tasks; never blocks note generation.
-        if USE_HIERARCHICAL_INGEST:
+        # Gated on cancellation: these write document_sections / document_sources
+        # rows, and dispatching them after a cancel would resurrect the document.
+        if USE_HIERARCHICAL_INGEST and not await is_document_cancelled(doc_id):
             from tasks.hierarchical_ingest_tasks import (
                 extract_doc_summary,
                 extract_doc_concepts,
@@ -2902,6 +3102,19 @@ async def _process_document_async_workflow(
             'total_tokens': embedding_result['total_tokens'],
             'processing_time_ms': int(timings.total_ms),
             'phase_timings_ms': timings.to_dict(),
+        }
+
+    except DocumentCancelledError as e:
+        # Not a failure — the user asked for this. Return a distinct status so
+        # finalize_batch_and_create_note doesn't count it as a failed document
+        # (and so an all-cancelled batch doesn't persist a PARSE_ERROR note).
+        logger.info(f"🚫 [DOC-{short_id}] {e}")
+        timings.log()
+        return {
+            'doc_id': doc_id,
+            'processing_type': 'NEW',
+            'status': 'CANCELLED',
+            'chunks_created': 0
         }
 
     except Exception as e:

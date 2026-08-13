@@ -54,7 +54,14 @@ ENV CELERY_HIJACK_ROOT_LOGGER=False
 #    CMD ["sh", "-c", "celery -A tasks.celery_app worker --loglevel=info --concurrency=2"]
 
 # Asyncio
-CMD ["sh", "-c", "echo '🧹 Purging queues on startup...' && celery -A tasks.celery_app purge -f && echo '✅ Queues purged, 🔀 starting worker [ASYNCIO]...' && celery -A tasks.celery_app worker --loglevel=info --concurrency=100 -Q celery,ingest,parsing,embedding,finalize,notes -P threads"]
+#
+# --concurrency: this is the number of documents/chats that can be in flight at
+#   once. It was 100, which on a 4GB instance let a burst of uploads run enough
+#   simultaneous Docling parses to OOM-kill the worker. Docling conversions are
+#   additionally capped by DOCLING_PARSE_CONCURRENCY (default 1), but the pool
+#   size still bounds how many tasks hold file buffers and chunk lists at once.
+#   Override with CELERY_CONCURRENCY without rebuilding the image.
+CMD ["sh", "-c", "echo '🧹 Purging queues on startup...' && celery -A tasks.celery_app purge -f && echo '✅ Queues purged, 🔀 starting worker [ASYNCIO]...' && celery -A tasks.celery_app worker --loglevel=info --concurrency=${CELERY_CONCURRENCY:-8} -Q celery,ingest,parsing,embedding,finalize,notes -P threads"]
 
 # Gevent (greenlets)
 # CMD ["sh", "-c", "echo '🧹 Purging queues on startup...' && celery -A tasks.celery_app purge -f && echo '✅ Queues purged, starting worker...' && celery -A tasks.celery_app worker --loglevel=info --concurrency=100 -Q celery,ingest,parsing,embedding,finalize -P gevent"]

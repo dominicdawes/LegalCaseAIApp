@@ -3,7 +3,10 @@
     "allow": [
       "Bash(python -m pytest test/ -q --no-header)",
       "Bash(conda run *)",
-      "Bash(python verify_ingest.py)"
+      "Bash(python verify_ingest.py)",
+      "Bash(python -c ' *)",
+      "Bash(PYTHONIOENCODING=utf-8 python verify_cancel.py)",
+      "Bash(PYTHONIOENCODING=utf-8 python verify_ingest.py)"
     ]
   }
 }

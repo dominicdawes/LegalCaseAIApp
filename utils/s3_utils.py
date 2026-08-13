@@ -133,6 +133,68 @@ def upload_to_s3(client, file_source, s3_object_key, bucket_name=s3_bucket_name,
 #     except Exception as e:
 #         raise Exception(f"Failed to upload to S3: {e}")
 
+def s3_key_from_url(url):
+    """
+    Recover the S3 object key from a CloudFront or S3 URL.
+
+    Objects are stored under "{project_id}/{uuid}{ext}", and only the URL is
+    persisted (document_sources.cdn_url) — the key itself is never saved. So
+    deleting an object means parsing it back out of the URL.
+
+    Handles all three shapes we produce or accept:
+        https://<cloudfront-domain>/<project_id>/<uuid>.pdf
+        https://<bucket>.s3.amazonaws.com/<project_id>/<uuid>.pdf
+        https://s3.<region>.amazonaws.com/<bucket>/<project_id>/<uuid>.pdf
+
+    Returns None when the URL doesn't look like one of ours, so callers can
+    skip the delete rather than guess at a key.
+    """
+    from urllib.parse import urlparse, unquote
+
+    if not url:
+        return None
+
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return None
+
+    host = (parsed.netloc or "").lower()
+    key = unquote((parsed.path or "").lstrip("/"))
+
+    if not key:
+        return None
+
+    # Path-style S3 URL: the first path segment is the bucket, not the key.
+    if host.startswith("s3.") and s3_bucket_name and key.startswith(f"{s3_bucket_name}/"):
+        key = key[len(s3_bucket_name) + 1:]
+
+    return key or None
+
+
+def delete_from_s3(object_key, bucket_name=s3_bucket_name, client=s3_client):
+    """
+    Delete a single object from the S3 bucket.
+
+    `object_key` is a key, not a URL and not a document id — use
+    s3_key_from_url() first if all you have is a cdn_url.
+
+    Returns True if the delete call succeeded. S3 DELETE is idempotent, so a
+    missing key is still a success. Raises on credential/permission errors so
+    the caller can log them rather than silently leaking objects.
+    """
+    if not object_key:
+        raise ValueError("delete_from_s3 requires an object key")
+    if not bucket_name:
+        raise ValueError("AWS_S3_BUCKET_NAME is not configured")
+
+    try:
+        client.delete_object(Bucket=bucket_name, Key=object_key)
+        return True
+    except ClientError as e:
+        raise Exception(f"Failed to delete s3://{bucket_name}/{object_key}: {e}")
+
+
 def generate_presigned_url(client, bucket_name, object_key, expiration=7200):
     """
     Generate a presigned URL to share an S3 object
