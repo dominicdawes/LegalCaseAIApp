@@ -3,15 +3,29 @@
 """
 Speculative Pre-Upload helpers.
 
-Redis gate pattern:
-  Key:    pending_uploads:{chat_session_id}   (Redis Hash)
-  Fields: {doc_id} → {celery_task_id}
-  TTL:    600s (safety net against orphaned uploads)
+A speculative upload is tracked at two independent scopes, because a document
+belongs to the PROJECT, not to any one chat:
+
+  • Doc-scoped task map (always set)
+      Key:  spec_upload_task:{doc_id}  (Redis String → celery_task_id)
+      Purpose: lets cancel/revoke find the Celery task from doc_id alone, so it
+      works in the new-project flow where no chat session exists yet.
+
+  • Session barrier gate (set only when a chat_session_id is present)
+      Key:    pending_uploads:{chat_session_id}  (Redis Hash)
+      Fields: {doc_id} → {celery_task_id}
+      Purpose: lets the in-chat RAG barrier (tasks/chat_tasks.py) wait for that
+      session's in-flight uploads before answering. New-project uploads have no
+      session and nothing waits on them, so they skip this gate entirely.
+
+  Both carry a 600s TTL (safety net against orphaned uploads). Durable
+  ownership is NOT tracked here — that lives in document_sources.project_id, so
+  a doc survives chat deletion and still appears in the project's Sources tab.
 
 Workflow:
-  1. On drag-drop  → register_speculative_upload()
-  2. After embed   → clear_speculative_upload()   (called from upload_tasks.py)
-  3. User clicks x → cancel_speculative_upload()
+  1. On drag-drop  → register_speculative_upload()   (chat_session_id optional)
+  2. After embed   → clear_speculative_upload()       (called from upload_tasks.py)
+  3. User clicks x → cancel_speculative_upload()      (chat_session_id optional)
   4. User hits Send → persist_inline_upload()
 
 Deferred note gate:
@@ -69,24 +83,50 @@ _TERMINAL_STATUSES = {
 # ——— Redis Gate ——————————————————————————————————————————————————————————————
 
 
+def _task_key(doc_id: str) -> str:
+    return f"spec_upload_task:{doc_id}"
+
+
 async def register_speculative_upload(
-    chat_session_id: str,
     doc_id: str,
     celery_task_id: str,
+    chat_session_id: Optional[str] = None,
 ) -> None:
-    """Register a doc as speculatively uploading. Sets the Redis gate."""
-    gate_key = f"pending_uploads:{chat_session_id}"
+    """
+    Register a doc as speculatively uploading.
+
+    Always records the doc-scoped task map (so cancel/revoke works without a
+    session). Additionally joins the session barrier gate when a chat_session_id
+    is supplied — i.e. the in-chat drag-drop flow. The new-project flow passes
+    no session and skips the gate.
+    """
     async with get_redis_connection() as r:
-        await r.hset(gate_key, doc_id, celery_task_id)
-        await r.expire(gate_key, _GATE_TTL)
-    logger.info(f"🚦 Registered speculative upload {doc_id[:8]} for session {chat_session_id[:8]}")
+        await r.set(_task_key(doc_id), celery_task_id, ex=_GATE_TTL)
+        if chat_session_id:
+            gate_key = f"pending_uploads:{chat_session_id}"
+            await r.hset(gate_key, doc_id, celery_task_id)
+            await r.expire(gate_key, _GATE_TTL)
+    logger.info(
+        f"🚦 Registered speculative upload {doc_id[:8]}"
+        + (f" for session {chat_session_id[:8]}" if chat_session_id else " (no session)")
+    )
 
 
-async def clear_speculative_upload(chat_session_id: str, doc_id: str) -> None:
-    """Remove a doc from the Redis gate once its embeddings are committed."""
+async def clear_speculative_upload(
+    doc_id: str,
+    chat_session_id: Optional[str] = None,
+) -> None:
+    """
+    Release a doc's tracking once its embeddings are committed (or it failed).
+
+    Clears the doc-scoped task map unconditionally, and removes it from the
+    session barrier gate when a chat_session_id is supplied.
+    """
     async with get_redis_connection() as r:
-        await r.hdel(f"pending_uploads:{chat_session_id}", doc_id)
-    logger.info(f"✅ Cleared speculative upload {doc_id[:8]} for session {chat_session_id[:8]}")
+        await r.delete(_task_key(doc_id))
+        if chat_session_id:
+            await r.hdel(f"pending_uploads:{chat_session_id}", doc_id)
+    logger.info(f"✅ Cleared speculative upload {doc_id[:8]}")
 
 
 # ——— Cooperative Cancellation ————————————————————————————————————————————————
@@ -273,9 +313,9 @@ async def cancel_pending_note(project_id: str) -> None:
 
 
 async def cancel_speculative_upload(
-    chat_session_id: str,
     doc_id: str,
     project_id: str,
+    chat_session_id: Optional[str] = None,
 ) -> None:
     """
     User cancelled the file. Undo everything:
@@ -297,14 +337,19 @@ async def cancel_speculative_upload(
     # document_sources via the ON CONFLICT upsert, resurrecting the row.
     await mark_document_cancelled(doc_id)
 
-    # 2 & 3 — Revoke (stops it if it hasn't started yet) and clear the gate
+    # 2 & 3 — Revoke (stops it if it hasn't started yet) and clear tracking.
+    # The task id comes from the doc-scoped map so this works even when the
+    # upload never belonged to a chat session (new-project flow). If a session
+    # was supplied, also drop it from that session's barrier gate.
     async with get_redis_connection() as r:
-        celery_task_id = await r.hget(f"pending_uploads:{chat_session_id}", doc_id)
+        celery_task_id = await r.get(_task_key(doc_id))
         if celery_task_id:
             task_id_str = celery_task_id.decode() if isinstance(celery_task_id, bytes) else celery_task_id
             celery_app.control.revoke(task_id_str, terminate=True, signal="SIGTERM")
             logger.info(f"🛑 Revoked Celery task {task_id_str} for doc {doc_id[:8]}")
-        await r.hdel(f"pending_uploads:{chat_session_id}", doc_id)
+        await r.delete(_task_key(doc_id))
+        if chat_session_id:
+            await r.hdel(f"pending_uploads:{chat_session_id}", doc_id)
 
     # 4 — Delete DB rows.
     # The old code deleted from "document_chunks", which does not exist — every

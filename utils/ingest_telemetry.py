@@ -50,6 +50,11 @@ MEM_CRITICAL_PCT = float(os.getenv("MEM_CRITICAL_PCT", "88"))
 # high-water mark. Set to roughly the point where the worker got into trouble.
 FANOUT_ALERT_THRESHOLD = int(os.getenv("FANOUT_ALERT_THRESHOLD", "4"))
 
+# RSS still held after a document that ran ALONE finishes. Torch caches arenas
+# and lazily initialises clients, so small positive deltas are normal early on;
+# what matters is whether this keeps growing batch after batch.
+RETAINED_ALERT_MB = float(os.getenv("RETAINED_ALERT_MB", "100"))
+
 
 # ——— Container Memory Limit ——————————————————————————————————————————————————
 
@@ -238,18 +243,36 @@ class IngestTelemetry:
         start_rss: Optional[float] = None,
         status: str = "",
     ) -> None:
-        """Record a document leaving the pipeline, with its net memory cost."""
+        """
+        Record a document leaving the pipeline, with its memory delta.
+
+        The delta is process-wide RSS between this document's start and end, so
+        it is only attributable to THIS document when nothing else was running.
+        With concurrent documents it necessarily includes their allocations too —
+        labelling it "retained" regardless would cry leak on every busy batch.
+        """
         with self._lock:
             self._inflight = max(0, self._inflight - 1)
+            others_running = self._inflight
 
         end_rss = rss_mb()
         delta = ""
         if start_rss is not None and end_rss is not None:
             change = end_rss - start_rss
-            # A positive net delta after a document completes is the signature of
-            # a leak — the interesting number, so call it out explicitly.
-            marker = " ⬆ RETAINED" if change > 50 else ""
-            delta = f" net={change:+,.0f}MB{marker}"
+            if others_running > 0:
+                # Confounded: other documents allocated during this window.
+                delta = (
+                    f" rss{change:+,.0f}MB over its lifetime "
+                    f"(shared with {others_running} concurrent doc(s), not attributable)"
+                )
+            elif change > RETAINED_ALERT_MB:
+                # Sole occupant and RSS still climbed — the real leak signature.
+                delta = (
+                    f" net={change:+,.0f}MB ⬆ RETAINED "
+                    f"(ran alone — this memory was not released)"
+                )
+            else:
+                delta = f" net={change:+,.0f}MB"
 
         label = f" {status}" if status else ""
         logger.info(f"📉 [MEM] doc={doc_id[:8]} END{label}{delta} — {self.format_state()}")

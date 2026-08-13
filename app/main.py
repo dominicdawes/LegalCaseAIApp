@@ -1064,14 +1064,18 @@ class SpeculativeIngestRequest(BaseModel):
     file_size_bytes: int
     project_id: str
     user_id: str
-    chat_session_id: str
+    # Optional: present for in-chat drag-drop (drives the session barrier +
+    # progress socket), absent for the new-project spin-up where no chat session
+    # exists yet. The document is owned by project_id either way.
+    chat_session_id: Optional[str] = None
 
 
 class CancelSpeculativeUploadRequest(BaseModel):
     """Cancel a speculative upload — revoke task, purge DB rows and S3 object."""
-    chat_session_id: str
     doc_id: str
     project_id: str
+    # Optional — only used to also drop the doc from a session's barrier gate.
+    chat_session_id: Optional[str] = None
 
 
 class InlineUploadMessageRequest(BaseModel):
@@ -1092,10 +1096,15 @@ class AttachNoteRequest(BaseModel):
     """
     project_id: str
     user_id: str
-    chat_session_id: str
+    # Optional: the new-project flow has no chat session yet. When present it
+    # anchors the upload in that session's timeline and streams note progress;
+    # when absent those are skipped and the note still generates (it is keyed on
+    # project_id + note_id, never on the chat session).
+    chat_session_id: Optional[str] = None
     document_ids: List[str]
     note_type: str
-    note_title: str
+    # Optional: defaults to note_type when the client doesn't supply a title.
+    note_title: Optional[str] = None
     provider: Optional[str] = None
     model_name: Optional[str] = None
     temperature: Optional[float] = None
@@ -1157,7 +1166,7 @@ async def speculative_ingest(request: SpeculativeIngestRequest):
 
         # ── 3. Register Redis gate ─────────────────────────────────────────────
         from utils.speculative_upload import register_speculative_upload
-        await register_speculative_upload(request.chat_session_id, doc_id, job.id)
+        await register_speculative_upload(doc_id, job.id, request.chat_session_id)
 
         logger.info(
             f"🚀 Speculative ingest started: doc={doc_id[:8]} task={job.id[:8]} "
@@ -1196,7 +1205,7 @@ async def cancel_speculative_upload_endpoint(request: CancelSpeculativeUploadReq
     try:
         from utils.speculative_upload import cancel_speculative_upload
         await cancel_speculative_upload(
-            request.chat_session_id, request.doc_id, request.project_id
+            request.doc_id, request.project_id, request.chat_session_id
         )
         return {"status": "cancelled", "doc_id": request.doc_id}
     except Exception as e:
@@ -1226,6 +1235,7 @@ async def attach_note_to_speculative_project(request: AttachNoteRequest):
     """
     try:
         note_id = str(uuid.uuid4())
+        note_title = request.note_title or request.note_type
 
         # ── 1. Stub note row (drives the /chat spinner immediately) ───────────
         supabase_client.table("notes").insert(
@@ -1233,7 +1243,7 @@ async def attach_note_to_speculative_project(request: AttachNoteRequest):
                 "id":                   note_id,
                 "user_id":              request.user_id,
                 "project_id":           request.project_id,
-                "title":                request.note_title,
+                "title":                note_title,
                 "note_type":            request.note_type,
                 "note_progress_status": "INITIALIZED",
                 "created_at":           datetime.now(timezone.utc).isoformat(),
@@ -1247,7 +1257,9 @@ async def attach_note_to_speculative_project(request: AttachNoteRequest):
             try_fire_pending_note,
         )
 
-        if request.document_ids:
+        # Only meaningful inside an existing chat. The new-project flow has no
+        # session yet, so there is no timeline to anchor into — skip it.
+        if request.chat_session_id and request.document_ids:
             try:
                 persist_inline_upload(
                     request.user_id, request.chat_session_id, request.document_ids
@@ -1269,7 +1281,7 @@ async def attach_note_to_speculative_project(request: AttachNoteRequest):
                     "user_id":     request.user_id,
                     "note_type":   request.note_type,
                     "project_id":  request.project_id,
-                    "note_title":  request.note_title,
+                    "note_title":  note_title,
                     "provider":    request.provider,
                     "model_name":  request.model_name,
                     "temperature": request.temperature,

@@ -1262,6 +1262,13 @@ async def _download_and_prep_doc(client: httpx.AsyncClient, url: str, project_id
             ext = get_file_extension_from_url(url)
             filename = parse_clean_filename_from_url(url, ext)
 
+            # Park the bytes for the parser FIRST. boto3's upload_fileobj closes
+            # the stream it is handed (multipart TransferConfig), so caching
+            # after an upload always failed with "I/O operation on closed file"
+            # and the parser silently fell back to re-downloading from the CDN —
+            # defeating the whole point of the cache.
+            await asyncio.to_thread(_write_ingest_cache, content_hash, content_stream)
+
             if _is_own_cdn_url(url):
                 # Already on our CDN — nothing to copy.
                 cdn_url = url
@@ -1270,6 +1277,7 @@ async def _download_and_prep_doc(client: httpx.AsyncClient, url: str, project_id
                 s3_key = f"{project_id}/{uuid.uuid4()}{ext}"
                 # Stream directly to S3 && AWS CloudFront from the in-memory buffer
                 # (boto3 is blocking, so keep it off the shared event loop).
+                content_stream.seek(0)
                 await asyncio.to_thread(
                     upload_to_s3,
                     client=s3_client,
@@ -1277,9 +1285,6 @@ async def _download_and_prep_doc(client: httpx.AsyncClient, url: str, project_id
                     s3_object_key=s3_key,
                 )
                 cdn_url = get_cloudfront_url(s3_key)
-
-            # Park the bytes so the parser does not re-download them.
-            await asyncio.to_thread(_write_ingest_cache, content_hash, content_stream)
 
             # Leverages my url (AWS Cloudfront) to perform in-memory streaming for the rest of the ingest pipeline
             return {
@@ -2584,13 +2589,13 @@ def finalize_batch_and_create_note(
     # Covers both the new-doc path (process_new_document_wrapper also clears, but
     # that's a no-op) and the reused-doc path which has no per-task clearing.
     chat_session_id = workflow_metadata.get('chat_session_id')
-    if chat_session_id and batch_status in ('COMPLETE', 'PARTIAL'):
+    if batch_status in ('COMPLETE', 'PARTIAL'):
         from utils.speculative_upload import clear_speculative_upload
         for doc_result in successful_docs:
             doc_id_to_clear = doc_result.get('doc_id')
             if doc_id_to_clear:
                 run_async_in_worker(
-                    clear_speculative_upload(chat_session_id, doc_id_to_clear)
+                    clear_speculative_upload(doc_id_to_clear, chat_session_id)
                 )
 
     # ——— 📝 Trigger Note Generation (Based on Resilience Rules) ——————————————————————
@@ -2745,9 +2750,8 @@ def process_new_document_wrapper(
             f"Abandoned after {attempt} failed attempts (worker kept dying on this document)",
         )
         chat_session_id = workflow_metadata.get('chat_session_id')
-        if chat_session_id:
-            from utils.speculative_upload import clear_speculative_upload
-            run_async_in_worker(clear_speculative_upload(chat_session_id, doc_id))
+        from utils.speculative_upload import clear_speculative_upload
+        run_async_in_worker(clear_speculative_upload(doc_id, chat_session_id))
         publish_ingest_progress_sync(
             chat_session_id, doc_id, IngestStage.FAILED,
             filename=doc_data.get('filename'),
@@ -2803,8 +2807,7 @@ def process_new_document_wrapper(
                 clear_document_cancelled,
                 clear_speculative_upload,
             )
-            if chat_session_id:
-                run_async_in_worker(clear_speculative_upload(chat_session_id, doc_id))
+            run_async_in_worker(clear_speculative_upload(doc_id, chat_session_id))
             run_async_in_worker(clear_document_cancelled(doc_id))
             logger.info(f"🚫 [DOC-{short_id}] Processing stopped — upload was cancelled")
             result_status = 'CANCELLED'
@@ -2819,11 +2822,11 @@ def process_new_document_wrapper(
             filename=doc_data.get('filename'),
         )
 
-        # Clear the speculative-upload Redis gate for this doc (if the call
-        # came from a drag-drop chat flow that included chat_session_id).
-        if chat_session_id:
-            from utils.speculative_upload import clear_speculative_upload
-            run_async_in_worker(clear_speculative_upload(chat_session_id, doc_id))
+        # Clear the speculative-upload tracking for this doc. The doc-scoped
+        # task key always clears; the session barrier gate is cleared too when
+        # this ingest came from an in-chat drag-drop (chat_session_id present).
+        from utils.speculative_upload import clear_speculative_upload
+        run_async_in_worker(clear_speculative_upload(doc_id, chat_session_id))
 
         run_async_in_worker(_clear_ingest_attempts(doc_id))
         logger.info(f"✅ [DOC-{short_id}] Document processing completed successfully")
