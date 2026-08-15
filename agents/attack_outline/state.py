@@ -240,3 +240,12 @@ class AgentState(TypedDict):
 
     # ── budget tracking ──────────────────────────────────────────────────────
     budget: NotRequired[Dict[str, Any]]
+
+    # ── compact 4-stage pipeline (compact_nodes.py) ──────────────────────────
+    # research_agent output: clusters + artifact cards + evidence references.
+    research_dossier: NotRequired[Dict[str, Any]]
+    # Every chunk payload harvested from the research agent's tool calls,
+    # keyed by chunk_id — generators ground against this without re-retrieving.
+    evidence_store: NotRequired[Dict[str, Dict[str, Any]]]
+    # block_generator fan-out accumulation (one dict per cluster section).
+    compact_blocks: Annotated[List[Dict[str, Any]], operator.add]

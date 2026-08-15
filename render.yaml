@@ -14,3 +14,9 @@ services:
     startCommand: "celery -A tasks.celery_app worker --loglevel=info --concurrency=2"
     pythonVersion: 3.9.12
     terminationGracePeriodSeconds: 300
+    envVars:
+      # Docling TableFormer runs over every page and is a large share of parse
+      # time; legal PDFs (opinions/statutes) contain almost no tables, so we skip
+      # structured-table extraction to speed ingest. See docling_loader.py:76-80.
+      - key: DOCLING_TABLE_STRUCTURE
+        value: "false"

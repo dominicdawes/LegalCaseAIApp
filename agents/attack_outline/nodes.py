@@ -316,8 +316,11 @@ async def head_orchestrator(state: AgentState) -> Dict:
         "stages (list), retrieval_depth (always 'deep' for attack outlines)."
     )
 
+    # worker_mid = same deepseek-v4-pro model, thinking disabled. This node just
+    # routes (mode + course areas) from a small input; the ~45s of extended
+    # reasoning it was paying for isn't needed here.
     raw = await _llm(
-        "orchestrator",
+        "worker_mid",
         f"Sources available:\n{sources_json}\n\nUser request: {state['request']}",
         system=system,
         max_tokens=1500,
@@ -343,7 +346,7 @@ async def head_orchestrator(state: AgentState) -> Dict:
         state,
         artifact_key="job_plan",
         content=job_plan,
-        worker_class="orchestrator",
+        worker_class="worker_mid",
         node_name="head_orchestrator",
         artifact_type="job_plan",
         source_ids=state.get("source_ids"),
@@ -354,7 +357,7 @@ async def head_orchestrator(state: AgentState) -> Dict:
     return {"job_plan": job_plan}
 
 
-head_orchestrator.default_worker_class = "orchestrator"
+head_orchestrator.default_worker_class = "worker_mid"
 
 
 def head_orchestrator_to_profiler(state: AgentState) -> List[Send]:
@@ -643,7 +646,11 @@ async def retrieval_planner(state: AgentState) -> Dict:
         f"User request: {state['request']}"
     )
 
-    raw = await _llm("orchestrator", prompt, system=system, max_tokens=10000,
+    # worker_mid = same deepseek-v4-pro model, thinking disabled; and the output
+    # budget is trimmed from 10000 to 6000 (system prompt already targets ~800
+    # tokens/topic × ≤10 topics). Together these cut this node's ~171s serial
+    # cost sharply. Structural fan-out (one call per topic) is the next lever.
+    raw = await _llm("worker_mid", prompt, system=system, max_tokens=6000,
                      _node="retrieval_planner")
     try:
         plans: List[ConceptRetrievalPlan] = _parse_json(raw)
@@ -673,7 +680,7 @@ async def retrieval_planner(state: AgentState) -> Dict:
         state,
         artifact_key="retrieval_plans",
         content={"plans": plans},
-        worker_class="orchestrator",
+        worker_class="worker_mid",
         node_name="retrieval_planner",
         artifact_type="retrieval_plan",
         source_ids=state.get("source_ids"),
@@ -684,7 +691,7 @@ async def retrieval_planner(state: AgentState) -> Dict:
     return {"retrieval_plans": plans}
 
 
-retrieval_planner.default_worker_class = "orchestrator"
+retrieval_planner.default_worker_class = "worker_mid"
 
 
 def retrieval_planner_to_retriever(state: AgentState) -> List[Send]:
@@ -1034,7 +1041,7 @@ async def artifact_normalizer(state: AgentState) -> Dict:
         state,
         artifact_key="normalized_artifacts",
         content={"artifacts": normalised},
-        worker_class="worker_mid",
+        worker_class="worker_low",
         node_name="artifact_normalizer",
         artifact_type="normalized_artifacts",
         source_ids=state.get("source_ids"),
@@ -1151,7 +1158,7 @@ async def concept_clusterer(state: AgentState) -> Dict:
         state,
         artifact_key="concept_clusters",
         content={"clusters": clusters},
-        worker_class="worker_mid",
+        worker_class="worker_low",
         node_name="concept_clusterer",
         artifact_type="concept_clusters",
         source_ids=state.get("source_ids"),
@@ -1215,7 +1222,10 @@ async def doctrine_graph_builder(state: AgentState) -> Dict:
         f"Build the if/then doctrine analysis graph."
     )
 
-    raw = await _llm("orchestrator", prompt, system=system, max_tokens=3000,
+    # worker_mid = same deepseek-v4-pro model, thinking disabled. Connecting
+    # pre-clustered doctrines into an if/then graph is near-deterministic
+    # structural work; the ~81s of extended reasoning wasn't buying quality here.
+    raw = await _llm("worker_mid", prompt, system=system, max_tokens=3000,
                      _node="doctrine_graph_builder")
     try:
         graph_data = _parse_json(raw)
@@ -1235,7 +1245,7 @@ async def doctrine_graph_builder(state: AgentState) -> Dict:
         state,
         artifact_key="doctrine_graph",
         content={"nodes": nodes, "edges": edges},
-        worker_class="orchestrator",
+        worker_class="worker_mid",
         node_name="doctrine_graph_builder",
         artifact_type="doctrine_graph",
         source_ids=state.get("source_ids"),
@@ -1245,7 +1255,7 @@ async def doctrine_graph_builder(state: AgentState) -> Dict:
     return {"doctrine_graph": doctrine_graph}
 
 
-doctrine_graph_builder.default_worker_class = "orchestrator"
+doctrine_graph_builder.default_worker_class = "worker_mid"
 
 
 def doctrine_to_block_builder(state: AgentState) -> List[Send]:

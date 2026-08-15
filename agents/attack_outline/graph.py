@@ -41,6 +41,11 @@ load_dotenv()
 
 USE_ATTACK_OUTLINE_AGENT = os.getenv("USE_ATTACK_OUTLINE_AGENT", "false").lower() == "true"
 
+# Compact 4-stage pipeline (compact_nodes.py): plan → research (tool-loop) →
+# [Send×N] block_generator → deterministic formatter. Default ON; set
+# ATTACK_OUTLINE_COMPACT=false to fall back to the legacy 15-node graph.
+ATTACK_OUTLINE_COMPACT = os.getenv("ATTACK_OUTLINE_COMPACT", "true").lower() == "true"
+
 
 # ── Checkpointer factory (mirrors exam_questions/graph.py) ────────────────────
 
@@ -75,7 +80,52 @@ async def _checkpointer_ctx():
 
 # ── Graph builder ──────────────────────────────────────────────────────────────
 
+def _build_compact_graph(checkpointer):
+    """
+    Compact 4-stage topology (ATTACK_OUTLINE_COMPACT=true, the default):
+
+      plan_agent → research_agent → [Send×N] block_generator → final_formatter → END
+                                  └────────────(no clusters)──→ final_formatter
+
+    research_agent is a bounded multistep tool-calling loop (its own internal
+    LLM turns), so the graph itself stays tiny; state carries the dossier and
+    the harvested evidence_store between stages.
+    """
+    from langgraph.graph import StateGraph, END
+
+    from .state import AgentState
+    from .compact_nodes import (
+        plan_agent,
+        research_agent,
+        block_generator,
+        final_formatter,
+        research_to_generators,
+    )
+
+    builder = StateGraph(AgentState)
+    builder.add_node("plan_agent",      plan_agent)
+    builder.add_node("research_agent",  research_agent)
+    builder.add_node("block_generator", block_generator)
+    builder.add_node("final_formatter", final_formatter)
+
+    builder.set_entry_point("plan_agent")
+    builder.add_edge("plan_agent", "research_agent")
+    # List[Send] fan-out, or the string route straight to the formatter when
+    # research produced no clusters (same pattern as assembler_to_verifier).
+    builder.add_conditional_edges(
+        "research_agent",
+        research_to_generators,
+        {"final_formatter": "final_formatter"},
+    )
+    builder.add_edge("block_generator", "final_formatter")
+    builder.add_edge("final_formatter", END)
+
+    return builder.compile(checkpointer=checkpointer)
+
+
 def _build_graph(checkpointer):
+    if ATTACK_OUTLINE_COMPACT:
+        return _build_compact_graph(checkpointer)
     from langgraph.graph import StateGraph, END
 
     from .state import AgentState
@@ -235,6 +285,7 @@ async def run_attack_outline_agent(
         "raw_artifacts":      [],
         "raw_blocks":         [],
         "verification_reports": [],
+        "compact_blocks":     [],
     }
     config = {"configurable": {"thread_id": thread_id or "attack-outline-agent"}}
 
@@ -281,6 +332,7 @@ async def run_attack_outline_agent_stream(
         "raw_artifacts":      [],
         "raw_blocks":         [],
         "verification_reports": [],
+        "compact_blocks":     [],
     }
     config = {"configurable": {"thread_id": thread_id or "attack-outline-agent-stream"}}
 

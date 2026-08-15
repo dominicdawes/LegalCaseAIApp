@@ -70,6 +70,25 @@ ATTACK_PROFILER_TOOLS = [
     "get_doc_metadata",
 ]
 
+# research_agent (compact pipeline) — one multistep tool-calling agent that
+# compresses profiling + topic mapping + retrieval planning + extraction +
+# clustering. Union of the profiler and retriever sets: discovery to survey the
+# corpus, then BM25/vector/section drilldown to pull evidence.
+ATTACK_RESEARCH_TOOLS = [
+    "list_sources",
+    "get_doc_outline",
+    "find_docs_about",
+    "get_doc_metadata",
+    "find_sections_about",
+    "get_section",
+    "get_parents",
+    "get_neighbors",
+    "search_passages",
+    "hybrid_search",
+    "expand_query",
+    "find_concept_across_docs",
+]
+
 # planned_retriever executes multi-intent retrieval (BM25, vector, section drilldown)
 ATTACK_RETRIEVER_TOOLS = [
     "search_passages",
