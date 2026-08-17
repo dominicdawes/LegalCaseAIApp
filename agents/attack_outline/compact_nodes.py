@@ -5,24 +5,40 @@ Compact 4-stage attack-outline pipeline ("the haircut").
 Replaces the 15-node graph's five serial LLM stages with one multistep
 tool-calling research agent, cutting LLM roundtrips from ~9 serial stages to:
 
-  1. plan_agent        — one worker_mid call → master job plan
-  2. research_agent    — ONE agent, thinking=True, native tool-calling ReAct
-                         loop (bounded turns, parallel tool execution).
-                         Compresses: source_profiler + corpus_topic_mapper +
-                         retrieval_planner + legal_artifact_extractor +
-                         concept_clusterer. Emits a research dossier:
-                         clusters + per-cluster legal artifact cards +
-                         evidence chunk references. Every retrieval tool
-                         result is harvested into state["evidence_store"] so
-                         downstream generators never re-retrieve.
-  3. block_generator   — [Send×N] one per cluster, thinking=True. One-stop
-                         section builder (compresses attack_block_builder +
-                         doctrine_graph_builder's if/then logic + the critic's
-                         grounding pass): drafts the full T-14 block and
-                         self-checks every rule claim against the evidence
-                         chunks included in its prompt.
+  1. plan_agent        — one worker_mid call → master job plan. Runs in
+                         PARALLEL with research_agent (see graph.py) — neither
+                         depends on the other's output.
+  2. research_agent    — ONE agent, native tool-calling ReAct loop (bounded
+                         turns, parallel tool execution). Does its own survey
+                         (list_sources/get_doc_outline) rather than waiting on
+                         plan_agent's job_plan. Compresses: source_profiler +
+                         corpus_topic_mapper + retrieval_planner +
+                         legal_artifact_extractor + concept_clusterer. Emits a
+                         research dossier: clusters + per-cluster legal
+                         artifact cards + evidence chunk references. Every
+                         retrieval tool result is harvested into
+                         state["evidence_store"] so downstream generators
+                         never re-retrieve.
+     sync_barrier      — no-op join: waits for BOTH plan_agent and
+                         research_agent (standard LangGraph fan-in) before
+                         fanning out to block_generator, so every block has
+                         both job_plan and the research dossier available.
+  3. block_generator   — [Send×N] one per cluster. One-stop section builder
+                         (compresses attack_block_builder + doctrine_graph_
+                         builder's if/then logic + the critic's grounding
+                         pass): drafts the full T-14 block, framed by
+                         job_plan's course structure, and self-checks every
+                         rule claim against the evidence in its prompt — with
+                         bounded tool access (a free local grep over the
+                         research corpus, then a live DB fallback) for claims
+                         the prompt's evidence doesn't cover.
   4. final_formatter   — pure Python. Deterministic assembly, blank-section
                          checks, TOC. Zero LLM calls.
+
+Model selection for research_agent/block_generator goes through the repo's
+tiered WORKER_MODEL_MAP framework (_fetch_worker_model in worker_config.py)
+via _build_tool_model() below, rather than hardcoding a provider's client —
+escalating to a flagship model is a provider/env-var change, not a code change.
 
 Intermediate products live in LangGraph state (durable via the Postgres
 checkpointer; observable via ledger artifacts) — no temp files, no extra
@@ -65,8 +81,13 @@ logger = logging.getLogger(__name__)
 # ── Tunables ──────────────────────────────────────────────────────────────────
 
 # Max model turns in the research loop. Each turn may issue MANY tool calls
-# (executed in parallel), so 8 turns is a lot of retrieval ground.
-MAX_RESEARCH_TURNS = int(os.getenv("ATTACK_RESEARCH_MAX_TURNS", "8"))
+# (executed in parallel).
+MAX_RESEARCH_TURNS = int(os.getenv("ATTACK_RESEARCH_MAX_TURNS", "5"))
+
+# Max model turns per block_generator call. One drafting turn with tool
+# access, one forced-final if it reached for evidence — keeps the new tool
+# capability from compounding latency across the parallel fan-out.
+ATTACK_BLOCK_MAX_TURNS = int(os.getenv("ATTACK_BLOCK_MAX_TURNS", "2"))
 
 # Per-tool-result cap injected back into the conversation. Full chunk payloads
 # are harvested separately into evidence_store, so the transcript stays lean.
@@ -91,6 +112,8 @@ async def plan_agent(state: AgentState) -> Dict:
     from agents.tools.base import make_tools
     from agents.tools.registry import ATTACK_PLANNER_TOOLS
 
+    logger.info("🔀 [%s] PARALLEL fire → plan_agent (alongside research_agent)",
+                (state.get("job_id") or "")[:8] or "no-job")
     _node_start("plan_agent", state,
                 n_sources=len(state.get("source_ids") or []),
                 request=state.get("request", "")[:60])
@@ -161,8 +184,10 @@ async def plan_agent(state: AgentState) -> Dict:
 _RESEARCH_SYSTEM = (
     "You are a legal research agent building the evidence base for a T-14 "
     "attack outline. You have retrieval tools over the student's source "
-    "documents. Work in bounded steps:\n"
-    "  1. Survey: get_doc_outline / find_docs_about to map what each source covers.\n"
+    "documents — no prior plan is provided; survey and prioritize the "
+    "doctrines yourself. Work in bounded steps:\n"
+    "  1. Survey: list_sources / get_doc_outline / find_docs_about to map what "
+    "each source covers and identify the major doctrines at stake.\n"
     "  2. Retrieve: hybrid_search + search_passages per doctrine (batch MANY tool "
     "calls in a single turn — they run in parallel). Drill into sections with "
     "get_section / get_neighbors where a hit looks central.\n"
@@ -171,8 +196,14 @@ _RESEARCH_SYSTEM = (
     "RULES:\n"
     "• Prefer FEW turns with MANY parallel tool calls over many small turns.\n"
     "• Only claim rules/holdings you actually retrieved — cite chunk_ids.\n"
-    "• When you have enough evidence for every major doctrine, STOP calling "
-    "tools and emit the final dossier.\n\n"
+    "• STOP CRITERION (concrete — check it every turn): once every major "
+    "doctrine you identified in your survey has at least 1-2 grounded "
+    "artifacts, STOP calling tools and emit the final dossier immediately, "
+    "even if turns remain. Do not keep researching doctrines you've already "
+    "covered just because turns are left.\n"
+    "• Target 6-10 clusters total; do NOT exceed 12. If tempted to split one "
+    "doctrine into multiple clusters, prefer merging — fewer, well-scoped "
+    "clusters beat many overlapping ones.\n\n"
     "FINAL ANSWER — return ONLY this JSON object (no prose):\n"
     "{\n"
     '  "source_profiles": [{"source_id", "course_area", "document_type", "summary"}],\n'
@@ -245,21 +276,139 @@ async def _exec_tool_call(
     ), result_str
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Shared tool-calling infrastructure — used by BOTH research_agent (below) and
+# block_generator (further down), not just section 2.
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def _build_tool_model(worker_class: str, provider: Optional[str] = None):
+    """
+    Resolve a tool-bindable LangChain chat model via the tiered
+    WORKER_MODEL_MAP framework (_fetch_worker_model), instead of hardcoding a
+    provider's client. Escalating a node to a flagship model becomes a
+    provider/env-var change, not a code change.
+
+    Returns (base_model, semaphore). base_model is UNBOUND — callers call
+    base_model.bind_tools(tools) themselves (see _run_bounded_tool_loop), so
+    the same base_model instance also serves as the "no tools" model for a
+    forced-final turn when the turn budget runs out.
+
+    Only deepseek and anthropic are wired for tool-calling here; any other
+    resolved provider raises rather than silently mis-binding tools.
+    """
+    from .worker_config import _fetch_worker_model
+
+    resolved_provider, model_name, thinking = _fetch_worker_model(worker_class, provider)
+
+    if resolved_provider == "deepseek":
+        from utils.llm_clients.deepseek_client import DeepSeekClient
+        client = DeepSeekClient(
+            model_name=model_name, temperature=0.3,
+            max_output_tokens=8000, thinking=thinking,
+        )
+        base_model = client._client
+        sem = _get_deepseek_semaphore()
+    elif resolved_provider == "anthropic":
+        from langchain_anthropic import ChatAnthropic
+        from utils.llm_clients.anthropic_rate_limits import get_llm_semaphore
+        # Built directly rather than via LLMFactory.get_langchain_model() —
+        # that helper hardcodes max_tokens=4096, too tight for a multi-cluster
+        # JSON dossier or a full attack-outline section.
+        base_model = ChatAnthropic(model=model_name, max_tokens=8000, temperature=0.3)
+        sem = await get_llm_semaphore()
+    else:
+        raise NotImplementedError(
+            f"_build_tool_model: provider '{resolved_provider}' is not wired "
+            "for tool-calling here (only deepseek/anthropic are supported)."
+        )
+
+    logger.info("  🤖 [_build_tool_model] worker_class=%s provider=%s model=%s thinking=%s",
+                worker_class, resolved_provider, model_name, thinking)
+    return base_model, sem
+
+
+async def _run_bounded_tool_loop(
+    base_model: Any,
+    tools: List[Any],
+    messages: List[Any],
+    max_turns: int,
+    sem: Any,
+    node_name: str,
+    state: Dict,
+    evidence_store: Optional[Dict[str, Dict]] = None,
+    countdown_from_turn: int = 3,
+    forced_stop_prompt: str = "STOP calling tools. Answer NOW using only what you've gathered.",
+) -> str:
+    """
+    Shared bounded ReAct loop used by both research_agent and block_generator:
+    turns with parallel tool execution, a turn-countdown nudge as the budget
+    runs low, and — if the budget runs out — a forced final answer via the
+    UNBOUND base_model (no tools attached, so it cannot emit more tool calls).
+
+    Returns the final answer's raw text; callers decide how to parse it
+    (JSON dossier vs. markdown section).
+    """
+    tool_map = {t.name: t for t in tools}
+    bound_model = base_model.bind_tools(tools)
+
+    for turn in range(1, max_turns + 1):
+        if turn >= countdown_from_turn:
+            remaining = max_turns - turn + 1
+            messages.append(HumanMessage(content=(
+                f"({remaining} of {max_turns} turns remain — wrap up and answer "
+                "soon if you have sufficient evidence.)"
+            )))
+        async with sem:
+            try:
+                resp: AIMessage = await bound_model.ainvoke(messages)
+            except Exception as exc:
+                # One retry for transient/429 blips, then bail to fallback.
+                _node_warn(node_name, state, f"turn {turn} LLM error ({exc}) — retrying once")
+                await asyncio.sleep(5)
+                resp = await bound_model.ainvoke(messages)
+        messages.append(resp)
+
+        tool_calls = getattr(resp, "tool_calls", None) or []
+        if not tool_calls:
+            return resp.content
+
+        logger.info("  🔧 [%s] turn %d/%d → %d tool call(s): %s",
+                    node_name, turn, max_turns, len(tool_calls),
+                    [tc.get("name") for tc in tool_calls][:8])
+        results = await asyncio.gather(
+            *(_exec_tool_call(tool_map, tc) for tc in tool_calls)
+        )
+        for (tool_msg, full_result), tc in zip(results, tool_calls):
+            messages.append(tool_msg)
+            if evidence_store is not None:
+                _harvest_evidence(tc.get("name", ""), full_result, evidence_store)
+
+    # Turn budget exhausted — force a final no-tools answer via the unbound model.
+    _node_warn(node_name, state, "forcing final answer emission")
+    messages.append(HumanMessage(content=forced_stop_prompt))
+    async with sem:
+        final = await base_model.ainvoke(messages)  # unbound — cannot call tools
+    return final.content
+
+
 async def research_agent(state: AgentState) -> Dict:
     """
-    The all-in-one multistep research agent (thinking=True).
+    The all-in-one multistep research agent.
 
-    A hand-rolled ReAct loop rather than langgraph.prebuilt.create_react_agent
-    so we keep: per-turn telemetry, a hard turn budget, parallel tool
-    execution, evidence harvesting, and the repo's DeepSeek semaphore.
+    A hand-rolled ReAct loop (via _run_bounded_tool_loop) rather than
+    langgraph.prebuilt.create_react_agent so we keep: per-turn telemetry, a
+    hard turn budget, parallel tool execution, evidence harvesting, and the
+    repo's tiered WORKER_MODEL_MAP model selection.
+
+    Runs in PARALLEL with plan_agent (see graph.py's sync_barrier) — it does
+    NOT depend on job_plan; its own turn-1/2 survey stands in for that.
     """
     from agents.tools.base import make_tools
     from agents.tools.registry import ATTACK_RESEARCH_TOOLS
-    from utils.llm_clients.deepseek_client import DeepSeekClient
 
-    job_plan = state.get("job_plan") or {}
-    _node_start("research_agent", state,
-                priority_doctrines=(job_plan.get("priority_doctrines") or [])[:5])
+    logger.info("🔀 [%s] PARALLEL fire → research_agent (alongside plan_agent)",
+                (state.get("job_id") or "")[:8] or "no-job")
+    _node_start("research_agent", state, max_turns=MAX_RESEARCH_TURNS)
 
     tools = make_tools(
         state["project_id"],
@@ -267,23 +416,18 @@ async def research_agent(state: AgentState) -> Dict:
         use_voyage=state.get("use_voyage", False),
         tool_names=ATTACK_RESEARCH_TOOLS,
     )
-    tool_map = {t.name: t for t in tools}
 
-    # thinking=True is deliberate: this is the one multistep reasoning stage.
-    client = DeepSeekClient(
-        model_name="deepseek-v4-pro",
-        temperature=0.3,
-        max_output_tokens=8000,
-        thinking=True,
+    # "orchestrator" tier is deliberate: this is the one multistep reasoning
+    # stage. Provider resolved via WORKER_MODEL_MAP — ATTACK_RESEARCH_PROVIDER
+    # overrides just this node; unset, it falls through to ATTACK_AGENT_PROVIDER
+    # (default deepseek, the same model the clean baseline run used).
+    base_model, sem = await _build_tool_model(
+        "orchestrator", provider=os.getenv("ATTACK_RESEARCH_PROVIDER")
     )
-    model = client._client.bind_tools(tools)
-    logger.info("  🤖 [research_agent] deepseek-v4-pro thinking=True tools=%d max_turns=%d",
-                len(tools), MAX_RESEARCH_TURNS)
 
     messages: List[Any] = [
         SystemMessage(content=_RESEARCH_SYSTEM),
         HumanMessage(content=(
-            f"Job plan:\n{json.dumps(job_plan, indent=2)}\n\n"
             f"Source ids in scope: {state.get('source_ids', [])}\n"
             f"User request: {state['request']}\n\n"
             "Begin your research. Batch parallel tool calls aggressively."
@@ -291,56 +435,20 @@ async def research_agent(state: AgentState) -> Dict:
     ]
 
     evidence_store: Dict[str, Dict] = {}
-    dossier: Optional[Dict[str, Any]] = None
-    sem = _get_deepseek_semaphore()
-
-    for turn in range(1, MAX_RESEARCH_TURNS + 1):
-        async with sem:
-            try:
-                resp: AIMessage = await model.ainvoke(messages)
-            except Exception as exc:
-                # One retry for transient/429 blips, then bail to fallback.
-                _node_warn("research_agent", state, f"turn {turn} LLM error ({exc}) — retrying once")
-                await asyncio.sleep(5)
-                resp = await model.ainvoke(messages)
-        messages.append(resp)
-
-        tool_calls = getattr(resp, "tool_calls", None) or []
-        if not tool_calls:
-            # Model is done researching — this should be the dossier.
-            try:
-                dossier = _parse_json(resp.content)
-            except Exception as exc:
-                _node_warn("research_agent", state,
-                           f"final answer JSON parse failed on turn {turn}: {exc}")
-                dossier = None
-            break
-
-        logger.info("  🔧 [research_agent] turn %d/%d → %d tool call(s): %s",
-                    turn, MAX_RESEARCH_TURNS, len(tool_calls),
-                    [tc.get("name") for tc in tool_calls][:8])
-        results = await asyncio.gather(
-            *(_exec_tool_call(tool_map, tc) for tc in tool_calls)
-        )
-        for (tool_msg, full_result), tc in zip(results, tool_calls):
-            messages.append(tool_msg)
-            _harvest_evidence(tc.get("name", ""), full_result, evidence_store)
-
-    if dossier is None and MAX_RESEARCH_TURNS > 0:
-        # Turn budget exhausted mid-research (or final parse failed):
-        # force the dossier from what has been gathered so far.
-        _node_warn("research_agent", state, "forcing final dossier emission")
-        messages.append(HumanMessage(content=(
+    raw_answer = await _run_bounded_tool_loop(
+        base_model, tools, messages, MAX_RESEARCH_TURNS, sem,
+        "research_agent", state, evidence_store=evidence_store,
+        countdown_from_turn=3,
+        forced_stop_prompt=(
             "STOP researching. Emit the final dossier JSON NOW using only the "
             "evidence already gathered. Return ONLY the JSON object."
-        )))
-        async with sem:
-            final = await client._client.ainvoke(messages)  # unbound — no more tools
-        try:
-            dossier = _parse_json(final.content)
-        except Exception as exc:
-            _node_warn("research_agent", state, f"forced dossier parse failed: {exc}")
-            dossier = None
+        ),
+    )
+    try:
+        dossier: Optional[Dict[str, Any]] = _parse_json(raw_answer)
+    except Exception as exc:
+        _node_warn("research_agent", state, f"dossier JSON parse failed: {exc}")
+        dossier = None
 
     if not isinstance(dossier, dict):
         dossier = {"source_profiles": [], "clusters": []}
@@ -363,6 +471,35 @@ async def research_agent(state: AgentState) -> Dict:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# sync_barrier — join point for the parallel plan_agent / research_agent branches
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def sync_barrier(state: AgentState) -> Dict:
+    """
+    Join node. plan_agent and research_agent run in parallel from START
+    (graph.py) since research_agent doesn't depend on job_plan — but
+    block_generator needs BOTH job_plan and the research dossier. A node with
+    two incoming static edges waits for both predecessors before running
+    (standard LangGraph fan-in), so routing the research_to_generators
+    conditional edge from here — instead of directly from research_agent —
+    guarantees job_plan is always present in block_generator's Send payload.
+
+    Logs proof the join actually waited for both branches (not just that it
+    ran) — job_plan present and non-empty is the tell; if it were ever False
+    here, the parallel-entry edges wouldn't be firing as designed.
+    """
+    job = (state.get("job_id") or "")[:8] or "no-job"
+    has_plan = bool(state.get("job_plan"))
+    n_clusters = len((state.get("research_dossier") or {}).get("clusters") or [])
+    logger.info(
+        "🔗 [%s] sync_barrier — joined plan_agent + research_agent  "
+        "job_plan=%s research_clusters=%d",
+        job, "present" if has_plan else "MISSING (join failed?)", n_clusters,
+    )
+    return {}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # 3. block_generator — [Send×N] one per cluster
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -378,11 +515,21 @@ def research_to_generators(state: AgentState):
 
 async def block_generator(state: Dict) -> Dict:
     """
-    One-stop section builder for a single cluster (thinking=True).
-    Drafts the full T-14 attack block AND self-grounds it against the evidence
-    chunks in its prompt — compressing builder + graph-edges + critic passes.
+    One-stop section builder for a single cluster.
+    Drafts the full T-14 attack block AND self-grounds it against the
+    evidence chunks in its prompt — compressing builder + doctrine-graph
+    if/then logic + the critic's grounding pass.
+
+    Has bounded tool access (ATTACK_BLOCK_MAX_TURNS turns): a free local grep
+    over the full research corpus, then a live DB fallback to reach primary
+    source, for claims the prompt's evidence doesn't already cover.
     """
+    from agents.tools.base import make_tools
+    from agents.tools.registry import ATTACK_VERIFIER_TOOLS
+    from langchain_core.tools import tool as _tool_decorator
+
     cluster: Dict[str, Any] = state["cluster"]
+    job_plan: Dict[str, Any] = state.get("job_plan") or {}
     evidence_store: Dict[str, Dict] = state.get("evidence_store") or {}
     label = cluster.get("label", cluster.get("cluster_id", "?"))
 
@@ -409,6 +556,39 @@ async def block_generator(state: Dict) -> Dict:
         for e in evidence
     ) or "(no evidence chunks captured — rely strictly on the artifact cards)"
 
+    # Local, zero-cost grep over the FULL research corpus (not just this
+    # cluster's cited chunks) — closure-defined so it needs no ToolContext and
+    # makes no DB round trip.
+    @_tool_decorator
+    def grep_research_corpus(keyword: str) -> str:
+        """Case-insensitive substring search over the research corpus already
+        harvested by research_agent (every chunk retrieved for this outline,
+        not just the ones cited by this cluster). Use this FIRST — it's free
+        and instant — before reaching for a live database tool. Returns up to
+        10 matching chunk excerpts with their chunk_id."""
+        kw = keyword.lower()
+        matches = [
+            {"chunk_id": cid, "excerpt": e["content"][:400]}
+            for cid, e in evidence_store.items()
+            if kw in e["content"].lower()
+        ][:10]
+        return json.dumps(matches) if matches else json.dumps({"result": "no matches"})
+
+    verifier_tools = make_tools(
+        state["project_id"],
+        source_ids=state.get("source_ids", []),
+        use_voyage=state.get("use_voyage", False),
+        tool_names=[t for t in ATTACK_VERIFIER_TOOLS
+                    if t in ("find_supporting_evidence", "get_citations_for")],
+    )
+    tools = [grep_research_corpus] + verifier_tools
+
+    job_plan_ctx = (
+        f"Outline mode: {job_plan.get('outline_mode', 'single_course')}\n"
+        f"Course areas: {job_plan.get('course_areas', [])}\n"
+        f"Target format: {job_plan.get('target_format', 'T-14 comprehensive attack outline')}\n\n"
+    ) if job_plan else ""
+
     system = (
         "You are a T-14 law student writing ONE section of an attack outline. "
         "Produce the complete markdown section for this doctrine cluster:\n\n"
@@ -424,23 +604,40 @@ async def block_generator(state: Dict) -> Dict:
         "**Exam traps**\n"
         "**One-paragraph model application**\n"
         "**If/then transitions** — one line per related cluster edge.\n\n"
+        "Write this section consistent with the overall outline's course "
+        "structure (given below).\n\n"
         "GROUNDING (critical): every rule, element, holding, and case you state "
         "must be supported by the artifact cards or the evidence excerpts "
-        "provided. After drafting, RE-CHECK each claim against the evidence; "
-        "delete or soften anything unsupported. Cite chunk ids inline like "
-        "[chunk_id] after grounded rules. Do not invent authority.\n\n"
-        "Return ONLY the markdown section, starting with the '## ' heading."
+        "provided. If a claim you want to make ISN'T covered by what's given, "
+        "call grep_research_corpus first (free, instant) and only fall back to "
+        "find_supporting_evidence/get_citations_for (live database) if that "
+        "comes up empty — most sections need no tool calls at all. After "
+        "drafting, RE-CHECK each claim against the evidence; delete or soften "
+        "anything unsupported. Cite chunk ids inline like [chunk_id] after "
+        "grounded rules. Do not invent authority.\n\n"
+        "Once satisfied, return ONLY the markdown section, starting with the "
+        "'## ' heading — no other text, no further tool calls."
     )
     prompt = (
+        f"{job_plan_ctx}"
         f"Cluster: {json.dumps({k: v for k, v in cluster.items() if k != 'artifacts'}, indent=2)}\n\n"
         f"Artifact cards:\n{json.dumps(cluster.get('artifacts') or [], indent=2)}\n\n"
         f"Evidence excerpts:\n{evidence_text}"
     )
 
-    # orchestrator tier = deepseek-v4-pro thinking=True — the deliberate
-    # reasoning stage where drafting + self-grounding happen together.
-    markdown = await _llm("orchestrator", prompt, system=system,
-                          max_tokens=10000, _node="block_generator")
+    # orchestrator tier is deliberate: the reasoning stage where drafting +
+    # self-grounding happen together. Provider resolved via WORKER_MODEL_MAP.
+    base_model, sem = await _build_tool_model("orchestrator")
+    messages: List[Any] = [SystemMessage(content=system), HumanMessage(content=prompt)]
+    markdown = await _run_bounded_tool_loop(
+        base_model, tools, messages, ATTACK_BLOCK_MAX_TURNS, sem,
+        "block_generator", state,
+        countdown_from_turn=ATTACK_BLOCK_MAX_TURNS,
+        forced_stop_prompt=(
+            "STOP calling tools. Write the final markdown section NOW using "
+            "only the evidence already gathered."
+        ),
+    )
     markdown = (markdown or "").strip()
     if not markdown.startswith("##"):
         markdown = f"## {label}\n\n{markdown}"

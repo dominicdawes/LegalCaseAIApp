@@ -84,19 +84,29 @@ def _build_compact_graph(checkpointer):
     """
     Compact 4-stage topology (ATTACK_OUTLINE_COMPACT=true, the default):
 
-      plan_agent → research_agent → [Send×N] block_generator → final_formatter → END
-                                  └────────────(no clusters)──→ final_formatter
+      START ──┬─▶ plan_agent ─────┐
+              └─▶ research_agent ─┴─▶ sync_barrier ─▶ [Send×N] block_generator → final_formatter → END
+                                                    └──────(no clusters)───────→ final_formatter
+
+    plan_agent and research_agent run in PARALLEL — research_agent does its
+    own survey (list_sources/get_doc_outline) rather than waiting on
+    plan_agent's job_plan, so there's no real dependency between them.
+    sync_barrier is a no-op join: a node with two incoming static edges waits
+    for both predecessors (standard LangGraph fan-in), guaranteeing
+    block_generator's Send payload always has both job_plan and the research
+    dossier, regardless of which branch finishes first.
 
     research_agent is a bounded multistep tool-calling loop (its own internal
     LLM turns), so the graph itself stays tiny; state carries the dossier and
     the harvested evidence_store between stages.
     """
-    from langgraph.graph import StateGraph, END
+    from langgraph.graph import StateGraph, START, END
 
     from .state import AgentState
     from .compact_nodes import (
         plan_agent,
         research_agent,
+        sync_barrier,
         block_generator,
         final_formatter,
         research_to_generators,
@@ -105,15 +115,22 @@ def _build_compact_graph(checkpointer):
     builder = StateGraph(AgentState)
     builder.add_node("plan_agent",      plan_agent)
     builder.add_node("research_agent",  research_agent)
+    builder.add_node("sync_barrier",    sync_barrier)
     builder.add_node("block_generator", block_generator)
     builder.add_node("final_formatter", final_formatter)
 
-    builder.set_entry_point("plan_agent")
-    builder.add_edge("plan_agent", "research_agent")
+    # Parallel entry — both branches start immediately, neither waits on the other.
+    builder.add_edge(START, "plan_agent")
+    builder.add_edge(START, "research_agent")
+
+    # Join: sync_barrier only runs once BOTH branches have completed.
+    builder.add_edge("plan_agent", "sync_barrier")
+    builder.add_edge("research_agent", "sync_barrier")
+
     # List[Send] fan-out, or the string route straight to the formatter when
     # research produced no clusters (same pattern as assembler_to_verifier).
     builder.add_conditional_edges(
-        "research_agent",
+        "sync_barrier",
         research_to_generators,
         {"final_formatter": "final_formatter"},
     )
