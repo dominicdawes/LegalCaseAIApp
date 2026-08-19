@@ -80,8 +80,9 @@ logger = logging.getLogger(__name__)
 
 # ── Tunables ──────────────────────────────────────────────────────────────────
 
-# Max model turns in the research loop. Each turn may issue MANY tool calls
-# (executed in parallel).
+# Max RETRIEVAL turns in the research loop. Each turn may issue MANY tool calls
+# (executed in parallel). The final dossier emission happens in an additional
+# reserved turn on top of these — see _run_bounded_tool_loop.
 MAX_RESEARCH_TURNS = int(os.getenv("ATTACK_RESEARCH_MAX_TURNS", "5"))
 
 # Max model turns per block_generator call. One drafting turn with tool
@@ -92,6 +93,28 @@ ATTACK_BLOCK_MAX_TURNS = int(os.getenv("ATTACK_BLOCK_MAX_TURNS", "2"))
 # Per-tool-result cap injected back into the conversation. Full chunk payloads
 # are harvested separately into evidence_store, so the transcript stays lean.
 TOOL_RESULT_CHAR_CAP = 6000
+
+# ── Output budget ─────────────────────────────────────────────────────────────
+# SOFT target is stated in the system prompt so the model self-regulates and
+# finishes its structure; the HARD cap sits well above it purely as a runaway
+# guard. Keeping the hard cap above the soft target is what prevents a
+# mid-sentence clip (the whole point of budgeting by prompt, not by max_tokens).
+SOFT_OUTPUT_TOKEN_TARGET = int(os.getenv("ATTACK_SOFT_OUTPUT_TOKENS", "10000"))
+HARD_OUTPUT_TOKEN_CAP = int(os.getenv("ATTACK_HARD_OUTPUT_TOKENS", "14000"))
+
+_SOFT_BUDGET_LINE = (
+    f"\n\n**IMPORTANT**: keep your total response under ~{SOFT_OUTPUT_TOKEN_TARGET:,} "
+    "tokens. This is a soft budget — prefer tightening wording over dropping "
+    "required structure, and always finish the element you started rather than "
+    "stopping mid-way."
+)
+
+# ── Corpus survey pre-fetch (R1) ──────────────────────────────────────────────
+# Caps on the deterministically-injected survey, so a large project can't blow
+# up the opening prompt.
+PREFETCH_MAX_OUTLINES = int(os.getenv("ATTACK_PREFETCH_MAX_OUTLINES", "10"))
+PREFETCH_MAX_SECTIONS = int(os.getenv("ATTACK_PREFETCH_MAX_SECTIONS", "40"))
+PREFETCH_SECTION_SUMMARY_CHARS = 300
 
 # Evidence included in each generator prompt.
 GENERATOR_MAX_CHUNKS = 12
@@ -184,16 +207,21 @@ async def plan_agent(state: AgentState) -> Dict:
 _RESEARCH_SYSTEM = (
     "You are a legal research agent building the evidence base for a T-14 "
     "attack outline. You have retrieval tools over the student's source "
-    "documents — no prior plan is provided; survey and prioritize the "
-    "doctrines yourself. Work in bounded steps:\n"
-    "  1. Survey: list_sources / get_doc_outline / find_docs_about to map what "
-    "each source covers and identify the major doctrines at stake.\n"
-    "  2. Retrieve: hybrid_search + search_passages per doctrine (batch MANY tool "
-    "calls in a single turn — they run in parallel). Drill into sections with "
-    "get_section / get_neighbors where a hit looks central.\n"
+    "documents. Work in bounded steps:\n"
+    "  1. Orient: the CORPUS SURVEY — every source, its outline/key concepts, "
+    "and a section-by-section summary map — is ALREADY PROVIDED in the first "
+    "message. Read it and pick your doctrines from it. Do NOT spend turns "
+    "re-fetching it with list_sources / get_doc_outline / find_docs_about / "
+    "find_sections_about; that data is already in front of you.\n"
+    "  2. Retrieve (START HERE on turn 1): hybrid_search + search_passages per "
+    "doctrine (batch MANY tool calls in a single turn — they run in parallel). "
+    "Drill into sections with get_section / get_neighbors where a hit looks "
+    "central; the section map gives you exact section_paths to target.\n"
     "  3. Extract & cluster: identify every legal artifact present "
     f"({ARTIFACT_CARD_TYPES}) and group doctrines into outline clusters.\n\n"
     "RULES:\n"
+    "• Your turn budget is for RETRIEVAL. Turn 1 should already be a large "
+    "batch of search calls, not discovery.\n"
     "• Prefer FEW turns with MANY parallel tool calls over many small turns.\n"
     "• Only claim rules/holdings you actually retrieved — cite chunk_ids.\n"
     "• STOP CRITERION (concrete — check it every turn): once every major "
@@ -222,6 +250,7 @@ _RESEARCH_SYSTEM = (
     "Keep every artifact text under 120 words. Cover EVERY major doctrine in "
     "the sources — completeness beats depth here; the outline writers deepen "
     "each cluster later."
+    + _SOFT_BUDGET_LINE
 )
 
 
@@ -276,6 +305,102 @@ async def _exec_tool_call(
     ), result_str
 
 
+async def _prefetch_corpus_survey(state: Dict, tools: List[Any]) -> str:
+    """
+    Deterministically fetch the corpus survey so research_agent can skip
+    discovery entirely and spend every turn on actual retrieval.
+
+    Three layers, all plain indexed DB reads — no LLM, no embeddings, no
+    vector search:
+      1. corpus   — list_sources: filenames, chunk counts, doc summaries
+      2. document — get_doc_outline per source: TOC + doc concepts
+      3. section  — document_sections: every section_path plus the 2-4 sentence
+                    summary generated during hierarchical ingest
+                    (tasks/hierarchical_ingest_tasks.py::build_section_summaries)
+
+    Why: the model was burning 2 of its 5 turns rediscovering exactly this via
+    list_sources / get_doc_outline / find_sections_about — data that requires
+    no intelligence to fetch and that we already have primary keys for. It also
+    lands in the FIRST message, so it stays a stable, cacheable prefix instead
+    of growing the transcript turn by turn.
+
+    Never raises: any layer that fails degrades to a note, and the model still
+    has the tools to fetch it the slow way.
+    """
+    source_ids: List[str] = list(state.get("source_ids") or [])
+    parts: List[str] = []
+    tool_by_name = {t.name: t for t in tools}
+
+    # ── Layer 1: corpus ───────────────────────────────────────────────────
+    list_tool = tool_by_name.get("list_sources")
+    if list_tool is not None:
+        try:
+            parts.append(f"## Sources in this project\n{await list_tool.ainvoke({})}")
+        except Exception as exc:
+            _node_warn("research_agent", state, f"prefetch list_sources failed: {exc}")
+
+    # ── Layer 2: per-document outlines (concurrent) ───────────────────────
+    outline_tool = tool_by_name.get("get_doc_outline")
+    if outline_tool is not None and source_ids:
+        targets = source_ids[:PREFETCH_MAX_OUTLINES]
+        results = await asyncio.gather(
+            *(outline_tool.ainvoke({"source_id": sid}) for sid in targets),
+            return_exceptions=True,
+        )
+        outlines = [
+            f"### {sid}\n{res}"
+            for sid, res in zip(targets, results)
+            if not isinstance(res, Exception)
+        ]
+        if outlines:
+            parts.append("## Document outlines (TOC + key concepts)\n" + "\n".join(outlines))
+
+    # ── Layer 3: hierarchical section summaries ───────────────────────────
+    if source_ids:
+        try:
+            from tasks.database import get_global_async_db_pool, init_async_pools
+
+            await init_async_pools()
+            pool = get_global_async_db_pool()
+            async with pool.acquire() as conn:
+                rows = await conn.fetch(
+                    """
+                    SELECT source_id, section_path, section_summary
+                    FROM document_sections
+                    WHERE project_id = $1
+                      AND source_id = ANY($2::uuid[])
+                    ORDER BY source_id, start_chunk_idx
+                    LIMIT $3
+                    """,
+                    state["project_id"], source_ids, PREFETCH_MAX_SECTIONS,
+                )
+            if rows:
+                lines = [
+                    f"[{str(r['source_id'])[:8]}] {r['section_path']}\n"
+                    f"    {(r['section_summary'] or '')[:PREFETCH_SECTION_SUMMARY_CHARS]}"
+                    for r in rows
+                ]
+                parts.append(
+                    "## Section map (hierarchical summaries built at ingest)\n"
+                    + "\n".join(lines)
+                )
+                logger.info("  📚 [research_agent] prefetched %d section summaries", len(rows))
+        except Exception as exc:
+            _node_warn("research_agent", state, f"prefetch section summaries failed: {exc}")
+
+    if not parts:
+        return (
+            "(Corpus survey pre-fetch unavailable — use list_sources / "
+            "get_doc_outline / find_sections_about to orient yourself first.)"
+        )
+
+    return (
+        "=== CORPUS SURVEY (pre-fetched for you) ===\n"
+        + "\n\n".join(parts)
+        + "\n=== END CORPUS SURVEY ==="
+    )
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Shared tool-calling infrastructure — used by BOTH research_agent (below) and
 # block_generator (further down), not just section 2.
@@ -300,11 +425,14 @@ async def _build_tool_model(worker_class: str, provider: Optional[str] = None):
 
     resolved_provider, model_name, thinking = _fetch_worker_model(worker_class, provider)
 
+    # HARD_OUTPUT_TOKEN_CAP sits deliberately ABOVE the soft budget stated in
+    # the system prompts: the prompt does the budgeting, this is only a runaway
+    # guard. Setting it near the target is what causes mid-sentence clipping.
     if resolved_provider == "deepseek":
         from utils.llm_clients.deepseek_client import DeepSeekClient
         client = DeepSeekClient(
             model_name=model_name, temperature=0.3,
-            max_output_tokens=8000, thinking=thinking,
+            max_output_tokens=HARD_OUTPUT_TOKEN_CAP, thinking=thinking,
         )
         base_model = client._client
         sem = _get_deepseek_semaphore()
@@ -314,7 +442,9 @@ async def _build_tool_model(worker_class: str, provider: Optional[str] = None):
         # Built directly rather than via LLMFactory.get_langchain_model() —
         # that helper hardcodes max_tokens=4096, too tight for a multi-cluster
         # JSON dossier or a full attack-outline section.
-        base_model = ChatAnthropic(model=model_name, max_tokens=8000, temperature=0.3)
+        base_model = ChatAnthropic(
+            model=model_name, max_tokens=HARD_OUTPUT_TOKEN_CAP, temperature=0.3
+        )
         sem = await get_llm_semaphore()
     else:
         raise NotImplementedError(
@@ -340,10 +470,17 @@ async def _run_bounded_tool_loop(
     forced_stop_prompt: str = "STOP calling tools. Answer NOW using only what you've gathered.",
 ) -> str:
     """
-    Shared bounded ReAct loop used by both research_agent and block_generator:
-    turns with parallel tool execution, a turn-countdown nudge as the budget
-    runs low, and — if the budget runs out — a forced final answer via the
-    UNBOUND base_model (no tools attached, so it cannot emit more tool calls).
+    Shared bounded ReAct loop used by both research_agent and block_generator.
+
+    `max_turns` is the RETRIEVAL budget. The final answer is emitted in an
+    additional reserved turn on top of it, via the UNBOUND base_model (no
+    tools attached, so it cannot emit further tool calls).
+
+    The model is told about that reserved turn in advance — a countdown while
+    the budget runs down, then an explicit "last retrieval turn" notice — so
+    the emission is a planned hand-off rather than an interrupt mid-research.
+    If the model finishes early (a turn with no tool calls), that response IS
+    the answer and the reserved turn is skipped entirely.
 
     Returns the final answer's raw text; callers decide how to parse it
     (JSON dossier vs. markdown section).
@@ -352,12 +489,30 @@ async def _run_bounded_tool_loop(
     bound_model = base_model.bind_tools(tools)
 
     for turn in range(1, max_turns + 1):
+        # Turn-budget ladder, only once the countdown window opens. Gating the
+        # whole ladder on countdown_from_turn keeps short budgets quiet early:
+        # block_generator runs a 2-turn budget whose common case is emitting on
+        # turn 1, and a "one turn remains" nudge there would invite tool calls
+        # it would not otherwise make.
         if turn >= countdown_from_turn:
-            remaining = max_turns - turn + 1
-            messages.append(HumanMessage(content=(
-                f"({remaining} of {max_turns} turns remain — wrap up and answer "
-                "soon if you have sufficient evidence.)"
-            )))
+            if turn == max_turns:
+                messages.append(HumanMessage(content=(
+                    f"(⚠ FINAL RETRIEVAL TURN — turn {turn} of {max_turns}. Make any "
+                    "last tool calls now. Your NEXT response must be the final "
+                    "answer itself, with no tool calls.)"
+                )))
+            elif turn == max_turns - 1:
+                messages.append(HumanMessage(content=(
+                    f"(Turn {turn} of {max_turns} — one retrieval turn remains after "
+                    "this one, then you must emit the final answer. Gather anything "
+                    "still missing now.)"
+                )))
+            else:
+                remaining = max_turns - turn + 1
+                messages.append(HumanMessage(content=(
+                    f"({remaining} of {max_turns} retrieval turns remain — wrap up and "
+                    "answer as soon as you have sufficient evidence.)"
+                )))
         async with sem:
             try:
                 resp: AIMessage = await bound_model.ainvoke(messages)
@@ -383,8 +538,10 @@ async def _run_bounded_tool_loop(
             if evidence_store is not None:
                 _harvest_evidence(tc.get("name", ""), full_result, evidence_store)
 
-    # Turn budget exhausted — force a final no-tools answer via the unbound model.
-    _node_warn(node_name, state, "forcing final answer emission")
+    # Reserved emission turn. The model was warned this was coming, so this is
+    # a planned hand-off, not an interrupt. Unbound model = cannot call tools.
+    logger.info("  📝 [%s] reserved emission turn (retrieval budget %d/%d used)",
+                node_name, max_turns, max_turns)
     messages.append(HumanMessage(content=forced_stop_prompt))
     async with sem:
         final = await base_model.ainvoke(messages)  # unbound — cannot call tools
@@ -425,12 +582,21 @@ async def research_agent(state: AgentState) -> Dict:
         "orchestrator", provider=os.getenv("ATTACK_RESEARCH_PROVIDER")
     )
 
+    # Deterministic corpus survey (R1) — hands the model the orientation data
+    # it used to spend 2 of 5 turns rediscovering, so turn 1 starts on retrieval.
+    survey = await _prefetch_corpus_survey(state, tools)
+    logger.info("  📚 [research_agent] corpus survey pre-fetched (%d chars)", len(survey))
+
     messages: List[Any] = [
         SystemMessage(content=_RESEARCH_SYSTEM),
         HumanMessage(content=(
+            f"{survey}\n\n"
             f"Source ids in scope: {state.get('source_ids', [])}\n"
             f"User request: {state['request']}\n\n"
-            "Begin your research. Batch parallel tool calls aggressively."
+            "You already have the corpus survey above — do not re-fetch it. "
+            "Begin RETRIEVAL immediately: issue a large batch of parallel "
+            "search_passages / hybrid_search calls for the doctrines you can "
+            "already see in the survey."
         )),
     ]
 
@@ -440,8 +606,8 @@ async def research_agent(state: AgentState) -> Dict:
         "research_agent", state, evidence_store=evidence_store,
         countdown_from_turn=3,
         forced_stop_prompt=(
-            "STOP researching. Emit the final dossier JSON NOW using only the "
-            "evidence already gathered. Return ONLY the JSON object."
+            "Retrieval is complete. Emit the final dossier JSON now, using the "
+            "evidence gathered. Return ONLY the JSON object."
         ),
     )
     try:
@@ -617,6 +783,7 @@ async def block_generator(state: Dict) -> Dict:
         "grounded rules. Do not invent authority.\n\n"
         "Once satisfied, return ONLY the markdown section, starting with the "
         "'## ' heading — no other text, no further tool calls."
+        + _SOFT_BUDGET_LINE
     )
     prompt = (
         f"{job_plan_ctx}"
