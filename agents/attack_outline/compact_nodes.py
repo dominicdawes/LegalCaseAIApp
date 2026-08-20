@@ -52,6 +52,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 from typing import Any, Dict, List, Optional, Tuple
 
 from langchain_core.messages import (
@@ -95,19 +96,50 @@ ATTACK_BLOCK_MAX_TURNS = int(os.getenv("ATTACK_BLOCK_MAX_TURNS", "2"))
 TOOL_RESULT_CHAR_CAP = 6000
 
 # ── Output budget ─────────────────────────────────────────────────────────────
-# SOFT target is stated in the system prompt so the model self-regulates and
-# finishes its structure; the HARD cap sits well above it purely as a runaway
-# guard. Keeping the hard cap above the soft target is what prevents a
-# mid-sentence clip (the whole point of budgeting by prompt, not by max_tokens).
-SOFT_OUTPUT_TOKEN_TARGET = int(os.getenv("ATTACK_SOFT_OUTPUT_TOKENS", "10000"))
+# Budgeted in WORDS, not tokens — a token budget is invisible to the model and
+# the previous 10k-token target never bound (sections were ~3k tokens, so the
+# cap sat 3x above actual output and did nothing).
+#
+# The numbers come from what an attack outline actually IS. Law-school prep
+# guidance is consistent: an attack outline is 1-5 pages, or "up to about 10%
+# of your comprehensive outline" — a memorisable checklist, not an exposition.
+# A prior run produced ~20,000 words (~40+ pages) for two documents, i.e. longer
+# than a full-semester comprehensive outline. That is not an attack outline by
+# definition, so the budget is a PRODUCT requirement, not a latency knob (though
+# it cuts latency hard as a side effect).
+#
+#   ~300 words/section x ~10 sections ≈ 3,000 words ≈ 5-6 pages.
+BLOCK_TARGET_WORDS = int(os.getenv("ATTACK_BLOCK_TARGET_WORDS", "300"))
+BLOCK_MAX_WORDS = int(os.getenv("ATTACK_BLOCK_MAX_WORDS", "400"))
+
+# The dossier is an internal hand-off, not user-facing prose; it only needs to
+# carry enough for each generator to write its section.
+DOSSIER_TARGET_WORDS = int(os.getenv("ATTACK_DOSSIER_TARGET_WORDS", "1200"))
+
+# Runaway guard only. Deliberately far above both budgets so nothing clips
+# mid-structure — the prompt does the budgeting, this just bounds pathology.
 HARD_OUTPUT_TOKEN_CAP = int(os.getenv("ATTACK_HARD_OUTPUT_TOKENS", "14000"))
 
-_SOFT_BUDGET_LINE = (
-    f"\n\n**IMPORTANT**: keep your total response under ~{SOFT_OUTPUT_TOKEN_TARGET:,} "
-    "tokens. This is a soft budget — prefer tightening wording over dropping "
-    "required structure, and always finish the element you started rather than "
-    "stopping mid-way."
-)
+
+def _word_budget_line(target: int, cap: int, kind: str = "outline") -> str:
+    """Soft word budget stated in the system prompt so the model self-regulates."""
+    if kind == "dossier":
+        tail = (
+            "This is an internal hand-off, not prose for a reader — terse "
+            "fragments only, no explanation, no restating the same rule twice."
+        )
+    else:
+        tail = (
+            "This is an attack outline — a memorisable checklist a student scans "
+            "under exam pressure, NOT an essay or a case brief. Compress "
+            "ruthlessly: fragments, not full sentences; bullets, not paragraphs. "
+            "If you are running long, cut explanation and keep the rule, the "
+            "triggers, and the IF/THEN logic."
+        )
+    return (
+        f"\n\n**LENGTH LIMIT (hard requirement)**: aim for ~{target} words; "
+        f"never exceed {cap}. {tail}"
+    )
 
 # ── Corpus survey pre-fetch (R1) ──────────────────────────────────────────────
 # Caps on the deterministically-injected survey, so a large project can't blow
@@ -120,10 +152,10 @@ PREFETCH_SECTION_SUMMARY_CHARS = 300
 GENERATOR_MAX_CHUNKS = 12
 GENERATOR_CHUNK_CHAR_CAP = 1400
 
-ARTIFACT_CARD_TYPES = (
-    "rule_card, element_card, exception_card, issue_trigger_card, "
-    "defense_card, case_card, policy_card, remedy_card, exam_trap_card"
-)
+# NOTE: the old 9-type ARTIFACT_CARD_TYPES taxonomy is gone. research_agent no
+# longer pre-extracts cards (that inflated the serial dossier and duplicated
+# work); block_generator derives rule / triggers / elements / exceptions /
+# defenses / traps directly from evidence, guided by its section template.
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -217,21 +249,32 @@ _RESEARCH_SYSTEM = (
     "doctrine (batch MANY tool calls in a single turn — they run in parallel). "
     "Drill into sections with get_section / get_neighbors where a hit looks "
     "central; the section map gives you exact section_paths to target.\n"
-    "  3. Extract & cluster: identify every legal artifact present "
-    f"({ARTIFACT_CARD_TYPES}) and group doctrines into outline clusters.\n\n"
+    "  3. Cluster: group the doctrines into outline sections and capture, for "
+    "each, the black-letter rule plus the chunk_ids that prove it. You do NOT "
+    "extract the full card taxonomy — the section writers derive elements, "
+    "exceptions, defenses and traps from the evidence themselves.\n\n"
     "RULES:\n"
     "• Your turn budget is for RETRIEVAL. Turn 1 should already be a large "
     "batch of search calls, not discovery.\n"
     "• Prefer FEW turns with MANY parallel tool calls over many small turns.\n"
     "• Only claim rules/holdings you actually retrieved — cite chunk_ids.\n"
     "• STOP CRITERION (concrete — check it every turn): once every major "
-    "doctrine you identified in your survey has at least 1-2 grounded "
-    "artifacts, STOP calling tools and emit the final dossier immediately, "
-    "even if turns remain. Do not keep researching doctrines you've already "
-    "covered just because turns are left.\n"
+    "doctrine you identified in your survey has a black-letter rule plus "
+    "supporting chunk_ids, STOP calling tools and emit the final dossier "
+    "immediately, even if turns remain. Do not keep researching doctrines "
+    "you've already covered just because turns are left.\n"
     "• Target 6-10 clusters total; do NOT exceed 12. If tempted to split one "
     "doctrine into multiple clusters, prefer merging — fewer, well-scoped "
-    "clusters beat many overlapping ones.\n\n"
+    "clusters beat many overlapping ones.\n"
+    "• EXAM RELEVANCE: cluster only doctrines a law professor would actually "
+    "TEST. Prefer claims, defenses, elements, and tests. Drop pure practitioner "
+    "mechanics (filing/notice/fee-award/administrative procedure) unless the "
+    "course is plainly about them — they are not exam material.\n"
+    "• SOURCE TYPE MATTERS: if a source is a law-review article, critique, "
+    "op-ed or advocacy brief, its conclusions are ARGUMENTS, not law. Record "
+    "the neutral black-letter rule as the rule, and mark the source's position "
+    "in `contested_positions`. Never promote one commentator's litigation "
+    "position into the rule statement.\n\n"
     "FINAL ANSWER — return ONLY this JSON object (no prose):\n"
     "{\n"
     '  "source_profiles": [{"source_id", "course_area", "document_type", "summary"}],\n'
@@ -240,17 +283,19 @@ _RESEARCH_SYSTEM = (
     '     "label": display label (prefix Claim:/Defense:/Doctrine:/Remedy:/Procedural:),\n'
     '     "course_area": string,\n'
     '     "priority": 1|2|3,\n'
-    '     "doctrine_summary": 2-3 sentences,\n'
-    '     "artifacts": [{"artifact_type": one of the card types, "text": the '
-    'card content, "elements": [..], "exceptions": [..], "chunk_ids": [..]}],\n'
-    '     "evidence_chunk_ids": chunk_ids most central to this cluster,\n'
+    '     "rule_statement": the neutral black-letter rule, ONE sentence (<40 words),\n'
+    '     "doctrine_summary": ONE sentence,\n'
+    '     "contested_positions": [short strings — positions argued by advocacy '
+    'sources, or points later authority may have overtaken; [] if none],\n'
+    '     "evidence_chunk_ids": 10-12 chunk_ids most central to this cluster '
+    '(this is the ONLY evidence selector the section writer gets — be generous),\n'
     '     "if_then_edges": [{"to_cluster", "condition"}]\n'
     "  }]\n"
     "}\n"
-    "Keep every artifact text under 120 words. Cover EVERY major doctrine in "
-    "the sources — completeness beats depth here; the outline writers deepen "
-    "each cluster later."
-    + _SOFT_BUDGET_LINE
+    "Cover EVERY major testable doctrine in the sources. Keep the dossier terse "
+    "— it is an internal hand-off, not prose for a reader."
+    + _word_budget_line(DOSSIER_TARGET_WORDS, int(DOSSIER_TARGET_WORDS * 1.5),
+                        kind="dossier")
 )
 
 
@@ -700,12 +745,12 @@ async def block_generator(state: Dict) -> Dict:
     label = cluster.get("label", cluster.get("cluster_id", "?"))
 
     _node_start("block_generator", state, cluster=label[:40],
-                n_artifacts=len(cluster.get("artifacts") or []))
+                n_chunk_ids=len(cluster.get("evidence_chunk_ids") or []))
 
-    # Evidence: prefer the cluster's own chunk ids, then artifact-cited ids.
+    # Evidence selection. The dossier no longer carries artifact cards (their
+    # chunk_ids used to be a secondary source here), so evidence_chunk_ids is
+    # now the ONLY selector — hence the prompt asks research_agent for 10-12.
     chunk_ids: List[str] = list(cluster.get("evidence_chunk_ids") or [])
-    for art in cluster.get("artifacts") or []:
-        chunk_ids.extend(art.get("chunk_ids") or [])
     seen = set()
     evidence: List[Dict] = []
     for cid in chunk_ids:
@@ -720,7 +765,7 @@ async def block_generator(state: Dict) -> Dict:
         f"[{e['chunk_id']}] (source {e.get('source_id', '?')[:8]}, p.{e.get('page', '?')})\n"
         f"{e['content'][:GENERATOR_CHUNK_CHAR_CAP]}"
         for e in evidence
-    ) or "(no evidence chunks captured — rely strictly on the artifact cards)"
+    ) or "(no evidence chunks captured — use grep_research_corpus to find support)"
 
     # Local, zero-cost grep over the FULL research corpus (not just this
     # cluster's cited chunks) — closure-defined so it needs no ToolContext and
@@ -756,39 +801,48 @@ async def block_generator(state: Dict) -> Dict:
     ) if job_plan else ""
 
     system = (
-        "You are a T-14 law student writing ONE section of an attack outline. "
-        "Produce the complete markdown section for this doctrine cluster:\n\n"
+        "You are a T-14 law student writing ONE section of an ATTACK OUTLINE — "
+        "the condensed checklist you scan during a timed exam, not a study "
+        "guide and not a case brief. Every line must be something you would "
+        "actually use with 40 minutes on the clock.\n\n"
+        "Produce EXACTLY this markdown skeleton — no extra headings, no prose "
+        "sections, nothing outside it:\n\n"
         "## {label}\n"
-        "**Big exam takeaway** — 1-2 sentences.\n"
-        "**Exam-ready rule statement** — one complete sentence.\n"
-        "**Issue triggers** — fact-pattern signals.\n"
-        "**Attack steps** — numbered; each step: the element/test, key facts "
-        "for and against, and IF/THEN logic lines.\n"
-        "**Exceptions & limits**\n"
-        "**Defenses & counterarguments**\n"
-        "**Remedies** (when applicable)\n"
-        "**Exam traps**\n"
-        "**One-paragraph model application**\n"
-        "**If/then transitions** — one line per related cluster edge.\n\n"
-        "Write this section consistent with the overall outline's course "
-        "structure (given below).\n\n"
-        "GROUNDING (critical): every rule, element, holding, and case you state "
-        "must be supported by the artifact cards or the evidence excerpts "
-        "provided. If a claim you want to make ISN'T covered by what's given, "
-        "call grep_research_corpus first (free, instant) and only fall back to "
-        "find_supporting_evidence/get_citations_for (live database) if that "
-        "comes up empty — most sections need no tool calls at all. After "
-        "drafting, RE-CHECK each claim against the evidence; delete or soften "
-        "anything unsupported. Cite chunk ids inline like [chunk_id] after "
-        "grounded rules. Do not invent authority.\n\n"
-        "Once satisfied, return ONLY the markdown section, starting with the "
-        "'## ' heading — no other text, no further tool calls."
-        + _SOFT_BUDGET_LINE
+        "**RULE:** one sentence of black-letter law (<40 words).\n"
+        "**TRIGGERS:** 3-5 bullet fragments — the fact patterns that raise this "
+        "issue. Fragments, not sentences.\n"
+        "**ELEMENTS / STEPS:** numbered list. One line per element. Format each "
+        "as `Element — key question` and, where it decides the outcome, add a "
+        "nested `IF … → THEN …` line. No argument paragraphs.\n"
+        "**EXCEPTIONS & DEFENSES:** bullet fragments, one per exception or "
+        "defense. Name it; do not argue it.\n"
+        "**TRAPS:** 2-4 bullets — the specific errors students make here.\n"
+        "**IF/THEN → NEXT:** one line per cross-reference to another section.\n\n"
+        "STYLE RULES (these are what make it an attack outline):\n"
+        "• Fragments over sentences. Cut every article and filler word you can.\n"
+        "• NO 'For / Against / Rebuttal' blocks. NO model answer paragraph. NO "
+        "block quotes. NO restating the rule in multiple places.\n"
+        "• A student must be able to read the whole section in ~30 seconds.\n"
+        "• Omit any heading that has no real content — do not pad.\n\n"
+        "NEUTRALITY: state the black-letter rule as the RULE. If a source is a "
+        "law-review article, critique, op-ed or brief, its conclusions are one "
+        "side's ARGUMENT — put those under EXCEPTIONS & DEFENSES and attribute "
+        "them ('critics argue…'), never as the rule. If the cluster lists "
+        "contested_positions, treat them that way.\n\n"
+        "GROUNDING: every rule, element and case must be supported by the "
+        "evidence excerpts provided. If something you want to state isn't "
+        "covered, call grep_research_corpus first (free, instant); fall back to "
+        "find_supporting_evidence / get_citations_for only if that comes up "
+        "empty — most sections need no tool calls at all. Cite support inline "
+        "as [chunk_id] immediately after the proposition it supports (these are "
+        "stripped before the student sees them, so they cost you no length). "
+        "Do not invent authority.\n\n"
+        "Return ONLY the markdown section, starting with '## ' — no other text."
+        + _word_budget_line(BLOCK_TARGET_WORDS, BLOCK_MAX_WORDS)
     )
     prompt = (
         f"{job_plan_ctx}"
-        f"Cluster: {json.dumps({k: v for k, v in cluster.items() if k != 'artifacts'}, indent=2)}\n\n"
-        f"Artifact cards:\n{json.dumps(cluster.get('artifacts') or [], indent=2)}\n\n"
+        f"Cluster:\n{json.dumps(cluster, indent=2)}\n\n"
         f"Evidence excerpts:\n{evidence_text}"
     )
 
@@ -834,6 +888,34 @@ block_generator.default_worker_class = "orchestrator"
 
 _MIN_SECTION_CHARS = 200
 
+# ── Chunk-citation stripping ──────────────────────────────────────────────────
+# block_generator cites evidence inline as [<chunk uuid>] so its self-grounding
+# pass is checkable. Those are internal retrieval IDs — meaningless to a student
+# and visually wrecking — so they are stripped here, at the presentation
+# boundary. The RAW markdown (citations intact) stays in state["compact_blocks"]
+# and in the ledger artifact, so grounding remains auditable after the fact.
+_UUID_PAT = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+# Matches [uuid], [uuid; uuid], [uuid, uuid] and runs of adjacent brackets.
+# Leading whitespace is [ \t] only — never \s — so a citation at the start of a
+# line cannot swallow the preceding newline and weld two lines together.
+_CHUNK_CITE_RE = re.compile(
+    r"[ \t]*\[\s*" + _UUID_PAT + r"(?:\s*[;,]\s*" + _UUID_PAT + r")*\s*\]"
+)
+
+
+def _strip_chunk_citations(markdown: str) -> Tuple[str, int]:
+    """Remove inline [chunk-uuid] citations and tidy the punctuation they leave
+    behind. Returns (cleaned_markdown, n_citations_removed)."""
+    if not markdown:
+        return markdown, 0
+    n = len(_CHUNK_CITE_RE.findall(markdown))
+    cleaned = _CHUNK_CITE_RE.sub("", markdown)
+    cleaned = re.sub(r"[ \t]+([.,;:!?)])", r"\1", cleaned)  # " ." -> "."
+    cleaned = re.sub(r"\(\s*\)", "", cleaned)               # empty parens
+    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)            # collapse space runs
+    cleaned = re.sub(r"[ \t]+$", "", cleaned, flags=re.M)   # trailing space
+    return cleaned, n
+
 
 async def final_formatter(state: AgentState) -> Dict:
     """Deterministic assembly: order, stitch, TOC, blank-section checks."""
@@ -851,9 +933,22 @@ async def final_formatter(state: AgentState) -> Dict:
     )
     title_suffix = " — ".join(course_areas[:3]) if course_areas else "Attack Outline"
 
+    # Strip internal chunk-uuid citations BEFORE the size check, so the floor is
+    # measured against what the student actually sees rather than against
+    # citation noise. `clean_markdown` is used for rendering only; b["markdown"]
+    # keeps its citations for the ledger/audit trail.
+    citations_removed = 0
+    for b in blocks:
+        cleaned, n = _strip_chunk_citations(b.get("markdown", ""))
+        b["clean_markdown"] = cleaned
+        citations_removed += n
+    if citations_removed:
+        logger.info("  🧹 [final_formatter] stripped %d inline chunk citation(s)",
+                    citations_removed)
+
     kept, dropped = [], []
     for b in blocks:
-        if len(b.get("markdown", "").strip()) >= _MIN_SECTION_CHARS:
+        if len(b.get("clean_markdown", "").strip()) >= _MIN_SECTION_CHARS:
             kept.append(b)
         else:
             dropped.append(b.get("label", "?"))
@@ -871,13 +966,16 @@ async def final_formatter(state: AgentState) -> Dict:
             if area and area != current_area and len(course_areas) > 1:
                 lines += [f"# {area}", ""]
                 current_area = area
-            lines += [b["markdown"].strip(), "", "---", ""]
+            lines += [b["clean_markdown"].strip(), "", "---", ""]
     else:
         # Total generation failure — surface what research found instead of
         # returning an empty note.
         lines.append("*(Outline generation produced no sections — research summary below.)*")
         for c in dossier.get("clusters") or []:
-            lines += [f"## {c.get('label', '?')}", c.get("doctrine_summary", ""), ""]
+            summary, _ = _strip_chunk_citations(
+                c.get("rule_statement") or c.get("doctrine_summary", "")
+            )
+            lines += [f"## {c.get('label', '?')}", summary, ""]
 
     lines.append(
         f"<!-- attack-outline compact pipeline | {len(kept)} sections | "
