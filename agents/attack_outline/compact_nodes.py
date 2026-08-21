@@ -236,67 +236,98 @@ async def plan_agent(state: AgentState) -> Dict:
 # 2. research_agent — multistep tool-calling loop
 # ─────────────────────────────────────────────────────────────────────────────
 
-_RESEARCH_SYSTEM = (
-    "You are a legal research agent building the evidence base for a T-14 "
-    "attack outline. You have retrieval tools over the student's source "
-    "documents. Work in bounded steps:\n"
-    "  1. Orient: the CORPUS SURVEY — every source, its outline/key concepts, "
-    "and a section-by-section summary map — is ALREADY PROVIDED in the first "
-    "message. Read it and pick your doctrines from it. Do NOT spend turns "
-    "re-fetching it with list_sources / get_doc_outline / find_docs_about / "
-    "find_sections_about; that data is already in front of you.\n"
-    "  2. Retrieve (START HERE on turn 1): hybrid_search + search_passages per "
-    "doctrine (batch MANY tool calls in a single turn — they run in parallel). "
-    "Drill into sections with get_section / get_neighbors where a hit looks "
-    "central; the section map gives you exact section_paths to target.\n"
-    "  3. Cluster: group the doctrines into outline sections and capture, for "
-    "each, the black-letter rule plus the chunk_ids that prove it. You do NOT "
-    "extract the full card taxonomy — the section writers derive elements, "
-    "exceptions, defenses and traps from the evidence themselves.\n\n"
-    "RULES:\n"
-    "• Your turn budget is for RETRIEVAL. Turn 1 should already be a large "
-    "batch of search calls, not discovery.\n"
-    "• Prefer FEW turns with MANY parallel tool calls over many small turns.\n"
-    "• Only claim rules/holdings you actually retrieved — cite chunk_ids.\n"
-    "• STOP CRITERION (concrete — check it every turn): once every major "
-    "doctrine you identified in your survey has a black-letter rule plus "
-    "supporting chunk_ids, STOP calling tools and emit the final dossier "
-    "immediately, even if turns remain. Do not keep researching doctrines "
-    "you've already covered just because turns are left.\n"
-    "• Target 6-10 clusters total; do NOT exceed 12. If tempted to split one "
-    "doctrine into multiple clusters, prefer merging — fewer, well-scoped "
-    "clusters beat many overlapping ones.\n"
-    "• EXAM RELEVANCE: cluster only doctrines a law professor would actually "
-    "TEST. Prefer claims, defenses, elements, and tests. Drop pure practitioner "
-    "mechanics (filing/notice/fee-award/administrative procedure) unless the "
-    "course is plainly about them — they are not exam material.\n"
-    "• SOURCE TYPE MATTERS: if a source is a law-review article, critique, "
-    "op-ed or advocacy brief, its conclusions are ARGUMENTS, not law. Record "
-    "the neutral black-letter rule as the rule, and mark the source's position "
-    "in `contested_positions`. Never promote one commentator's litigation "
-    "position into the rule statement.\n\n"
-    "FINAL ANSWER — return ONLY this JSON object (no prose):\n"
-    "{\n"
-    '  "source_profiles": [{"source_id", "course_area", "document_type", "summary"}],\n'
-    '  "clusters": [{\n'
-    '     "cluster_id": snake_case string,\n'
-    '     "label": display label (prefix Claim:/Defense:/Doctrine:/Remedy:/Procedural:),\n'
-    '     "course_area": string,\n'
-    '     "priority": 1|2|3,\n'
-    '     "rule_statement": the neutral black-letter rule, ONE sentence (<40 words),\n'
-    '     "doctrine_summary": ONE sentence,\n'
-    '     "contested_positions": [short strings — positions argued by advocacy '
-    'sources, or points later authority may have overtaken; [] if none],\n'
-    '     "evidence_chunk_ids": 10-12 chunk_ids most central to this cluster '
-    '(this is the ONLY evidence selector the section writer gets — be generous),\n'
-    '     "if_then_edges": [{"to_cluster", "condition"}]\n'
-    "  }]\n"
-    "}\n"
-    "Cover EVERY major testable doctrine in the sources. Keep the dossier terse "
-    "— it is an internal hand-off, not prose for a reader."
-    + _word_budget_line(DOSSIER_TARGET_WORDS, int(DOSSIER_TARGET_WORDS * 1.5),
-                        kind="dossier")
-)
+# Cluster count scales with corpus size: a 2-page essay does not contain ten
+# distinct testable doctrines, and asking for a fixed 6-10 made the model shred
+# one §2 analysis into "Exclusionary Conduct", "Monopoly Maintenance" and
+# "Consumer Preference" as separate sections. ~1 cluster per 10 chunks, clamped.
+CHUNKS_PER_CLUSTER = int(os.getenv("ATTACK_CHUNKS_PER_CLUSTER", "10"))
+MIN_CLUSTERS = 3
+MAX_CLUSTERS = 10
+
+
+def _target_cluster_count(n_chunks: int) -> int:
+    """Cluster target for a corpus of n_chunks (0 = unknown → mid-range)."""
+    if n_chunks <= 0:
+        return 6
+    return max(MIN_CLUSTERS, min(MAX_CLUSTERS, round(n_chunks / CHUNKS_PER_CLUSTER)))
+
+
+def _research_system(n_chunks: int) -> str:
+    """Build the research system prompt, scaled to the corpus actually in scope."""
+    target = _target_cluster_count(n_chunks)
+    corpus_note = (
+        f"This corpus holds ~{n_chunks} chunks total."
+        if n_chunks > 0 else "Corpus size unknown."
+    )
+    return (
+        "You are a legal research agent building the evidence base for a T-14 "
+        "attack outline. You have retrieval tools over the student's source "
+        "documents. Work in bounded steps:\n"
+        "  1. Orient: the CORPUS SURVEY — every source, its outline/key concepts, "
+        "and a section-by-section map — is ALREADY PROVIDED in the first "
+        "message. Read it and pick your doctrines from it. Do NOT spend turns "
+        "re-fetching it with list_sources / get_doc_outline / get_doc_metadata / "
+        "find_docs_about / find_sections_about; that data is already in front "
+        "of you. Calling any of them wastes a whole turn.\n"
+        "  2. Retrieve (START HERE on turn 1): hybrid_search + search_passages per "
+        "doctrine (batch MANY tool calls in a single turn — they run in parallel). "
+        "Drill into sections with get_section / get_neighbors where a hit looks "
+        "central; the section map gives you exact section_paths to target.\n"
+        "  3. Cluster: group the doctrines into outline sections and capture, for "
+        "each, the black-letter rule plus the chunk_ids that prove it. You do NOT "
+        "extract a card taxonomy — the section writers derive elements, "
+        "exceptions, defenses and traps from the evidence themselves.\n\n"
+        "RULES:\n"
+        "• Your turn budget is for RETRIEVAL. Turn 1 should already be a large "
+        "batch of search calls, not discovery.\n"
+        "• Prefer FEW turns with MANY parallel tool calls over many small turns.\n"
+        "• Only claim rules/holdings you actually retrieved — cite chunk_ids.\n"
+        "• STOP CRITERION (concrete — check it every turn): once every major "
+        "doctrine you identified in your survey has a black-letter rule plus "
+        "supporting chunk_ids, STOP calling tools and emit the final dossier "
+        "immediately, even if turns remain. Do not keep researching doctrines "
+        "you've already covered just because turns are left.\n"
+        f"• CLUSTER COUNT: {corpus_note} Produce about {target} clusters "
+        f"(hard ceiling {MAX_CLUSTERS}). A short source does NOT contain ten "
+        "distinct doctrines — if you are tempted to split one analysis into "
+        "several clusters (e.g. separating 'exclusionary conduct' from "
+        "'monopoly maintenance' from 'consumer preference' within one §2 "
+        "claim), MERGE them. Few well-scoped clusters beat many overlapping "
+        "ones.\n"
+        "• EXAM RELEVANCE: cluster only doctrines a law professor would actually "
+        "TEST. Prefer claims, defenses, elements, and tests. Drop pure practitioner "
+        "mechanics (filing/notice/fee-award/administrative procedure) unless the "
+        "course is plainly about them — they are not exam material.\n"
+        "• SOURCE TYPE MATTERS: if a source is a law-review article, critique, "
+        "op-ed or advocacy brief, its conclusions are ARGUMENTS, not law. Record "
+        "the neutral black-letter rule as the rule, and mark the source's position "
+        "in `contested_positions`. Never promote one commentator's litigation "
+        "position into the rule statement.\n\n"
+        "FINAL ANSWER — return ONLY this JSON object (no prose):\n"
+        "{\n"
+        '  "source_profiles": [{"source_id", "course_area", "document_type", "summary"}],\n'
+        '  "clusters": [{\n'
+        '     "cluster_id": snake_case string,\n'
+        '     "label": display label (prefix Claim:/Defense:/Doctrine:/Remedy:/Procedural:),\n'
+        '     "course_area": string,\n'
+        '     "priority": 1|2|3,\n'
+        '     "rule_statement": the neutral black-letter rule, ONE sentence (<40 words),\n'
+        '     "doctrine_summary": ONE sentence,\n'
+        '     "contested_positions": [short strings — positions argued by advocacy '
+        'sources, or points later authority may have overtaken; [] if none],\n'
+        '     "evidence_chunk_ids": up to 12 chunk_ids most central to this '
+        "cluster — or every relevant chunk if the corpus holds fewer than that. "
+        "This is the ONLY evidence selector the section writer gets, so include "
+        "each chunk that supports the rule; never pad with ids you did not "
+        'actually retrieve.,\n'
+        '     "if_then_edges": [{"to_cluster", "condition"}]\n'
+        "  }]\n"
+        "}\n"
+        "Cover EVERY major testable doctrine in the sources. Keep the dossier terse "
+        "— it is an internal hand-off, not prose for a reader."
+        + _word_budget_line(DOSSIER_TARGET_WORDS, int(DOSSIER_TARGET_WORDS * 1.5),
+                            kind="dossier")
+    )
 
 
 def _harvest_evidence(tool_name: str, result_str: str, store: Dict[str, Dict]) -> None:
@@ -350,7 +381,7 @@ async def _exec_tool_call(
     ), result_str
 
 
-async def _prefetch_corpus_survey(state: Dict, tools: List[Any]) -> str:
+async def _prefetch_corpus_survey(state: Dict, tools: List[Any]) -> Tuple[str, int]:
     """
     Deterministically fetch the corpus survey so research_agent can skip
     discovery entirely and spend every turn on actual retrieval.
@@ -359,21 +390,30 @@ async def _prefetch_corpus_survey(state: Dict, tools: List[Any]) -> str:
     vector search:
       1. corpus   — list_sources: filenames, chunk counts, doc summaries
       2. document — get_doc_outline per source: TOC + doc concepts
-      3. section  — document_sections: every section_path plus the 2-4 sentence
-                    summary generated during hierarchical ingest
-                    (tasks/hierarchical_ingest_tasks.py::build_section_summaries)
+      3. section  — the section map. Prefers document_sections (2-4 sentence
+                    LLM summaries from hierarchical ingest), and FALLS BACK to
+                    distinct section_paths straight out of document_vector_store.
 
-    Why: the model was burning 2 of its 5 turns rediscovering exactly this via
-    list_sources / get_doc_outline / find_sections_about — data that requires
-    no intelligence to fetch and that we already have primary keys for. It also
+    The fallback is not an edge case, it is the normal path: ingest dispatches
+    build_section_summaries fire-and-forget (upload_tasks.py) at the same moment
+    the doc goes COMPLETE, and try_fire_pending_note fires ~0.8s later — so
+    document_sections is reliably EMPTY at survey time for speculative uploads.
+    Section paths themselves are written with the chunks, so they are always
+    available; we lose the summaries but keep the structural map.
+
+    Why any of this: the model was burning 2 of its 5 turns rediscovering this
+    via list_sources / get_doc_outline / find_sections_about — data that needs
+    no intelligence to fetch and whose primary keys we already hold. It also
     lands in the FIRST message, so it stays a stable, cacheable prefix instead
     of growing the transcript turn by turn.
 
-    Never raises: any layer that fails degrades to a note, and the model still
-    has the tools to fetch it the slow way.
+    Returns (survey_text, n_chunks). n_chunks scales the cluster-count target;
+    0 means "unknown". Never raises: any layer that fails degrades to a note,
+    and the model still has the tools to fetch it the slow way.
     """
     source_ids: List[str] = list(state.get("source_ids") or [])
     parts: List[str] = []
+    n_chunks = 0
     tool_by_name = {t.name: t for t in tools}
 
     # ── Layer 1: corpus ───────────────────────────────────────────────────
@@ -400,7 +440,7 @@ async def _prefetch_corpus_survey(state: Dict, tools: List[Any]) -> str:
         if outlines:
             parts.append("## Document outlines (TOC + key concepts)\n" + "\n".join(outlines))
 
-    # ── Layer 3: hierarchical section summaries ───────────────────────────
+    # ── Layer 3: section map (+ corpus size, same round trip) ─────────────
     if source_ids:
         try:
             from tasks.database import get_global_async_db_pool, init_async_pools
@@ -408,6 +448,14 @@ async def _prefetch_corpus_survey(state: Dict, tools: List[Any]) -> str:
             await init_async_pools()
             pool = get_global_async_db_pool()
             async with pool.acquire() as conn:
+                n_chunks = await conn.fetchval(
+                    """
+                    SELECT COUNT(*) FROM document_vector_store
+                    WHERE project_id = $1 AND source_id = ANY($2::uuid[])
+                    """,
+                    state["project_id"], source_ids,
+                ) or 0
+
                 rows = await conn.fetch(
                     """
                     SELECT source_id, section_path, section_summary
@@ -419,31 +467,55 @@ async def _prefetch_corpus_survey(state: Dict, tools: List[Any]) -> str:
                     """,
                     state["project_id"], source_ids, PREFETCH_MAX_SECTIONS,
                 )
+
+                # Fallback: summaries are usually still being built when the
+                # note fires, but section_path ships with every chunk.
+                if not rows:
+                    rows = await conn.fetch(
+                        """
+                        SELECT DISTINCT ON (source_id, section_path)
+                               source_id, section_path,
+                               NULL::text AS section_summary
+                        FROM document_vector_store
+                        WHERE project_id = $1
+                          AND source_id = ANY($2::uuid[])
+                          AND section_path IS NOT NULL
+                          AND section_path <> ''
+                        ORDER BY source_id, section_path, chunk_index
+                        LIMIT $3
+                        """,
+                        state["project_id"], source_ids, PREFETCH_MAX_SECTIONS,
+                    )
+                    if rows:
+                        logger.info(
+                            "  📚 [research_agent] document_sections empty — "
+                            "derived %d section paths from chunks instead", len(rows)
+                        )
+
             if rows:
-                lines = [
-                    f"[{str(r['source_id'])[:8]}] {r['section_path']}\n"
-                    f"    {(r['section_summary'] or '')[:PREFETCH_SECTION_SUMMARY_CHARS]}"
-                    for r in rows
-                ]
-                parts.append(
-                    "## Section map (hierarchical summaries built at ingest)\n"
-                    + "\n".join(lines)
-                )
-                logger.info("  📚 [research_agent] prefetched %d section summaries", len(rows))
+                lines = []
+                for r in rows:
+                    line = f"[{str(r['source_id'])[:8]}] {r['section_path']}"
+                    summary = (r["section_summary"] or "")[:PREFETCH_SECTION_SUMMARY_CHARS]
+                    if summary:
+                        line += f"\n    {summary}"
+                    lines.append(line)
+                parts.append("## Section map\n" + "\n".join(lines))
+                logger.info("  📚 [research_agent] prefetched %d section entries", len(rows))
         except Exception as exc:
-            _node_warn("research_agent", state, f"prefetch section summaries failed: {exc}")
+            _node_warn("research_agent", state, f"prefetch section map failed: {exc}")
 
     if not parts:
         return (
             "(Corpus survey pre-fetch unavailable — use list_sources / "
             "get_doc_outline / find_sections_about to orient yourself first.)"
-        )
+        ), n_chunks
 
     return (
         "=== CORPUS SURVEY (pre-fetched for you) ===\n"
         + "\n\n".join(parts)
         + "\n=== END CORPUS SURVEY ==="
-    )
+    ), n_chunks
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -627,13 +699,19 @@ async def research_agent(state: AgentState) -> Dict:
         "orchestrator", provider=os.getenv("ATTACK_RESEARCH_PROVIDER")
     )
 
-    # Deterministic corpus survey (R1) — hands the model the orientation data
-    # it used to spend 2 of 5 turns rediscovering, so turn 1 starts on retrieval.
-    survey = await _prefetch_corpus_survey(state, tools)
-    logger.info("  📚 [research_agent] corpus survey pre-fetched (%d chars)", len(survey))
+    # Deterministic corpus survey — hands the model the orientation data it used
+    # to spend 2 of 5 turns rediscovering, so turn 1 starts on retrieval. The
+    # chunk count comes back with it and scales the cluster-count target.
+    survey, n_chunks = await _prefetch_corpus_survey(state, tools)
+    target_clusters = _target_cluster_count(n_chunks)
+    logger.info(
+        "  📚 [research_agent] corpus survey pre-fetched (%d chars) "
+        "n_chunks=%d → target_clusters=%d",
+        len(survey), n_chunks, target_clusters,
+    )
 
     messages: List[Any] = [
-        SystemMessage(content=_RESEARCH_SYSTEM),
+        SystemMessage(content=_research_system(n_chunks)),
         HumanMessage(content=(
             f"{survey}\n\n"
             f"Source ids in scope: {state.get('source_ids', [])}\n"
