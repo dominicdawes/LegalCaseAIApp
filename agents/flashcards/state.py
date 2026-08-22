@@ -132,3 +132,12 @@ class AgentState(TypedDict):
 
     # ── budget tracking ───────────────────────────────────────────────────────
     budget: NotRequired[Dict[str, Any]]
+
+    # ── compact 4-stage pipeline (compact_nodes.py) ──────────────────────────
+    # research_agent output: concept inventory + exactly num_cards card specs
+    # with card-type assignments from the full 33-type taxonomy.
+    flashcard_dossier: NotRequired[Dict[str, Any]]
+    # Every chunk harvested during research, keyed by chunk_id.
+    evidence_store: NotRequired[Dict[str, Dict[str, Any]]]
+    # card_batch_generator fan-out accumulation (complete cards).
+    generated_cards: Annotated[List[Dict[str, Any]], operator.add]

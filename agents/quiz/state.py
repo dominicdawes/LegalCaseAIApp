@@ -155,3 +155,12 @@ class AgentState(TypedDict):
 
     # ── budget tracking ───────────────────────────────────────────────────────
     budget: NotRequired[Dict[str, Any]]
+
+    # ── compact 4-stage pipeline (compact_nodes.py) ──────────────────────────
+    # research_agent output: case extracts + traps/confusables + exactly
+    # num_questions question specs with distractor-type assignments.
+    quiz_dossier: NotRequired[Dict[str, Any]]
+    # Every chunk harvested during research, keyed by chunk_id.
+    evidence_store: NotRequired[Dict[str, Dict[str, Any]]]
+    # question_batch_generator fan-out accumulation (complete MCQs).
+    generated_questions: Annotated[List[Dict[str, Any]], operator.add]

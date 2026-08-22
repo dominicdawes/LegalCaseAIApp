@@ -137,6 +137,26 @@ BRIEF_PROFILER_TOOLS = [
     "get_doc_metadata",
 ]
 
+# research_agent (compact pipeline) — one multistep tool-calling agent that
+# compresses profiling + corpus orientation + retrieval planning + retrieval +
+# evidence carding + artifact extraction. Union of the profiler and retriever
+# sets: discovery to pin down the primary opinion, then case-name-anchored
+# keyword/vector retrieval and structural drill-down into it.
+BRIEF_RESEARCH_TOOLS = [
+    "list_sources",
+    "get_doc_outline",
+    "get_doc_metadata",
+    "find_docs_about",
+    "find_sections_about",
+    "get_section",
+    "get_parents",
+    "get_neighbors",
+    "search_passages",
+    "hybrid_search",
+    "expand_query",
+    "find_concept_across_docs",
+]
+
 # planned_retriever executes multi-method retrieval per brief artifact
 BRIEF_RETRIEVER_TOOLS = [
     "search_passages",
@@ -265,6 +285,33 @@ FLASHCARD_RETRIEVER_TOOLS = [
     "get_neighbors",
     "find_concept_across_docs",
 ]
+
+# ── Compact-pipeline research sets ───────────────────────────────────────────
+# One multistep tool-calling research agent replaces each legacy pipeline's
+# profiler + orientation + retrieval-planning + retrieval + extraction nodes,
+# so it needs the union of the profiler and retriever sets: discovery to orient,
+# then keyword/vector retrieval and structural drill-down. Mirrors
+# ATTACK_RESEARCH_TOOLS / BRIEF_RESEARCH_TOOLS above.
+
+_RESEARCH_UNION = [
+    "list_sources",
+    "get_doc_outline",
+    "get_doc_metadata",
+    "find_docs_about",
+    "find_sections_about",
+    "get_section",
+    "get_parents",
+    "get_neighbors",
+    "search_passages",
+    "hybrid_search",
+    "expand_query",
+    "find_concept_across_docs",
+]
+
+COLD_CALL_RESEARCH_TOOLS = list(_RESEARCH_UNION)
+EXAM_RESEARCH_TOOLS      = list(_RESEARCH_UNION) + ["find_tables_about"]
+QUIZ_RESEARCH_TOOLS      = list(_RESEARCH_UNION)
+FLASHCARD_RESEARCH_TOOLS = list(_RESEARCH_UNION)
 
 # Full set — only used when explicit node routing is unavailable
 ALL_TOOLS = [

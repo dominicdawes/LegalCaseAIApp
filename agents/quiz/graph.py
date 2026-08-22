@@ -34,6 +34,11 @@ load_dotenv()
 
 USE_QUIZ_AGENT = os.getenv("USE_QUIZ_AGENT", "false").lower() == "true"
 
+# Compact 4-stage pipeline (compact_nodes.py): plan ∥ research (tool-loop) →
+# sync_barrier → [Send×N_batches] question_batch_generator → deterministic
+# formatter. Default ON; set QUIZ_COMPACT=false for the legacy graph.
+QUIZ_COMPACT = os.getenv("QUIZ_COMPACT", "true").lower() == "true"
+
 
 @asynccontextmanager
 async def _checkpointer_ctx():
@@ -64,7 +69,57 @@ async def _checkpointer_ctx():
     yield MemorySaver()
 
 
+def _build_compact_graph(checkpointer):
+    """
+    Compact 4-stage topology (QUIZ_COMPACT=true, the default):
+
+      START ──┬─▶ plan_agent ─────┐
+              └─▶ research_agent ─┴─▶ sync_barrier ─▶ [Send×N] question_batch_generator
+                                                        → final_formatter → END
+                                    └──(no specs)────────→ final_formatter
+
+    The legacy graph was already blueprint→parallel-batch; the compression is
+    in the research stage (case_rule_extractor made up to 15 orchestrator calls)
+    and in folding the per-question distractor/evaluator/grounder calls into
+    the batch generator.
+    """
+    from langgraph.graph import StateGraph, START, END
+
+    from .state import AgentState
+    from .compact_nodes import (
+        plan_agent,
+        research_agent,
+        sync_barrier,
+        question_batch_generator,
+        final_formatter,
+        dossier_to_batches,
+    )
+
+    builder = StateGraph(AgentState)
+    builder.add_node("plan_agent",               plan_agent)
+    builder.add_node("research_agent",           research_agent)
+    builder.add_node("sync_barrier",             sync_barrier)
+    builder.add_node("question_batch_generator", question_batch_generator)
+    builder.add_node("final_formatter",          final_formatter)
+
+    builder.add_edge(START, "plan_agent")
+    builder.add_edge(START, "research_agent")
+    builder.add_edge("plan_agent", "sync_barrier")
+    builder.add_edge("research_agent", "sync_barrier")
+    builder.add_conditional_edges(
+        "sync_barrier",
+        dossier_to_batches,
+        {"final_formatter": "final_formatter"},
+    )
+    builder.add_edge("question_batch_generator", "final_formatter")
+    builder.add_edge("final_formatter", END)
+
+    return builder.compile(checkpointer=checkpointer)
+
+
 def _build_graph(checkpointer):
+    if QUIZ_COMPACT:
+        return _build_compact_graph(checkpointer)
     from langgraph.graph import StateGraph, END
 
     from .state import AgentState
@@ -170,6 +225,7 @@ async def run_quiz_agent(
         "rejected_question_metadata": [],
         "used_question_signatures": [],
         "batch_results":            [],
+        "generated_questions":      [],
         "budget": {"input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0},
     }
     config = {"configurable": {"thread_id": thread_id or f"quiz-agent-{job_id or 'local'}"}}
@@ -224,6 +280,7 @@ async def run_quiz_agent_stream(
         "rejected_question_metadata": [],
         "used_question_signatures": [],
         "batch_results":            [],
+        "generated_questions":      [],
         "budget": {"input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0},
     }
     config = {

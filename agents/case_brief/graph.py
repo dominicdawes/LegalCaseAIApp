@@ -40,6 +40,12 @@ load_dotenv()
 
 USE_CASE_BRIEF_AGENT = os.getenv("USE_CASE_BRIEF_AGENT", "false").lower() == "true"
 
+# Compact 4-stage pipeline (compact_nodes.py): plan ∥ research (tool-loop) →
+# sync_barrier → [Send×N] section_generator → deterministic formatter.
+# Default ON; set CASE_BRIEF_COMPACT=false to fall back to the legacy 14-node
+# graph, which is retained in nodes.py for rollback.
+CASE_BRIEF_COMPACT = os.getenv("CASE_BRIEF_COMPACT", "true").lower() == "true"
+
 
 # ── Checkpointer factory (mirrors attack_outline/graph.py) ────────────────────
 
@@ -74,7 +80,68 @@ async def _checkpointer_ctx():
 
 # ── Graph builder ──────────────────────────────────────────────────────────────
 
+def _build_compact_graph(checkpointer):
+    """
+    Compact 4-stage topology (CASE_BRIEF_COMPACT=true, the default):
+
+      START ──┬─▶ plan_agent ─────┐
+              └─▶ research_agent ─┴─▶ sync_barrier ─▶ [Send×N] section_generator
+                                                        → final_formatter → END
+                                    └──(no dossier)──────→ final_formatter
+
+    plan_agent and research_agent run in PARALLEL — research_agent does its own
+    corpus survey rather than waiting on job_plan. sync_barrier is a no-op join:
+    a node with two incoming static edges waits for both predecessors, so every
+    section writer sees both job_plan and the dossier.
+
+    The join also keeps conditional edges OFF fan-out nodes. The legacy graph
+    hung routers directly on Send-parallel nodes (planned_retriever,
+    evidence_card_builder, section_writer), where the branch re-evaluates once
+    per parallel task over an accumulating list.
+    """
+    from langgraph.graph import StateGraph, START, END
+
+    from .state import AgentState
+    from .compact_nodes import (
+        plan_agent,
+        research_agent,
+        sync_barrier,
+        section_generator,
+        final_formatter,
+        dossier_to_generators,
+    )
+
+    builder = StateGraph(AgentState)
+    builder.add_node("plan_agent",        plan_agent)
+    builder.add_node("research_agent",    research_agent)
+    builder.add_node("sync_barrier",      sync_barrier)
+    builder.add_node("section_generator", section_generator)
+    builder.add_node("final_formatter",   final_formatter)
+
+    # Parallel entry — neither branch waits on the other.
+    builder.add_edge(START, "plan_agent")
+    builder.add_edge(START, "research_agent")
+
+    # Join: sync_barrier runs only once BOTH branches have completed.
+    builder.add_edge("plan_agent", "sync_barrier")
+    builder.add_edge("research_agent", "sync_barrier")
+
+    # List[Send] fan-out over the fixed brief-unit table, or the string route
+    # straight to the formatter when research produced no dossier.
+    builder.add_conditional_edges(
+        "sync_barrier",
+        dossier_to_generators,
+        {"final_formatter": "final_formatter"},
+    )
+    builder.add_edge("section_generator", "final_formatter")
+    builder.add_edge("final_formatter", END)
+
+    return builder.compile(checkpointer=checkpointer)
+
+
 def _build_graph(checkpointer):
+    if CASE_BRIEF_COMPACT:
+        return _build_compact_graph(checkpointer)
     from langgraph.graph import StateGraph, END
 
     from .state import AgentState
@@ -224,6 +291,7 @@ async def run_case_brief_agent(
         "extracted_artifacts": [],
         "raw_sections":        [],
         "grounding_reports":   [],
+        "brief_units":         [],
     }
     config = {"configurable": {"thread_id": thread_id or "case-brief-agent"}}
 
@@ -271,6 +339,7 @@ async def run_case_brief_agent_stream(
         "extracted_artifacts": [],
         "raw_sections":        [],
         "grounding_reports":   [],
+        "brief_units":         [],
     }
     config = {"configurable": {"thread_id": thread_id or "case-brief-agent-stream"}}
 

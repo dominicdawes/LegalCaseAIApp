@@ -31,6 +31,12 @@ load_dotenv()
 
 USE_LANGGRAPH_AGENT = os.getenv("USE_LANGGRAPH_AGENT", "false").lower() == "true"
 
+# Compact 4-stage pipeline (compact_nodes.py): plan ∥ research (tool-loop) →
+# sync_barrier → [Send×n_questions] question_generator → deterministic formatter.
+# Default ON; set EXAM_QUESTIONS_COMPACT=false to fall back to the legacy
+# 13-node graph, retained in nodes.py for rollback.
+EXAM_QUESTIONS_COMPACT = os.getenv("EXAM_QUESTIONS_COMPACT", "true").lower() == "true"
+
 
 # ── Checkpointer factory ───────────────────────────────────────────────────────
 
@@ -70,11 +76,64 @@ async def _checkpointer_ctx():
 
 # ── Graph builder ──────────────────────────────────────────────────────────────
 
+def _build_compact_graph(checkpointer):
+    """
+    Compact 4-stage topology (EXAM_QUESTIONS_COMPACT=true, the default):
+
+      START ──┬─▶ plan_agent ─────┐
+              └─▶ research_agent ─┴─▶ sync_barrier ─▶ [Send×N] question_generator
+                                                        → final_formatter → END
+                                    └──(no specs)────────→ final_formatter
+
+    plan_agent and research_agent run in PARALLEL. sync_barrier joins them and
+    also does the job of the legacy `grounder_dispatcher`, which existed purely
+    as a barrier against an N² grounder fan-out.
+
+    Unlike the legacy graph, `final_output` is actually produced here — the old
+    `assembler` node was defined but never registered, so the dispatcher read an
+    empty string on every run.
+    """
+    from langgraph.graph import StateGraph, START, END
+
+    from .state import AgentState
+    from .compact_nodes import (
+        plan_agent,
+        research_agent,
+        sync_barrier,
+        question_generator,
+        final_formatter,
+        dossier_to_generators,
+    )
+
+    builder = StateGraph(AgentState)
+    builder.add_node("plan_agent",         plan_agent)
+    builder.add_node("research_agent",     research_agent)
+    builder.add_node("sync_barrier",       sync_barrier)
+    builder.add_node("question_generator", question_generator)
+    builder.add_node("final_formatter",    final_formatter)
+
+    builder.add_edge(START, "plan_agent")
+    builder.add_edge(START, "research_agent")
+    builder.add_edge("plan_agent", "sync_barrier")
+    builder.add_edge("research_agent", "sync_barrier")
+    builder.add_conditional_edges(
+        "sync_barrier",
+        dossier_to_generators,
+        {"final_formatter": "final_formatter"},
+    )
+    builder.add_edge("question_generator", "final_formatter")
+    builder.add_edge("final_formatter", END)
+
+    return builder.compile(checkpointer=checkpointer)
+
+
 def _build_graph(checkpointer):
     """
     Compile the StateGraph with the supplied checkpointer.
     Separated from the async runner so the topology is easy to read.
     """
+    if EXAM_QUESTIONS_COMPACT:
+        return _build_compact_graph(checkpointer)
     from langgraph.graph import StateGraph, END
 
     from .state import AgentState
@@ -210,6 +269,15 @@ async def run_exam_agent(
         "job_id":         job_id or "",
         "run_id":         run_id or "",
         "user_id":        user_id or "",
+        # initialise Annotated list fields so operator.add has a base.
+        # Previously unseeded here, unlike every other agent in the repo.
+        "source_profiles":        [],
+        "retrieval_bundles":      [],
+        "draft_questions":        [],
+        "grounder_queue":         [],
+        "grounded_questions":     [],
+        "persisted_question_ids": [],
+        "generated_questions":    [],
     }
     config = {"configurable": {"thread_id": thread_id or "exam-agent"}}
 
@@ -253,6 +321,15 @@ async def run_exam_agent_stream(
         "job_id":         job_id or "",
         "run_id":         run_id or "",
         "user_id":        user_id or "",
+        # initialise Annotated list fields so operator.add has a base.
+        # Previously unseeded here, unlike every other agent in the repo.
+        "source_profiles":        [],
+        "retrieval_bundles":      [],
+        "draft_questions":        [],
+        "grounder_queue":         [],
+        "grounded_questions":     [],
+        "persisted_question_ids": [],
+        "generated_questions":    [],
     }
     config = {"configurable": {"thread_id": thread_id or "exam-agent-stream"}}
 

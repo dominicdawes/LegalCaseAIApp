@@ -232,3 +232,14 @@ class AgentState(TypedDict):
 
     # ── budget tracking ──────────────────────────────────────────────────────
     budget: NotRequired[Dict[str, Any]]
+
+    # ── compact 4-stage pipeline (compact_nodes.py) ──────────────────────────
+    # research_agent output: per-case rule objects + doctrine edges + compare/
+    # distinguish prompts + a per-case evidence chunk-id index. Deliberately
+    # LEAN — the sequence writers do the depth work.
+    case_dossier: NotRequired[Dict[str, Any]]
+    # Every chunk harvested during research, keyed by chunk_id.
+    evidence_store: NotRequired[Dict[str, Dict[str, Any]]]
+    # sequence_generator fan-out accumulation. Each entry is a QuestionSequence
+    # with an extra "answers" key (the compact generator emits both together).
+    generated_sequences: Annotated[List[Dict[str, Any]], operator.add]

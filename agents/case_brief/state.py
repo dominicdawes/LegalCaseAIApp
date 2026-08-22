@@ -218,3 +218,14 @@ class AgentState(TypedDict):
 
     # ── budget tracking ──────────────────────────────────────────────────────
     budget: NotRequired[Dict[str, Any]]
+
+    # ── compact 4-stage pipeline (compact_nodes.py) ──────────────────────────
+    # research_agent output: case identity, anchors, and a role→chunk_id index.
+    # Deliberately LEAN — the section writers derive their own prose from the
+    # evidence rather than receiving pre-digested cards.
+    case_dossier: NotRequired[Dict[str, Any]]
+    # Every chunk harvested from the research agent's tool calls, keyed by
+    # chunk_id; section writers ground against this without re-retrieving.
+    evidence_store: NotRequired[Dict[str, Dict[str, Any]]]
+    # section_generator fan-out accumulation (one entry per brief unit).
+    brief_units: Annotated[List[Dict[str, Any]], operator.add]

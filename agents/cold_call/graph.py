@@ -47,6 +47,12 @@ load_dotenv()
 
 USE_COLD_CALL_AGENT = os.getenv("USE_COLD_CALL_AGENT", "false").lower() == "true"
 
+# Compact 4-stage pipeline (compact_nodes.py): plan ∥ research (tool-loop) →
+# sync_barrier → [Send×N] sequence_generator → deterministic formatter.
+# Default ON; set COLD_CALL_COMPACT=false to fall back to the legacy 14-node
+# graph, retained in nodes.py for rollback.
+COLD_CALL_COMPACT = os.getenv("COLD_CALL_COMPACT", "true").lower() == "true"
+
 
 # ── Checkpointer factory ───────────────────────────────────────────────────────
 
@@ -81,7 +87,61 @@ async def _checkpointer_ctx():
 
 # ── Graph builder ──────────────────────────────────────────────────────────────
 
+def _build_compact_graph(checkpointer):
+    """
+    Compact 4-stage topology (COLD_CALL_COMPACT=true, the default):
+
+      START ──┬─▶ plan_agent ─────┐
+              └─▶ research_agent ─┴─▶ sync_barrier ─▶ [Send×N] sequence_generator
+                                                        → final_formatter → END
+                                    └──(no cases)────────→ final_formatter
+
+    plan_agent and research_agent run in PARALLEL (research does its own corpus
+    survey rather than waiting on job_plan). sync_barrier is a no-op join so
+    every generator sees both, and it keeps conditional edges off Send-parallel
+    nodes — the legacy graph hung routers directly on fan-out nodes.
+
+    Sequence diversity is assigned deterministically at fan-out (theme + case
+    round-robin) rather than by generating 3x the seeds and paying an LLM to
+    prune them.
+    """
+    from langgraph.graph import StateGraph, START, END
+
+    from .state import AgentState
+    from .compact_nodes import (
+        plan_agent,
+        research_agent,
+        sync_barrier,
+        sequence_generator,
+        final_formatter,
+        dossier_to_generators,
+    )
+
+    builder = StateGraph(AgentState)
+    builder.add_node("plan_agent",         plan_agent)
+    builder.add_node("research_agent",     research_agent)
+    builder.add_node("sync_barrier",       sync_barrier)
+    builder.add_node("sequence_generator", sequence_generator)
+    builder.add_node("final_formatter",    final_formatter)
+
+    builder.add_edge(START, "plan_agent")
+    builder.add_edge(START, "research_agent")
+    builder.add_edge("plan_agent", "sync_barrier")
+    builder.add_edge("research_agent", "sync_barrier")
+    builder.add_conditional_edges(
+        "sync_barrier",
+        dossier_to_generators,
+        {"final_formatter": "final_formatter"},
+    )
+    builder.add_edge("sequence_generator", "final_formatter")
+    builder.add_edge("final_formatter", END)
+
+    return builder.compile(checkpointer=checkpointer)
+
+
 def _build_graph(checkpointer):
+    if COLD_CALL_COMPACT:
+        return _build_compact_graph(checkpointer)
     from langgraph.graph import StateGraph, END
 
     from .state import AgentState
@@ -239,6 +299,7 @@ async def run_cold_call_agent(
         "socratic_sequences":       [],
         "answer_sequences":         [],
         "grounding_results":        [],
+        "generated_sequences":      [],
     }
     config = {"configurable": {"thread_id": thread_id or "cold-call-agent"}}
 
@@ -285,6 +346,7 @@ async def run_cold_call_agent_stream(
         "socratic_sequences":       [],
         "answer_sequences":         [],
         "grounding_results":        [],
+        "generated_sequences":      [],
     }
     config = {"configurable": {"thread_id": thread_id or "cold-call-agent-stream"}}
 

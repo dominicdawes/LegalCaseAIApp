@@ -40,6 +40,11 @@ load_dotenv()
 
 USE_FLASHCARD_AGENT = os.getenv("USE_FLASHCARD_AGENT", "false").lower() == "true"
 
+# Compact 4-stage pipeline (compact_nodes.py): plan ∥ research (tool-loop) →
+# sync_barrier → [Send×N_batches] card_batch_generator → deterministic
+# formatter. Default ON; set FLASHCARD_COMPACT=false for the legacy graph.
+FLASHCARD_COMPACT = os.getenv("FLASHCARD_COMPACT", "true").lower() == "true"
+
 
 # ── Checkpointer factory ───────────────────────────────────────────────────────
 
@@ -74,7 +79,56 @@ async def _checkpointer_ctx():
 
 # ── Graph builder ──────────────────────────────────────────────────────────────
 
+def _build_compact_graph(checkpointer):
+    """
+    Compact 4-stage topology (FLASHCARD_COMPACT=true, the default):
+
+      START ──┬─▶ plan_agent ─────┐
+              └─▶ research_agent ─┴─▶ sync_barrier ─▶ [Send×N] card_batch_generator
+                                                        → final_formatter → END
+                                    └──(no specs)────────→ final_formatter
+
+    The legacy graph was already blueprint→parallel-batch; the compression is in
+    the research stage (concept_extractor's 7 probe searches become retrieval
+    turns) and in folding the critic/repair calls into the batch generator.
+    """
+    from langgraph.graph import StateGraph, START, END
+
+    from .state import AgentState
+    from .compact_nodes import (
+        plan_agent,
+        research_agent,
+        sync_barrier,
+        card_batch_generator,
+        final_formatter,
+        dossier_to_batches,
+    )
+
+    builder = StateGraph(AgentState)
+    builder.add_node("plan_agent",           plan_agent)
+    builder.add_node("research_agent",       research_agent)
+    builder.add_node("sync_barrier",         sync_barrier)
+    builder.add_node("card_batch_generator", card_batch_generator)
+    builder.add_node("final_formatter",      final_formatter)
+
+    builder.add_edge(START, "plan_agent")
+    builder.add_edge(START, "research_agent")
+    builder.add_edge("plan_agent", "sync_barrier")
+    builder.add_edge("research_agent", "sync_barrier")
+    builder.add_conditional_edges(
+        "sync_barrier",
+        dossier_to_batches,
+        {"final_formatter": "final_formatter"},
+    )
+    builder.add_edge("card_batch_generator", "final_formatter")
+    builder.add_edge("final_formatter", END)
+
+    return builder.compile(checkpointer=checkpointer)
+
+
 def _build_graph(checkpointer):
+    if FLASHCARD_COMPACT:
+        return _build_compact_graph(checkpointer)
     from langgraph.graph import StateGraph, END
 
     from .state import AgentState
@@ -152,6 +206,7 @@ def _base_initial_state(
         "used_card_signatures": [],
         "rejected_card_metadata": [],
         "batch_results":        [],
+        "generated_cards":      [],
         "budget": {"input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0},
     }
 

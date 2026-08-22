@@ -110,3 +110,12 @@ class AgentState(TypedDict):
 
     # ── revision loop counter ────────────────────────────────────────────────
     revision_count: NotRequired[int]
+
+    # ── compact 4-stage pipeline (compact_nodes.py) ──────────────────────────
+    # research_agent output: exactly n_questions grounded issue specs, each with
+    # a pedagogical archetype and its own evidence chunk-id list.
+    exam_dossier: NotRequired[Dict[str, Any]]
+    # Every chunk harvested during research, keyed by chunk_id.
+    evidence_store: NotRequired[Dict[str, Dict[str, Any]]]
+    # question_generator fan-out accumulation (fact pattern + call + answer key).
+    generated_questions: Annotated[List[Dict[str, Any]], operator.add]
