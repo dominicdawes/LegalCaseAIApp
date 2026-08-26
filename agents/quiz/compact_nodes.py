@@ -199,15 +199,18 @@ def _research_system(num_questions: int, quiz_mode: str, difficulty: str) -> str
         "dicta and dissent.\n"
         "  3. Analyse and blueprint: extract what distractors are built from, "
         "then allocate the question specs.\n\n"
-        "WHAT TO EXTRACT PER CASE:\n"
-        "• legally_relevant_facts — the 4-8 facts that drove the outcome. "
+        "WHAT TO EXTRACT PER CASE (keep it TERSE — the question writers grep "
+        "the full corpus for anything they need beyond this):\n"
+        "• legally_relevant_facts — AT MOST 4 facts that drove the outcome. "
         "**These feed distractor construction.**\n"
-        "• rule — the operative rule as a standalone statement, usable in a "
-        "future case WITHOUT referring back to this case by name.\n"
-        "• holding vs dicta — mark which statements were necessary to the "
-        "result. Dicta mistaken for holding is a prime distractor.\n"
-        "• dissent — the dissent's core position, if any. **A high-yield "
-        "distractor source** (dissent logic presented as the majority's).\n\n"
+        "• rule — ONE sentence: the operative rule as a standalone statement, "
+        "usable in a future case WITHOUT referring back to this case by name.\n"
+        "• holding — ONE sentence, what was necessary to the result. (Do not "
+        "list dicta here; note dicta-vs-holding confusions under common_traps "
+        "instead, which is where distractors are built from.)\n"
+        "• dissent — ONE sentence, the dissent's core position, if any. **A "
+        "high-yield distractor source** (dissent logic presented as the "
+        "majority's).\n\n"
         "CROSS-CUTTING ANALYSIS (drives the wrong answers):\n"
         "• confusable_concepts — pairs students routinely mix up, and WHY.\n"
         "• common_traps — overbroad readings, mis-stated rules, scope errors. "
@@ -231,8 +234,9 @@ def _research_system(num_questions: int, quiz_mode: str, difficulty: str) -> str
         f"{num_questions} distinct specs, STOP calling tools and emit.\n\n"
         f"FINAL ANSWER — return ONLY this JSON with EXACTLY {num_questions} specs:\n"
         "{\n"
-        '  "case_extracts": [{"case_name", "rule", "holding", "dicta": [str],\n'
-        '      "dissent": str, "legally_relevant_facts": [str]}],\n'
+        '  "case_extracts": [{"case_name", "rule" (1 sentence),\n'
+        '      "holding" (1 sentence), "dissent" (1 sentence or ""),\n'
+        '      "legally_relevant_facts": [at most 4 strings]}],\n'
         '  "common_traps": [str], "confusable_concepts": [str],\n'
         '  "specs": [{\n'
         '     "spec_index": 0-based int,\n'
@@ -393,6 +397,7 @@ async def question_batch_generator(state: Dict) -> Dict:
 
     batch: Dict[str, Any] = state["batch"]
     dossier: Dict[str, Any] = state.get("quiz_dossier") or {}
+    job_plan: Dict[str, Any] = state.get("job_plan") or {}
     evidence_store: Dict[str, Dict] = state.get("evidence_store") or {}
     specs: List[Dict] = batch["specs"]
     batch_idx = batch["batch_index"]
@@ -481,7 +486,10 @@ async def question_batch_generator(state: Dict) -> Dict:
         "GROUNDING: use only the evidence provided. If something is missing, "
         "call grep_research_corpus first (free, instant); use verify_claim at "
         "most once per batch when unsure a legal assertion holds. Most batches "
-        "need no tool calls. Never invent authority.\n\n"
+        "need no tool calls. Never invent authority. Cite support inline as "
+        "[chunk_id] immediately after the proposition it supports, in the stem "
+        "and in each feedback string — these are stripped before the student "
+        "sees them, so they cost you no length.\n\n"
         "Return ONLY this JSON array — one object per spec, in spec order:\n"
         "[{\n"
         '  "spec_index": int (copy from the spec),\n'
@@ -494,7 +502,16 @@ async def question_batch_generator(state: Dict) -> Dict:
         "}]"
     )
 
+    plan_ctx = (
+        f"COURSE CONTEXT: {job_plan.get('course_context', '')}\n"
+        f"PRIORITY TOPICS: {json.dumps(job_plan.get('priority_topics') or [])}\n"
+        f"HIGH-YIELD NOTES: {job_plan.get('high_yield_notes', '')}\n"
+        f"QUIZ MODE: {state.get('quiz_mode', 'mixed')} | "
+        f"DIFFICULTY: {state.get('target_difficulty', 'application')}\n\n"
+    ) if job_plan else ""
+
     prompt = (
+        f"{plan_ctx}"
         f"SPECS FOR THIS BATCH:\n{json.dumps(specs, indent=2)}\n\n"
         f"COMMON TRAPS (build distractors from these):\n"
         f"{json.dumps(dossier.get('common_traps') or [])}\n"

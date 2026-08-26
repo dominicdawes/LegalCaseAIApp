@@ -176,7 +176,11 @@ async def run_quiz_agent(
     project_id: str,
     source_ids: List[str],
     num_questions: int = 10,
-    batch_size: int = 5,
+    # 3 (not 5) so a 10-question quiz fans out to 4 Sends rather than 2:
+    # generator latency under thinking=True varies wildly per call, and
+    # with only 2 batches one slow draw sets the whole stage (observed
+    # 137s vs 351s on identically-shaped batches).
+    batch_size: int = 3,
     quiz_mode: str = "mixed",
     target_difficulty: str = "application",
     use_voyage: bool = False,
@@ -240,7 +244,11 @@ async def run_quiz_agent_stream(
     project_id: str,
     source_ids: List[str],
     num_questions: int = 10,
-    batch_size: int = 5,
+    # 3 (not 5) so a 10-question quiz fans out to 4 Sends rather than 2:
+    # generator latency under thinking=True varies wildly per call, and
+    # with only 2 batches one slow draw sets the whole stage (observed
+    # 137s vs 351s on identically-shaped batches).
+    batch_size: int = 3,
     quiz_mode: str = "mixed",
     target_difficulty: str = "application",
     use_voyage: bool = False,

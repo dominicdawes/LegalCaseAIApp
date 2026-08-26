@@ -112,6 +112,11 @@ class AgentState(TypedDict):
     revision_count: NotRequired[int]
 
     # ── compact 4-stage pipeline (compact_nodes.py) ──────────────────────────
+    # plan_agent output. MUST be declared here: LangGraph silently drops any key
+    # a node returns that is not a channel in this TypedDict, and the legacy
+    # `planner` stored only a free-text `plan`, so this field was absent and
+    # plan_agent's structured output vanished (`sync_barrier … job_plan=MISSING`).
+    job_plan: NotRequired[Dict[str, Any]]
     # research_agent output: exactly n_questions grounded issue specs, each with
     # a pedagogical archetype and its own evidence chunk-id list.
     exam_dossier: NotRequired[Dict[str, Any]]

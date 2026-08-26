@@ -80,8 +80,10 @@ MAX_RESEARCH_TURNS = int(os.getenv("FLASHCARD_RESEARCH_MAX_TURNS", "5"))
 BATCH_GEN_MAX_TURNS = int(os.getenv("FLASHCARD_GEN_MAX_TURNS", "2"))
 HARD_OUTPUT_TOKENS = int(os.getenv("FLASHCARD_HARD_OUTPUT_TOKENS", "14000"))
 DOSSIER_TARGET_WORDS = int(os.getenv("FLASHCARD_DOSSIER_TARGET_WORDS", "900"))
-# Cards are moderate index-card Q/As — 7 per Send keeps the batch coherent.
-DEFAULT_BATCH_SIZE = int(os.getenv("FLASHCARD_BATCH_SIZE", "7"))
+# Cards are moderate index-card Q/As. 5 per Send (not 7) so a deck fans out to
+# more, smaller batches: generator latency under thinking=True varies widely per
+# call, and with too few batches one slow draw sets the whole stage.
+DEFAULT_BATCH_SIZE = int(os.getenv("FLASHCARD_BATCH_SIZE", "5"))
 
 GENERATOR_MAX_CHUNKS = 14
 GENERATOR_CHUNK_CHAR_CAP = 1200
@@ -358,6 +360,7 @@ async def card_batch_generator(state: Dict) -> Dict:
 
     batch: Dict[str, Any] = state["batch"]
     dossier: Dict[str, Any] = state.get("flashcard_dossier") or {}
+    job_plan: Dict[str, Any] = state.get("job_plan") or {}
     evidence_store: Dict[str, Dict] = state.get("evidence_store") or {}
     specs: List[Dict] = batch["specs"]
     batch_idx = batch["batch_index"]
@@ -443,7 +446,10 @@ async def card_batch_generator(state: Dict) -> Dict:
         "fails before emitting.\n\n"
         "GROUNDING: use only the evidence provided. If something is missing, "
         "call grep_research_corpus first (free, instant). Most batches need no "
-        "tool calls. Never invent a holding, a citation, or authority.\n\n"
+        "tool calls. Never invent a holding, a citation, or authority. Cite "
+        "support inline as [chunk_id] immediately after the proposition it "
+        "supports on the back of the card — these are stripped before the "
+        "student sees them, so they cost you no length.\n\n"
         "Return ONLY this JSON array — one object per spec, in spec order:\n"
         "[{\n"
         '  "spec_index": int (copy from the spec),\n'
@@ -456,7 +462,14 @@ async def card_batch_generator(state: Dict) -> Dict:
         "}]"
     )
 
+    plan_ctx = (
+        f"COURSE CONTEXT: {job_plan.get('course_context', '')}\n"
+        f"PRIORITY TOPICS: {json.dumps(job_plan.get('priority_topics') or [])}\n"
+        f"HIGH-YIELD NOTES: {job_plan.get('high_yield_notes', '')}\n\n"
+    ) if job_plan else ""
+
     prompt = (
+        f"{plan_ctx}"
         f"SPECS FOR THIS BATCH:\n{json.dumps(specs, indent=2)}\n\n"
         f"CONCEPT INVENTORY:\n{json.dumps(dossier.get('inventory') or {}, indent=2)[:4000]}\n\n"
         f"EVIDENCE:\n{evidence_text}"

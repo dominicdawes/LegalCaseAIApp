@@ -157,6 +157,12 @@ class AgentState(TypedDict):
     budget: NotRequired[Dict[str, Any]]
 
     # ── compact 4-stage pipeline (compact_nodes.py) ──────────────────────────
+    # plan_agent output. MUST be declared here: LangGraph silently drops any key
+    # a node returns that is not a channel in this TypedDict, and the legacy
+    # head_orchestrator never emitted a job_plan (it discarded its LLM result),
+    # so the field was absent and plan_agent's output vanished — visible in the
+    # logs as `sync_barrier … job_plan=MISSING`.
+    job_plan: NotRequired[Dict[str, Any]]
     # research_agent output: case extracts + traps/confusables + exactly
     # num_questions question specs with distractor-type assignments.
     quiz_dossier: NotRequired[Dict[str, Any]]

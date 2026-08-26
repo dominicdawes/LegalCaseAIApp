@@ -55,6 +55,7 @@ from pybreaker import CircuitBreaker
 # ===== DATABASE =====
 import asyncpg
 import psycopg2
+import psycopg2.errors
 from psycopg2.extras import Json
 from psycopg2.pool import ThreadedConnectionPool
 from psycopg2.extras import execute_batch, execute_values
@@ -582,6 +583,54 @@ def _purge_ingest_cache(content_hash: Optional[str]) -> None:
         logger.debug(f"Ingest cache purge failed for {content_hash[:8]}: {e}")
 
 
+def _trim_malloc() -> None:
+    """
+    gc.collect() only reclaims Python objects — it can't make glibc give freed
+    arena pages back to the OS. A big document (DoclingDocument tree, chunk
+    metadata, embedding vectors, insert payloads) fragments the heap enough
+    that RSS stays elevated long after every Python reference is gone, which
+    is exactly the "RETAINED" signature ingest_telemetry logs. malloc_trim(0)
+    asks glibc to release what it can. Linux/glibc only; no-op elsewhere.
+    """
+    if sys.platform != "linux":
+        return
+    try:
+        import ctypes
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:
+        pass
+
+
+def _project_exists_sync(project_id: str) -> bool:
+    """
+    Cheap PK existence check used to guard document_sources inserts against a
+    project that was deleted while this document was queued/processing —
+    there's no way for a Celery task to be notified of that delete, so we
+    poll for it immediately before the insert that would otherwise fail with
+    a foreign key violation.
+    """
+    pool = get_global_sync_db_pool()
+    conn = pool.getconn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM projects WHERE id = %s", (project_id,))
+            return cur.fetchone() is not None
+    finally:
+        pool.putconn(conn)
+
+
+def _document_source_exists_sync(doc_id: str) -> bool:
+    """Same idea as _project_exists_sync, but for document_sources before embedding."""
+    pool = get_global_sync_db_pool()
+    conn = pool.getconn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM document_sources WHERE id = %s", (doc_id,))
+            return cur.fetchone() is not None
+    finally:
+        pool.putconn(conn)
+
+
 def _calculate_stream_hash(stream: io.BytesIO) -> str:
     """Calculate SHA-256 hash from an in-memory stream without consuming it."""
     sha256_hash = hashlib.sha256()
@@ -643,6 +692,19 @@ def _update_document_status_sync(doc_id: str, status: ProcessingStatus, error_me
             conn.commit()
             return # Success
 
+        except psycopg2.IntegrityError as e:
+            # A constraint violation (e.g. the document_sources row itself was
+            # deleted) will fail identically on every retry — don't burn 3
+            # attempts on a statement that can never succeed.
+            if conn:
+                try:
+                    conn.rollback()
+                    pool.putconn(conn, close=True)
+                except Exception:
+                    pass
+                conn = None
+            raise e
+
         except (psycopg2.OperationalError, psycopg2.DatabaseError) as e:
             logger.warning(f"⚠️ DB Connection failed in doc update (attempt {attempt+1}/{retries}): {e}")
             if conn:
@@ -651,11 +713,11 @@ def _update_document_status_sync(doc_id: str, status: ProcessingStatus, error_me
                 except Exception:
                     pass
                 conn = None
-            
+
             if attempt == retries - 1:
                 raise e
             time.sleep(0.5)
-            
+
         finally:
             if conn:
                 pool.putconn(conn)
@@ -707,6 +769,18 @@ def _update_batch_progress_sync(
             conn.commit()
             logger.info(f"📊 [BATCH-{batch_id[:8]}] Progress → {status.value} ({rows_updated} docs)")
             return # Success, exit loop
+
+        except psycopg2.IntegrityError as e:
+            # Same statement will fail the same way on every retry — don't
+            # burn 3 attempts on a constraint violation that can't self-heal.
+            if conn:
+                try:
+                    conn.rollback()
+                    pool.putconn(conn, close=True)
+                except Exception:
+                    pass
+                conn = None
+            raise e
 
         except (psycopg2.OperationalError, psycopg2.DatabaseError) as e:
             logger.warning(f"⚠️ DB Connection failed in batch update (attempt {attempt+1}/{retries}): {e}")
@@ -1218,6 +1292,9 @@ def copy_embeddings_for_project_sync(existing_source_id: str, new_source_id: str
             'sections_copied': len(section_records),
         }
 
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         pool.putconn(conn)
 
@@ -2015,19 +2092,37 @@ async def _embed_batch_async(
                         page_size=200,
                     )
                     conn.commit()
+            except Exception:
+                # Leave the connection clean before it goes back to the pool —
+                # otherwise a failed insert (e.g. an FK violation) hands the
+                # next borrower a connection mid-aborted-transaction.
+                conn.rollback()
+                raise
             finally:
                 pool.putconn(conn)
 
         await asyncio.to_thread(_insert_vectors)
 
         logger.info(f"✅ [BATCH-{short_id}] Stored {len(records_to_insert)} embeddings")
-        
+
         return {
             'success': True,
             'chunks_embedded': len(records_to_insert),
             'token_count': total_tokens
         }
-        
+
+    except psycopg2.errors.ForeignKeyViolation as e:
+        # The document_sources row this batch belongs to was deleted while
+        # this document was still processing (project/document deleted
+        # mid-flight) — an expected race, not a pipeline bug.
+        logger.warning(
+            f"⚠️ [BATCH-{short_id}] Parent document was deleted mid-flight — "
+            f"dropping this batch: {e}"
+        )
+        return {
+            'success': False,
+            'error': 'Parent document was deleted before embeddings could be stored'
+        }
     except Exception as e:
         logger.error(f"❌ [BATCH-{short_id}] Batch processing failed: {e}")
         return {
@@ -2067,6 +2162,20 @@ async def _process_embeddings_async(doc_id: str, project_id: str, chunks: List[s
     short_id = doc_id[:8]
 
     try:
+        # The document_sources row this batch will reference can have been
+        # deleted while parsing/blurb generation was running (project or
+        # document deleted mid-flight). Check before spending an embedding
+        # API call and hitting an FK violation on insert.
+        if not await asyncio.to_thread(_document_source_exists_sync, doc_id):
+            logger.warning(
+                f"⚠️ [DOC-{short_id}] document_sources row is gone — "
+                f"it was deleted while this document was still processing. Skipping embedding."
+            )
+            return {
+                'success': False,
+                'error': 'Parent document was deleted before embeddings could be generated'
+            }
+
         # Create batches (Token-Aware batching)
         embedding_batches = _create_smart_embedding_batches(chunks, metadatas or [{}] * len(chunks))
         
@@ -2859,8 +2968,11 @@ def process_new_document_wrapper(
         _purge_ingest_cache(doc_data.get('content_hash'))
         # Cleanup (like your pattern). gc runs BEFORE the telemetry read so the
         # reported net delta reflects memory actually retained by this document
-        # rather than garbage that simply hasn't been collected yet.
+        # rather than garbage that simply hasn't been collected yet. malloc_trim
+        # follows gc.collect() so freed arenas are handed back to the OS instead
+        # of sitting in glibc waiting to be reused.
         gc.collect()
+        _trim_malloc()
         telemetry.document_finished(doc_id, doc_start_rss, result_status)
 
 async def _process_document_async_workflow(
@@ -2966,10 +3078,33 @@ async def _process_document_async_workflow(
                             datetime.now(timezone.utc), Json(workflow_metadata))
                         )
                     conn.commit()
+            except Exception:
+                # Leave the connection clean before it goes back to the pool —
+                # otherwise a failed insert (e.g. an FK violation) hands the
+                # next borrower a connection mid-aborted-transaction.
+                conn.rollback()
+                raise
             finally:
                 pool.putconn(conn)
 
         with timings.phase("insert"):
+            # The parent project can have been deleted while this document was
+            # queued (rapid-fire uploads racing a project delete) — nothing
+            # notifies this task of that, so check immediately before the
+            # insert that would otherwise fail with a foreign key violation.
+            if not await asyncio.to_thread(_project_exists_sync, project_id):
+                logger.warning(
+                    f"⚠️ [DOC-{short_id}] Parent project {project_id[:8]} no longer exists — "
+                    f"it was deleted while this document was queued/processing. Aborting."
+                )
+                timings.log()
+                return {
+                    'doc_id': doc_id,
+                    'processing_type': 'NEW',
+                    'status': 'FAILED',
+                    'error': 'Parent project was deleted before this document could be processed',
+                    'chunks_created': 0,
+                }
             await asyncio.to_thread(_insert_document_row)
 
         # ——— 2. PARSE Document ———————————————————————————————————————————————————
@@ -3060,6 +3195,12 @@ async def _process_document_async_workflow(
             except Exception as toc_err:
                 logger.warning(f"⚠️ TOC extraction failed: {toc_err}")
 
+        # The DoclingDocument tree (raw_doc) is the single largest per-document
+        # allocation and isn't needed past TOC extraction — drop the reference
+        # now instead of letting it ride in this frame through blurbs/embedding.
+        del raw_doc
+        parse_result['raw_doc'] = None
+
         # ——— 2b. CONTEXTUAL BLURBS (hierarchical path only) ——————————————————
         # Must run before embedding: table chunks embed their LLM summary, not raw markdown.
         if used_hierarchical or USE_HIERARCHICAL_INGEST:
@@ -3146,6 +3287,20 @@ async def _process_document_async_workflow(
             'doc_id': doc_id,
             'processing_type': 'NEW',
             'status': 'CANCELLED',
+            'chunks_created': 0
+        }
+
+    except psycopg2.errors.ForeignKeyViolation as e:
+        # The pre-insert existence check narrows this to a tight race window,
+        # but doesn't close it — log it as the expected "deleted mid-flight"
+        # outcome it is, not a scary unhandled DB error.
+        logger.warning(f"⚠️ [DOC-{short_id}] Parent row deleted mid-flight: {e}")
+        timings.log()
+        return {
+            'doc_id': doc_id,
+            'processing_type': 'NEW',
+            'status': 'FAILED',
+            'error': 'Parent project/document was deleted while this document was processing',
             'chunks_created': 0
         }
 
@@ -3323,6 +3478,21 @@ def process_reused_document_task(
     new_doc_id = workflow_metadata.get('speculative_doc_id') or str(uuid.uuid4())
 
     try:
+        # The parent project can have been deleted while this reuse task was
+        # queued — check before the insert that would otherwise fail with a
+        # foreign key violation (same race as the full ingest pipeline).
+        if not _project_exists_sync(project_id):
+            logger.warning(
+                f"⚠️ [DOC-{new_doc_id[:8]}] Parent project {project_id[:8]} no longer exists — "
+                f"it was deleted while this document was queued. Aborting reuse."
+            )
+            return {
+                'doc_id': new_doc_id,
+                'processing_type': 'REUSED',
+                'status': 'FAILED',
+                'error': 'Parent project was deleted before this document could be processed',
+            }
+
         # ——— Create New Document Entry + Copy Embeddings ——————————————————————————
         # Use global pool instead of local pool
         pool = get_global_sync_db_pool()
@@ -3369,6 +3539,9 @@ def process_reused_document_task(
                     source_info.get('doc_summary'), source_info.get('doc_concepts'))
                 )
                 conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
         finally:
             pool.putconn(conn)
         
@@ -3394,12 +3567,20 @@ def process_reused_document_task(
             'sections_copied': copy_result['sections_copied'],
         }
         
+    except psycopg2.errors.ForeignKeyViolation as e:
+        logger.warning(f"⚠️ [DOC-{new_doc_id[:8]}] Parent row deleted mid-flight: {e}")
+        return {
+            'doc_id': new_doc_id,
+            'processing_type': 'REUSED',
+            'status': 'FAILED',
+            'error': 'Parent project/document was deleted while this document was processing',
+        }
     except Exception as e:
         logger.error(f"❌ [DOC-{new_doc_id[:8]}] Reused document processing failed: {e}", exc_info=True)
         return {
             'doc_id': new_doc_id,
             'processing_type': 'REUSED',
-            'status': 'FAILED', 
+            'status': 'FAILED',
             'error': str(e)
         }
 

@@ -494,7 +494,9 @@ async def question_generator(state: Dict) -> Dict:
         "grep_research_corpus first (free, instant); use find_supporting_evidence "
         "/ get_citations_for to reach the source, and verify_claim when unsure a "
         "legal assertion holds. Most questions need no tool calls. Never invent "
-        "authority.\n\n"
+        "authority. In the answer_key, cite support inline as [chunk_id] "
+        "immediately after each rule statement — these are stripped before the "
+        "student sees them, so they cost you no length.\n\n"
         "Return ONLY this JSON object:\n"
         "{\n"
         '  "issue_label": str,\n'
@@ -513,6 +515,9 @@ async def question_generator(state: Dict) -> Dict:
     prompt = (
         f"SPEC: {json.dumps(spec, indent=2)}\n\n"
         f"Course context: {job_plan.get('course_context', '')}\n"
+        f"Priority doctrines: {json.dumps(job_plan.get('priority_doctrines') or [])}\n"
+        f"Exam-wide difficulty mix: {json.dumps(job_plan.get('difficulty_mix') or {})}\n"
+        f"Exam-wide archetype mix: {json.dumps(job_plan.get('archetype_mix') or {})}\n"
         f"Cross-document throughlines: "
         f"{json.dumps(dossier.get('cross_doc_throughlines') or [])}\n\n"
         f"LEGAL CONTEXT:\n{evidence_text}"
